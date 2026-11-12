@@ -69,6 +69,13 @@ async fn main() -> Result<()> {
         timeout: config.qualification_timeout,
     };
     let engine = SimulatorEngine::new();
+    let engine_identity = engine.identity().await?;
+    if engine_identity.qualification != QualificationStatus::PhysicallyQualified {
+        warn!(
+            qualification = ?engine_identity.qualification,
+            "ordinary backup jobs remain blocked by the unqualified simulator; the attended btape qualification harness uses its separate lab gate"
+        );
+    }
     let worker_id = Uuid::now_v7();
     let shutdown = CancellationToken::new();
     let shutdown_listener = shutdown.clone();
@@ -83,7 +90,6 @@ async fn main() -> Result<()> {
         }
         reconcile_once(
             pool.as_ref(),
-            &engine,
             &sas_config,
             config.lab_tape_motion_enabled,
             &btape_config,
@@ -110,21 +116,12 @@ async fn main() -> Result<()> {
 
 async fn reconcile_once(
     pool: Option<&sqlx::PgPool>,
-    engine: &impl TapeEngine,
     sas_config: &SasDiscoveryConfig,
     lab_tape_motion_enabled: bool,
     btape_config: &BtapeQualificationConfig,
     worker_id: Uuid,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    let identity = engine.identity().await?;
-    if identity.qualification != QualificationStatus::PhysicallyQualified {
-        warn!(
-            qualification = ?identity.qualification,
-            "engine is not physically qualified; tape data operations remain blocked"
-        );
-    }
-
     reconcile_sas_devices(pool, sas_config).await?;
 
     if let Some(pool) = pool {
@@ -137,12 +134,26 @@ async fn reconcile_once(
             cancellation,
         )
         .await?;
-        let queued = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM job_runs WHERE state IN ('queued', 'blocked', 'interrupted') AND finished_at IS NULL",
+        let queue_counts = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+            "SELECT
+                (SELECT count(*) FROM job_runs
+                 WHERE state IN ('queued', 'blocked', 'interrupted')
+                   AND finished_at IS NULL),
+                (SELECT count(*) FROM qualification_runs WHERE state = 'queued'),
+                (SELECT count(*) FROM qualification_runs WHERE state = 'running'),
+                (SELECT count(*) FROM drive_operations WHERE state = 'queued'),
+                (SELECT count(*) FROM drive_operations WHERE state = 'running')",
         )
         .fetch_one(pool)
         .await?;
-        info!(queued_runs = queued, "durable queue reconciled");
+        info!(
+            backup_job_runs = queue_counts.0,
+            qualification_queued_runs = queue_counts.1,
+            qualification_running_runs = queue_counts.2,
+            motion_queued_operations = queue_counts.3,
+            motion_running_operations = queue_counts.4,
+            "durable work queues reconciled"
+        );
     } else {
         info!("simulation reconciliation complete; no durable queue configured");
     }
@@ -505,6 +516,26 @@ fn qualification_terminal_label(state: store::QualificationTerminalState) -> &'s
     }
 }
 
+fn qualification_log_detail(result: &Value) -> String {
+    const MAX_CHARS: usize = 512;
+    let raw = result
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("terminal qualification evidence was recorded");
+    let mut characters = raw.chars().map(|character| {
+        if character.is_control() {
+            ' '
+        } else {
+            character
+        }
+    });
+    let mut concise = characters.by_ref().take(MAX_CHARS).collect::<String>();
+    if characters.next().is_some() {
+        concise.push('…');
+    }
+    concise
+}
+
 fn insert_result_field(result: &mut Value, key: &str, value: Value) {
     if let Some(object) = result.as_object_mut() {
         object.insert(key.to_owned(), value);
@@ -596,10 +627,20 @@ async fn finish_qualification(
     state: store::QualificationTerminalState,
     result: Value,
 ) -> Result<()> {
+    let detail = qualification_log_detail(&result);
     if !store::finish_qualification_run(pool, claim, state, result).await? {
         warn!(
             qualification_run_id = %claim.run.id,
             "qualification completion was rejected by its fencing token; reconciliation is required"
+        );
+    } else {
+        info!(
+            qualification_run_id = %claim.run.id,
+            drive_id = %claim.run.drive_id,
+            cartridge_id = %claim.run.cartridge_id,
+            terminal_state = qualification_terminal_label(state),
+            %detail,
+            "destructive Bacula tape qualification reached a durable terminal state"
         );
     }
     Ok(())
@@ -1166,5 +1207,19 @@ mod tests {
         assert_eq!(bounded["position_uncertain"], false);
         assert_eq!(bounded["evidence_reduced"], true);
         assert!(serde_json::to_vec(&bounded).expect("json").len() < 2_048);
+    }
+
+    #[test]
+    fn qualification_terminal_log_detail_is_safe_and_bounded() {
+        let detail = qualification_log_detail(&json!({
+            "detail": format!("first line\n{}", "x".repeat(600))
+        }));
+        assert!(!detail.contains('\n'));
+        assert_eq!(detail.chars().count(), 513);
+        assert!(detail.ends_with('…'));
+        assert_eq!(
+            qualification_log_detail(&json!({})),
+            "terminal qualification evidence was recorded"
+        );
     }
 }

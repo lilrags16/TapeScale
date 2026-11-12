@@ -15,6 +15,7 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
+use tracing::info;
 use uuid::Uuid;
 
 use crate::{
@@ -670,17 +671,27 @@ async fn queue_qualification_run(
     )
     .await?
     {
-        store::QueueQualificationRunResult::Queued(run) => Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "run":run,
-                "durability":"postgresql",
-                "audit":"appended",
-                "destructive":true,
-                "engine_candidate":"Bacula Community 15.0.3",
-                "physical_qualification":"not_established"
-            })),
-        )),
+        store::QueueQualificationRunResult::Queued(run) => {
+            info!(
+                qualification_run_id = %run.id,
+                drive_id = %run.drive_id,
+                cartridge_id = %run.cartridge_id,
+                cartridge_label = %run.expected_cartridge_label,
+                state = %run.state,
+                "destructive Bacula tape qualification was durably queued"
+            );
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "run":run,
+                    "durability":"postgresql",
+                    "audit":"appended",
+                    "destructive":true,
+                    "engine_candidate":"Bacula Community 15.0.3",
+                    "physical_qualification":"not_established"
+                })),
+            ))
+        }
         store::QueueQualificationRunResult::NotFound => Err(AppError::NotFound),
         store::QueueQualificationRunResult::Blocked(reason) => Err(AppError::Blocked(reason)),
     }

@@ -13,8 +13,8 @@ x-tapescale-common: &tapescale-common
   build:
     context: https://github.com/lilrags16/TapeScale.git#main
     args:
-      TAPESCALE_VERSION: 0.1.0-test.4
-  image: tapescale:0.1.0-test.4
+      TAPESCALE_VERSION: 0.1.0-test.5
+  image: tapescale:0.1.0-test.5
   pull_policy: build
   restart: unless-stopped
   read_only: true

@@ -450,10 +450,14 @@
   function renderQualification() {
     const value = state.data.qualification;
     let html = noticeFor("qualification") + noticeFor("qualificationRuns");
-    if (!value || !Object.keys(value).length) return html + empty("Qualification not available", state.errors.qualification ? "Qualification metadata could not be loaded." : "No qualification metadata has been reported.");
-    html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>G0 is still open</strong><span>A passing btape run proves Bacula record, filemark, positioning, append, and re-read behavior for one exact drive and scratch cartridge. It is not yet backup, full readback, restore, ACL, spanning, encryption, or clean-catalog recovery evidence.</span></div></div>';
-    html += metadata(value, ["cases", "generations"]);
     const runs = state.data.qualificationRuns;
+    if (runs.length) html += qualificationRunNotice(runs[0]);
+    if (!value || !Object.keys(value).length) {
+      html += empty("Qualification metadata not available", state.errors.qualification ? "The qualification definition could not be loaded; durable run history is still shown below." : "No qualification definition has been reported; durable run history is still shown below.");
+    } else {
+      html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>G0 is still open</strong><span>A passing btape run proves Bacula record, filemark, positioning, append, and re-read behavior for one exact drive and scratch cartridge. It is not yet backup, full readback, restore, ACL, spanning, encryption, or clean-catalog recovery evidence.</span></div></div>';
+      html += metadata(value, ["cases", "generations"]);
+    }
     if (runs.length) {
       const rows = runs.map((run) => {
         const result = run.result && typeof run.result === "object" ? run.result : {};
@@ -613,6 +617,40 @@
     return state.data.media.filter((item) => item.worm !== true && count(pick(item, "active_holds")) === 0 && pick(item, "has_content") !== true && !pick(item, "reserved_by") && !["foreign", "mismatch"].includes(String(pick(item, "identity_status") || "")));
   }
 
+  function qualificationRunDetail(run) {
+    const result = run && run.result && typeof run.result === "object" ? run.result : {};
+    const evidence = result.evidence && typeof result.evidence === "object" ? result.evidence : {};
+    return pick(result, "detail") || pick(evidence, "detail");
+  }
+
+  function qualificationRunNotice(run) {
+    if (!run) return "";
+    const runState = String(pick(run, "state") || "queued").toLowerCase();
+    const tone = runState === "passed" ? " success" : ["failed", "blocked"].includes(runState) ? " danger" : runState === "interrupted" ? " warning" : " info";
+    const titles = {
+      queued: "Bacula qualification queued",
+      running: "Bacula qualification is running",
+      passed: "Bacula qualification passed",
+      failed: "Bacula qualification failed",
+      blocked: "Bacula qualification was blocked",
+      interrupted: "Bacula qualification was interrupted"
+    };
+    const cartridge = label(pick(run, "expected_cartridge_label"));
+    const detail = qualificationRunDetail(run) || (runState === "queued"
+      ? "The worker has not claimed this destructive run yet."
+      : runState === "running"
+        ? "Keep the worker and tape drive online. TapeScale is retaining evidence and will finish with a rewind-to-BOT check."
+        : "Open the run record below for retained evidence.");
+    return '<div class="notice' + tone + ' qualification-run-notice"><span class="notice-icon" aria-hidden="true">' + (runState === "passed" ? "✓" : runState === "running" ? "▶" : "!") + '</span><div class="notice-copy"><strong>' + esc(titles[runState] || "Bacula qualification " + human(runState)) + '</strong><span>Scratch cartridge ' + esc(cartridge) + " · " + esc(detail) + '</span></div><button class="button button-small button-quiet" type="button" data-action="open-record" data-kind="qualificationRuns" data-id="' + esc(recordId(run)) + '">View evidence</button></div>';
+  }
+
+  function rememberQualificationRun(run) {
+    if (!run || typeof run !== "object" || !recordId(run)) return;
+    state.data.qualificationRuns = [run].concat(state.data.qualificationRuns.filter((item) => recordId(item) !== recordId(run)));
+    state.received.add("qualificationRuns");
+    delete state.errors.qualificationRuns;
+  }
+
   function openQualification(button) {
     const driveId = button.dataset.id;
     const stableId = button.dataset.stableId;
@@ -644,7 +682,7 @@
     submit.textContent = "Queueing destructive test…";
     errorBox.hidden = true;
     try {
-      await request(endpoints.qualificationRuns, {
+      const response = await request(endpoints.qualificationRuns, {
         method: "POST",
         headers: { Accept: "application/json", "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -657,12 +695,20 @@
           destructive_overwrite_confirmed: values.get("destructive_overwrite_confirmed") === "on"
         })
       });
+      const queuedRun = response && response.run;
+      rememberQualificationRun(queuedRun);
       closeModal();
+      state.settingsTab = "qualification";
+      if (location.hash !== "#settings") location.hash = "#settings";
+      updateChrome();
+      render();
+      scheduleQualificationPoll();
+      live.textContent = "Bacula qualification queued for " + cartridgeLabel + ". Opening durable run status.";
+      toast("Bacula qualification queued", "Opening the durable run status. Keep the worker and tape drive online.");
       await Promise.all([loadOne("qualificationRuns"), loadOne("drives"), loadOne("media")]);
       updateChrome();
       render();
       scheduleQualificationPoll();
-      toast("Bacula qualification queued", "The worker will revalidate the exact drive and cartridge reservation before btape writes anything.");
     } catch (error) {
       errorBox.textContent = errorMessage(error);
       errorBox.hidden = false;
