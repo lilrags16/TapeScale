@@ -18,6 +18,9 @@ LABEL org.opencontainers.image.title="TapeScale" \
       org.opencontainers.image.source="https://github.com/lilrags16/TapeScale" \
       org.opencontainers.image.licenses="Apache-2.0 AND AGPL-3.0-only"
 
+# The pinned bacula-director postinst unconditionally sources
+# /usr/share/bacula-common/dbc_database.conf, while dbconfig-no-thanks
+# intentionally does not create it. TapeScale initializes the catalog itself.
 RUN echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-backports main" \
       > /etc/apt/sources.list.d/tapescale-bookworm-backports.list \
     && apt-get -o Acquire::Check-Valid-Until=false update \
@@ -27,6 +30,9 @@ RUN echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/$
          dbconfig-no-thanks \
          mt-st \
          tzdata \
+    && install -d -m 0755 /usr/share/bacula-common \
+    && printf '%s\n' 'dbc_install=false' > /usr/share/bacula-common/dbc_database.conf \
+    && chmod 0644 /usr/share/bacula-common/dbc_database.conf \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
          -t bookworm-backports \
          bacula-bscan=15.0.3-3~bpo12+1 \
