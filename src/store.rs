@@ -3217,14 +3217,14 @@ pub async fn mark_single_tape_media_write_started(
     Ok(true)
 }
 
-/// Append fenced engine-dispatch evidence without changing the job phase.
+/// Append fenced physical-media or engine-dispatch evidence without changing the job phase.
 pub async fn append_single_tape_data_evidence_event(
     pool: &PgPool,
     claim: &ClaimedSingleTapeDataRun,
     event_type: &str,
     evidence: Value,
 ) -> Result<bool, sqlx::Error> {
-    if event_type != "engine_dispatched" || !evidence.is_object() {
+    if !matches!(event_type, "media_prepared" | "engine_dispatched") || !evidence.is_object() {
         return Ok(false);
     }
     let mut transaction = pool.begin().await?;

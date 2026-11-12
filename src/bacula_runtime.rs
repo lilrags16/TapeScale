@@ -179,6 +179,16 @@ pub struct BaculaRuntime {
 }
 
 impl BaculaRuntime {
+    /// Initialize and validate the Bacula catalog before any irreversible media command.
+    pub async fn prepare_catalog(
+        pool: &PgPool,
+        database_url: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<i32, BaculaRuntimeError> {
+        let catalog = BaculaCatalogConnection::parse(database_url)?;
+        ensure_catalog_schema(pool, &catalog, cancellation).await
+    }
+
     pub async fn start(
         pool: &PgPool,
         database_url: &str,
@@ -309,25 +319,115 @@ async fn ensure_catalog_schema(
                 "-".to_owned(),
             ])
             .env("PGPASSWORD", catalog.password.as_str())
+            .env("PGOPTIONS", "-c search_path=public")
             .stdin_bytes(schema_sql.as_bytes())
             .timeout(Duration::from_secs(180))
             .retained_output_bytes(1024 * 1024);
         tool_runner::run(&command, cancellation)
             .await
-            .map_err(|error| BaculaRuntimeError::CatalogInitialization(error.to_string()))?;
+            .map_err(|error| {
+                BaculaRuntimeError::CatalogInitialization(error.diagnostic_summary(4096))
+            })?;
     }
-    let version = sqlx::query_scalar::<_, i32>("SELECT versionid FROM version LIMIT 1")
-        .fetch_one(&mut *schema_lock)
+    let versions = sqlx::query_scalar::<_, i32>("SELECT versionid FROM public.version")
+        .fetch_all(&mut *schema_lock)
         .await
         .map_err(|error| BaculaRuntimeError::CatalogInitialization(error.to_string()))?;
+    if versions.len() != 1 {
+        return Err(BaculaRuntimeError::CatalogInitialization(format!(
+            "public.version contains {} rows; the pinned catalog requires exactly one",
+            versions.len()
+        )));
+    }
+    let version = versions[0];
     if version != 1026 {
         return Err(BaculaRuntimeError::CatalogVersion(version));
     }
+    validate_catalog_fingerprint(&mut schema_lock).await?;
     schema_lock
         .commit()
         .await
         .map_err(|error| BaculaRuntimeError::CatalogInitialization(error.to_string()))?;
     Ok(version)
+}
+
+async fn validate_catalog_fingerprint(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), BaculaRuntimeError> {
+    let missing = sqlx::query_as::<_, (String, String)>(
+        "WITH required(table_name, column_name) AS (VALUES
+            ('pool', 'poolid'), ('pool', 'name'), ('pool', 'maxvols'),
+            ('pool', 'recycle'), ('pool', 'autoprune'),
+            ('media', 'mediaid'), ('media', 'volumename'), ('media', 'poolid'),
+            ('media', 'mediatype'), ('media', 'volstatus'), ('media', 'enabled'),
+            ('media', 'recycle'), ('media', 'volbytes'),
+            ('job', 'jobid'), ('job', 'name'), ('job', 'type'), ('job', 'level'),
+            ('job', 'jobstatus'), ('job', 'priorjobid'), ('job', 'jobfiles'),
+            ('job', 'jobbytes'), ('job', 'joberrors'), ('job', 'poolid'),
+            ('job', 'lastreadstorageid'), ('job', 'writestorageid'),
+            ('jobmedia', 'jobmediaid'), ('jobmedia', 'jobid'),
+            ('jobmedia', 'mediaid'), ('jobmedia', 'volindex'),
+            ('jobmedia', 'firstindex'), ('jobmedia', 'lastindex'),
+            ('jobmedia', 'startfile'), ('jobmedia', 'startblock'),
+            ('jobmedia', 'endfile'), ('jobmedia', 'endblock'),
+            ('storage', 'storageid'), ('storage', 'name'),
+            ('client', 'clientid'), ('client', 'name'),
+            ('log', 'logid'), ('log', 'jobid'), ('log', 'logtext'),
+            ('path', 'pathid'), ('path', 'path'),
+            ('file', 'fileid'), ('file', 'jobid'), ('file', 'pathid'),
+            ('file', 'filename')
+         )
+         SELECT required.table_name, required.column_name
+         FROM required
+         LEFT JOIN information_schema.columns actual
+           ON actual.table_schema = 'public'
+          AND actual.table_name = required.table_name
+          AND actual.column_name = required.column_name
+         WHERE actual.column_name IS NULL
+         ORDER BY required.table_name, required.column_name",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|error| BaculaRuntimeError::CatalogInitialization(error.to_string()))?;
+    if !missing.is_empty() {
+        let detail = missing
+            .iter()
+            .map(|(table, column)| format!("public.{table}.{column}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(BaculaRuntimeError::CatalogInitialization(format!(
+            "catalog version 1026 is incomplete; missing {detail}"
+        )));
+    }
+
+    let inaccessible = sqlx::query_scalar::<_, String>(
+        "WITH required(table_name) AS (VALUES
+            ('pool'), ('media'), ('job'), ('jobmedia'), ('storage'),
+            ('client'), ('log'), ('path'), ('file'), ('fileset')
+         )
+         SELECT table_name
+         FROM required
+         WHERE NOT has_table_privilege(
+             current_user,
+             'public.' || table_name,
+             'SELECT, INSERT, UPDATE, DELETE'
+         )
+         ORDER BY table_name",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|error| BaculaRuntimeError::CatalogInitialization(error.to_string()))?;
+    if !inaccessible.is_empty() {
+        return Err(BaculaRuntimeError::CatalogInitialization(format!(
+            "catalog role lacks required DML privileges on: {}",
+            inaccessible
+                .iter()
+                .map(|table| format!("public.{table}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn extract_catalog_schema_sql(script: &str) -> Option<&str> {
@@ -442,7 +542,7 @@ async fn validate_daemon(
         .map(|_| ())
         .map_err(|error| BaculaRuntimeError::Validation {
             daemon,
-            detail: error.to_string(),
+            detail: error.diagnostic_summary(4096),
         })
 }
 

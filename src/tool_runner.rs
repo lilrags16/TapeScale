@@ -123,6 +123,109 @@ pub enum ToolError {
     },
 }
 
+impl ToolError {
+    /// Return a compact diagnostic suitable for durable status and logs.
+    ///
+    /// The summary includes only the executable path and tool-emitted output;
+    /// command arguments, stdin, and environment values are never included.
+    /// `max_output_chars` bounds the selected stderr/stdout excerpt, while the
+    /// error classification remains intact even when the excerpt is empty.
+    #[must_use]
+    pub fn diagnostic_summary(&self, max_output_chars: usize) -> String {
+        let (summary, stdout, stderr, output_truncated) = match self {
+            Self::Timeout {
+                program,
+                timeout,
+                stdout,
+                stderr,
+                output_truncated,
+                ..
+            } => (
+                format!("tool timed out after {timeout:?}: {}", program.display()),
+                stdout.as_str(),
+                stderr.as_str(),
+                *output_truncated,
+            ),
+            Self::Cancelled {
+                program,
+                stdout,
+                stderr,
+                output_truncated,
+                ..
+            } => (
+                format!("tool was cancelled: {}", program.display()),
+                stdout.as_str(),
+                stderr.as_str(),
+                *output_truncated,
+            ),
+            Self::Failed {
+                program,
+                code,
+                stdout,
+                stderr,
+                output_truncated,
+                ..
+            } => (
+                format!("tool failed with exit code {code}: {}", program.display()),
+                stdout.as_str(),
+                stderr.as_str(),
+                *output_truncated,
+            ),
+            Self::Unavailable { .. } | Self::Io { .. } => {
+                return collapse_diagnostic_text(&self.to_string());
+            }
+        };
+
+        let summary = collapse_diagnostic_text(&summary);
+        let stderr = collapse_diagnostic_text(stderr);
+        let (stream, output) = if stderr.is_empty() {
+            ("stdout", collapse_diagnostic_text(stdout))
+        } else {
+            ("stderr", stderr)
+        };
+        if output.is_empty() {
+            return if output_truncated {
+                format!("{summary}; tool output was truncated")
+            } else {
+                summary
+            };
+        }
+
+        let (excerpt, excerpt_truncated) = truncate_chars(&output, max_output_chars);
+        let truncation = output_truncated || excerpt_truncated;
+        if excerpt.is_empty() {
+            format!("{summary}; {stream}: [truncated]")
+        } else if truncation {
+            format!("{summary}; {stream}: {excerpt} [truncated]")
+        } else {
+            format!("{summary}; {stream}: {excerpt}")
+        }
+    }
+}
+
+fn collapse_diagnostic_text(value: &str) -> String {
+    let mut collapsed = String::with_capacity(value.len());
+    let mut separator_pending = false;
+    for character in value.chars() {
+        if character.is_control() || character.is_whitespace() {
+            separator_pending = !collapsed.is_empty();
+            continue;
+        }
+        if separator_pending {
+            collapsed.push(' ');
+            separator_pending = false;
+        }
+        collapsed.push(character);
+    }
+    collapsed
+}
+
+fn truncate_chars(value: &str, limit: usize) -> (String, bool) {
+    let mut characters = value.chars();
+    let excerpt = characters.by_ref().take(limit).collect();
+    (excerpt, characters.next().is_some())
+}
+
 pub async fn run(
     command: &ToolCommand,
     cancellation: &CancellationToken,
@@ -427,6 +530,88 @@ mod tests {
             Err(ToolError::Cancelled { .. })
         ));
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn diagnostic_summary_prefers_and_sanitizes_stderr() {
+        let error = ToolError::Failed {
+            program: PathBuf::from("/usr/bin/psql"),
+            code: 3,
+            stdout: "stdout should not be selected".to_owned(),
+            stderr: "\nERROR:\tbad\0relation\r\n".to_owned(),
+            output_truncated: false,
+            elapsed_ms: 12,
+        };
+
+        assert_eq!(
+            error.diagnostic_summary(512),
+            "tool failed with exit code 3: /usr/bin/psql; stderr: ERROR: bad relation"
+        );
+    }
+
+    #[test]
+    fn diagnostic_summary_falls_back_to_bounded_stdout() {
+        let error = ToolError::Failed {
+            program: PathBuf::from("/usr/bin/tool"),
+            code: 9,
+            stdout: "abcdefgh".to_owned(),
+            stderr: " \n\t".to_owned(),
+            output_truncated: false,
+            elapsed_ms: 4,
+        };
+
+        assert_eq!(
+            error.diagnostic_summary(4),
+            "tool failed with exit code 9: /usr/bin/tool; stdout: abcd [truncated]"
+        );
+    }
+
+    #[test]
+    fn diagnostic_summary_reports_upstream_truncation() {
+        let error = ToolError::Timeout {
+            program: PathBuf::from("/usr/bin/tool"),
+            timeout: Duration::from_secs(30),
+            stdout: String::new(),
+            stderr: "last retained error".to_owned(),
+            output_truncated: true,
+            elapsed_ms: 30_000,
+        };
+
+        assert_eq!(
+            error.diagnostic_summary(512),
+            "tool timed out after 30s: /usr/bin/tool; stderr: last retained error [truncated]"
+        );
+    }
+
+    #[test]
+    fn diagnostic_summary_preserves_cancelled_status_without_output() {
+        let error = ToolError::Cancelled {
+            program: PathBuf::from("/usr/bin/tool"),
+            stdout: String::new(),
+            stderr: String::new(),
+            output_truncated: false,
+            elapsed_ms: 7,
+        };
+
+        assert_eq!(
+            error.diagnostic_summary(512),
+            "tool was cancelled: /usr/bin/tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_summary_omits_arguments_and_environment() {
+        let command = ToolCommand::new("/bin/sh")
+            .args(["-c", "exit 7", "argument-secret"])
+            .env("TOOL_SECRET", "environment-secret");
+        let error = run(&command, &CancellationToken::new())
+            .await
+            .expect_err("command must fail");
+        let summary = error.diagnostic_summary(512);
+
+        assert_eq!(summary, "tool failed with exit code 7: /bin/sh");
+        assert!(!summary.contains("argument-secret"));
+        assert!(!summary.contains("environment-secret"));
     }
 
     #[tokio::test]

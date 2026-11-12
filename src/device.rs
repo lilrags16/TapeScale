@@ -1,8 +1,10 @@
 //! Discovery and constrained lab motion for explicitly mapped Linux SCSI tape devices.
 //!
 //! Identity and `mt status` are read-only. A separately gated worker path may issue the two
-//! closed non-data motion operations below. Format, erase, label, file-mark, seek, spacing,
-//! retension, read, and write commands are not exposed.
+//! closed non-data motion operations below. The destructive G0.2 worker also has one internal,
+//! fixed file-mark operation used only to invalidate prior scratch contents before Bacula owns the
+//! tape. Format, erase, arbitrary file-mark, seek, spacing, retension, read, and general write
+//! commands are not exposed.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -184,6 +186,55 @@ pub async fn execute_sas_motion(
     tool_runner::run(&command, cancellation)
         .await
         .map_err(SasMotionError::from)
+}
+
+/// Invalidate the existing on-tape label at BOT before the fenced G0.2 Bacula run.
+///
+/// Qualification, an interrupted earlier attempt, or another scratch workflow can leave records
+/// or a valid label at BOT. The Director's safe `label` command intentionally refuses a valid
+/// existing label, so the already-authorized destructive recovery workflow first makes the
+/// cartridge blank from Bacula's perspective. This operation is not represented by the public
+/// motion API and accepts no caller-controlled command or argument.
+pub(crate) async fn clear_sas_scratch_label(
+    config: &SasDiscoveryConfig,
+    device: &Path,
+    cancellation: &CancellationToken,
+) -> Result<ToolOutput, SasMotionError> {
+    let command = build_clear_label_command(config, device)?;
+    verify_device_binding(config, device).map_err(|reason| SasMotionError::DeviceBinding {
+        device: device.to_owned(),
+        reason,
+    })?;
+    tool_runner::run(&command, cancellation)
+        .await
+        .map_err(SasMotionError::from)
+}
+
+fn build_clear_label_command(
+    config: &SasDiscoveryConfig,
+    device: &Path,
+) -> Result<ToolCommand, SasMotionError> {
+    if validate_tape_path(device).is_err()
+        || !config
+            .devices
+            .iter()
+            .any(|configured| configured.as_path() == device)
+    {
+        return Err(SasMotionError::DeviceNotConfigured {
+            device: device.to_owned(),
+        });
+    }
+
+    let mut command = ToolCommand::new(&config.mt_path)
+        .args([
+            "-f".to_owned(),
+            device.display().to_string(),
+            "weof".to_owned(),
+            "1".to_owned(),
+        ])
+        .timeout(MOTION_TIMEOUT);
+    command.retained_output_bytes = MOTION_OUTPUT_LIMIT;
+    Ok(command)
 }
 
 fn build_motion_command(
@@ -797,6 +848,29 @@ mod tests {
             assert_eq!(command.timeout, MOTION_TIMEOUT);
             assert_eq!(command.retained_output_bytes, MOTION_OUTPUT_LIMIT);
             assert!(command.working_dir.is_none());
+        }
+    }
+
+    #[test]
+    fn scratch_label_clear_is_one_fixed_internal_command() {
+        let config = motion_config(&["/dev/nst0"], "/usr/bin/mt-st");
+        let command = build_clear_label_command(&config, Path::new("/dev/nst0"))
+            .expect("configured scratch-label command");
+        assert_eq!(command.program, PathBuf::from("/usr/bin/mt-st"));
+        assert_eq!(command.args, ["-f", "/dev/nst0", "weof", "1"]);
+        assert_eq!(command.timeout, MOTION_TIMEOUT);
+        assert_eq!(command.retained_output_bytes, MOTION_OUTPUT_LIMIT);
+        assert!(command.working_dir.is_none());
+    }
+
+    #[test]
+    fn scratch_label_clear_rejects_unconfigured_or_rewinding_paths() {
+        let config = motion_config(&["/dev/nst0", "/dev/st0"], "/usr/bin/mt-st");
+        for rejected in ["/dev/nst1", "/dev/st0", "/dev/sg0"] {
+            assert!(matches!(
+                build_clear_label_command(&config, Path::new(rejected)),
+                Err(SasMotionError::DeviceNotConfigured { .. })
+            ));
         }
     }
 

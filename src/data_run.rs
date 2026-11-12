@@ -29,8 +29,8 @@ use crate::{
         FileManifest, JsonArtifactSummary, ManifestArtifactSummary, ManifestComparison,
     },
     device::{
-        discover_sas_drives, execute_sas_motion, SasDiscoveryConfig, SasMotionError,
-        SasMotionOperation, SasProbeResult,
+        clear_sas_scratch_label, discover_sas_drives, execute_sas_motion, SasDiscoveryConfig,
+        SasMotionError, SasMotionOperation, SasProbeResult,
     },
     engine::bacula::{
         BaculaAdapter, BaculaCommands, BaculaJobEvidence, BaculaJobId, BaculaJobResource,
@@ -255,6 +255,16 @@ async fn perform_exercise(
                 "the worker could not prove the selected source is mounted read-only: {error}"
             ))
         })?;
+        let database_url = config.database_url.as_deref().ok_or_else(|| {
+            ExerciseFailure::blocked("DATABASE_URL is required for the Bacula catalog")
+        })?;
+        BaculaRuntime::prepare_catalog(pool, database_url, cancellation)
+            .await
+            .map_err(|error| {
+                ExerciseFailure::blocked(format!(
+                    "Bacula catalog preflight failed before any tape write: {error}"
+                ))
+            })?;
         if cancellation.is_cancelled() {
             return Err(ExerciseFailure::interrupted(
                 "worker shutdown was requested before source inventory",
@@ -331,10 +341,73 @@ async fn perform_exercise(
         )
         .await
         .map_err(|error| {
+            let detail = sas_command_error_detail(&error);
             if matches!(error, SasMotionError::Tool(ToolError::Cancelled { .. })) {
-                ExerciseFailure::interrupted(format!("pre-write rewind was interrupted: {error}"))
+                ExerciseFailure::interrupted(format!(
+                    "pre-write rewind was interrupted: {detail}"
+                ))
             } else {
-                ExerciseFailure::failed(format!("pre-write rewind failed: {error}"))
+                ExerciseFailure::failed(format!("pre-write rewind failed: {detail}"))
+            }
+        })?;
+
+        let label_clear = clear_sas_scratch_label(
+            sas_config,
+            Path::new(&claim.run.expected_path),
+            cancellation,
+        )
+        .await
+        .map_err(|error| {
+            let detail = sas_command_error_detail(&error);
+            if matches!(error, SasMotionError::Tool(ToolError::Cancelled { .. })) {
+                ExerciseFailure::interrupted(format!(
+                    "scratch-header preparation was interrupted after the cartridge entered the write boundary: {detail}"
+                ))
+            } else {
+                ExerciseFailure::failed(format!(
+                    "could not clear prior contents at BOT on the authorized scratch cartridge: {detail}"
+                ))
+            }
+        })?;
+        if !store::append_single_tape_data_evidence_event(
+            pool,
+            claim,
+            "media_prepared",
+            json!({
+                "phase": "writing",
+                "operation": "clear_prior_scratch_header",
+                "device": claim.run.expected_path,
+                "tool": label_clear,
+                "detail": "prior scratch contents at BOT were invalidated before Director labeling"
+            }),
+        )
+        .await
+        .map_err(|error| ExerciseFailure::interrupted(error.to_string()))?
+        {
+            return Err(ExerciseFailure::interrupted(
+                "the fenced run could not retain scratch-header preparation evidence",
+            ));
+        }
+
+        // `weof` leaves the non-rewinding device after the new file mark. Return to
+        // BOT so the Bacula Storage Daemon begins label inspection deterministically.
+        execute_sas_motion(
+            sas_config,
+            Path::new(&claim.run.expected_path),
+            SasMotionOperation::Rewind,
+            cancellation,
+        )
+        .await
+        .map_err(|error| {
+            let detail = sas_command_error_detail(&error);
+            if matches!(error, SasMotionError::Tool(ToolError::Cancelled { .. })) {
+                ExerciseFailure::interrupted(format!(
+                    "post-invalidation rewind was interrupted: {detail}"
+                ))
+            } else {
+                ExerciseFailure::failed(format!(
+                    "post-invalidation rewind failed before Bacula labeling: {detail}"
+                ))
             }
         })?;
 
@@ -346,9 +419,6 @@ async fn perform_exercise(
             PathBuf::from(&claim.run.expected_path),
         )
         .map_err(|error| ExerciseFailure::blocked(error.to_string()))?;
-        let database_url = config.database_url.as_deref().ok_or_else(|| {
-            ExerciseFailure::blocked("DATABASE_URL is required for the Bacula catalog")
-        })?;
         runtime = Some(
             BaculaRuntime::start(
                 pool,
@@ -1166,10 +1236,14 @@ fn validate_console_output(
     let lowercase = combined.to_ascii_lowercase();
     if [
         "error:",
+        "sql error",
+        "fatal",
         "failed",
         "not found",
         "invalid command",
         "permission denied",
+        "cannot label",
+        "already labeled",
     ]
     .iter()
     .any(|marker| lowercase.contains(marker))
@@ -1180,6 +1254,15 @@ fn validate_console_output(
         )));
     }
     Ok(())
+}
+
+fn sas_command_error_detail(error: &SasMotionError) -> String {
+    match error {
+        SasMotionError::Tool(tool) => tool.diagnostic_summary(2048),
+        SasMotionError::DeviceNotConfigured { .. } | SasMotionError::DeviceBinding { .. } => {
+            error.to_string()
+        }
+    }
 }
 
 async fn append_manifest_artifact(
@@ -1463,4 +1546,29 @@ fn concise_text(value: &str, limit: usize) -> String {
         concise.push('…');
     }
     concise
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_validation_rejects_existing_media_and_sql_failures() {
+        for output in [
+            "3920 Cannot label Volume because it is already labeled: TEST001",
+            "SQL error. Expected one MediaId",
+            "Fatal catalog error",
+        ] {
+            assert!(
+                validate_console_output("label", output.as_bytes(), b"").is_err(),
+                "accepted Bacula failure output: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn label_validation_accepts_success() {
+        let output = b"3000 OK label. VolBytes=283 Volume=TEST001 Device=TS-LTO-Drive";
+        assert!(validate_console_output("label", output, b"").is_ok());
+    }
 }

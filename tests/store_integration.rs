@@ -654,6 +654,14 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     assert!(store::append_single_tape_data_evidence_event(
         &pool,
         &data_claim,
+        "media_prepared",
+        json!({"operation":"clear_prior_scratch_header","exit_code":0}),
+    )
+    .await
+    .expect("scratch-label invalidation evidence should append"));
+    assert!(store::append_single_tape_data_evidence_event(
+        &pool,
+        &data_claim,
         "engine_dispatched",
         json!({"operation":"backup","engine_job_id":1001}),
     )
@@ -838,6 +846,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             "started",
             "writing",
             "media_write_started",
+            "media_prepared",
             "engine_dispatched",
             "written",
             "verifying",
