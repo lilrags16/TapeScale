@@ -18,6 +18,7 @@ x-tapescale-common: &tapescale-common
   environment: &tapescale-environment
     TAPESCALE_DEMO_MODE: ${TAPESCALE_DEMO_MODE:-false}
     TAPESCALE_LAB_TAPE_MOTION_ENABLED: ${TAPESCALE_LAB_TAPE_MOTION_ENABLED:-false}
+    TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED: ${TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED:-false}
     TAPESCALE_DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
     TAPESCALE_DATABASE_HOST: postgres
     TAPESCALE_DATABASE_PORT: 5432
@@ -61,11 +62,15 @@ services:
       TAPESCALE_TAPE_DEVICES: ${TAPESCALE_TAPE_DEVICES:-}
       TAPESCALE_SYSFS_ROOT: ${TAPESCALE_SYSFS_ROOT:-/sys}
       TAPESCALE_MT_PATH: ${TAPESCALE_MT_PATH:-/usr/bin/mt-st}
+      TAPESCALE_BTAPE_PATH: ${TAPESCALE_BTAPE_PATH:-/usr/sbin/btape}
+      TAPESCALE_BACULA_STATE_DIR: /var/lib/tapescale/bacula
+      TAPESCALE_QUALIFICATION_TIMEOUT_SECS: ${TAPESCALE_QUALIFICATION_TIMEOUT_SECS:-1800}
     healthcheck:
       disable: true
     volumes:
       - recovery_exports:/var/lib/tapescale/recovery
       - spool:/var/lib/tapescale/spool
+      - engine_state:/var/lib/tapescale/bacula
     deploy:
       resources:
         limits:
@@ -90,7 +95,7 @@ services:
           pids: 256
 
   postgres:
-    image: postgres:16.15-bookworm
+    image: postgres:16.15-bookworm@sha256:5264710be20f409750ac6dc4e5706dcef929c87e241605463f0f9aefa932a8d9
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -132,6 +137,7 @@ volumes:
   postgres_data:
   recovery_exports:
   spool:
+  engine_state:
 
 networks:
   edge:

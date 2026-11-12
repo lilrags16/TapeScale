@@ -31,16 +31,23 @@ pub struct AppState {
     pub demo_mode: bool,
     pub engine: Arc<dyn TapeEngine>,
     pub lab_tape_motion_enabled: bool,
+    pub lab_tape_qualification_enabled: bool,
 }
 
 impl AppState {
     #[must_use]
-    pub fn new(pool: Option<PgPool>, demo_mode: bool, lab_tape_motion_enabled: bool) -> Self {
+    pub fn new(
+        pool: Option<PgPool>,
+        demo_mode: bool,
+        lab_tape_motion_enabled: bool,
+        lab_tape_qualification_enabled: bool,
+    ) -> Self {
         Self {
             pool,
             demo_mode,
             engine: Arc::new(SimulatorEngine::new()),
             lab_tape_motion_enabled,
+            lab_tape_qualification_enabled,
         }
     }
 }
@@ -64,7 +71,12 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .route("/api/v1/recovery-points", get(recovery_points))
         .route("/api/v1/restores/plan", post(plan_restore))
         .route("/api/v1/preflight", get(preflight))
-        .route("/api/v1/qualification", get(qualification_report));
+        .route("/api/v1/qualification", get(qualification_report))
+        .route(
+            "/api/v1/qualification/runs",
+            get(qualification_runs).post(queue_qualification_run),
+        )
+        .route("/api/v1/qualification/runs/{id}", get(qualification_run));
 
     let static_files = ServeDir::new(&web_dir)
         .append_index_html_on_directories(true)
@@ -126,6 +138,7 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
         "engine":identity,
         "capabilities":capabilities,
         "lab_tape_motion_enabled":state.lab_tape_motion_enabled,
+        "lab_tape_qualification_enabled":state.lab_tape_qualification_enabled,
         "operational_data":"postgresql_only"
     })))
 }
@@ -501,7 +514,7 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
             "checked_at":chrono::Utc::now(),
             "checks":[
                 preflight_check("database", "Database", "blocked", "PostgreSQL is not configured"),
-                preflight_check("engine", "Tape engine", "blocked", "Only the simulator adapter is available")
+                preflight_check("engine", "Tape backup engine", "blocked", "Backup jobs still use the simulator; Bacula btape is qualification-only")
             ],
             "inventory":empty_inventory()
         })));
@@ -548,10 +561,129 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
                 if inventory.qualified_drives > 0 {"A physically qualified drive is recorded"} else {"No physically qualified drive is recorded"}),
             preflight_check("media_inventory", "Media inventory", media_status,
                 if inventory.cartridges > 0 {"Cartridges are registered; on-tape identity still governs safe use"} else {"No cartridges are registered"}),
-            preflight_check("engine", "Tape engine", "blocked", "Only the simulator adapter is available")
+            preflight_check("engine", "Tape backup engine", "blocked", "Backup jobs still use the simulator; Bacula btape is qualification-only")
         ],
         "inventory":inventory
     })))
+}
+
+async fn qualification_runs(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let runs = match state.pool.as_ref() {
+        Some(pool) => store::list_qualification_runs(pool).await?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({
+        "runs": runs,
+        "engine_candidate": {"name":"Bacula Community","version":"15.0.3"},
+        "physical_qualification":"not_established"
+    })))
+}
+
+async fn qualification_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let id = Uuid::parse_str(&id)
+        .map_err(|_| AppError::Invalid("qualification run id must be a UUID".to_owned()))?;
+    let run = store::get_qualification_run(pool, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let events = store::qualification_events(pool, id).await?;
+    Ok(Json(json!({
+        "run":run,
+        "events":events,
+        "physical_qualification":"not_established"
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueQualificationRunRequest {
+    drive_id: Uuid,
+    stable_id: String,
+    cartridge_id: Uuid,
+    cartridge_label: String,
+    confirmation: String,
+    scratch_media_confirmed: bool,
+    destructive_overwrite_confirmed: bool,
+}
+
+impl QueueQualificationRunRequest {
+    fn expected_confirmation(&self) -> String {
+        format!("DESTROY {} WITH BACULA BTAPE TEST", self.cartridge_label)
+    }
+
+    fn validate(&self) -> Result<(&str, &str), AppError> {
+        let stable_id = self.stable_id.trim();
+        if stable_id.is_empty()
+            || stable_id.chars().count() > 512
+            || stable_id.chars().any(char::is_control)
+        {
+            return Err(AppError::Invalid(
+                "stable_id must contain 1 to 512 characters".to_owned(),
+            ));
+        }
+        if self.cartridge_label.is_empty()
+            || self.cartridge_label.chars().count() > 128
+            || self.cartridge_label.chars().any(char::is_control)
+        {
+            return Err(AppError::Invalid(
+                "cartridge_label must contain 1 to 128 characters".to_owned(),
+            ));
+        }
+        if !self.scratch_media_confirmed || !self.destructive_overwrite_confirmed {
+            return Err(AppError::Invalid(
+                "scratch_media_confirmed and destructive_overwrite_confirmed must both be true"
+                    .to_owned(),
+            ));
+        }
+        if self.confirmation != self.expected_confirmation() {
+            return Err(AppError::Invalid(format!(
+                "confirmation must exactly equal {}",
+                self.expected_confirmation()
+            )));
+        }
+        Ok((stable_id, &self.cartridge_label))
+    }
+}
+
+async fn queue_qualification_run(
+    State(state): State<AppState>,
+    Json(request): Json<QueueQualificationRunRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    if !state.lab_tape_qualification_enabled {
+        return Err(AppError::Blocked(
+            "destructive lab tape qualification is disabled; set TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED=true on the API and worker only for an attended scratch-media test host"
+                .to_owned(),
+        ));
+    }
+    let pool = require_pool(&state)?;
+    let (stable_id, cartridge_label) = request.validate()?;
+    match store::queue_qualification_run(
+        pool,
+        request.drive_id,
+        stable_id,
+        request.cartridge_id,
+        cartridge_label,
+        request.scratch_media_confirmed,
+        request.destructive_overwrite_confirmed,
+    )
+    .await?
+    {
+        store::QueueQualificationRunResult::Queued(run) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "run":run,
+                "durability":"postgresql",
+                "audit":"appended",
+                "destructive":true,
+                "engine_candidate":"Bacula Community 15.0.3",
+                "physical_qualification":"not_established"
+            })),
+        )),
+        store::QueueQualificationRunResult::NotFound => Err(AppError::NotFound),
+        store::QueueQualificationRunResult::Blocked(reason) => Err(AppError::Blocked(reason)),
+    }
 }
 
 async fn qualification_report() -> Json<Value> {
@@ -675,6 +807,26 @@ mod tests {
 
         let invalid = DriveActionRequest {
             confirmation: "rewind".to_owned(),
+            ..request
+        };
+        assert!(matches!(invalid.validate(), Err(AppError::Invalid(_))));
+    }
+
+    #[test]
+    fn tape_qualification_requires_exact_destructive_confirmation() {
+        let request = QueueQualificationRunRequest {
+            drive_id: Uuid::now_v7(),
+            stable_id: "scsi:naa.5001".to_owned(),
+            cartridge_id: Uuid::now_v7(),
+            cartridge_label: "SCRATCH-L9-001".to_owned(),
+            confirmation: "DESTROY SCRATCH-L9-001 WITH BACULA BTAPE TEST".to_owned(),
+            scratch_media_confirmed: true,
+            destructive_overwrite_confirmed: true,
+        };
+        assert!(request.validate().is_ok());
+
+        let invalid = QueueQualificationRunRequest {
+            confirmation: "DESTROY THE TAPE".to_owned(),
             ..request
         };
         assert!(matches!(invalid.validate(), Err(AppError::Invalid(_))));

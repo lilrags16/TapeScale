@@ -5,8 +5,9 @@ use serde_json::json;
 use tapescale::{
     device::{MissingSasDrive, SasDriveObservation, SasMotionOperation},
     store::{
-        self, ClaimDriveOperationResult, DriveOperationTerminalState, NewMedia,
-        QueueDriveOperationResult, ReconcileDriveResult,
+        self, ClaimDriveOperationResult, ClaimQualificationRunResult, DriveOperationTerminalState,
+        NewMedia, QualificationTerminalState, QueueDriveOperationResult,
+        QueueQualificationRunResult, ReconcileDriveResult,
     },
 };
 
@@ -284,6 +285,188 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     .await
     .expect("motion audit query should succeed");
     assert_eq!(motion_audit, 3);
+
+    assert!(matches!(
+        store::queue_qualification_run(
+            &pool,
+            drive_id,
+            "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+            created.id,
+            &created.internal_label,
+            true,
+            true,
+        )
+        .await
+        .expect("WORM gate should be a domain outcome"),
+        QueueQualificationRunResult::Blocked(_)
+    ));
+    let scratch_request = NewMedia {
+        internal_label: "INTEGRATION-SCRATCH-L9-000001".to_owned(),
+        barcode: Some("INT9SCR001".to_owned()),
+        media_generation: 9,
+        media_format: "LTO-9".to_owned(),
+        worm: false,
+    };
+    let scratch = store::create_media(&pool, &scratch_request)
+        .await
+        .expect("scratch cartridge should be inserted");
+    let queued_qualification = store::queue_qualification_run(
+        &pool,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        scratch.id,
+        &scratch.internal_label,
+        true,
+        true,
+    )
+    .await
+    .expect("qualification request should persist");
+    let QueueQualificationRunResult::Queued(queued_qualification) = queued_qualification else {
+        panic!("eligible qualification request should queue");
+    };
+    assert_eq!(queued_qualification.state, "queued");
+    assert_eq!(queued_qualification.engine_version, "15.0.3");
+    assert!(matches!(
+        store::queue_drive_operation(
+            &pool,
+            drive_id,
+            "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+            SasMotionOperation::Rewind,
+            true,
+        )
+        .await
+        .expect("qualification should block a competing motion"),
+        QueueDriveOperationResult::Blocked(_)
+    ));
+    let claimed_qualification = store::claim_next_qualification_run(&pool, uuid::Uuid::now_v7())
+        .await
+        .expect("qualification claim should succeed");
+    let ClaimQualificationRunResult::Claimed(claimed_qualification) = claimed_qualification else {
+        panic!("queued qualification should be claimed");
+    };
+    assert!(
+        store::renew_qualification_run_lease(&pool, &claimed_qualification)
+            .await
+            .expect("qualification lease should renew")
+    );
+    assert!(store::finish_qualification_run(
+        &pool,
+        &claimed_qualification,
+        QualificationTerminalState::Passed,
+        json!({
+            "detail":"integration btape evidence fixture",
+            "position_uncertain":false,
+            "engine_version":"15.0.3"
+        }),
+    )
+    .await
+    .expect("qualification completion should persist"));
+    let completed_qualification = store::get_qualification_run(&pool, queued_qualification.id)
+        .await
+        .expect("qualification should reload")
+        .expect("qualification remains in history");
+    assert_eq!(completed_qualification.state, "passed");
+    let qualification_events = store::qualification_events(&pool, queued_qualification.id)
+        .await
+        .expect("qualification events should reload");
+    assert_eq!(
+        qualification_events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["queued", "started", "passed"]
+    );
+    let reservation =
+        sqlx::query_scalar::<_, Option<String>>("SELECT reserved_by FROM cartridges WHERE id = $1")
+            .bind(scratch.id)
+            .fetch_one(&pool)
+            .await
+            .expect("scratch reservation should reload");
+    assert_eq!(reservation, None);
+    let qualified_status =
+        sqlx::query_scalar::<_, String>("SELECT qualification_status FROM drives WHERE id = $1")
+            .bind(drive_id)
+            .fetch_one(&pool)
+            .await
+            .expect("drive qualification status should reload");
+    assert_eq!(qualified_status, "detected_unqualified");
+    let immutable_event = sqlx::query(
+        "UPDATE qualification_events SET evidence = '{}' WHERE qualification_run_id = $1",
+    )
+    .bind(queued_qualification.id)
+    .execute(&pool)
+    .await
+    .expect_err("qualification evidence must be append-only");
+    assert_eq!(
+        immutable_event
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("P0001")
+    );
+    let queued_then_disabled = store::queue_qualification_run(
+        &pool,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        scratch.id,
+        &scratch.internal_label,
+        true,
+        true,
+    )
+    .await
+    .expect("second qualification should persist");
+    assert!(matches!(
+        queued_then_disabled,
+        QueueQualificationRunResult::Queued(_)
+    ));
+    assert_eq!(
+        store::block_queued_qualification_runs(&pool, "qualification gate disabled")
+            .await
+            .expect("disabled qualification should terminalize queued work"),
+        1
+    );
+    let reservation_after_block =
+        sqlx::query_scalar::<_, Option<String>>("SELECT reserved_by FROM cartridges WHERE id = $1")
+            .bind(scratch.id)
+            .fetch_one(&pool)
+            .await
+            .expect("blocked scratch reservation should reload");
+    assert_eq!(reservation_after_block, None);
+
+    let stale_confirmation = store::queue_qualification_run(
+        &pool,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        scratch.id,
+        &scratch.internal_label,
+        true,
+        true,
+    )
+    .await
+    .expect("stale-confirmation fixture should queue");
+    let QueueQualificationRunResult::Queued(stale_confirmation) = stale_confirmation else {
+        panic!("stale-confirmation fixture should initially be eligible");
+    };
+    sqlx::query(
+        "UPDATE qualification_runs SET created_at = now() - interval '6 minutes' WHERE id = $1",
+    )
+    .bind(stale_confirmation.id)
+    .execute(&pool)
+    .await
+    .expect("fixture timestamp should update");
+    assert!(matches!(
+        store::claim_next_qualification_run(&pool, uuid::Uuid::now_v7())
+            .await
+            .expect("expired confirmation should be a domain outcome"),
+        ClaimQualificationRunResult::Blocked { .. }
+    ));
+    let reservation_after_expiry =
+        sqlx::query_scalar::<_, Option<String>>("SELECT reserved_by FROM cartridges WHERE id = $1")
+            .bind(scratch.id)
+            .fetch_one(&pool)
+            .await
+            .expect("expired confirmation should release scratch media");
+    assert_eq!(reservation_after_expiry, None);
 
     let inventory = store::inventory_counts(&pool)
         .await

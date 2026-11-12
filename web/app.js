@@ -12,7 +12,8 @@
     verification: "/verification",
     recoveryPoints: "/recovery-points",
     preflight: "/preflight",
-    qualification: "/qualification"
+    qualification: "/qualification",
+    qualificationRuns: "/qualification/runs"
   };
   const routes = new Set(["overview", "jobs", "restore", "movements", "tapes", "drives", "verification", "settings"]);
   const state = {
@@ -32,10 +33,12 @@
       verification: [],
       recoveryPoints: [],
       preflight: null,
-      qualification: null
+      qualification: null,
+      qualificationRuns: []
     },
     received: new Set(),
-    errors: {}
+    errors: {},
+    qualificationPollTimer: null
   };
 
   const main = document.querySelector("#main-content");
@@ -122,6 +125,7 @@
     if (key === "movements") return list(payload, "movements");
     if (key === "verification") return list(payload, "verification");
     if (key === "recoveryPoints") return list(payload, "recovery_points");
+    if (key === "qualificationRuns") return list(payload, "runs");
     if (key === "drives") {
       return { drives: list(payload, "drives"), slots: list(payload, "slots"), operations: list(payload, "operations") };
     }
@@ -185,6 +189,7 @@
     state.refreshing = false;
     updateChrome();
     render();
+    scheduleQualificationPoll();
   }
 
   function setBadge(id, value) {
@@ -327,7 +332,11 @@
 
   function renderDrives() {
     const motionEnabled = pick(state.data.system, "lab_tape_motion_enabled") === true;
+    const qualificationEnabled = pick(state.data.system, "lab_tape_qualification_enabled") === true;
     let html = pageHead("Drives & libraries", "Hardware inventory returned by TapeScale.", refreshButton()) + noticeFor("drives");
+    if (qualificationEnabled) {
+      html += '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Destructive Bacula qualification enabled</strong><span>The attended btape test overwrites the selected cartridge. It is limited to registered, unprotected, non-WORM scratch media and does not complete the broader G0 product gate.</span></div></div>';
+    }
     if (motionEnabled) {
       html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Scratch-media lab motion enabled</strong><span>Rewind and unload physically move tape. Linux can finalize a prior write with a filemark before moving it. Use designated scratch media only; this does not qualify the drive for backup.</span></div></div>';
     } else {
@@ -348,10 +357,17 @@
           .sort((left, right) => new Date(pick(right, "created_at") || 0) - new Date(pick(left, "created_at") || 0));
         const latestOperation = operations[0] || null;
         const activeOperation = operations.find((operation) => ["queued", "running"].includes(String(pick(operation, "state"))));
+        const qualificationRuns = state.data.qualificationRuns
+          .filter((run) => String(pick(run, "drive_id")) === recordId(drive))
+          .sort((left, right) => new Date(pick(right, "created_at") || 0) - new Date(pick(left, "created_at") || 0));
+        const latestQualification = qualificationRuns[0] || null;
+        const activeQualification = qualificationRuns.find((run) => ["queued", "running"].includes(String(pick(run, "state"))));
+        const eligibleMedia = state.data.media.filter((item) => item.worm !== true && count(pick(item, "active_holds")) === 0 && pick(item, "has_content") !== true && !pick(item, "reserved_by") && !["foreign", "mismatch"].includes(String(pick(item, "identity_status") || "")));
         const canReconcile = current && !drive.reconciled && health.present === true && health.accessible === true && health.motion_position_uncertain !== true && health.immediate_mode === false && health.in_flight === 0 && health.identity_verified === true && health.identity_conflict !== true;
         const action = canReconcile ? '<button class="button button-small" type="button" data-action="reconcile-drive" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '">Trust identity</button>' : status(drive.reconciled ? "reconciled" : "unreconciled");
         const access = current ? pick(health, "status") || pick(drive, "qualification_status") : "stale";
-        const motionBlocker = activeOperation ? "A tape motion request is already " + String(pick(activeOperation, "state") || "active") + "."
+        const motionBlocker = activeQualification ? "A destructive qualification run is already " + String(pick(activeQualification, "state") || "active") + "."
+          : activeOperation ? "A tape motion request is already " + String(pick(activeOperation, "state") || "active") + "."
           : !motionEnabled ? "Lab tape motion is disabled in this deployment."
             : !current ? "The drive observation is stale; refresh and wait for the worker."
               : health.present !== true ? "The configured tape device is not present."
@@ -372,9 +388,25 @@
         const motionAttributes = ' data-action="drive-motion" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '" data-drive-label="' + esc(pick(drive, "model", "observed_path", "stable_id")) + '"';
         motion += '<div class="drive-actions"><button class="button button-small button-quiet" type="button" data-motion="rewind"' + motionAttributes + disabled + '>Rewind</button><button class="button button-small" type="button" data-motion="unload"' + motionAttributes + disabled + '>Unload</button></div>';
         if (motionBlocker) motion += '<small class="drive-motion-reason">' + esc(motionBlocker) + "</small>";
-        return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="drives" data-id="' + esc(recordId(drive)) + '"><td class="primary-cell"><strong>' + esc(label(pick(drive, "stable_id", "name", "id", "device"))) + '</strong><small>' + esc(label(pick(drive, "model", "serial", "observed_path"))) + "</small></td>" + cell(pick(drive, "generation", "model")) + "<td>" + status(access) + "</td><td>" + status(pick(drive, "qualification_status")) + "</td><td>" + action + "</td><td>" + motion + "</td></tr>";
+        const qualificationBlocker = activeQualification ? "A qualification run is already " + String(pick(activeQualification, "state") || "active") + "."
+          : activeOperation ? "A tape motion request is already active."
+            : !qualificationEnabled ? "Destructive tape qualification is disabled in this deployment."
+              : !current ? "The drive observation is stale; refresh and wait for the worker."
+                : health.present !== true || health.accessible !== true ? "The configured tape device is not accessible."
+                  : health.identity_verified !== true || health.identity_conflict === true ? "The stable drive identity is not safe."
+                    : health.motion_position_uncertain === true ? "A prior result requires fresh drive reconciliation."
+                      : health.immediate_mode !== false || health.in_flight !== 0 ? "Kernel tape I/O state is not safe."
+                        : drive.reconciled !== true ? "Trust this exact drive identity first."
+                          : health.medium_loaded !== true || health.ready !== true ? "Load the designated scratch cartridge and wait for ready."
+                            : !eligibleMedia.length ? "Register an unprotected, non-WORM scratch cartridge first."
+                              : null;
+        let qualification = status(latestQualification ? "btape " + String(pick(latestQualification, "state")) : "not run");
+        const qualificationDisabled = qualificationBlocker ? ' disabled aria-disabled="true" title="' + esc(qualificationBlocker) + '"' : "";
+        qualification += '<div class="drive-actions"><button class="button button-small button-danger" type="button" data-action="open-qualification" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '" data-drive-label="' + esc(pick(drive, "model", "observed_path", "stable_id")) + '"' + qualificationDisabled + '>Run btape test</button></div>';
+        qualification += '<small class="drive-motion-reason">Product gate: ' + esc(label(pick(drive, "qualification_status"))) + "." + (qualificationBlocker ? " " + esc(qualificationBlocker) : " This will destroy the selected tape.") + "</small>";
+        return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="drives" data-id="' + esc(recordId(drive)) + '"><td class="primary-cell"><strong>' + esc(label(pick(drive, "stable_id", "name", "id", "device"))) + '</strong><small>' + esc(label(pick(drive, "model", "serial", "observed_path"))) + "</small></td>" + cell(pick(drive, "generation", "model")) + "<td>" + status(access) + "</td><td>" + qualification + "</td><td>" + action + "</td><td>" + motion + "</td></tr>";
       });
-      html += table(["Drive", "Generation / model", "Access", "Qualification", "Identity", "Lab motion"], rows);
+      html += table(["Drive", "Generation / model", "Access", "G0 evidence", "Identity", "Lab motion"], rows);
     }
     if (state.data.slots.length) {
       const rows = state.data.slots.map((slot) => "<tr>" + cell(pick(slot, "element_address", "name", "id", "slot")) + cell(pick(slot, "type", "kind")) + cell(pick(slot, "state", "status")) + cell(pick(slot, "observed_barcode", "media_label", "barcode", "cartridge")) + "</tr>");
@@ -417,9 +449,22 @@
 
   function renderQualification() {
     const value = state.data.qualification;
-    let html = noticeFor("qualification");
+    let html = noticeFor("qualification") + noticeFor("qualificationRuns");
     if (!value || !Object.keys(value).length) return html + empty("Qualification not available", state.errors.qualification ? "Qualification metadata could not be loaded." : "No qualification metadata has been reported.");
+    html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>G0 is still open</strong><span>A passing btape run proves Bacula record, filemark, positioning, append, and re-read behavior for one exact drive and scratch cartridge. It is not yet backup, full readback, restore, ACL, spanning, encryption, or clean-catalog recovery evidence.</span></div></div>';
     html += metadata(value, ["cases", "generations"]);
+    const runs = state.data.qualificationRuns;
+    if (runs.length) {
+      const rows = runs.map((run) => {
+        const result = run.result && typeof run.result === "object" ? run.result : {};
+        const evidence = result.evidence && typeof result.evidence === "object" ? result.evidence : {};
+        const detail = pick(result, "detail") || pick(evidence, "detail") || (pick(run, "state") === "passed" ? "btape passed and cleanup rewind established BOT" : null);
+        return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="qualificationRuns" data-id="' + esc(recordId(run)) + '"><td class="primary-cell"><strong>' + esc(label(pick(run, "expected_cartridge_label"))) + '</strong><small>' + esc(label(pick(run, "engine_name"))) + " " + esc(label(pick(run, "engine_version"))) + "</small></td>" + cell(pick(run, "expected_stable_id")) + "<td>" + status(pick(run, "state")) + "</td>" + cell(date(pick(run, "finished_at", "started_at", "created_at"))) + cell(detail) + "</tr>";
+      });
+      html += '<section class="section"><div class="section-head"><div><h2>Physical qualification runs</h2><p>Durable, append-only evidence from the attended scratch-media harness.</p></div></div>' + table(["Scratch cartridge", "Drive", "Status", "Activity", "Evidence"], rows) + "</section>";
+    } else {
+      html += empty("No physical qualification runs", "Use Run btape test on a trusted, ready drive after registering the loaded scratch cartridge.");
+    }
     const cases = list(value, "cases");
     if (cases.length) {
       const rows = cases.map((item) => "<tr>" + cell(pick(item, "id", "name")) + "<td>" + status(pick(item, "status", "state")) + "</td>" + cell(pick(item, "reason", "detail")) + "</tr>");
@@ -476,20 +521,39 @@
     return Array.isArray(records) ? records.find((record) => recordId(record) === id) : null;
   }
 
-  function openRecord(kind, id) {
-    const record = findRecord(kind, id);
+  function renderRecordDrawer(kind, id, record, events) {
     if (!record) return;
     const title = pick(record, "name", "internal_label", "external_id", "stable_id", "label", "id", "job_id") || human(kind);
     const rows = Object.entries(record)
       .map(([key, value]) => "<li><span>" + esc(human(key)) + "</span><strong>" + esc(value && typeof value === "object" ? JSON.stringify(value) : label(value)) + "</strong></li>")
       .join("");
-    drawerLayer.innerHTML = '<aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title"><div class="drawer-head"><h2 id="drawer-title">' + esc(title) + '</h2><button class="icon-button" type="button" data-action="close-drawer" aria-label="Close">&times;</button></div><div class="drawer-body"><ul class="detail-list">' + rows + "</ul></div></aside>";
+    const history = Array.isArray(events) && events.length ? '<section class="drawer-section"><h3>Append-only events</h3><ol class="event-list">' + events.map((event) => {
+      const evidence = event.evidence && typeof event.evidence === "object" ? event.evidence : {};
+      return "<li><span>" + status(pick(event, "event_type")) + "</span><div><strong>" + esc(date(pick(event, "occurred_at"))) + "</strong><small>" + esc(label(pick(evidence, "detail", "path", "cartridge_label"))) + "</small></div></li>";
+    }).join("") + "</ol></section>" : "";
+    drawerLayer.innerHTML = '<aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title"><div class="drawer-head"><h2 id="drawer-title">' + esc(title) + '</h2><button class="icon-button" type="button" data-action="close-drawer" aria-label="Close">&times;</button></div><div class="drawer-body"><ul class="detail-list">' + rows + "</ul>" + history + "</div></aside>";
+    drawerLayer.dataset.recordKey = kind + ":" + id;
     drawerLayer.hidden = false;
+  }
+
+  async function openRecord(kind, id) {
+    const record = findRecord(kind, id);
+    if (!record) return;
+    renderRecordDrawer(kind, id, record, null);
+    if (kind !== "qualificationRuns") return;
+    try {
+      const detail = await request(endpoints.qualificationRuns + "/" + encodeURIComponent(id));
+      if (drawerLayer.hidden || drawerLayer.dataset.recordKey !== kind + ":" + id) return;
+      renderRecordDrawer(kind, id, pick(detail, "run") || record, list(detail, "events"));
+    } catch (error) {
+      if (!drawerLayer.hidden && drawerLayer.dataset.recordKey === kind + ":" + id) toast("Could not load qualification events", errorMessage(error));
+    }
   }
 
   function closeDrawer() {
     drawerLayer.hidden = true;
     drawerLayer.innerHTML = "";
+    delete drawerLayer.dataset.recordKey;
   }
 
   function openModal(title, body, footer) {
@@ -543,6 +607,83 @@
       submit.disabled = false;
       submit.textContent = "Add cartridge";
     }
+  }
+
+  function qualificationMedia() {
+    return state.data.media.filter((item) => item.worm !== true && count(pick(item, "active_holds")) === 0 && pick(item, "has_content") !== true && !pick(item, "reserved_by") && !["foreign", "mismatch"].includes(String(pick(item, "identity_status") || "")));
+  }
+
+  function openQualification(button) {
+    const driveId = button.dataset.id;
+    const stableId = button.dataset.stableId;
+    const driveLabel = button.dataset.driveLabel || stableId;
+    const media = qualificationMedia();
+    if (!driveId || !stableId || !media.length) return;
+    const options = ['<option value="">Select the loaded scratch cartridge</option>'].concat(media.map((item) => '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '">' + esc(mediaName(item)) + (pick(item, "barcode") ? " · barcode " + esc(pick(item, "barcode")) : "") + " · " + esc(label(pick(item, "media_format", "media_generation"))) + "</option>"));
+    const body = '<form id="qualification-form" data-drive-id="' + esc(driveId) + '" data-stable-id="' + esc(stableId) + '"><div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>This destroys the selected tape</strong><span>Bacula btape writes, rewinds, spaces, appends, and re-reads test records. Every existing byte on the loaded cartridge must be treated as lost.</span></div></div><div class="form-grid"><div class="form-field full"><label>Exact trusted drive</label><div class="static-field"><strong>' + esc(driveLabel) + "</strong><small>" + esc(stableId) + '</small></div></div><div class="form-field full"><label for="qualification-cartridge">Loaded scratch cartridge</label><select class="select" id="qualification-cartridge" name="cartridge_id" required>' + options.join("") + '</select><small>The standalone drive cannot verify this inventory label; you are asserting that this exact registered cartridge is physically loaded.</small></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="scratch_media_confirmed" required> I physically verified the loaded cartridge is designated scratch media.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="destructive_overwrite_confirmed" required> I authorize complete destruction of all existing data on that cartridge.</label></div><div class="form-field full"><label for="qualification-confirmation">Type the exact destructive confirmation</label><input class="input input-mono" id="qualification-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small id="qualification-confirmation-help">Select a cartridge to display the required phrase.</small></div></div><p class="notice danger" id="qualification-form-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-danger" type="submit">Destroy tape and run btape</button></div></form>';
+    openModal("Run Bacula tape qualification", body);
+    document.querySelector("#qualification-cartridge").focus();
+  }
+
+  function updateQualificationConfirmation(select) {
+    const option = select.options[select.selectedIndex];
+    const cartridgeLabel = option && option.dataset.label;
+    const help = document.querySelector("#qualification-confirmation-help");
+    if (help) help.textContent = cartridgeLabel ? "Required: DESTROY " + cartridgeLabel + " WITH BACULA BTAPE TEST" : "Select a cartridge to display the required phrase.";
+  }
+
+  async function submitQualification(form) {
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#qualification-form-error");
+    const values = new FormData(form);
+    const select = form.querySelector('[name="cartridge_id"]');
+    const option = select.options[select.selectedIndex];
+    const cartridgeLabel = option && option.dataset.label;
+    if (!cartridgeLabel) return;
+    submit.disabled = true;
+    submit.textContent = "Queueing destructive test…";
+    errorBox.hidden = true;
+    try {
+      await request(endpoints.qualificationRuns, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          drive_id: form.dataset.driveId,
+          stable_id: form.dataset.stableId,
+          cartridge_id: String(values.get("cartridge_id")),
+          cartridge_label: cartridgeLabel,
+          confirmation: String(values.get("confirmation") || ""),
+          scratch_media_confirmed: values.get("scratch_media_confirmed") === "on",
+          destructive_overwrite_confirmed: values.get("destructive_overwrite_confirmed") === "on"
+        })
+      });
+      closeModal();
+      await Promise.all([loadOne("qualificationRuns"), loadOne("drives"), loadOne("media")]);
+      updateChrome();
+      render();
+      scheduleQualificationPoll();
+      toast("Bacula qualification queued", "The worker will revalidate the exact drive and cartridge reservation before btape writes anything.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Destroy tape and run btape";
+    }
+  }
+
+  function scheduleQualificationPoll() {
+    if (state.qualificationPollTimer) window.clearTimeout(state.qualificationPollTimer);
+    const active = state.data.qualificationRuns.some((run) => ["queued", "running"].includes(String(pick(run, "state"))));
+    if (!active) {
+      state.qualificationPollTimer = null;
+      return;
+    }
+    state.qualificationPollTimer = window.setTimeout(async () => {
+      await Promise.all([loadOne("qualificationRuns"), loadOne("drives"), loadOne("media")]);
+      updateChrome();
+      render();
+      scheduleQualificationPoll();
+    }, 5000);
   }
 
   async function reconcileDrive(button) {
@@ -635,6 +776,7 @@
     if (action === "close-nav") shell.classList.remove("nav-open");
     if (action === "refresh") loadAll(false);
     if (action === "add-media") openAddMedia();
+    if (action === "open-qualification") openQualification(target);
     if (action === "reconcile-drive") reconcileDrive(target);
     if (action === "drive-motion") queueDriveMotion(target);
     if (action === "close-modal") closeModal();
@@ -652,9 +794,18 @@
   });
 
   document.addEventListener("submit", (event) => {
-    if (event.target.id !== "add-media-form") return;
-    event.preventDefault();
-    submitMedia(event.target);
+    if (event.target.id === "add-media-form") {
+      event.preventDefault();
+      submitMedia(event.target);
+    }
+    if (event.target.id === "qualification-form") {
+      event.preventDefault();
+      submitQualification(event.target);
+    }
+  });
+
+  document.addEventListener("change", (event) => {
+    if (event.target.id === "qualification-cartridge") updateQualificationConfirmation(event.target);
   });
 
   document.addEventListener("keydown", (event) => {

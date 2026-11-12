@@ -204,6 +204,101 @@ pub struct DriveOperationRecord {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct QualificationRunRecord {
+    pub id: Uuid,
+    pub drive_id: Uuid,
+    pub cartridge_id: Uuid,
+    pub expected_stable_id: String,
+    pub expected_path: String,
+    pub expected_vendor: Option<String>,
+    pub expected_model: Option<String>,
+    pub expected_serial: Option<String>,
+    pub expected_wwn: Option<String>,
+    pub expected_firmware: Option<String>,
+    pub expected_cartridge_label: String,
+    pub expected_media_generation: Option<i16>,
+    pub expected_media_format: Option<String>,
+    pub engine_name: String,
+    pub engine_version: String,
+    pub test_kind: String,
+    pub scratch_media_confirmed: bool,
+    pub destructive_overwrite_confirmed: bool,
+    pub state: String,
+    pub requested_by_label: String,
+    pub correlation_id: Uuid,
+    pub lease_id: Option<Uuid>,
+    pub fencing_token: Option<i64>,
+    pub attempt: i32,
+    pub result: Value,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct QualificationEventRecord {
+    pub id: i64,
+    pub event_type: String,
+    pub evidence: Value,
+    pub correlation_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct QualificationCartridge {
+    id: Uuid,
+    internal_label: String,
+    media_generation: Option<i16>,
+    media_format: Option<String>,
+    identity_status: String,
+    worm: bool,
+    reserved_by: Option<String>,
+    active_holds: i64,
+    has_content: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClaimedQualificationRun {
+    pub run: QualificationRunRecord,
+    pub lease_id: Uuid,
+    pub fencing_token: i64,
+    pub worker_id: Uuid,
+}
+
+#[derive(Clone, Debug)]
+pub enum QueueQualificationRunResult {
+    Queued(Box<QualificationRunRecord>),
+    NotFound,
+    Blocked(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum ClaimQualificationRunResult {
+    Claimed(Box<ClaimedQualificationRun>),
+    Blocked { id: Uuid, reason: String },
+    Empty,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QualificationTerminalState {
+    Passed,
+    Failed,
+    Blocked,
+    Interrupted,
+}
+
+impl QualificationTerminalState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClaimedDriveOperation {
     pub operation: DriveOperationRecord,
@@ -659,8 +754,11 @@ pub async fn list_drive_operations(
 
 pub async fn running_drive_operation_paths(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT DISTINCT expected_path FROM drive_operations
-         WHERE state = 'running' ORDER BY expected_path",
+        "SELECT DISTINCT expected_path FROM (
+             SELECT expected_path FROM drive_operations WHERE state = 'running'
+             UNION ALL
+             SELECT expected_path FROM qualification_runs WHERE state = 'running'
+         ) active_paths ORDER BY expected_path",
     )
     .fetch_all(pool)
     .await
@@ -706,6 +804,9 @@ pub async fn queue_drive_operation(
     let busy = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(
              SELECT 1 FROM drive_operations
+             WHERE drive_id = $1 AND state IN ('queued', 'running')
+             UNION ALL
+             SELECT 1 FROM qualification_runs
              WHERE drive_id = $1 AND state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM resource_leases
@@ -887,6 +988,10 @@ pub async fn claim_next_drive_operation(
                WHERE l.resource_kind = 'drive'
                  AND l.resource_id = drive_operations.drive_id::text
                  AND l.released_at IS NULL AND l.expires_at > now())
+           AND NOT EXISTS (
+               SELECT 1 FROM qualification_runs q
+               WHERE q.drive_id = drive_operations.drive_id
+                 AND q.state IN ('queued', 'running'))
          ORDER BY created_at
          FOR UPDATE SKIP LOCKED LIMIT 1"
     ))
@@ -1205,6 +1310,644 @@ async fn append_drive_operation_audit(
     .bind(evidence)
     .bind(result_label)
     .bind(operation.correlation_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+const QUALIFICATION_RUN_SELECT: &str = "SELECT id, drive_id, cartridge_id,
+            expected_stable_id, expected_path, expected_vendor, expected_model,
+            expected_serial, expected_wwn, expected_firmware,
+            expected_cartridge_label, expected_media_generation, expected_media_format,
+            engine_name, engine_version, test_kind,
+            scratch_media_confirmed, destructive_overwrite_confirmed,
+            state, requested_by_label, correlation_id, lease_id, fencing_token,
+            attempt, result, created_at, started_at, finished_at
+     FROM qualification_runs";
+
+const QUALIFICATION_CARTRIDGE_SELECT: &str = "SELECT c.id, c.internal_label,
+            c.media_generation, c.media_format, c.identity_status, c.worm, c.reserved_by,
+            (SELECT count(*) FROM holds h
+             WHERE h.cartridge_id = c.id AND h.released_at IS NULL) AS active_holds,
+            EXISTS (SELECT 1 FROM volume_records vr WHERE vr.cartridge_id = c.id) AS has_content
+     FROM cartridges c";
+
+pub async fn list_qualification_runs(
+    pool: &PgPool,
+) -> Result<Vec<QualificationRunRecord>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "{QUALIFICATION_RUN_SELECT}
+         WHERE state IN ('queued', 'running')
+            OR id IN (SELECT id FROM qualification_runs ORDER BY created_at DESC LIMIT 100)
+         ORDER BY created_at DESC"
+    ))
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_qualification_run(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<QualificationRunRecord>, sqlx::Error> {
+    sqlx::query_as(&format!("{QUALIFICATION_RUN_SELECT} WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn qualification_events(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Vec<QualificationEventRecord>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, event_type, evidence, correlation_id, occurred_at
+         FROM qualification_events
+         WHERE qualification_run_id = $1 ORDER BY occurred_at, id",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn running_qualification_paths(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT expected_path FROM qualification_runs
+         WHERE state = 'running' ORDER BY expected_path",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn queue_qualification_run(
+    pool: &PgPool,
+    drive_id: Uuid,
+    expected_stable_id: &str,
+    cartridge_id: Uuid,
+    typed_cartridge_label: &str,
+    scratch_media_confirmed: bool,
+    destructive_overwrite_confirmed: bool,
+) -> Result<QueueQualificationRunResult, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let drive = sqlx::query_as::<_, DriveRecord>(&format!(
+        "{DRIVE_SELECT} WHERE d.id = $1 FOR UPDATE OF d"
+    ))
+    .bind(drive_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(drive) = drive else {
+        transaction.rollback().await?;
+        return Ok(QueueQualificationRunResult::NotFound);
+    };
+    let cartridge = sqlx::query_as::<_, QualificationCartridge>(&format!(
+        "{QUALIFICATION_CARTRIDGE_SELECT} WHERE c.id = $1 FOR UPDATE OF c"
+    ))
+    .bind(cartridge_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(cartridge) = cartridge else {
+        transaction.rollback().await?;
+        return Ok(QueueQualificationRunResult::NotFound);
+    };
+
+    let blocker = if drive.stable_id != expected_stable_id {
+        Some("the requested stable identity does not match the current drive".to_owned())
+    } else if !scratch_media_confirmed || !destructive_overwrite_confirmed {
+        Some(
+            "qualification requires explicit scratch-media and destructive-overwrite confirmations"
+                .to_owned(),
+        )
+    } else if cartridge.internal_label != typed_cartridge_label {
+        Some("the typed cartridge label does not exactly match the selected cartridge".to_owned())
+    } else if let Some(reason) = drive_motion_blocker(&drive) {
+        Some(reason)
+    } else {
+        qualification_cartridge_blocker(&cartridge, None)
+    };
+    if let Some(reason) = blocker {
+        transaction.rollback().await?;
+        return Ok(QueueQualificationRunResult::Blocked(reason));
+    }
+
+    let busy = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM drive_operations
+             WHERE drive_id = $1 AND state IN ('queued', 'running')
+             UNION ALL
+             SELECT 1 FROM qualification_runs
+             WHERE (drive_id = $1 OR cartridge_id = $2) AND state IN ('queued', 'running')
+             UNION ALL
+             SELECT 1 FROM resource_leases
+             WHERE resource_kind = 'drive' AND resource_id = $1::text
+               AND released_at IS NULL AND expires_at > now()
+         )",
+    )
+    .bind(drive_id)
+    .bind(cartridge_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if busy {
+        transaction.rollback().await?;
+        return Ok(QueueQualificationRunResult::Blocked(
+            "the drive or cartridge already has queued work or an active controller lease"
+                .to_owned(),
+        ));
+    }
+
+    let expected_path = drive
+        .observed_path
+        .as_deref()
+        .expect("the qualification gate requires an observed path");
+    let id = Uuid::now_v7();
+    let correlation_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO qualification_runs
+            (id, drive_id, cartridge_id, expected_stable_id, expected_path,
+             expected_vendor, expected_model, expected_serial, expected_wwn, expected_firmware,
+             expected_cartridge_label, expected_media_generation, expected_media_format,
+             scratch_media_confirmed, destructive_overwrite_confirmed,
+             requested_by_label, correlation_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                 $11, $12, $13, $14, $15, 'local-api', $16)",
+    )
+    .bind(id)
+    .bind(drive_id)
+    .bind(cartridge_id)
+    .bind(expected_stable_id)
+    .bind(expected_path)
+    .bind(&drive.vendor)
+    .bind(&drive.model)
+    .bind(&drive.serial)
+    .bind(&drive.wwn)
+    .bind(&drive.firmware)
+    .bind(&cartridge.internal_label)
+    .bind(cartridge.media_generation)
+    .bind(&cartridge.media_format)
+    .bind(scratch_media_confirmed)
+    .bind(destructive_overwrite_confirmed)
+    .bind(correlation_id)
+    .execute(&mut *transaction)
+    .await?;
+    let reservation = format!("qualification:{id}");
+    sqlx::query("UPDATE cartridges SET reserved_by = $1, updated_at = now() WHERE id = $2")
+        .bind(&reservation)
+        .bind(cartridge_id)
+        .execute(&mut *transaction)
+        .await?;
+    append_qualification_event(
+        &mut transaction,
+        id,
+        correlation_id,
+        "queued",
+        json!({
+            "drive_id": drive_id,
+            "stable_id": expected_stable_id,
+            "path": expected_path,
+            "cartridge_id": cartridge_id,
+            "cartridge_label": cartridge.internal_label,
+            "engine": "Bacula Community",
+            "engine_version": "15.0.3",
+            "test_kind": "btape_test",
+            "destructive": true
+        }),
+        "local-api",
+    )
+    .await?;
+    let run = sqlx::query_as(&format!("{QUALIFICATION_RUN_SELECT} WHERE id = $1"))
+        .bind(id)
+        .fetch_one(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(QueueQualificationRunResult::Queued(Box::new(run)))
+}
+
+pub async fn recover_expired_qualification_runs(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let expired = sqlx::query_as::<_, QualificationRunRecord>(&format!(
+        "{QUALIFICATION_RUN_SELECT}
+         WHERE id IN (
+             SELECT q.id FROM qualification_runs q
+             LEFT JOIN resource_leases l ON l.id = q.lease_id
+             WHERE q.state = 'running'
+               AND (l.id IS NULL OR l.released_at IS NOT NULL OR l.expires_at <= now())
+         ) FOR UPDATE"
+    ))
+    .fetch_all(&mut *transaction)
+    .await?;
+    let mut recovered = 0_u64;
+    for run in &expired {
+        let lease_expired = match run.lease_id {
+            Some(lease_id) => sqlx::query_scalar::<_, bool>(
+                "SELECT released_at IS NOT NULL OR expires_at <= now()
+                 FROM resource_leases WHERE id = $1 FOR UPDATE",
+            )
+            .bind(lease_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .unwrap_or(true),
+            None => true,
+        };
+        if !lease_expired {
+            continue;
+        }
+        let detail =
+            "the worker lease expired during destructive tape qualification; tape position and contents require reconciliation";
+        sqlx::query(
+            "UPDATE qualification_runs
+             SET state = 'interrupted', finished_at = now(),
+                 result = result || jsonb_build_object(
+                     'detail', $1::text, 'position_uncertain', true)
+             WHERE id = $2",
+        )
+        .bind(detail)
+        .bind(run.id)
+        .execute(&mut *transaction)
+        .await?;
+        release_qualification_resources(&mut transaction, run).await?;
+        mark_drive_motion_uncertain(&mut transaction, run.drive_id, detail).await?;
+        append_qualification_event(
+            &mut transaction,
+            run.id,
+            run.correlation_id,
+            "interrupted",
+            json!({"detail": detail, "position_uncertain": true}),
+            "tapescale-worker",
+        )
+        .await?;
+        recovered += 1;
+    }
+    transaction.commit().await?;
+    Ok(recovered)
+}
+
+pub async fn block_queued_qualification_runs(
+    pool: &PgPool,
+    reason: &str,
+) -> Result<u64, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let queued = sqlx::query_as::<_, QualificationRunRecord>(&format!(
+        "{QUALIFICATION_RUN_SELECT} WHERE state = 'queued' FOR UPDATE"
+    ))
+    .fetch_all(&mut *transaction)
+    .await?;
+    for run in &queued {
+        sqlx::query(
+            "UPDATE qualification_runs
+             SET state = 'blocked', started_at = now(), finished_at = now(),
+                 result = jsonb_build_object('detail', $1::text)
+             WHERE id = $2",
+        )
+        .bind(reason)
+        .bind(run.id)
+        .execute(&mut *transaction)
+        .await?;
+        clear_qualification_reservation(&mut transaction, run).await?;
+        append_qualification_event(
+            &mut transaction,
+            run.id,
+            run.correlation_id,
+            "blocked",
+            json!({"detail": reason}),
+            "tapescale-worker",
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(queued.len() as u64)
+}
+
+pub async fn claim_next_qualification_run(
+    pool: &PgPool,
+    worker_id: Uuid,
+) -> Result<ClaimQualificationRunResult, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let run = sqlx::query_as::<_, QualificationRunRecord>(&format!(
+        "{QUALIFICATION_RUN_SELECT}
+         WHERE state = 'queued'
+           AND NOT EXISTS (
+               SELECT 1 FROM resource_leases l
+               WHERE l.resource_kind = 'drive'
+                 AND l.resource_id = qualification_runs.drive_id::text
+                 AND l.released_at IS NULL AND l.expires_at > now())
+         ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1"
+    ))
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(run) = run else {
+        transaction.rollback().await?;
+        return Ok(ClaimQualificationRunResult::Empty);
+    };
+    let drive = sqlx::query_as::<_, DriveRecord>(&format!(
+        "{DRIVE_SELECT} WHERE d.id = $1 FOR UPDATE OF d"
+    ))
+    .bind(run.drive_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let cartridge = sqlx::query_as::<_, QualificationCartridge>(&format!(
+        "{QUALIFICATION_CARTRIDGE_SELECT} WHERE c.id = $1 FOR UPDATE OF c"
+    ))
+    .bind(run.cartridge_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let expected_reservation = format!("qualification:{}", run.id);
+    let motion_waiting = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM drive_operations
+                       WHERE drive_id = $1 AND state IN ('queued', 'running'))",
+    )
+    .bind(run.drive_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let blocker = if motion_waiting {
+        Some("a tape-motion request is already queued for this drive".to_owned())
+    } else {
+        qualification_run_blocker(&run, &drive, &cartridge, &expected_reservation)
+    };
+    if let Some(reason) = blocker {
+        sqlx::query(
+            "UPDATE qualification_runs SET state = 'blocked', started_at = now(),
+                    finished_at = now(), result = jsonb_build_object('detail', $1::text)
+             WHERE id = $2",
+        )
+        .bind(&reason)
+        .bind(run.id)
+        .execute(&mut *transaction)
+        .await?;
+        clear_qualification_reservation(&mut transaction, &run).await?;
+        append_qualification_event(
+            &mut transaction,
+            run.id,
+            run.correlation_id,
+            "blocked",
+            json!({"detail": reason}),
+            "tapescale-worker",
+        )
+        .await?;
+        transaction.commit().await?;
+        return Ok(ClaimQualificationRunResult::Blocked { id: run.id, reason });
+    }
+
+    sqlx::query(
+        "UPDATE resource_leases SET released_at = now()
+         WHERE resource_kind = 'drive' AND resource_id = $1::text
+           AND released_at IS NULL AND expires_at <= now()",
+    )
+    .bind(run.drive_id)
+    .execute(&mut *transaction)
+    .await?;
+    let lease_id = Uuid::now_v7();
+    let fencing_token = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO resource_leases
+            (id, resource_kind, resource_id, owner_id, fencing_token, expires_at)
+         VALUES ($1, 'drive', $2::text, $3, nextval('resource_fencing_token_seq'),
+                 now() + interval '30 minutes')
+         ON CONFLICT DO NOTHING RETURNING fencing_token",
+    )
+    .bind(lease_id)
+    .bind(run.drive_id)
+    .bind(worker_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(fencing_token) = fencing_token else {
+        transaction.rollback().await?;
+        return Ok(ClaimQualificationRunResult::Empty);
+    };
+    sqlx::query(
+        "UPDATE qualification_runs
+         SET state = 'running', lease_id = $1, fencing_token = $2,
+             attempt = attempt + 1, started_at = now()
+         WHERE id = $3 AND state = 'queued'",
+    )
+    .bind(lease_id)
+    .bind(fencing_token)
+    .bind(run.id)
+    .execute(&mut *transaction)
+    .await?;
+    append_qualification_event(
+        &mut transaction,
+        run.id,
+        run.correlation_id,
+        "started",
+        json!({"lease_id": lease_id, "fencing_token": fencing_token}),
+        "tapescale-worker",
+    )
+    .await?;
+    let run = sqlx::query_as(&format!("{QUALIFICATION_RUN_SELECT} WHERE id = $1"))
+        .bind(run.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(ClaimQualificationRunResult::Claimed(Box::new(
+        ClaimedQualificationRun {
+            run,
+            lease_id,
+            fencing_token,
+            worker_id,
+        },
+    )))
+}
+
+pub async fn renew_qualification_run_lease(
+    pool: &PgPool,
+    claim: &ClaimedQualificationRun,
+) -> Result<bool, sqlx::Error> {
+    let renewed = sqlx::query(
+        "UPDATE resource_leases l SET expires_at = now() + interval '30 minutes'
+         FROM qualification_runs q
+         WHERE l.id = $1 AND l.owner_id = $2 AND l.fencing_token = $3
+           AND l.released_at IS NULL AND l.expires_at > now()
+           AND q.id = $4 AND q.state = 'running'
+           AND q.lease_id = l.id AND q.fencing_token = l.fencing_token",
+    )
+    .bind(claim.lease_id)
+    .bind(claim.worker_id)
+    .bind(claim.fencing_token)
+    .bind(claim.run.id)
+    .execute(pool)
+    .await?;
+    Ok(renewed.rows_affected() == 1)
+}
+
+pub async fn finish_qualification_run(
+    pool: &PgPool,
+    claim: &ClaimedQualificationRun,
+    state: QualificationTerminalState,
+    result: Value,
+) -> Result<bool, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE qualification_runs q
+         SET state = $1, result = $2, finished_at = now()
+         FROM resource_leases l
+         WHERE q.id = $3 AND q.state = 'running'
+           AND q.lease_id = $4 AND q.fencing_token = $5
+           AND l.id = q.lease_id AND l.owner_id = $6
+           AND l.fencing_token = q.fencing_token
+           AND l.released_at IS NULL AND l.expires_at > now()",
+    )
+    .bind(state.as_str())
+    .bind(&result)
+    .bind(claim.run.id)
+    .bind(claim.lease_id)
+    .bind(claim.fencing_token)
+    .bind(claim.worker_id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    release_qualification_resources(&mut transaction, &claim.run).await?;
+    let position_uncertain = result
+        .get("position_uncertain")
+        .and_then(Value::as_bool)
+        .unwrap_or(state != QualificationTerminalState::Passed);
+    if position_uncertain {
+        let detail = result
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("destructive tape qualification did not leave a verified tape position");
+        mark_drive_motion_uncertain(&mut transaction, claim.run.drive_id, detail).await?;
+    }
+    append_qualification_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        state.as_str(),
+        result,
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+fn qualification_run_blocker(
+    run: &QualificationRunRecord,
+    drive: &DriveRecord,
+    cartridge: &QualificationCartridge,
+    expected_reservation: &str,
+) -> Option<String> {
+    if run.created_at < Utc::now() - chrono::TimeDelta::minutes(5) {
+        return Some(
+            "the attended destructive confirmation expired before worker dispatch; inspect the loaded cartridge and queue a new run"
+                .to_owned(),
+        );
+    }
+    if !run.scratch_media_confirmed || !run.destructive_overwrite_confirmed {
+        return Some("persisted destructive scratch-media confirmations are missing".to_owned());
+    }
+    if drive.stable_id != run.expected_stable_id
+        || drive.observed_path.as_deref() != Some(run.expected_path.as_str())
+        || drive.vendor != run.expected_vendor
+        || drive.model != run.expected_model
+        || drive.serial != run.expected_serial
+        || drive.wwn != run.expected_wwn
+        || drive.firmware != run.expected_firmware
+    {
+        return Some("the drive identity, path, model, serial, WWN, or firmware changed after the request was queued".to_owned());
+    }
+    if let Some(reason) = drive_motion_blocker(drive) {
+        return Some(reason);
+    }
+    if cartridge.id != run.cartridge_id
+        || cartridge.internal_label != run.expected_cartridge_label
+        || cartridge.media_generation != run.expected_media_generation
+        || cartridge.media_format != run.expected_media_format
+    {
+        return Some(
+            "the registered cartridge metadata changed after the request was queued".to_owned(),
+        );
+    }
+    qualification_cartridge_blocker(cartridge, Some(expected_reservation))
+}
+
+fn qualification_cartridge_blocker(
+    cartridge: &QualificationCartridge,
+    expected_reservation: Option<&str>,
+) -> Option<String> {
+    if cartridge.worm {
+        return Some("WORM media cannot be used for a destructive qualification test".to_owned());
+    }
+    if cartridge.active_holds > 0 || cartridge.has_content {
+        return Some("the cartridge has protected content or an active hold".to_owned());
+    }
+    if matches!(cartridge.identity_status.as_str(), "foreign" | "mismatch") {
+        return Some(
+            "foreign or identity-mismatched media cannot be selected as scratch".to_owned(),
+        );
+    }
+    match (expected_reservation, cartridge.reserved_by.as_deref()) {
+        (None, Some(_)) => Some("the cartridge is already reserved".to_owned()),
+        (Some(expected), Some(actual)) if expected == actual => None,
+        (Some(_), _) => Some("the cartridge reservation changed after queuing".to_owned()),
+        (None, None) => None,
+    }
+}
+
+async fn clear_qualification_reservation(
+    transaction: &mut Transaction<'_, Postgres>,
+    run: &QualificationRunRecord,
+) -> Result<(), sqlx::Error> {
+    let reservation = format!("qualification:{}", run.id);
+    sqlx::query(
+        "UPDATE cartridges SET reserved_by = NULL, updated_at = now()
+         WHERE id = $1 AND reserved_by = $2",
+    )
+    .bind(run.cartridge_id)
+    .bind(reservation)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn release_qualification_resources(
+    transaction: &mut Transaction<'_, Postgres>,
+    run: &QualificationRunRecord,
+) -> Result<(), sqlx::Error> {
+    if let Some(lease_id) = run.lease_id {
+        sqlx::query(
+            "UPDATE resource_leases SET released_at = now()
+             WHERE id = $1 AND released_at IS NULL",
+        )
+        .bind(lease_id)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    clear_qualification_reservation(transaction, run).await
+}
+
+async fn append_qualification_event(
+    transaction: &mut Transaction<'_, Postgres>,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    event_type: &str,
+    evidence: Value,
+    actor_label: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO qualification_events
+            (qualification_run_id, event_type, evidence, correlation_id)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(run_id)
+    .bind(event_type)
+    .bind(&evidence)
+    .bind(correlation_id)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO audit_events
+            (id, actor_label, action, object_type, object_id,
+             requested, result, correlation_id)
+         VALUES ($1, $2, $3, 'qualification_run', $4, $5, $6, $7)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(actor_label)
+    .bind(format!("qualification.{event_type}"))
+    .bind(run_id.to_string())
+    .bind(evidence)
+    .bind(event_type)
+    .bind(correlation_id)
     .execute(&mut **transaction)
     .await?;
     Ok(())

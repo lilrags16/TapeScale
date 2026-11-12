@@ -579,7 +579,7 @@ svg {
   display: block;
   max-width: 260px;
   margin-top: 5px;
-  color: var(--text-muted);
+  color: var(--ink-faint);
   line-height: 1.35;
 }
 
@@ -1515,6 +1515,18 @@ svg {
   accent-color: var(--teal);
 }
 
+.danger-check {
+  padding: 10px;
+  border: 1px solid #e5b6b2;
+  border-radius: var(--radius-sm);
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.danger-check input {
+  accent-color: var(--red);
+}
+
 .drawer-layer,
 .modal-layer {
   position: fixed;
@@ -1628,6 +1640,46 @@ svg {
   overflow-wrap: anywhere;
 }
 
+.drawer-section {
+  margin-top: 22px;
+}
+
+.drawer-section h3 {
+  margin: 0 0 8px;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.event-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.event-list li {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: start;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+
+.event-list div,
+.event-list small {
+  display: block;
+}
+
+.event-list small {
+  margin-top: 2px;
+  color: var(--ink-faint);
+}
+
 .modal {
   position: absolute;
   top: 50%;
@@ -1673,6 +1725,27 @@ svg {
   margin-top: 4px;
   color: var(--ink-faint);
   font-size: 10px;
+}
+
+.static-field {
+  display: flex;
+  min-height: 42px;
+  flex-direction: column;
+  justify-content: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+
+.static-field small {
+  margin-top: 2px;
+  font-family: var(--font-mono);
+}
+
+.input-mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
 }
 
 .restore-shell {

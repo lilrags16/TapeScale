@@ -11,6 +11,10 @@ pub struct Config {
     pub database_connect_timeout: Duration,
     pub worker_poll_interval: Duration,
     pub lab_tape_motion_enabled: bool,
+    pub lab_tape_qualification_enabled: bool,
+    pub btape_path: PathBuf,
+    pub bacula_state_dir: PathBuf,
+    pub qualification_timeout: Duration,
 }
 
 impl Config {
@@ -24,6 +28,24 @@ impl Config {
         let database_connect_timeout = Duration::from_secs(parse("TAPESCALE_DB_TIMEOUT_SECS", 10)?);
         let worker_poll_interval = Duration::from_secs(parse("TAPESCALE_WORKER_POLL_SECS", 5)?);
         let lab_tape_motion_enabled = parse_bool("TAPESCALE_LAB_TAPE_MOTION_ENABLED", false)?;
+        let lab_tape_qualification_enabled =
+            parse_bool("TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED", false)?;
+        let btape_path = PathBuf::from(value("TAPESCALE_BTAPE_PATH", "/usr/sbin/btape"));
+        let bacula_state_dir = PathBuf::from(value(
+            "TAPESCALE_BACULA_STATE_DIR",
+            "/var/lib/tapescale/bacula",
+        ));
+        let qualification_timeout =
+            Duration::from_secs(parse("TAPESCALE_QUALIFICATION_TIMEOUT_SECS", 1_800)?);
+
+        anyhow::ensure!(
+            qualification_timeout >= Duration::from_secs(60),
+            "TAPESCALE_QUALIFICATION_TIMEOUT_SECS must be at least 60"
+        );
+        anyhow::ensure!(
+            qualification_timeout <= Duration::from_secs(5_400),
+            "TAPESCALE_QUALIFICATION_TIMEOUT_SECS must not exceed 5400 for an attended lab run"
+        );
 
         Ok(Self {
             bind,
@@ -33,6 +55,10 @@ impl Config {
             database_connect_timeout,
             worker_poll_interval,
             lab_tape_motion_enabled,
+            lab_tape_qualification_enabled,
+            btape_path,
+            bacula_state_dir,
+            qualification_timeout,
         })
     }
 }

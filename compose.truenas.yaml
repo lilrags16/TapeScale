@@ -2,8 +2,9 @@
 # The worker expects one standalone SAS tape drive at /dev/nst0. If TrueNAS
 # exposes /dev/nst1 instead, set TAPESCALE_TAPE_DEVICES and both sides of the
 # device mapping to /dev/nst1 so the container path matches Linux sysfs.
-# This lab stack exposes only status, rewind, and unload. Linux may finalize a
-# prior write with a filemark before motion, so use designated scratch media.
+# This lab stack exposes status, rewind, unload, and an attended Bacula btape
+# qualification run. Qualification deliberately overwrites the loaded tape.
+# Use only a registered cartridge that is physically designated as scratch.
 # Paste this entire file into Apps > Discover Apps > Install via YAML.
 
 name: tapescale
@@ -12,8 +13,8 @@ x-tapescale-common: &tapescale-common
   build:
     context: https://github.com/lilrags16/TapeScale.git#main
     args:
-      TAPESCALE_VERSION: 0.1.0-test.3
-  image: tapescale:0.1.0-test.3
+      TAPESCALE_VERSION: 0.1.0-test.4
+  image: tapescale:0.1.0-test.4
   pull_policy: build
   restart: unless-stopped
   read_only: true
@@ -25,6 +26,7 @@ x-tapescale-common: &tapescale-common
   environment: &tapescale-environment
     TAPESCALE_DEMO_MODE: "false"
     TAPESCALE_LAB_TAPE_MOTION_ENABLED: "true"
+    TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED: "true"
     DATABASE_URL: postgresql://tapescale:tapescale_test_only_password@postgres:5432/tapescale
     RUST_LOG: tapescale=info,tower_http=info
   networks:
@@ -65,13 +67,17 @@ services:
       TAPESCALE_TAPE_DEVICES: /dev/nst0
       TAPESCALE_SYSFS_ROOT: /sys
       TAPESCALE_MT_PATH: /usr/bin/mt-st
+      TAPESCALE_BTAPE_PATH: /usr/sbin/btape
+      TAPESCALE_BACULA_STATE_DIR: /var/lib/tapescale/bacula
+      TAPESCALE_QUALIFICATION_TIMEOUT_SECS: "1800"
     healthcheck:
       disable: true
     devices:
-      - /dev/nst0:/dev/nst0:r
+      - /dev/nst0:/dev/nst0:rwm
     volumes:
       - recovery_exports:/var/lib/tapescale/recovery
       - spool:/var/lib/tapescale/spool
+      - engine_state:/var/lib/tapescale/bacula
     deploy:
       resources:
         limits:
@@ -96,7 +102,7 @@ services:
           pids: 256
 
   postgres:
-    image: postgres:16.15-bookworm
+    image: postgres:16.15-bookworm@sha256:5264710be20f409750ac6dc4e5706dcef929c87e241605463f0f9aefa932a8d9
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -132,6 +138,7 @@ volumes:
   postgres_data:
   recovery_exports:
   spool:
+  engine_state:
 
 networks:
   edge:

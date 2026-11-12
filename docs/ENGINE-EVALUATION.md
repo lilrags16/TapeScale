@@ -20,6 +20,8 @@ The Bacula 15 documentation referenced by the specification is the initial study
 
 Research checkpoint (12 November 2026): **Bacula Community 15.0.3 is the first G0 laboratory candidate, not a production selection or qualification result.** The lab adapter should evaluate the supported Baculum API v2 and allowlisted JSON console surfaces, use `btape` for designated-scratch-media drive/EOM exercises, and retain `bscan` clean-catalog recovery evidence. TapeScale must keep Bacula Director, Storage Daemon, and the engine catalog isolated; only the Storage Daemon receives the qualified tape/changer devices. Bareos remains the comparison fallback if any mandatory Bacula result fails.
 
+Implementation checkpoint (12 November 2026): the G0.1 quick test is wired to Debian's exact `bacula-sd=15.0.3-3~bpo12+1` package from snapshot `20250730T000000Z`. The worker accepts only the packaged `/usr/sbin/btape` amd64 digest, a generated exact-device configuration, and the fixed `test\n` transcript. Durable drive/media fencing, typed destructive confirmation, completed-test output markers, bounded evidence, and cleanup rewind-to-BOT are implemented. No physical run is recorded in this repository, and this harness does not start the Storage Daemon or select Bacula's production format. The later backup data plane must give the isolated Storage Daemon exclusive device ownership rather than sharing the preview worker path.
+
 The candidate has a release-blocking encryption question: the documented Storage Daemon volume-encryption construction and its metadata coverage must be tested against the authenticated-encryption and independent-recovery requirements. A successful `btape` result alone selects neither the security pipeline nor the product format.
 
 Primary candidate references:
@@ -114,4 +116,4 @@ The adapter must prove hostile argument handling, missing tools, hung commands, 
 
 ## Current conclusion
 
-No engine is selected and no physical evidence is present. Production writes must remain disabled or clearly gated until this document is replaced by a signed G0 decision record backed by the named laboratory evidence.
+No production engine is selected and no physical evidence is present. The only enabled write is the attended destructive `btape test` against explicitly designated scratch media; it cannot create recovery data. Production writes must remain disabled until this document is replaced by a signed G0 decision record backed by the named laboratory evidence.

@@ -1,6 +1,6 @@
 # Operator guide
 
-This guide describes the intended TapeScale operating model. The current release is an engineering preview with SAS discovery, lab-only rewind/unload, and a simulator-only engine adapter. It must not be represented as protecting real tape until G0/G1 qualification is complete.
+This guide describes the intended TapeScale operating model. The current release is an engineering preview with SAS discovery, lab-only rewind/unload, a destructive Bacula `btape test` harness, and a simulator-only backup adapter. It must not be represented as protecting real tape until G0/G1 qualification is complete.
 
 Procedures below are the operator acceptance target. The preview can exercise console, policy, scheduler, custody, restore-planning, and failure states with simulated data, but it cannot perform or verify a physical backup, restore, movement, encryption recovery, or catalog-loss recovery. Controls that lack a qualified backend are demonstrations, not operational authorization.
 
@@ -54,7 +54,22 @@ Linux may write a filemark before rewind/offline when the previous tape operatio
 
 TapeScale leases one drive controller, rechecks its exact stable identity and safety state, executes only the fixed allowlisted command, and appends audit evidence. A missing/stale drive, identity change, conflict, TapeScale-uncertain prior motion result, absent medium, or existing active request blocks execution. The [Linux SCSI tape driver explicitly permits rewind/offline as recovery operations](https://github.com/torvalds/linux/blob/master/drivers/scsi/st.c#L3771-L3791) when its internal tape position was lost after reset; TapeScale still requires a ready scratch cartridge and verifies BOT after rewind or no-media after unload. Do not run another tape controller against the same drive during this lab workflow.
 
-This gate does not expose load, seek, spacing, retension, an explicit filemark, read, write, label, format, or erase command. A successful rewind/unload does not identify the cartridge, prove restoration, qualify hardware, or enable backup. Designated scratch media and a selected engine remain required for the write qualification gate.
+### Destructive Bacula drive qualification
+
+The disposable TrueNAS Compose also enables `TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED=true` and packages Debian's pinned Bacula Community 15.0.3 tools. This is an attended G0.1 harness, not a backup job.
+
+1. Physically load a blank or expendable cartridge and wait for the drive to report ready.
+2. Register that same cartridge in **Tapes & pools**. WORM media, cartridges with content/holds, foreign or mismatched identities, and reserved media are ineligible.
+3. Trust the exact drive identity and rewind it to BOT.
+4. Select **Run btape test**, choose the inventory label for the cartridge physically in the drive, accept both destructive acknowledgements, and type the displayed `DESTROY <label> WITH BACULA BTAPE TEST` phrase exactly.
+5. Keep the host, container, drive, and cartridge available while the run is queued/running. Do not use another tape controller.
+6. Inspect **System & qualification → Qualification**. A pass requires Bacula exit success plus TapeScale's own cleanup rewind and affirmative same-drive ready-at-BOT observation.
+
+The API reserves the selected cartridge and creates append-only events before the worker can claim the run. The worker rechecks path, stable identity, model, serial/WWN, firmware, device access, kernel immediate mode, outstanding I/O, loaded/ready state, reservation, and the two confirmations. It invokes only `btape -c <per-run-config> /dev/nstN` with a fixed `test\n` input transcript. A timeout, cancellation, worker loss, lease expiry, Bacula failure, identity change, or missing postcondition records a failed/interrupted result and revokes drive reconciliation. The captured output is deliberately bounded and reports truncation.
+
+`btape` overwrites media. A successful result demonstrates basic Bacula record/filemark/position/append/re-read behavior for the recorded tuple; it does not prove file backup, full readback, restore, metadata fidelity, spanning, encryption, catalog recovery, or G0 completion. The harness does not expose Bacula `fill`, label, erase, a console, or arbitrary command execution.
+
+The rewind/unload motion gate does not expose load, seek, spacing, retension, an explicit filemark, read, write, label, format, or erase command. A successful rewind/unload does not identify the cartridge, prove restoration, qualify hardware, or enable backup. The separate `btape` harness performs only its fixed destructive test and does not create a protected recovery point.
 
 For a standalone drive:
 
