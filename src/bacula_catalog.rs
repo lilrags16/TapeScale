@@ -4,8 +4,8 @@ use serde::Serialize;
 use sqlx::{FromRow, PgPool};
 
 use crate::engine::bacula::{
-    BaculaJobId, BaculaPoolName, VolumeLabel, BACKUP_JOB_NAME, RESTORE_JOB_NAME, STORAGE_NAME,
-    VERIFY_JOB_NAME,
+    BaculaJobId, BaculaPoolName, VolumeLabel, BACKUP_JOB_NAME, DIRECTOR_NAME, MEDIA_TYPE,
+    RESTORE_JOB_NAME, STORAGE_NAME, VERIFY_JOB_NAME,
 };
 
 // Bacula 15.0.3 persists these one-byte JCR codes in the catalog Job table.
@@ -206,18 +206,7 @@ pub async fn validate_backup_job(
     pool: &BaculaPoolName,
 ) -> Result<BaculaBackupCatalogEvidence, BaculaCatalogEvidenceError> {
     let job = load_job(database, job_id).await?;
-    validate_job_common(
-        &job,
-        BACKUP_JOB_NAME,
-        BACULA_BACKUP_JOB_TYPE,
-        BACULA_FULL_LEVEL,
-        pool,
-    )?;
-    expect_optional(
-        "backup.write_storage",
-        STORAGE_NAME,
-        job.write_storage_name.as_deref(),
-    )?;
+    validate_backup_job_record(&job, pool)?;
 
     let volume_rows = load_volumes(database, volume).await?;
     require_exactly_one("volume", volume_rows.len())?;
@@ -253,10 +242,9 @@ pub async fn validate_verify_job(
     database: &PgPool,
     verify_job_id: BaculaJobId,
     backup_job_id: BaculaJobId,
-    pool: &BaculaPoolName,
 ) -> Result<BaculaVerifyCatalogEvidence, BaculaCatalogEvidenceError> {
     let job = load_job(database, verify_job_id).await?;
-    validate_verify_job_record(&job, backup_job_id, pool)?;
+    validate_verify_job_record(&job, backup_job_id)?;
     Ok(BaculaVerifyCatalogEvidence {
         job,
         source_backup_job_id: backup_job_id,
@@ -266,14 +254,12 @@ pub async fn validate_verify_job(
 fn validate_verify_job_record(
     job: &BaculaCatalogJobEvidence,
     backup_job_id: BaculaJobId,
-    pool: &BaculaPoolName,
 ) -> Result<(), BaculaCatalogEvidenceError> {
     validate_job_common(
         job,
         VERIFY_JOB_NAME,
         BACULA_VERIFY_JOB_TYPE,
         BACULA_VERIFY_DATA_LEVEL,
-        pool,
     )?;
     expect_number(
         "verify.prior_job_id",
@@ -294,31 +280,16 @@ pub async fn validate_restore_job(
     database: &PgPool,
     restore_job_id: BaculaJobId,
     backup_job_id: BaculaJobId,
-    pool: &BaculaPoolName,
 ) -> Result<BaculaRestoreCatalogEvidence, BaculaCatalogEvidenceError> {
     let job = load_job(database, restore_job_id).await?;
-    validate_job_common(
-        &job,
-        RESTORE_JOB_NAME,
-        BACULA_RESTORE_JOB_TYPE,
-        BACULA_FULL_LEVEL,
-        pool,
-    )?;
-    expect_optional(
-        "restore.read_storage",
-        STORAGE_NAME,
-        job.read_storage_name.as_deref(),
-    )?;
+    validate_restore_job_record(&job)?;
     let relationship = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(
              SELECT 1 FROM log
-             WHERE jobid = $1 AND logtext LIKE $2)",
+             WHERE jobid = $1 AND btrim(logtext, E'\\r\\n') = $2)",
     )
     .bind(job_id_i32(restore_job_id)?)
-    .bind(format!(
-        "%Restoring files from JobId(s) {}%",
-        backup_job_id.get()
-    ))
+    .bind(restore_relationship_log(restore_job_id, backup_job_id))
     .fetch_one(database)
     .await?;
     if !relationship {
@@ -331,6 +302,48 @@ pub async fn validate_restore_job(
         job,
         source_backup_job_id: backup_job_id,
     })
+}
+
+fn validate_backup_job_record(
+    job: &BaculaCatalogJobEvidence,
+    pool: &BaculaPoolName,
+) -> Result<(), BaculaCatalogEvidenceError> {
+    validate_job_common(
+        job,
+        BACKUP_JOB_NAME,
+        BACULA_BACKUP_JOB_TYPE,
+        BACULA_FULL_LEVEL,
+    )?;
+    expect_optional("backup.pool", pool.as_str(), job.pool_name.as_deref())?;
+    expect_optional(
+        "backup.write_storage",
+        STORAGE_NAME,
+        job.write_storage_name.as_deref(),
+    )
+}
+
+fn validate_restore_job_record(
+    job: &BaculaCatalogJobEvidence,
+) -> Result<(), BaculaCatalogEvidenceError> {
+    validate_job_common(
+        job,
+        RESTORE_JOB_NAME,
+        BACULA_RESTORE_JOB_TYPE,
+        BACULA_FULL_LEVEL,
+    )?;
+    expect_optional(
+        "restore.read_storage",
+        STORAGE_NAME,
+        job.read_storage_name.as_deref(),
+    )
+}
+
+fn restore_relationship_log(restore_job_id: BaculaJobId, backup_job_id: BaculaJobId) -> String {
+    format!(
+        "{DIRECTOR_NAME} JobId {}: Restoring files from JobId(s) {}",
+        restore_job_id.get(),
+        backup_job_id.get()
+    )
 }
 
 async fn load_volumes(
@@ -396,7 +409,6 @@ fn validate_job_common(
     name: &str,
     job_type: &str,
     level: &str,
-    pool: &BaculaPoolName,
 ) -> Result<(), BaculaCatalogEvidenceError> {
     expect("job.name", name, &job.name)?;
     expect("job.type", job_type, &job.job_type)?;
@@ -408,8 +420,7 @@ fn validate_job_common(
         i64::try_from(job.errors).map_err(|_| BaculaCatalogEvidenceError::InvalidNumber {
             field: "job.errors",
         })?,
-    )?;
-    expect_optional("job.pool", pool.as_str(), job.pool_name.as_deref())
+    )
 }
 
 fn validated_volume(
@@ -419,6 +430,7 @@ fn validated_volume(
 ) -> Result<BaculaCatalogVolumeEvidence, BaculaCatalogEvidenceError> {
     expect("volume.name", volume.as_str(), &row.volume_name)?;
     expect("volume.pool", pool.as_str(), &row.pool_name)?;
+    expect("volume.media_type", MEDIA_TYPE, &row.media_type)?;
     expect("volume.enabled", "1", &row.enabled.to_string())?;
     expect("volume.recycle", "0", &row.recycle.to_string())?;
     if !matches!(row.volume_status.as_str(), "Append" | "Used" | "Full") {
@@ -585,12 +597,12 @@ mod tests {
     }
 
     #[test]
-    fn strict_job_validation_rejects_nonterminal_or_wrong_pool() {
-        let job = BaculaCatalogJobEvidence {
+    fn backup_validation_requires_terminal_job_and_exact_pool() {
+        let mut job = BaculaCatalogJobEvidence {
             job_id: BaculaJobId::new(10).expect("id"),
             name: BACKUP_JOB_NAME.to_owned(),
-            job_type: "B".to_owned(),
-            level: "F".to_owned(),
+            job_type: BACULA_BACKUP_JOB_TYPE.to_owned(),
+            level: BACULA_FULL_LEVEL.to_owned(),
             status: "R".to_owned(),
             prior_job_id: 0,
             files: 1,
@@ -600,7 +612,16 @@ mod tests {
             read_storage_name: None,
             write_storage_name: Some(STORAGE_NAME.to_owned()),
         };
-        assert!(validate_job_common(&job, BACKUP_JOB_NAME, "B", "F", &pool()).is_err());
+        assert!(validate_backup_job_record(&job, &pool()).is_err());
+
+        job.status = "T".to_owned();
+        assert!(matches!(
+            validate_backup_job_record(&job, &pool()),
+            Err(BaculaCatalogEvidenceError::Mismatch {
+                field: "backup.pool",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -616,22 +637,107 @@ mod tests {
             files: 746,
             job_bytes: 1_064_353_177,
             errors: 0,
-            pool_name: Some(pool().as_str().to_owned()),
+            // Bacula does not assign PoolId to Verify catalog records.
+            pool_name: None,
             read_storage_name: Some(STORAGE_NAME.to_owned()),
             write_storage_name: None,
         };
 
-        validate_verify_job_record(&job, backup_job_id, &pool())
+        validate_verify_job_record(&job, backup_job_id)
             .expect("Bacula Level=Data catalogs Job.Level as A");
 
         job.level = "D".to_owned();
         assert!(matches!(
-            validate_verify_job_record(&job, backup_job_id, &pool()),
+            validate_verify_job_record(&job, backup_job_id),
             Err(BaculaCatalogEvidenceError::Mismatch {
                 field: "job.level",
                 expected,
                 actual,
             }) if expected == "A" && actual == "D"
+        ));
+
+        job.level = BACULA_VERIFY_DATA_LEVEL.to_owned();
+        job.prior_job_id = 99;
+        assert!(matches!(
+            validate_verify_job_record(&job, backup_job_id),
+            Err(BaculaCatalogEvidenceError::Mismatch {
+                field: "verify.prior_job_id",
+                ..
+            })
+        ));
+
+        job.prior_job_id = backup_job_id.get();
+        job.read_storage_name = None;
+        assert!(matches!(
+            validate_verify_job_record(&job, backup_job_id),
+            Err(BaculaCatalogEvidenceError::Mismatch {
+                field: "verify.read_storage",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn accepts_completed_restore_without_a_catalog_pool() {
+        let mut job = BaculaCatalogJobEvidence {
+            job_id: BaculaJobId::new(43).expect("restore id"),
+            name: RESTORE_JOB_NAME.to_owned(),
+            job_type: BACULA_RESTORE_JOB_TYPE.to_owned(),
+            level: BACULA_FULL_LEVEL.to_owned(),
+            status: "T".to_owned(),
+            prior_job_id: 0,
+            files: 746,
+            job_bytes: 1_064_353_177,
+            errors: 0,
+            // Bacula does not assign PoolId to Restore catalog records.
+            pool_name: None,
+            read_storage_name: Some(STORAGE_NAME.to_owned()),
+            write_storage_name: None,
+        };
+
+        validate_restore_job_record(&job)
+            .expect("a successful Bacula restore legitimately has no PoolId");
+
+        job.read_storage_name = None;
+        assert!(matches!(
+            validate_restore_job_record(&job),
+            Err(BaculaCatalogEvidenceError::Mismatch {
+                field: "restore.read_storage",
+                ..
+            })
+        ));
+
+        assert_eq!(
+            restore_relationship_log(
+                BaculaJobId::new(43).expect("restore id"),
+                BaculaJobId::new(41).expect("backup id")
+            ),
+            "tapescale-dir JobId 43: Restoring files from JobId(s) 41"
+        );
+    }
+
+    #[test]
+    fn volume_validation_requires_the_pinned_lto_media_type() {
+        let volume = VolumeLabel::parse("SCRATCH-0001").expect("volume");
+        let mut row = CatalogVolumeRow {
+            media_id: 7,
+            volume_name: volume.as_str().to_owned(),
+            pool_name: pool().as_str().to_owned(),
+            media_type: MEDIA_TYPE.to_owned(),
+            volume_status: "Append".to_owned(),
+            enabled: 1,
+            recycle: 0,
+            volume_bytes: 4096,
+        };
+        validated_volume(&row, &volume, &pool()).expect("pinned media type");
+
+        row.media_type = "File".to_owned();
+        assert!(matches!(
+            validated_volume(&row, &volume, &pool()),
+            Err(BaculaCatalogEvidenceError::Mismatch {
+                field: "volume.media_type",
+                ..
+            })
         ));
     }
 }

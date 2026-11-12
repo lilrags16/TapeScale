@@ -5,6 +5,7 @@ use clap::Parser;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tapescale::{
+    bacula_catalog::{validate_backup_job, validate_restore_job, validate_verify_job},
     bacula_runtime::{validate_packaged_catalog_schema, BaculaRuntime},
     config::Config,
     data_run,
@@ -12,7 +13,11 @@ use tapescale::{
         discover_sas_drives, execute_sas_motion, SasDiscoveryConfig, SasMotionError,
         SasMotionOperation, SasProbeResult,
     },
-    engine::{simulator::SimulatorEngine, QualificationStatus, TapeEngine},
+    engine::{
+        bacula::{BaculaJobId, BaculaPoolName, VolumeLabel},
+        simulator::SimulatorEngine,
+        QualificationStatus, TapeEngine,
+    },
     qualification::{BtapeOutcomeKind, BtapeQualificationConfig},
     store,
     tool_runner::ToolError,
@@ -30,16 +35,59 @@ use uuid::Uuid;
 )]
 struct Arguments {
     /// Perform one reconciliation pass and exit.
-    #[arg(long, conflicts_with_all = ["validate_bacula_schema", "prepare_bacula_catalog"])]
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "validate_bacula_schema",
+            "prepare_bacula_catalog",
+            "validate_bacula_roundtrip_catalog"
+        ]
+    )]
     once: bool,
 
     /// Validate the digest and SQL payload of the packaged Bacula schema, then exit.
-    #[arg(long, conflicts_with = "prepare_bacula_catalog")]
+    #[arg(
+        long,
+        conflicts_with_all = ["prepare_bacula_catalog", "validate_bacula_roundtrip_catalog"]
+    )]
     validate_bacula_schema: bool,
 
     /// Initialize and validate the Bacula catalog in DATABASE_URL, then exit.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "validate_bacula_roundtrip_catalog")]
     prepare_bacula_catalog: bool,
+
+    /// Validate one completed Bacula backup/verify/restore catalog tuple, then exit.
+    #[arg(
+        long,
+        requires_all = [
+            "catalog_backup_job_id",
+            "catalog_verify_job_id",
+            "catalog_restore_job_id",
+            "catalog_run_id",
+            "catalog_volume"
+        ]
+    )]
+    validate_bacula_roundtrip_catalog: bool,
+
+    /// Bacula JobId of the completed Full backup.
+    #[arg(long, requires = "validate_bacula_roundtrip_catalog")]
+    catalog_backup_job_id: Option<u64>,
+
+    /// Bacula JobId of the completed Level=Data verification.
+    #[arg(long, requires = "validate_bacula_roundtrip_catalog")]
+    catalog_verify_job_id: Option<u64>,
+
+    /// Bacula JobId of the completed restore.
+    #[arg(long, requires = "validate_bacula_roundtrip_catalog")]
+    catalog_restore_job_id: Option<u64>,
+
+    /// TapeScale recovery-exercise UUID used to derive the Bacula pool.
+    #[arg(long, requires = "validate_bacula_roundtrip_catalog")]
+    catalog_run_id: Option<Uuid>,
+
+    /// Exact Bacula volume label used by the backup.
+    #[arg(long, requires = "validate_bacula_roundtrip_catalog")]
+    catalog_volume: Option<String>,
 }
 
 #[tokio::main]
@@ -69,6 +117,48 @@ async fn main() -> Result<()> {
             BaculaRuntime::prepare_catalog(database, database_url, &CancellationToken::new())
                 .await?;
         info!(catalog_schema_version = version, "Bacula catalog is ready");
+        return Ok(());
+    }
+    if arguments.validate_bacula_roundtrip_catalog {
+        let database = pool.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("PostgreSQL is required for catalog evidence validation")
+        })?;
+        let backup_job_id = BaculaJobId::new(
+            arguments
+                .catalog_backup_job_id
+                .ok_or_else(|| anyhow::anyhow!("--catalog-backup-job-id is required"))?,
+        )?;
+        let verify_job_id = BaculaJobId::new(
+            arguments
+                .catalog_verify_job_id
+                .ok_or_else(|| anyhow::anyhow!("--catalog-verify-job-id is required"))?,
+        )?;
+        let restore_job_id = BaculaJobId::new(
+            arguments
+                .catalog_restore_job_id
+                .ok_or_else(|| anyhow::anyhow!("--catalog-restore-job-id is required"))?,
+        )?;
+        let run_id = arguments
+            .catalog_run_id
+            .ok_or_else(|| anyhow::anyhow!("--catalog-run-id is required"))?;
+        let volume = VolumeLabel::parse(
+            arguments
+                .catalog_volume
+                .ok_or_else(|| anyhow::anyhow!("--catalog-volume is required"))?,
+        )?;
+        let bacula_pool = BaculaPoolName::for_run(run_id);
+
+        let backup = validate_backup_job(database, backup_job_id, &volume, &bacula_pool).await?;
+        let verify = validate_verify_job(database, verify_job_id, backup_job_id).await?;
+        let restore = validate_restore_job(database, restore_job_id, backup_job_id).await?;
+        info!(
+            backup_job_id = backup.job.job_id.get(),
+            verify_job_id = verify.job.job_id.get(),
+            restore_job_id = restore.job.job_id.get(),
+            volume = %backup.volume.volume_name,
+            pool = %backup.volume.pool_name,
+            "completed Bacula roundtrip catalog evidence passed"
+        );
         return Ok(());
     }
     let sas_config = SasDiscoveryConfig::from_env()?;
@@ -1151,6 +1241,32 @@ mod tests {
             started_at: Some(now),
             finished_at: None,
         }
+    }
+
+    #[test]
+    fn catalog_validation_cli_requires_a_complete_roundtrip_identity() {
+        assert!(Arguments::try_parse_from([
+            "tapescale-worker",
+            "--validate-bacula-roundtrip-catalog"
+        ])
+        .is_err());
+
+        let arguments = Arguments::try_parse_from([
+            "tapescale-worker",
+            "--validate-bacula-roundtrip-catalog",
+            "--catalog-backup-job-id",
+            "1",
+            "--catalog-verify-job-id",
+            "2",
+            "--catalog-restore-job-id",
+            "3",
+            "--catalog-run-id",
+            "01a1d15f-c6ae-768a-85ff-27b5121d5c05",
+            "--catalog-volume",
+            "AA0344",
+        ])
+        .expect("complete catalog tuple");
+        assert!(arguments.validate_bacula_roundtrip_catalog);
     }
 
     #[test]

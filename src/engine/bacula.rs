@@ -41,6 +41,7 @@ pub const CONSOLE_NAME: &str = "tapescale-adapter";
 pub const CATALOG_NAME: &str = "TS-Catalog";
 pub const STORAGE_NAME: &str = "TS-LTO";
 pub const DEVICE_NAME: &str = "TS-LTO-Drive";
+pub const MEDIA_TYPE: &str = "LTO";
 pub const POOL_NAME_PREFIX: &str = "TS-LTO-";
 pub const FILESET_NAME: &str = "TS-Source";
 pub const BACKUP_JOB_NAME: &str = "TS-Full";
@@ -584,7 +585,7 @@ Storage {{
   SDPort = 9103
   Password = "{storage_password}"
   Device = {DEVICE_NAME}
-  Media Type = LTO
+  Media Type = {MEDIA_TYPE}
   Maximum Concurrent Jobs = 1
   TLS Enable = no
   TLS Require = yes
@@ -723,7 +724,7 @@ Director {{
 
 Device {{
   Name = {DEVICE_NAME}
-  Media Type = LTO
+  Media Type = {MEDIA_TYPE}
   Archive Device = "{tape_device}"
   Automatic Mount = yes
   Always Open = no

@@ -554,12 +554,7 @@ async fn perform_exercise(
             cancellation,
         )
         .await?;
-        let verify_catalog = validate_verify_job(
-            pool,
-            verify.job_id,
-            backup.job_id,
-            &bacula_pool,
-        )
+        let verify_catalog = validate_verify_job(pool, verify.job_id, backup.job_id)
         .await
         .map_err(|error| {
             ExerciseFailure::failed(format!("Bacula Data verify catalog proof failed: {error}"))
@@ -621,12 +616,7 @@ async fn perform_exercise(
             cancellation,
         )
         .await?;
-        let restore_catalog = validate_restore_job(
-            pool,
-            restore.job_id,
-            backup.job_id,
-            &bacula_pool,
-        )
+        let restore_catalog = validate_restore_job(pool, restore.job_id, backup.job_id)
         .await
         .map_err(|error| {
             ExerciseFailure::failed(format!("Bacula restore catalog proof failed: {error}"))

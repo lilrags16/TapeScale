@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -64,7 +63,7 @@ jobs:
           --entrypoint /usr/local/bin/tapescale-worker
           tapescale:ci
           --validate-bacula-schema
-      - name: Bootstrap fresh Bacula catalog
+      - name: Exercise fresh Bacula backup, Data verify, restore, and catalog proof
         run: |
           set -euo pipefail
           catalog_network="tapescale-ci-catalog-${GITHUB_RUN_ID}"
@@ -95,10 +94,16 @@ jobs:
           done
           docker run --rm \
             --network "$catalog_network" \
+            --user 0:0 \
             --env DATABASE_URL=postgresql://tapescale:tapescale_ci@postgres:5432/tapescale \
-            --entrypoint /usr/local/bin/tapescale-worker \
-            tapescale:ci \
-            --prepare-bacula-catalog
+            --env BACULA_CATALOG_HOST=postgres \
+            --env BACULA_CATALOG_PORT=5432 \
+            --env BACULA_CATALOG_DATABASE=tapescale \
+            --env BACULA_CATALOG_USER=tapescale \
+            --env BACULA_CATALOG_PASSWORD=tapescale_ci \
+            --volume "$GITHUB_WORKSPACE/scripts/ci-bacula-file-roundtrip.sh:/usr/local/bin/ci-bacula-file-roundtrip:ro" \
+            --entrypoint /usr/local/bin/ci-bacula-file-roundtrip \
+            tapescale:ci
           catalog_result="$(docker exec \
             --env PGPASSWORD=tapescale_ci \
             "$catalog_postgres" \
