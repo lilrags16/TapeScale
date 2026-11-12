@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderName, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -34,7 +34,7 @@ use crate::{
     },
     engine::{simulator::SimulatorEngine, TapeEngine},
     error::AppError,
-    qualification, store, VERSION,
+    media_ops, qualification, store, VERSION,
 };
 
 #[derive(Clone)]
@@ -83,6 +83,21 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .route("/api/v1/jobs", get(jobs))
         .route("/api/v1/jobs/{id}", get(job))
         .route("/api/v1/media", get(media).post(create_media))
+        .route(
+            "/api/v1/media-pools",
+            get(media_pools).post(create_media_pool),
+        )
+        .route("/api/v1/media/{id}", get(media_detail))
+        .route(
+            "/api/v1/media/{id}/pool-assignment",
+            post(assign_media_pool),
+        )
+        .route("/api/v1/media/{id}/holds", post(create_media_hold))
+        .route(
+            "/api/v1/media/{id}/reuse-evaluation",
+            get(evaluate_media_reuse),
+        )
+        .route("/api/v1/holds/{id}/release", post(release_media_hold))
         .route("/api/v1/drives", get(drives))
         .route("/api/v1/drives/{id}/reconcile", post(reconcile_drive))
         .route("/api/v1/drives/{id}/actions", post(queue_drive_action))
@@ -205,17 +220,26 @@ async fn overview(State(state): State<AppState>) -> Result<Json<Value>, AppError
             "summary": empty_summary(),
             "sources": [],
             "actions": [],
+            "actions_total": 0,
+            "actions_returned": 0,
+            "actions_truncated": false,
             "storage": "not_configured"
         })));
     };
 
-    let summary = store::overview_counts(pool).await?;
+    let mut summary = store::overview_counts(pool).await?;
     let sources = store::list_sources(pool).await?;
     let actions = store::list_required_actions(pool).await?;
+    let actions_returned = i64::try_from(actions.len()).unwrap_or(i64::MAX);
+    summary.required_actions = summary.required_actions.max(actions_returned);
+    let actions_total = summary.required_actions;
     Ok(Json(json!({
         "summary": summary,
         "sources": sources,
         "actions": actions,
+        "actions_total": actions_total,
+        "actions_returned": actions_returned,
+        "actions_truncated": actions_returned < actions_total,
         "storage": "postgresql"
     })))
 }
@@ -243,10 +267,12 @@ async fn job(
 
 async fn media(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let records = match state.pool.as_ref() {
-        Some(pool) => store::list_media(pool).await?,
+        Some(pool) => media_ops::list_media_inventory(pool)
+            .await
+            .map_err(map_media_ops_error)?,
         None => Vec::new(),
     };
-    let media = records.iter().map(media_view).collect::<Vec<_>>();
+    let media = records.iter().map(media_inventory_view).collect::<Vec<_>>();
     Ok(Json(json!({"media":media})))
 }
 
@@ -336,14 +362,235 @@ async fn create_media(
         }
         Err(error) => return Err(error.into()),
     };
+    let detail = media_ops::get_media_detail(pool, record.id)
+        .await
+        .map_err(map_media_ops_error)?;
+    let media = media_inventory_view(&detail.cartridge);
     Ok((
         StatusCode::CREATED,
         Json(json!({
-            "media":media_view(&record),
+            "media":media,
             "durability":"postgresql",
             "audit":"appended"
         })),
     ))
+}
+
+async fn media_pools(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let pools = match state.pool.as_ref() {
+        Some(pool) => media_ops::list_media_pools(pool)
+            .await
+            .map_err(map_media_ops_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({"pools":pools})))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateMediaPoolApiRequest {
+    name: String,
+    purpose: media_ops::MediaPoolPurpose,
+    #[serde(default)]
+    indefinite_retention: bool,
+    #[serde(default = "empty_json_object")]
+    details: Value,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+async fn create_media_pool(
+    State(state): State<AppState>,
+    Json(request): Json<CreateMediaPoolApiRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let pool = require_pool(&state)?;
+    let media_pool = media_ops::create_media_pool(
+        pool,
+        &media_ops::CreateMediaPoolRequest {
+            name: request.name,
+            purpose: request.purpose,
+            indefinite_retention: request.indefinite_retention,
+            details: request.details,
+            actor: media_actor(request.actor.as_deref()),
+            correlation_id: Uuid::now_v7(),
+        },
+    )
+    .await
+    .map_err(map_media_ops_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "pool":media_pool,
+            "durability":"postgresql",
+            "audit":"appended"
+        })),
+    ))
+}
+
+async fn media_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let id = parse_uuid_path(&id, "cartridge")?;
+    let detail = media_ops::get_media_detail(pool, id)
+        .await
+        .map_err(map_media_ops_error)?;
+    Ok(Json(json!({"media":detail})))
+}
+
+#[derive(Debug, Deserialize)]
+struct AssignMediaPoolApiRequest {
+    #[serde(default)]
+    pool_id: Option<Uuid>,
+    expected_state_version: i64,
+    idempotency_key: String,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+async fn assign_media_pool(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<AssignMediaPoolApiRequest>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let cartridge_id = parse_uuid_path(&id, "cartridge")?;
+    let receipt = media_ops::assign_media_pool(
+        pool,
+        cartridge_id,
+        &media_ops::AssignMediaPoolRequest {
+            pool_id: request.pool_id,
+            expected_state_version: request.expected_state_version,
+            idempotency_key: request.idempotency_key,
+            actor: media_actor(request.actor.as_deref()),
+            correlation_id: Uuid::now_v7(),
+        },
+    )
+    .await
+    .map_err(map_media_ops_error)?;
+    let detail = media_ops::get_media_detail(pool, cartridge_id)
+        .await
+        .map_err(map_media_ops_error)?;
+    Ok(Json(json!({
+        "media":detail,
+        "receipt":receipt,
+        "durability":"postgresql",
+        "audit":"appended"
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateMediaHoldApiRequest {
+    kind: media_ops::MediaHoldKind,
+    reason: String,
+    #[serde(default)]
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    expected_state_version: i64,
+    idempotency_key: String,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+async fn create_media_hold(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<CreateMediaHoldApiRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let pool = require_pool(&state)?;
+    let cartridge_id = parse_uuid_path(&id, "cartridge")?;
+    let receipt = media_ops::add_media_hold(
+        pool,
+        cartridge_id,
+        &media_ops::CreateMediaHoldRequest {
+            kind: request.kind,
+            reason: request.reason,
+            expires_at: request.expires_at,
+            expected_state_version: request.expected_state_version,
+            idempotency_key: request.idempotency_key,
+            actor: media_actor(request.actor.as_deref()),
+            correlation_id: Uuid::now_v7(),
+        },
+    )
+    .await
+    .map_err(map_media_ops_error)?;
+    let detail = media_ops::get_media_detail(pool, cartridge_id)
+        .await
+        .map_err(map_media_ops_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "media":detail,
+            "receipt":receipt,
+            "durability":"postgresql",
+            "audit":"appended"
+        })),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseMediaHoldApiRequest {
+    reason: String,
+    expected_state_version: i64,
+    idempotency_key: String,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+async fn release_media_hold(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ReleaseMediaHoldApiRequest>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let hold_id = parse_uuid_path(&id, "hold")?;
+    let receipt = media_ops::release_media_hold(
+        pool,
+        hold_id,
+        &media_ops::ReleaseMediaHoldRequest {
+            reason: request.reason,
+            expected_state_version: request.expected_state_version,
+            idempotency_key: request.idempotency_key,
+            actor: media_actor(request.actor.as_deref()),
+            correlation_id: Uuid::now_v7(),
+        },
+    )
+    .await
+    .map_err(map_media_ops_error)?;
+    let detail = media_ops::get_media_detail(pool, receipt.cartridge_id)
+        .await
+        .map_err(map_media_ops_error)?;
+    Ok(Json(json!({
+        "media":detail,
+        "receipt":receipt,
+        "durability":"postgresql",
+        "audit":"appended"
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct MediaReuseQuery {
+    drive_id: Uuid,
+}
+
+async fn evaluate_media_reuse(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<MediaReuseQuery>,
+) -> Result<Response, AppError> {
+    let pool = require_pool(&state)?;
+    let cartridge_id = parse_uuid_path(&id, "cartridge")?;
+    let evaluation = media_ops::evaluate_media_reuse(pool, cartridge_id, query.drive_id)
+        .await
+        .map_err(map_media_ops_error)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "evaluation":evaluation,
+            "read_only":true,
+            "destructive_operation_available":false
+        })),
+    )
+        .into_response())
 }
 
 async fn drives(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -1704,6 +1951,96 @@ fn custody_actor(label: Option<&str>) -> CustodyActor {
     }
 }
 
+fn media_actor(label: Option<&str>) -> media_ops::MediaActor {
+    let label = label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local-operator")
+        .to_owned();
+    media_ops::MediaActor {
+        user_id: None,
+        label,
+    }
+}
+
+/// Preserve the original flat `/api/v1/media` fields while exposing the
+/// richer nested Media Control Center contract.  Exact-drive evaluation is
+/// still required, so the deprecated inventory-only overwrite flag remains
+/// false and cannot be mistaken for authorization.
+fn media_inventory_view(record: &media_ops::MediaInventorySummary) -> Value {
+    let blocker = match record.reuse_state {
+        media_ops::InventoryReuseState::PhysicallyBlocked => {
+            "physical media protection blocks overwrite"
+        }
+        media_ops::InventoryReuseState::Reserved => "the cartridge is reserved",
+        media_ops::InventoryReuseState::NeedsReconciliation => {
+            "media identity, catalog, location, health, or dependency state requires reconciliation"
+        }
+        media_ops::InventoryReuseState::Protected => {
+            "retention, dependency, archive, or hold protection is active"
+        }
+        media_ops::InventoryReuseState::DriveEvaluationRequired => {
+            "an exact-drive reuse evaluation is required"
+        }
+    };
+    let mut value =
+        serde_json::to_value(record).expect("serializing a media inventory summary cannot fail");
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "pool_id".to_owned(),
+            json!(record.pool.as_ref().map(|pool| pool.id)),
+        );
+        object.insert(
+            "pool_name".to_owned(),
+            json!(record.pool.as_ref().map(|pool| pool.name.as_str())),
+        );
+        object.insert(
+            "confirmed_location_id".to_owned(),
+            json!(record
+                .confirmed_location
+                .as_ref()
+                .map(|location| location.id)),
+        );
+        object.insert(
+            "confirmed_location_name".to_owned(),
+            json!(record
+                .confirmed_location
+                .as_ref()
+                .map(|location| location.name.as_str())),
+        );
+        object.insert(
+            "location_name".to_owned(),
+            json!(record
+                .confirmed_location
+                .as_ref()
+                .map(|location| location.name.as_str())),
+        );
+        object.insert("overwrite_eligible".to_owned(), json!(false));
+        object.insert("overwrite_blockers".to_owned(), json!([blocker]));
+    }
+    value
+}
+
+fn map_media_ops_error(error: media_ops::MediaOpsError) -> AppError {
+    match error {
+        media_ops::MediaOpsError::NotFound { .. } => AppError::NotFound,
+        media_ops::MediaOpsError::Invalid { field, message } => {
+            AppError::Invalid(format!("{field}: {message}"))
+        }
+        media_ops::MediaOpsError::Conflict { code, message } => {
+            AppError::Conflict(format!("{code}: {message}"))
+        }
+        media_ops::MediaOpsError::StaleVersion { expected, actual } => AppError::Conflict(format!(
+            "stale cartridge state version: expected {expected}, current {actual}"
+        )),
+        media_ops::MediaOpsError::IdempotencyConflict { key } => AppError::Conflict(format!(
+            "idempotency key {key} was already used for a different media operation"
+        )),
+        media_ops::MediaOpsError::Invariant(message) => AppError::Internal(message),
+        media_ops::MediaOpsError::Database(error) => AppError::Database(error),
+    }
+}
+
 fn map_custody_error(error: CustodyOpsError) -> AppError {
     match error {
         CustodyOpsError::NotFound { .. } => AppError::NotFound,
@@ -1959,21 +2296,6 @@ fn restore_warning_view(warning: &RestoreWarning) -> Value {
             "message": "Native extraction has stream-level evidence but no independent per-file digest proof."
         }),
     }
-}
-
-fn media_view(record: &store::MediaRecord) -> Value {
-    let overwrite_blocker = match record.identity_status.as_str() {
-        "unknown" => "on-tape identity has not been reconciled",
-        "foreign" => "foreign media is protected",
-        "mismatch" => "catalog and on-tape identity do not match",
-        _ => "overwrite eligibility evaluation is not implemented",
-    };
-    let mut value = serde_json::to_value(record).expect("serializing a media record cannot fail");
-    if let Some(object) = value.as_object_mut() {
-        object.insert("overwrite_eligible".to_owned(), json!(false));
-        object.insert("overwrite_blockers".to_owned(), json!([overwrite_blocker]));
-    }
-    value
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {

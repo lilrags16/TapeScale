@@ -1435,6 +1435,702 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     .expect("drive audit query should succeed");
     assert_eq!(reconcile_audit, 1);
 
+    // Exercise the complete Media Control Center contract against the same
+    // cartridge, recovery point, drive, and custody history proved above.
+    let device_location_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/locations".to_owned(),
+        Some(json!({
+            "name": "Integration tape drive bay",
+            "kind": "device",
+            "details": {"stable_drive_id":"serial:IBM:ULTRIUM-HH9:DRIVE-001"},
+            "actor": "integration operator"
+        })),
+    )
+    .await;
+    assert_eq!(device_location_response.status(), StatusCode::CREATED);
+    let device_location = response_json(device_location_response).await;
+    let device_location_id = uuid::Uuid::parse_str(
+        device_location["location"]["id"]
+            .as_str()
+            .expect("device location should have an id"),
+    )
+    .expect("device location id should parse");
+
+    let load_movement_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/movements".to_owned(),
+        Some(json!({
+            "external_id": "INT-MOVE-DEVICE-001",
+            "idempotency_key": "integration-create-device-load-001",
+            "kind": "recall",
+            "source_location_id": vault_id,
+            "destination_location_id": device_location_id,
+            "cartridge_ids": [scratch.id],
+            "reason": "Load the selected cartridge for read-only reuse evaluation",
+            "due_at": Utc::now() + chrono::TimeDelta::hours(1),
+            "actor": "integration operator"
+        })),
+    )
+    .await;
+    assert_eq!(load_movement_response.status(), StatusCode::CREATED);
+    let load_movement = response_json(load_movement_response).await;
+    let load_movement_id = load_movement["movement"]["summary"]["id"]
+        .as_str()
+        .expect("device-load movement should have an id")
+        .to_owned();
+    let load_confirmation_response = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/movements/{load_movement_id}/confirm"),
+        Some(json!({
+            "action": "direct",
+            "cartridge_ids": [scratch.id],
+            "expected_confirmation_version": 0,
+            "idempotency_key": "integration-confirm-device-load-001",
+            "physically_confirmed": true,
+            "note": "Barcode and drive bay were physically checked",
+            "actor": "integration operator"
+        })),
+    )
+    .await;
+    assert_eq!(load_confirmation_response.status(), StatusCode::OK);
+
+    observation.generation = Some(9);
+    observation.position_lost = Some(false);
+    observation.ready = Some(true);
+    observation.medium_loaded = Some(true);
+    observation.status = "ready".to_owned();
+    observation.observed_at = Utc::now();
+    store::record_drive_observation(&pool, &observation)
+        .await
+        .expect("reuse evaluation should have a current generation observation");
+    assert!(matches!(
+        store::reconcile_drive(&pool, drive_id, "serial:IBM:ULTRIUM-HH9:DRIVE-001")
+            .await
+            .expect("current drive identity should reconcile"),
+        ReconcileDriveResult::Reconciled(_)
+    ));
+    let routine_pool_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/media-pools".to_owned(),
+        Some(json!({
+            "name": "Integration routine pool",
+            "purpose": "routine",
+            "details": {"retention_owner":"integration"},
+            "actor": "integration administrator"
+        })),
+    )
+    .await;
+    assert_eq!(routine_pool_response.status(), StatusCode::CREATED);
+    let routine_pool = response_json(routine_pool_response).await;
+    let routine_pool_id = uuid::Uuid::parse_str(
+        routine_pool["pool"]["id"]
+            .as_str()
+            .expect("routine pool should have an id"),
+    )
+    .expect("routine pool id should parse");
+
+    let scratch_pool_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/media-pools".to_owned(),
+        Some(json!({
+            "name": "Integration scratch pool",
+            "purpose": "scratch",
+            "actor": "integration administrator"
+        })),
+    )
+    .await;
+    assert_eq!(scratch_pool_response.status(), StatusCode::CREATED);
+    let scratch_pool = response_json(scratch_pool_response).await;
+    let scratch_pool_id = uuid::Uuid::parse_str(
+        scratch_pool["pool"]["id"]
+            .as_str()
+            .expect("scratch pool should have an id"),
+    )
+    .expect("scratch pool id should parse");
+
+    let archive_pool_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/media-pools".to_owned(),
+        Some(json!({
+            "name": "Integration archive pool",
+            "purpose": "archive",
+            "indefinite_retention": false,
+            "actor": "integration administrator"
+        })),
+    )
+    .await;
+    assert_eq!(archive_pool_response.status(), StatusCode::CREATED);
+    let archive_pool = response_json(archive_pool_response).await;
+    assert_eq!(archive_pool["pool"]["indefinite_retention"], true);
+    let archive_pool_id = uuid::Uuid::parse_str(
+        archive_pool["pool"]["id"]
+            .as_str()
+            .expect("archive pool should have an id"),
+    )
+    .expect("archive pool id should parse");
+
+    let pools_response = api_request(
+        &application,
+        Method::GET,
+        "/api/v1/media-pools".to_owned(),
+        None,
+    )
+    .await;
+    assert_eq!(pools_response.status(), StatusCode::OK);
+    let pools = response_json(pools_response).await;
+    assert_eq!(pools["pools"].as_array().map(Vec::len), Some(3));
+
+    let inventory_response =
+        api_request(&application, Method::GET, "/api/v1/media".to_owned(), None).await;
+    assert_eq!(inventory_response.status(), StatusCode::OK);
+    let inventory_response = response_json(inventory_response).await;
+    let scratch_inventory = inventory_response["media"]
+        .as_array()
+        .expect("media inventory should be an array")
+        .iter()
+        .find(|media| media["id"] == json!(scratch.id))
+        .expect("written cartridge should be in media inventory");
+    assert_eq!(scratch_inventory["has_content"], true);
+    assert_eq!(scratch_inventory["retained_recovery_points"], 1);
+    assert_eq!(scratch_inventory["confirmed_location"]["kind"], "device");
+    assert_eq!(
+        scratch_inventory["location_name"],
+        "Integration tape drive bay"
+    );
+    assert_eq!(scratch_inventory["overwrite_eligible"], false);
+    assert!(scratch_inventory["overwrite_blockers"]
+        .as_array()
+        .is_some_and(|blockers| !blockers.is_empty()));
+    assert!(scratch_inventory["latest_verification"].is_object());
+    let initial_media_version = scratch_inventory["state_version"]
+        .as_i64()
+        .expect("inventory should expose the cartridge state version");
+
+    let pool_assignment_body = json!({
+        "pool_id": routine_pool_id,
+        "expected_state_version": initial_media_version,
+        "idempotency_key": "integration-media-pool-assign-001",
+        "actor": "integration administrator"
+    });
+    let pool_assignment_response = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/media/{}/pool-assignment", scratch.id),
+        Some(pool_assignment_body.clone()),
+    )
+    .await;
+    assert_eq!(pool_assignment_response.status(), StatusCode::OK);
+    let pool_assignment = response_json(pool_assignment_response).await;
+    assert_eq!(pool_assignment["receipt"]["idempotent_replay"], false);
+    assert_eq!(
+        pool_assignment["media"]["cartridge"]["pool"]["id"],
+        json!(routine_pool_id)
+    );
+    let mut media_version = pool_assignment["receipt"]["state_version"]
+        .as_i64()
+        .expect("pool assignment should return its resulting version");
+
+    let pool_assignment_replay = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/media/{}/pool-assignment", scratch.id),
+        Some(pool_assignment_body),
+    )
+    .await;
+    assert_eq!(pool_assignment_replay.status(), StatusCode::OK);
+    let pool_assignment_replay = response_json(pool_assignment_replay).await;
+    assert_eq!(pool_assignment_replay["receipt"]["idempotent_replay"], true);
+    assert_eq!(
+        pool_assignment_replay["receipt"]["state_version"],
+        media_version
+    );
+
+    let stale_assignment = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/media/{}/pool-assignment", scratch.id),
+        Some(json!({
+            "pool_id": archive_pool_id,
+            "expected_state_version": initial_media_version,
+            "idempotency_key": "integration-media-pool-stale-001",
+            "actor": "integration administrator"
+        })),
+    )
+    .await;
+    assert_eq!(stale_assignment.status(), StatusCode::CONFLICT);
+    let stale_assignment = response_json(stale_assignment).await;
+    assert!(stale_assignment["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("stale cartridge state version")));
+
+    let unsafe_scratch_assignment = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/media/{}/pool-assignment", scratch.id),
+        Some(json!({
+            "pool_id": scratch_pool_id,
+            "expected_state_version": media_version,
+            "idempotency_key": "integration-media-pool-protected-001",
+            "actor": "integration administrator"
+        })),
+    )
+    .await;
+    assert_eq!(unsafe_scratch_assignment.status(), StatusCode::CONFLICT);
+    let unsafe_scratch_assignment = response_json(unsafe_scratch_assignment).await;
+    assert!(unsafe_scratch_assignment["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("protected_media_pool_assignment")));
+
+    let mut created_hold_ids = Vec::new();
+    for (index, kind) in ["manual", "legal", "archive"].iter().enumerate() {
+        let body = json!({
+            "kind": kind,
+            "reason": format!("Integration {kind} protection review"),
+            "expected_state_version": media_version,
+            "idempotency_key": format!("integration-media-hold-create-{index}"),
+            "actor": "integration compliance operator"
+        });
+        let create_hold_response = api_request(
+            &application,
+            Method::POST,
+            format!("/api/v1/media/{}/holds", scratch.id),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(create_hold_response.status(), StatusCode::CREATED);
+        let create_hold = response_json(create_hold_response).await;
+        assert_eq!(create_hold["receipt"]["idempotent_replay"], false);
+        let hold_id = uuid::Uuid::parse_str(
+            create_hold["receipt"]["object_id"]
+                .as_str()
+                .expect("hold mutation should return the hold id"),
+        )
+        .expect("hold id should parse");
+        created_hold_ids.push(hold_id);
+        media_version = create_hold["receipt"]["state_version"]
+            .as_i64()
+            .expect("hold mutation should return a cartridge version");
+
+        if index == 0 {
+            let replay = api_request(
+                &application,
+                Method::POST,
+                format!("/api/v1/media/{}/holds", scratch.id),
+                Some(body),
+            )
+            .await;
+            assert_eq!(replay.status(), StatusCode::CREATED);
+            let replay = response_json(replay).await;
+            assert_eq!(replay["receipt"]["idempotent_replay"], true);
+            assert_eq!(replay["receipt"]["object_id"], json!(hold_id));
+        }
+    }
+
+    let descendant_job_id = uuid::Uuid::now_v7();
+    let descendant_run_id = uuid::Uuid::now_v7();
+    let descendant_recovery_point_id = uuid::Uuid::now_v7();
+    let descendant_hold_id = uuid::Uuid::now_v7();
+    let descendant_correlation_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO jobs (id, external_id, kind, priority)
+         VALUES ($1, 'integration-dependent-recovery-001', 'backup', 100)",
+    )
+    .bind(descendant_job_id)
+    .execute(&pool)
+    .await
+    .expect("dependent recovery fixture job should persist");
+    sqlx::query(
+        "INSERT INTO job_runs (
+             id, job_id, scheduled_occurrence, attempt, state, correlation_id,
+             source_snapshot_id, started_at, finished_at
+         ) VALUES (
+             $1, $2, 'integration-dependent-recovery-001', 1, 'verified', $3,
+             $4, now() - interval '2 minutes', now() - interval '1 minute'
+         )",
+    )
+    .bind(descendant_run_id)
+    .bind(descendant_job_id)
+    .bind(descendant_correlation_id)
+    .bind(created_profile.source_snapshot_id)
+    .execute(&pool)
+    .await
+    .expect("dependent recovery fixture run should persist");
+    sqlx::query(
+        "INSERT INTO recovery_points (
+             id, source_id, run_id, representation, level, source_scope_hash,
+             format_version, key_lineage_id, status, recovery_time,
+             expires_at, indefinite, coverage, manifest_digest, created_at
+         )
+         SELECT $1, source_id, $2, representation, 'incremental', source_scope_hash,
+                format_version, key_lineage_id, 'verified', now(),
+                NULL, true, coverage, $3, now()
+         FROM recovery_points WHERE id = $4",
+    )
+    .bind(descendant_recovery_point_id)
+    .bind(descendant_run_id)
+    .bind("d".repeat(64))
+    .bind(recovery_point_id)
+    .execute(&pool)
+    .await
+    .expect("verified indefinite descendant recovery point should persist");
+    sqlx::query(
+        "INSERT INTO recovery_dependencies (
+             recovery_point_id, depends_on_id, dependency_kind
+         ) VALUES ($1, $2, 'incremental_base')",
+    )
+    .bind(descendant_recovery_point_id)
+    .bind(recovery_point_id)
+    .execute(&pool)
+    .await
+    .expect("descendant dependency edge should persist");
+    sqlx::query(
+        "INSERT INTO holds (
+             id, recovery_point_id, kind, reason,
+             created_by_label, created_correlation_id
+         ) VALUES (
+             $1, $2, 'archive', 'Preserve dependent recovery chain for integration proof',
+             'integration compliance operator', $3
+         )",
+    )
+    .bind(descendant_hold_id)
+    .bind(descendant_recovery_point_id)
+    .bind(descendant_correlation_id)
+    .execute(&pool)
+    .await
+    .expect("descendant archive hold should persist");
+
+    let dependent_inventory_response =
+        api_request(&application, Method::GET, "/api/v1/media".to_owned(), None).await;
+    assert_eq!(dependent_inventory_response.status(), StatusCode::OK);
+    let dependent_inventory = response_json(dependent_inventory_response).await;
+    let dependent_cartridge = dependent_inventory["media"]
+        .as_array()
+        .expect("dependent inventory should be an array")
+        .iter()
+        .find(|media| media["id"] == json!(scratch.id))
+        .expect("dependency-protected cartridge should be in inventory");
+    assert_eq!(dependent_cartridge["dependent_recovery_points"], 1);
+    assert_eq!(dependent_cartridge["indefinite_archive_claims"], 1);
+    assert_eq!(dependent_cartridge["active_holds"], 4);
+    assert_eq!(dependent_cartridge["reuse_state"], "protected");
+
+    let dependent_dossier_response = api_request(
+        &application,
+        Method::GET,
+        format!("/api/v1/media/{}", scratch.id),
+        None,
+    )
+    .await;
+    assert_eq!(dependent_dossier_response.status(), StatusCode::OK);
+    let dependent_dossier = response_json(dependent_dossier_response).await;
+    assert!(dependent_dossier["media"]["dependent_recovery_points"]
+        .as_array()
+        .is_some_and(|points| points.iter().any(|point| {
+            point["id"] == json!(descendant_recovery_point_id)
+                && point["depth"] == 1
+                && point["indefinite"] == true
+        })));
+    assert!(dependent_dossier["media"]["holds"]
+        .as_array()
+        .is_some_and(|holds| holds.iter().any(|hold| {
+            hold["id"] == json!(descendant_hold_id)
+                && hold["recovery_point_id"] == json!(descendant_recovery_point_id)
+                && hold["active"] == true
+        })));
+
+    let protected_reuse_response = api_request(
+        &application,
+        Method::GET,
+        format!(
+            "/api/v1/media/{}/reuse-evaluation?drive_id={drive_id}",
+            scratch.id
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(protected_reuse_response.status(), StatusCode::OK);
+    assert_eq!(
+        protected_reuse_response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let protected_reuse = response_json(protected_reuse_response).await;
+    assert_eq!(protected_reuse["read_only"], true);
+    assert_eq!(protected_reuse["evaluation"]["allowed"], false);
+    assert_eq!(
+        protected_reuse["evaluation"]["destructive_operation_available"],
+        false
+    );
+    let protected_blockers = protected_reuse["evaluation"]["blockers"]
+        .as_array()
+        .expect("reuse blockers should be an array")
+        .iter()
+        .filter_map(|blocker| blocker["code"].as_str())
+        .collect::<Vec<_>>();
+    assert!(protected_blockers.contains(&"retained_recovery_points"));
+    assert!(protected_blockers.contains(&"dependent_recovery_points"));
+    assert!(protected_blockers.contains(&"explicit_holds"));
+    assert!(protected_blockers.contains(&"indefinite_archive"));
+    assert_eq!(
+        protected_reuse["evaluation"]["selected_drive"]["exact_qualification_current"],
+        true
+    );
+    assert!(protected_reuse["evaluation"]["affected_recovery_points"]
+        .as_array()
+        .is_some_and(|points| points
+            .iter()
+            .any(|point| point["id"] == json!(recovery_point_id))));
+    assert!(protected_reuse["evaluation"]["affected_recovery_points"]
+        .as_array()
+        .is_some_and(|points| points.iter().any(|point| {
+            point["id"] == json!(descendant_recovery_point_id)
+                && point["relation"] == "dependent"
+                && point["dependency_depth"] == 1
+        })));
+
+    for (index, hold_id) in created_hold_ids.iter().enumerate() {
+        let body = json!({
+            "reason": format!("Integration {index} review completed"),
+            "expected_state_version": media_version,
+            "idempotency_key": format!("integration-media-hold-release-{index}"),
+            "actor": "integration compliance operator"
+        });
+        let release_response = api_request(
+            &application,
+            Method::POST,
+            format!("/api/v1/holds/{hold_id}/release"),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(release_response.status(), StatusCode::OK);
+        let release = response_json(release_response).await;
+        assert_eq!(release["receipt"]["idempotent_replay"], false);
+        media_version = release["receipt"]["state_version"]
+            .as_i64()
+            .expect("hold release should return a cartridge version");
+
+        if index == 0 {
+            let replay = api_request(
+                &application,
+                Method::POST,
+                format!("/api/v1/holds/{hold_id}/release"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(replay.status(), StatusCode::OK);
+            let replay = response_json(replay).await;
+            assert_eq!(replay["receipt"]["idempotent_replay"], true);
+            assert_eq!(replay["receipt"]["state_version"], media_version);
+        }
+    }
+
+    sqlx::query(
+        "UPDATE holds
+         SET released_at = now(),
+             released_by_label = 'integration compliance operator',
+             release_reason = 'Dependent archive proof completed',
+             release_correlation_id = $2
+         WHERE id = $1",
+    )
+    .bind(descendant_hold_id)
+    .bind(uuid::Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .expect("descendant hold should retain a valid release receipt");
+    sqlx::query(
+        "UPDATE recovery_points
+         SET expires_at = now() - interval '1 day', indefinite = false
+         WHERE id = $1",
+    )
+    .bind(descendant_recovery_point_id)
+    .execute(&pool)
+    .await
+    .expect("descendant recovery protection should expire");
+
+    let released_dependency_inventory_response =
+        api_request(&application, Method::GET, "/api/v1/media".to_owned(), None).await;
+    assert_eq!(
+        released_dependency_inventory_response.status(),
+        StatusCode::OK
+    );
+    let released_dependency_inventory = response_json(released_dependency_inventory_response).await;
+    let released_dependency_cartridge = released_dependency_inventory["media"]
+        .as_array()
+        .expect("released dependency inventory should be an array")
+        .iter()
+        .find(|media| media["id"] == json!(scratch.id))
+        .expect("released dependency cartridge should remain in inventory");
+    assert_eq!(
+        released_dependency_cartridge["dependent_recovery_points"],
+        0
+    );
+    assert_eq!(
+        released_dependency_cartridge["indefinite_archive_claims"],
+        0
+    );
+    assert_eq!(released_dependency_cartridge["active_holds"], 0);
+
+    let dossier_response = api_request(
+        &application,
+        Method::GET,
+        format!("/api/v1/media/{}", scratch.id),
+        None,
+    )
+    .await;
+    assert_eq!(dossier_response.status(), StatusCode::OK);
+    let dossier = response_json(dossier_response).await;
+    assert_eq!(dossier["media"]["cartridge"]["active_holds"], 0);
+    assert!(dossier["media"]["holds"]
+        .as_array()
+        .is_some_and(|holds| holds.len() >= 4 && holds.iter().all(|hold| hold["active"] == false)));
+    let dossier_hold_kinds = dossier["media"]["holds"]
+        .as_array()
+        .expect("media dossier holds should be an array")
+        .iter()
+        .filter_map(|hold| hold["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert!(dossier_hold_kinds.contains(&"manual"));
+    assert!(dossier_hold_kinds.contains(&"legal"));
+    assert!(dossier_hold_kinds.contains(&"archive"));
+    assert!(dossier["media"]["volumes"]
+        .as_array()
+        .is_some_and(|volumes| !volumes.is_empty()));
+    assert!(dossier["media"]["custody_events"]
+        .as_array()
+        .is_some_and(|events| !events.is_empty()));
+    assert!(dossier["media"]["operations"]
+        .as_array()
+        .is_some_and(|operations| operations.len() >= 7));
+    assert!(
+        !serde_json::to_string(&dossier)
+            .expect("media dossier should serialize")
+            .contains("storage_ref"),
+        "public media detail must never expose artifact storage paths"
+    );
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM audit_events
+             WHERE object_type = 'cartridge' AND object_id = $1
+               AND action IN ('media.pool_assign', 'media.hold_create', 'media.hold_release')",
+        )
+        .bind(scratch.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("media-control audit records should query"),
+        7
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM notification_outbox
+             WHERE payload ->> 'cartridge_id' = $1
+               AND payload ->> 'event' IN (
+                   'media_pool_assigned', 'media_hold_created', 'media_hold_released'
+               )",
+        )
+        .bind(scratch.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("media-control outbox records should query"),
+        7
+    );
+    let immutable_media_operation =
+        sqlx::query("UPDATE media_operations SET result = '{}' WHERE cartridge_id = $1")
+            .bind(scratch.id)
+            .execute(&pool)
+            .await
+            .expect_err("media mutation receipts must be append-only");
+    assert_eq!(
+        immutable_media_operation
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("P0001")
+    );
+
+    sqlx::query(
+        "UPDATE recovery_points
+         SET expires_at = now() - interval '1 day', indefinite = false
+         WHERE id = $1",
+    )
+    .bind(recovery_point_id)
+    .execute(&pool)
+    .await
+    .expect("expired recovery-point fixture should update");
+
+    let eligible_reuse_response = api_request(
+        &application,
+        Method::GET,
+        format!(
+            "/api/v1/media/{}/reuse-evaluation?drive_id={drive_id}",
+            scratch.id
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(eligible_reuse_response.status(), StatusCode::OK);
+    let eligible_reuse = response_json(eligible_reuse_response).await;
+    assert_eq!(eligible_reuse["evaluation"]["allowed"], true);
+    assert_eq!(eligible_reuse["evaluation"]["blockers"], json!([]));
+    assert_eq!(
+        eligible_reuse["evaluation"]["destructive_operation_available"],
+        false
+    );
+    assert_eq!(eligible_reuse["evaluation"]["state_version"], media_version);
+
+    sqlx::query("UPDATE drives SET generation = 8 WHERE id = $1")
+        .bind(drive_id)
+        .execute(&pool)
+        .await
+        .expect("incompatible-drive fixture should update");
+    let incompatible_reuse_response = api_request(
+        &application,
+        Method::GET,
+        format!(
+            "/api/v1/media/{}/reuse-evaluation?drive_id={drive_id}",
+            scratch.id
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(incompatible_reuse_response.status(), StatusCode::OK);
+    let incompatible_reuse = response_json(incompatible_reuse_response).await;
+    assert_eq!(incompatible_reuse["evaluation"]["allowed"], false);
+    assert!(incompatible_reuse["evaluation"]["blockers"]
+        .as_array()
+        .is_some_and(|blockers| blockers
+            .iter()
+            .any(|blocker| { blocker["code"] == "drive_cannot_write_media_format" })));
+    sqlx::query("UPDATE drives SET generation = 9 WHERE id = $1")
+        .bind(drive_id)
+        .execute(&pool)
+        .await
+        .expect("drive generation fixture should restore");
+
+    let media_actions = store::list_required_actions(&pool)
+        .await
+        .expect("media required actions should query");
+    assert!(media_actions.iter().any(|action| {
+        action.id == format!("media:{}", created.id)
+            && action.route == format!("tapes/{}", created.id)
+    }));
+    assert_eq!(
+        store::overview_counts(&pool)
+            .await
+            .expect("media required-action summary should query")
+            .required_actions,
+        i64::try_from(media_actions.len()).expect("fixture action count should fit in i64")
+    );
+
     let quarantine_media = store::create_media(
         &pool,
         &NewMedia {

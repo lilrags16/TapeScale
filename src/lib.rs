@@ -15,6 +15,7 @@ pub mod device;
 pub mod domain;
 pub mod engine;
 pub mod error;
+pub mod media_ops;
 pub mod qualification;
 pub mod store;
 pub mod tool_runner;

@@ -869,7 +869,16 @@ pub async fn overview_counts(pool: &PgPool) -> Result<OverviewCounts, sqlx::Erro
               WHERE state IN ('waiting_for_media','blocked','interrupted','failed')
                 AND (finished_at IS NULL OR finished_at >= now() - interval '7 days')) +
              (SELECT count(*) FROM movement_tasks
-              WHERE state IN ('ready','departed','partially_confirmed','overdue','blocked'))) AS required_actions",
+              WHERE state IN ('ready','departed','partially_confirmed','overdue','blocked')) +
+             (SELECT count(*) FROM cartridges cartridge
+              WHERE cartridge.identity_status <> 'reconciled'
+                 OR cartridge.health_status IN (
+                    'qualification_interrupted', 'write_unverified', 'quarantined', 'failed'
+                 )
+                 OR (cartridge.confirmed_location_id IS NULL AND EXISTS (
+                    SELECT 1 FROM volume_records volume
+                    WHERE volume.cartridge_id = cartridge.id AND volume.finalized
+                 )))) AS required_actions",
     )
     .fetch_one(pool)
     .await
@@ -921,6 +930,52 @@ pub async fn list_required_actions(
              JOIN jobs job ON job.id = run.job_id
              WHERE run.state IN ('waiting_for_media', 'blocked', 'interrupted', 'failed')
                AND (run.finished_at IS NULL OR run.finished_at >= now() - interval '7 days')
+             UNION ALL
+             SELECT 'media:' || cartridge.id::text,
+                    CASE
+                        WHEN cartridge.identity_status = 'mismatch'
+                            THEN 'Resolve cartridge identity mismatch'
+                        WHEN cartridge.identity_status = 'foreign'
+                            THEN 'Review foreign cartridge'
+                        WHEN cartridge.health_status IN (
+                            'qualification_interrupted', 'write_unverified',
+                            'quarantined', 'failed'
+                        ) THEN 'Review quarantined cartridge'
+                        WHEN cartridge.identity_status = 'unknown'
+                            THEN 'Reconcile cartridge identity'
+                        ELSE 'Confirm protected cartridge location'
+                    END,
+                    concat_ws(' · ',
+                        cartridge.internal_label,
+                        CASE
+                            WHEN cartridge.identity_status <> 'reconciled'
+                                THEN 'identity ' || cartridge.identity_status
+                            WHEN cartridge.health_status IN (
+                                'qualification_interrupted', 'write_unverified',
+                                'quarantined', 'failed'
+                            ) THEN 'health ' || cartridge.health_status
+                            ELSE 'finalized content has no confirmed location'
+                        END),
+                    CASE
+                        WHEN cartridge.identity_status IN ('mismatch', 'foreign')
+                          OR cartridge.health_status IN (
+                            'qualification_interrupted', 'write_unverified',
+                            'quarantined', 'failed'
+                          ) THEN 'blocked'
+                        ELSE 'attention'
+                    END,
+                    NULL::timestamptz,
+                    'tapes/' || cartridge.id::text,
+                    cartridge.updated_at
+             FROM cartridges cartridge
+             WHERE cartridge.identity_status <> 'reconciled'
+                OR cartridge.health_status IN (
+                    'qualification_interrupted', 'write_unverified', 'quarantined', 'failed'
+                )
+                OR (cartridge.confirmed_location_id IS NULL AND EXISTS (
+                    SELECT 1 FROM volume_records volume
+                    WHERE volume.cartridge_id = cartridge.id AND volume.finalized
+                ))
          ) action
          ORDER BY (action.state = 'overdue') DESC,
                   action.due_at NULLS LAST, action.sort_at DESC

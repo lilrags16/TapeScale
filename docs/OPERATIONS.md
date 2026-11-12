@@ -150,11 +150,19 @@ Corrections append custody history. Do not edit a prior location into a value th
 
 ## Retention, holds, and reuse
 
-View retention on recovery points and dependency chains, not only tape dates. A cartridge is protected if any contained recovery point, base, increment, manifest, explicit hold, archive, incomplete recoverable record, export reservation, or active job needs it.
+Open **Tapes & pools** to work from the durable cartridge inventory rather than a handwritten label. Search and filter inventory by pool, confirmed location, identity, health, protection, and attention state. The cartridge dossier joins the registered identity to on-tape identity, pool, location, reservation, volume coordinates, recovery points, dependencies, expiry, verification, holds, custody, and audit history. It does not disclose worker artifact paths.
+
+View retention on recovery points and dependency chains, not only tape dates. A cartridge is protected if any contained recovery point, base, increment, manifest, explicit hold, archive, incomplete recoverable record, export reservation, pending custody task, or active job needs it. A cartridge may appear in more than one recovery dependency chain; every affected point must be cleared before reuse can be considered.
 
 Archives are self-contained full captures, retained indefinitely, with two independently verified copies by default and at least one off site. Archives do not delete source data and use separate media by default.
 
-Automatic reuse requires an expired dependency graph, no holds, correct physical and catalog identity, compatible actual format, healthy reconciled state, and policy authority. Exceptional destruction requires administrator reauthentication and an affected-recovery-point preview. Returning a tape from off site does not make it reusable.
+Create routine, archive, scratch, or cleaning pools deliberately. Pool assignment is an audited cartridge mutation. The browser submits the dossier's current `state_version`; if the cartridge changes first, refresh and review the new facts instead of forcing the assignment. Repeating the same idempotent request returns its original receipt. Never move protected archive content into a reusable pool or treat a pool name as proof that physical media is blank.
+
+Manual, legal, and archive holds can be added from the dossier. Releasing one of these operator-created holds requires a reason and appends actor, correlation, and release evidence; it does not delete the hold record. Dependency, active-job, and unknown-identity protection is derived from system state and is not released through this control. A stale cartridge version blocks either mutation.
+
+Select a currently observed drive to evaluate reuse. The evaluation is read-only and denies on uncertainty. It reports identity/catalog reconciliation, retained and dependent recovery points, holds and archives, reservations and custody, WORM state, health and location certainty, actual format/generation compatibility, and affected recovery points. Correct the listed state and evaluate again; do not substitute a different drive merely to hide a protection blocker.
+
+Returning a tape from off site does not make it reusable. This release has no general erase, relabel, recycle, overwrite-execution, or policy-override control. Even when the read-only evaluation says `allowed`, an operator has not authorized destruction and TapeScale dispatches no tape command. The production target's exceptional-destruction workflow still requires administrator reauthentication and an unchanged affected-object preview, but that workflow is not implemented in this preview.
 
 ## Scheduling behavior
 

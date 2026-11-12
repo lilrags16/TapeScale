@@ -38,7 +38,7 @@
     settingsTab: "preflight",
     data: {
       system: null,
-      overview: { summary: { protected_sources: 0, active_jobs: 0, required_actions: 0 }, sources: [], actions: [] },
+      overview: { summary: { protected_sources: 0, active_jobs: 0, required_actions: 0 }, sources: [], actions: [], actions_total: 0, actions_returned: 0, actions_truncated: false },
       jobs: [],
       media: [],
       mediaPools: [],
@@ -78,6 +78,7 @@
     mediaDetailLoading: new Set(),
     mediaReuseLoading: new Set(),
     mediaReuseDriveByMedia: {},
+    mediaReuseEvaluatedAt: {},
     recoveryPointQuery: "",
     recoveryPointStatus: "all",
     recoveryPointRepresentation: "all",
@@ -91,6 +92,7 @@
   const drawerLayer = document.querySelector("#drawer-layer");
   const shell = document.querySelector("#app-shell");
   const live = document.querySelector("#live-region");
+  let modalReturnFocus = null;
 
   function esc(value) {
     return String(value == null ? "" : value)
@@ -155,14 +157,20 @@
     if (key === "overview") {
       const raw = payload && typeof payload === "object" ? payload : {};
       const summary = raw.summary && typeof raw.summary === "object" ? raw.summary : {};
+      const actions = list(raw, "actions");
+      const requiredActions = Math.max(count(pick(summary, "required_actions", "requiredActions")), actions.length);
+      const actionsTotal = Math.max(count(pick(raw, "actions_total", "actionsTotal")), requiredActions);
       return Object.assign({}, raw, {
         summary: {
           protected_sources: count(pick(summary, "protected_sources", "protectedSources")),
           active_jobs: count(pick(summary, "active_jobs", "activeJobs")),
-          required_actions: count(pick(summary, "required_actions", "requiredActions"))
+          required_actions: actionsTotal
         },
         sources: list(raw, "sources"),
-        actions: list(raw, "actions")
+        actions,
+        actions_total: actionsTotal,
+        actions_returned: actions.length,
+        actions_truncated: pick(raw, "actions_truncated", "actionsTruncated") === true || actions.length < actionsTotal
       });
     }
     if (key === "jobs") return list(payload, "jobs");
@@ -220,6 +228,7 @@
   async function loadOne(key) {
     try {
       const normalized = normalize(key, await request(endpoints[key]));
+      if (key === "media" || key === "drives") invalidateMediaReuseEvaluations();
       if (key === "drives") {
         state.data.drives = normalized.drives;
         state.data.slots = normalized.slots;
@@ -373,6 +382,9 @@
     html += '</div></section><section class="panel"><div class="panel-head"><div><h2>Required actions</h2><p>Actions returned by the overview API.</p></div></div><div class="panel-body">';
     if (overview.actions.length) {
       html += '<ul class="action-list">' + overview.actions.map(renderActionItem).join("") + "</ul>";
+      if (overview.actions_truncated) {
+        html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Showing the first ' + esc(overview.actions.length) + ' of ' + esc(overview.actions_total) + ' required actions</strong><span>Resolve visible items or refresh as conditions change. The total includes additional actions not shown in this bounded overview.</span></div></div>';
+      }
     } else {
       html += "<p>No actions are currently reported.</p>";
     }
@@ -564,7 +576,7 @@
     const protectionCount = mediaRecoveryPointCount(item);
     const holds = count(pick(item, "active_holds", "hold_count"));
     const format = pick(item, "media_format", "format") || (pick(item, "media_generation", "generation") ? "LTO-" + pick(item, "media_generation", "generation") : null);
-    return '<button class="media-inventory-item' + (active ? " active" : "") + '" type="button" data-action="select-media" data-id="' + esc(id) + '" data-search="' + esc(mediaSearchText(item)) + '" data-pool="' + esc(mediaFilterValue(mediaPoolId(item))) + '" data-status="' + esc(mediaFilterValue(stateValue)) + '" data-location="' + esc(mediaFilterValue(mediaLocationId(item))) + '" data-identity="' + esc(mediaFilterValue(pick(item, "identity_status") || "unknown")) + '" data-health="' + esc(mediaFilterValue(pick(item, "health_status", "health") || "unknown")) + '" data-protection="' + esc(mediaProtectionState(item)) + '"><span class="media-tape-glyph" aria-hidden="true"><i></i><i></i></span><span class="media-inventory-copy"><span><strong>' + esc(label(mediaName(item))) + '</strong>' + status(human(stateValue)) + '</span><small>' + esc(label(format)) + " · " + esc(mediaPoolName(item)) + " · " + esc(mediaLocationName(item)) + '</small><span class="media-item-signals"><em>' + protectionCount + " recovery point" + (protectionCount === 1 ? "" : "s") + '</em><em>' + holds + " active hold" + (holds === 1 ? "" : "s") + '</em></span></span><span class="media-item-chevron" aria-hidden="true">›</span></button>';
+    return '<button class="media-inventory-item' + (active ? " active" : "") + '" type="button" aria-pressed="' + (active ? "true" : "false") + '" data-action="select-media" data-id="' + esc(id) + '" data-search="' + esc(mediaSearchText(item)) + '" data-pool="' + esc(mediaFilterValue(mediaPoolId(item))) + '" data-status="' + esc(mediaFilterValue(stateValue)) + '" data-location="' + esc(mediaFilterValue(mediaLocationId(item))) + '" data-identity="' + esc(mediaFilterValue(pick(item, "identity_status") || "unknown")) + '" data-health="' + esc(mediaFilterValue(pick(item, "health_status", "health") || "unknown")) + '" data-protection="' + esc(mediaProtectionState(item)) + '"><span class="media-tape-glyph" aria-hidden="true"><i></i><i></i></span><span class="media-inventory-copy"><span><strong>' + esc(label(mediaName(item))) + '</strong>' + status(human(stateValue)) + '</span><small>' + esc(label(format)) + " · " + esc(mediaPoolName(item)) + " · " + esc(mediaLocationName(item)) + '</small><span class="media-item-signals"><em>' + protectionCount + " recovery point" + (protectionCount === 1 ? "" : "s") + '</em><em>' + holds + " active hold" + (holds === 1 ? "" : "s") + '</em></span></span><span class="media-item-chevron" aria-hidden="true">›</span></button>';
   }
 
   function renderMediaCatalog(inventory, selectedId) {
@@ -623,6 +635,16 @@
     return Number(pick(parts.cartridge, "state_version") || 0);
   }
 
+  function invalidateMediaReuseEvaluations(cartridgeId) {
+    const prefix = cartridgeId ? String(cartridgeId) + ":" : null;
+    Object.keys(state.data.mediaReuseEvaluations).forEach((key) => {
+      if (!prefix || key.startsWith(prefix)) delete state.data.mediaReuseEvaluations[key];
+    });
+    Object.keys(state.mediaReuseEvaluatedAt).forEach((key) => {
+      if (!prefix || key.startsWith(prefix)) delete state.mediaReuseEvaluatedAt[key];
+    });
+  }
+
   function mediaDetailFact(name, value, mono) {
     return '<div><small>' + esc(name) + '</small><strong' + (mono ? ' class="mono"' : "") + '>' + esc(label(value)) + "</strong></div>";
   }
@@ -634,6 +656,13 @@
     const payload = key && state.data.mediaReuseEvaluations[key];
     const evaluation = payload && payload.evaluation && typeof payload.evaluation === "object" ? payload.evaluation : payload;
     if (loadingEval) return '<section class="media-dossier-section media-reuse"><div class="media-section-head"><div><span class="media-section-kicker">Decision evidence</span><h3>Exact-drive reuse evaluation</h3></div></div><div class="media-evaluation-loading"><span></span><div><strong>Evaluating cartridge and drive</strong><small>TapeScale is resolving physical, retention, and dependency blockers.</small></div></div></section>';
+    const evaluatedAt = key ? Number(state.mediaReuseEvaluatedAt[key]) : 0;
+    const evaluationVersion = Number(pick(evaluation, "state_version"));
+    const currentVersion = currentMediaStateVersion(id);
+    const evaluationCurrent = evaluation && typeof evaluation === "object" && Number.isFinite(evaluationVersion) && evaluationVersion === currentVersion && evaluatedAt > 0 && Date.now() - evaluatedAt <= 90000;
+    if (evaluation && !evaluationCurrent) {
+      return '<section class="media-dossier-section media-reuse"><div class="media-section-head"><div><span class="media-section-kicker">Decision evidence</span><h3>Exact-drive reuse evaluation</h3></div><button class="button button-small" type="button" data-action="open-media-reuse" data-id="' + esc(id) + '">Run fresh evaluation</button></div><div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Previous decision expired</strong><span>Cartridge or drive state may have changed. TapeScale will not present the cached result as current.</span></div></div></section>';
+    }
     if (!evaluation || typeof evaluation !== "object") {
       return '<section class="media-dossier-section media-reuse"><div class="media-section-head"><div><span class="media-section-kicker">Decision evidence</span><h3>Exact-drive reuse evaluation</h3></div><button class="button button-small" type="button" data-action="open-media-reuse" data-id="' + esc(id) + '">Evaluate with drive</button></div><div class="media-safety-boundary"><span aria-hidden="true">✓</span><div><strong>Read-only safety decision</strong><p>Select the exact physical drive to test compatibility, active holds, retained recovery points, and content dependencies. This evaluation does not change the cartridge.</p></div></div></section>';
     }
@@ -649,6 +678,7 @@
 
   function renderMediaHolds(id, parts) {
     const holds = parts.holds.slice().sort((left, right) => new Date(pick(right, "created_at") || 0) - new Date(pick(left, "created_at") || 0));
+    const partial = pick(parts.truncation, "holds") === true;
     const rows = holds.map((hold) => {
       const holdState = String(pick(hold, "state", "status") || (pick(hold, "released_at") ? "released" : pick(hold, "active") === false ? "expired" : "active")).toLowerCase();
       const active = pick(hold, "active") != null
@@ -659,13 +689,22 @@
       const inherited = !directCartridgeHold && Boolean(pick(hold, "recovery_point_id"));
       const releasable = active && directCartridgeHold && ["manual", "legal", "archive"].includes(kind);
       const origin = inherited ? '<em class="media-hold-origin">Dependency-propagated · system-managed</em>' : '<em class="media-hold-origin">Cartridge-level</em>';
-      return '<li><span class="media-hold-icon ' + (active ? "active" : "") + '" aria-hidden="true">' + (active ? "!" : "✓") + '</span><div><span><strong>' + esc(human(kind)) + " hold</strong>" + status(human(active ? "active" : holdState)) + '</span>' + origin + '<p>' + esc(label(pick(hold, "reason", "detail"))) + '</p><small>Created ' + esc(date(pick(hold, "created_at"))) + " by " + esc(label(pick(hold, "created_by_label", "actor"))) + (pick(hold, "expires_at") ? " · expires " + esc(date(pick(hold, "expires_at"))) : " · no expiry") + (inherited ? " · recovery point " + esc(label(pick(hold, "recovery_point_id"))) : "") + "</small></div>" + (releasable ? '<button class="button button-small button-quiet" type="button" data-action="release-media-hold" data-media-id="' + esc(id) + '" data-hold-id="' + esc(recordId(hold)) + '">Release</button>' : "") + "</li>";
+      const releasedAt = pick(hold, "released_at");
+      const lifecycle = releasedAt
+        ? " · released " + esc(date(releasedAt)) + " by " + esc(label(pick(hold, "released_by_label") || "unknown operator"))
+        : pick(hold, "expires_at") ? " · expires " + esc(date(pick(hold, "expires_at"))) : " · no expiry";
+      const releaseReason = releasedAt && pick(hold, "release_reason")
+        ? '<small>Release reason: ' + esc(pick(hold, "release_reason")) + "</small>"
+        : "";
+      return '<li><span class="media-hold-icon ' + (active ? "active" : "") + '" aria-hidden="true">' + (active ? "!" : "✓") + '</span><div><span><strong>' + esc(human(kind)) + " hold</strong>" + status(human(active ? "active" : holdState)) + '</span>' + origin + '<p>' + esc(label(pick(hold, "reason", "detail"))) + '</p><small>Created ' + esc(date(pick(hold, "created_at"))) + " by " + esc(label(pick(hold, "created_by_label", "actor"))) + lifecycle + (inherited ? " · recovery point " + esc(label(pick(hold, "recovery_point_id"))) : "") + "</small>" + releaseReason + "</div>" + (releasable ? '<button class="button button-small button-quiet" type="button" data-action="release-media-hold" data-media-id="' + esc(id) + '" data-hold-id="' + esc(recordId(hold)) + '">Release</button>' : "") + "</li>";
     }).join("");
-    return '<section class="media-dossier-section"><div class="media-section-head"><div><span class="media-section-kicker">Retention control</span><h3>Holds</h3></div><button class="button button-small" type="button" data-action="add-media-hold" data-id="' + esc(id) + '">Add hold</button></div><ul class="media-hold-list">' + (rows || '<li class="media-inline-empty">No manual, legal, or archive holds are recorded.</li>') + "</ul></section>";
+    return '<section class="media-dossier-section"><div class="media-section-head"><div><span class="media-section-kicker">Retention control</span><h3>Holds</h3>' + (partial ? '<p>' + holds.length + ' records shown; this list is partial.</p>' : "") + '</div><button class="button button-small" type="button" data-action="add-media-hold" data-id="' + esc(id) + '">Add hold</button></div><ul class="media-hold-list">' + (rows || '<li class="media-inline-empty">No manual, legal, or archive holds are recorded.</li>') + "</ul></section>";
   }
 
   function renderMediaProtection(parts) {
     const points = uniqueByIdentity(parts.recoveryPoints);
+    const pointsPartial = pick(parts.truncation, "recovery_points") === true || pick(parts.truncation, "dependent_recovery_points") === true;
+    const volumesPartial = pick(parts.truncation, "volumes") === true;
     const pointRows = points.map((point) => '<li><span class="media-recovery-symbol" aria-hidden="true">↶</span><div><span><strong>' + esc(label(pick(point, "dataset_name", "source", "name", "id"))) + "</strong>" + status(human(pick(point, "status", "state") || "retained")) + '</span><p>' + esc(date(pick(point, "recovery_time", "created_at"))) + " · " + esc(label(pick(point, "dependency_kind", "representation", "level", "dependency") || "Recovery dependency")) + '</p><code>' + esc(label(pick(point, "manifest_digest", "id"))) + "</code></div></li>").join("");
     const volumeRows = parts.volumes.map((volume) => {
       const firstRecord = pick(volume, "first_record");
@@ -673,12 +712,12 @@
       const recordRange = firstRecord ? firstRecord + (lastRecord ? " – " + lastRecord : " onward") : "Not reported";
       return '<tr><td><strong>' + esc(label(pick(volume, "name", "volume_name", "label", "engine_record_id", "id"))) + '</strong><small>Volume order ' + esc(label(pick(volume, "volume_order"))) + '</small></td><td>' + esc(bytes(pick(volume, "encoded_bytes", "logical_bytes", "bytes", "size"))) + '</td><td class="mono">' + esc(recordRange) + '</td><td>' + status(human(pick(volume, "finalized") === false ? "open" : pick(volume, "status", "state") || "finalized")) + "</td></tr>";
     }).join("");
-    return '<section class="media-dossier-section"><div class="media-section-head"><div><span class="media-section-kicker">Protected content</span><h3>Recovery dependencies</h3></div><span>' + points.length + " affected</span></div>" + (pointRows ? '<ul class="media-recovery-list">' + pointRows + "</ul>" : '<div class="media-inline-empty">No recovery-point dependency was returned.</div>') + (volumeRows ? '<div class="media-subsection"><h4>Recorded volumes</h4><div class="table-scroll"><table class="data-table media-volume-table"><thead><tr><th>Volume / engine record</th><th>Encoded</th><th>Record range</th><th>State</th></tr></thead><tbody>' + volumeRows + "</tbody></table></div></div>" : "") + "</section>";
+    return '<section class="media-dossier-section"><div class="media-section-head"><div><span class="media-section-kicker">Protected content</span><h3>Recovery dependencies</h3></div><span>' + points.length + (pointsPartial ? " shown · partial" : " affected") + "</span></div>" + (pointRows ? '<ul class="media-recovery-list">' + pointRows + "</ul>" : '<div class="media-inline-empty">No recovery-point dependency was returned.</div>') + (volumeRows ? '<div class="media-subsection"><h4>Recorded volumes' + (volumesPartial ? " · " + parts.volumes.length + " shown · partial" : "") + '</h4><div class="table-scroll"><table class="data-table media-volume-table"><thead><tr><th>Volume / engine record</th><th>Encoded</th><th>Record range</th><th>State</th></tr></thead><tbody>' + volumeRows + "</tbody></table></div></div>" : "") + "</section>";
   }
 
   function renderMediaVerification(parts) {
     const checks = parts.verifications.slice().sort((left, right) => new Date(pick(right, "completed_at", "created_at") || 0) - new Date(pick(left, "completed_at", "created_at") || 0));
-    const rows = checks.map((check) => '<li><span>' + status(human(pick(check, "outcome", "status", "state") || "unknown")) + '</span><div><strong>' + esc(label(pick(check, "kind", "method", "verification_type") || "Media verification")) + '</strong><p>Recovery point ' + esc(label(pick(check, "recovery_point_id"))) + " · drive " + esc(label(pick(check, "drive_id"))) + '</p></div><time>' + esc(date(pick(check, "finished_at", "completed_at", "created_at", "started_at"))) + "</time></li>").join("");
+    const rows = checks.map((check) => '<li><span>' + status(human(pick(check, "outcome", "status", "state") || "unknown")) + '</span><div><strong>' + esc(label(pick(check, "kind", "method", "verification_type") || "Media verification")) + '</strong><p>Recovery point ' + esc(label(pick(check, "recovery_point_id"))) + " · drive " + esc(label(pick(check, "drive_stable_id", "drive_id"))) + '</p></div><time>' + esc(date(pick(check, "finished_at", "completed_at", "created_at", "started_at"))) + "</time></li>").join("");
     return '<section class="media-dossier-section"><div class="media-section-head"><div><span class="media-section-kicker">Assurance</span><h3>Verification history</h3></div></div><ul class="media-verification-list">' + (rows || '<li class="media-inline-empty">No verification result is recorded for this cartridge.</li>') + "</ul></section>";
   }
 
@@ -686,7 +725,9 @@
     const events = uniqueByIdentity(parts.events).sort((left, right) => new Date(pick(right, "occurred_at", "created_at", "updated_at") || 0) - new Date(pick(left, "occurred_at", "created_at", "updated_at") || 0));
     const rows = events.map((event) => {
       const evidence = objectValue(event, "evidence", "details");
-      return '<li><time>' + esc(date(pick(event, "occurred_at", "created_at", "updated_at"))) + '</time><span class="media-event-dot" aria-hidden="true"></span><div><strong>' + esc(human(pick(event, "event_type", "operation_kind", "operation_type", "action", "kind") || "Recorded event")) + '</strong><p>' + esc(label(pick(event, "note", "detail", "message", "reason", "result") || pick(evidence, "detail", "path", "reason"))) + '</p><small>' + esc(label(pick(event, "actor_label", "actor", "created_by_label", "created_by", "source") || "TapeScale")) + "</small></div></li>";
+      const custody = [pick(event, "source_location_name"), pick(event, "destination_location_name", "destination_label")].filter(Boolean).join(" → ");
+      const detail = [pick(event, "note", "detail", "message", "reason", "result") || pick(evidence, "detail", "path", "reason"), custody].filter(Boolean).join(" · ");
+      return '<li><time>' + esc(date(pick(event, "occurred_at", "created_at", "updated_at"))) + '</time><span class="media-event-dot" aria-hidden="true"></span><div><strong>' + esc(human(pick(event, "event_type", "operation_kind", "operation_type", "action", "kind") || "Recorded event")) + '</strong><p>' + esc(label(detail)) + '</p><small>' + esc(label(pick(event, "actor_label", "actor", "created_by_label", "created_by", "source") || "TapeScale")) + "</small></div></li>";
     }).join("");
     return '<section class="media-dossier-section"><div class="media-section-head"><div><span class="media-section-kicker">Chain of evidence</span><h3>Cartridge history</h3></div></div><ol class="media-history">' + (rows || '<li class="media-inline-empty">No custody or audit history was returned.</li>') + "</ol></section>";
   }
@@ -705,7 +746,14 @@
     const locationName = pick(parts.location, "name") || mediaLocationName(cartridge);
     const stateValue = mediaOperationalState(cartridge);
     const version = mediaStateVersion(parts);
-    const activeHolds = parts.holds.filter((hold) => pick(hold, "active") != null ? pick(hold, "active") === true : !pick(hold, "released_at") && !["released", "expired", "inactive"].includes(String(pick(hold, "state", "status") || "active").toLowerCase())).length;
+    const reportedActiveHolds = pick(cartridge, "active_holds", "hold_count");
+    const activeHolds = reportedActiveHolds == null
+      ? parts.holds.filter((hold) => pick(hold, "active") != null ? pick(hold, "active") === true : !pick(hold, "released_at") && !["released", "expired", "inactive"].includes(String(pick(hold, "state", "status") || "active").toLowerCase())).length
+      : count(reportedActiveHolds);
+    const hasReportedProtectionCounts = pick(cartridge, "retained_recovery_points", "retained_recovery_point_count") != null || pick(cartridge, "dependent_recovery_points", "dependent_recovery_point_count") != null;
+    const protectedRecoveryPoints = hasReportedProtectionCounts ? mediaRecoveryPointCount(cartridge) : uniqueByIdentity(parts.recoveryPoints).length;
+    const reportedVolumes = pick(cartridge, "content_volume_count");
+    const recordedVolumes = reportedVolumes == null ? parts.volumes.length : count(reportedVolumes);
     const generation = pick(cartridge, "media_generation", "generation");
     const latestVerification = objectValue(cartridge, "latest_verification");
     const catalogReconciled = pick(cartridge, "catalog_reconciled", "catalogReconciled");
@@ -719,7 +767,7 @@
       ? '<div class="notice warning media-truncation-warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>This is a bounded dossier</strong><span>Additional records exist in: ' + esc(truncatedSections.join(", ")) + ". Those sections are partial; do not infer that an omitted hold, dependency, verification, or event is absent.</span></div></div>"
       : "";
     const hero = '<header class="media-dossier-hero"><div class="media-dossier-identity"><span class="media-hero-tape" aria-hidden="true"><i></i><i></i></span><div><span class="media-section-kicker">Cartridge dossier · state v' + version + '</span><div class="media-dossier-title"><h2>' + esc(label(mediaName(cartridge))) + "</h2>" + status(human(stateValue)) + '</div><p>' + esc(label(pick(cartridge, "barcode"))) + " · " + esc(generation ? "LTO-" + generation : pick(cartridge, "media_format", "format")) + " · " + esc(locationName) + '</p></div></div><div class="media-dossier-actions"><button class="button button-quiet" type="button" data-action="assign-media-pool" data-id="' + esc(id) + '">Assign pool</button><button class="button button-quiet" type="button" data-action="add-media-hold" data-id="' + esc(id) + '">Add hold</button><button class="button button-primary" type="button" data-action="open-media-reuse" data-id="' + esc(id) + '">Evaluate reuse</button></div></header>';
-    const ribbon = '<div class="media-protection-ribbon"><span><strong>' + activeHolds + '</strong> active hold' + (activeHolds === 1 ? "" : "s") + '</span><span><strong>' + uniqueByIdentity(parts.recoveryPoints).length + '</strong> recovery dependencies</span><span><strong>' + parts.volumes.length + '</strong> recorded volume' + (parts.volumes.length === 1 ? "" : "s") + '</span><span><strong>' + (pick(parts.protection, "indefinite") === true || pick(parts.pool, "indefinite_retention") === true ? "Indefinite" : "Policy") + '</strong> retention</span></div>';
+    const ribbon = '<div class="media-protection-ribbon"><span><strong>' + activeHolds + '</strong> active hold' + (activeHolds === 1 ? "" : "s") + '</span><span><strong>' + protectedRecoveryPoints + '</strong> protected recovery point' + (protectedRecoveryPoints === 1 ? "" : "s") + '</span><span><strong>' + recordedVolumes + '</strong> recorded volume' + (recordedVolumes === 1 ? "" : "s") + '</span><span><strong>' + (pick(parts.protection, "indefinite") === true || pick(parts.pool, "indefinite_retention") === true ? "Indefinite" : "Policy") + '</strong> retention</span></div>';
     const facts = mediaDetailFact("Internal label", mediaName(cartridge), true) +
       mediaDetailFact("Barcode", pick(cartridge, "barcode"), true) +
       mediaDetailFact("On-tape identity", pick(cartridge, "on_tape_identity") || "Not observed", true) +
@@ -750,7 +798,7 @@
     let html = pageHead("Media Control Center", "Operational cartridge inventory, retention controls, and read-only reuse decisions.", refreshButton() + createPool + add) + noticeFor("media") + noticeFor("mediaPools");
     if (!inventory.length) return html + renderMediaPools() + empty("No cartridges", state.errors.media ? "Cartridge inventory could not be loaded." : "Register a cartridge to begin building the operational inventory.", add);
     const protectedCount = inventory.filter((item) => pick(item, "dependency_graph_truncated") === true || mediaRecoveryPointCount(item) > 0 || count(pick(item, "indefinite_archive_claims", "indefinite_claims")) > 0 || mediaOperationalState(item) === "protected").length;
-    const heldCount = inventory.filter((item) => count(pick(item, "active_holds", "hold_count")) > 0).length;
+    const heldCount = inventory.reduce((total, item) => total + count(pick(item, "active_holds", "hold_count")), 0);
     const attentionCount = inventory.filter((item) => count(pick(item, "active_holds", "hold_count")) > 0 || ["held", "blocked", "physically_blocked", "needs_reconciliation", "foreign", "mismatch"].includes(mediaOperationalState(item))).length;
     html += '<section class="panel metric-strip media-metrics"><div class="metric"><span>Total cartridges</span><strong>' + inventory.length + '</strong></div><div class="metric"><span>Recovery protected</span><strong>' + protectedCount + '</strong></div><div class="metric"><span>Active holds</span><strong>' + heldCount + '</strong></div><div class="metric"><span>Needs attention</span><strong>' + attentionCount + "</strong></div></section>";
     html += renderMediaPools();
@@ -1728,7 +1776,12 @@
 
   function render() {
     state.route = routes.has(location.hash.slice(1).split("/")[0]) ? location.hash.slice(1).split("/")[0] : "overview";
-    document.querySelectorAll("[data-route]").forEach((link) => link.classList.toggle("active", link.dataset.route === state.route));
+    document.querySelectorAll("[data-route]").forEach((link) => {
+      const active = link.dataset.route === state.route;
+      link.classList.toggle("active", active);
+      if (active) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    });
     if (state.loading) {
       main.innerHTML = loading();
       return;
@@ -1789,13 +1842,26 @@
   }
 
   function openModal(title, body, footer) {
+    if (modalLayer.hidden) {
+      modalReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    }
     modalLayer.innerHTML = '<section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-head"><h2 id="modal-title">' + esc(title) + '</h2><button class="icon-button" type="button" data-action="close-modal" aria-label="Close">&times;</button></div><div class="modal-body">' + body + '</div>' + (footer ? '<div class="modal-foot">' + footer + "</div>" : "") + "</section>";
     modalLayer.hidden = false;
+    shell.setAttribute("inert", "");
+    drawerLayer.setAttribute("inert", "");
+    const initialFocus = modalLayer.querySelector("[autofocus], input:not([type='hidden']):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), a[href], [tabindex]:not([tabindex='-1'])");
+    if (initialFocus) initialFocus.focus();
   }
 
   function closeModal() {
+    if (modalLayer.hidden) return;
     modalLayer.hidden = true;
     modalLayer.innerHTML = "";
+    shell.removeAttribute("inert");
+    drawerLayer.removeAttribute("inert");
+    const returnFocus = modalReturnFocus;
+    modalReturnFocus = null;
+    if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === "function") returnFocus.focus();
   }
 
   function recoveryPointPlanDraft(point) {
@@ -2599,6 +2665,7 @@
   }
 
   async function refreshMediaRecord(id) {
+    invalidateMediaReuseEvaluations(id);
     await Promise.all([loadOne("media"), loadOne("mediaPools")]);
     await loadMediaDetail(id, true);
     updateChrome();
@@ -2683,12 +2750,31 @@
     }
   }
 
+  function updateMediaHoldExpiry(form) {
+    if (!form) return;
+    const kind = form.querySelector('[name="kind"]');
+    const expiry = form.querySelector('[name="expires_at"]');
+    if (!kind || !expiry) return;
+    const manual = kind.value === "manual";
+    if (!manual) expiry.value = "";
+    expiry.disabled = !manual;
+    const help = expiry.nextElementSibling;
+    if (help) {
+      help.id = "media-hold-expiry-help";
+      help.textContent = manual
+        ? "Only manual holds can auto-expire. Leave blank to require an explicit release."
+        : human(kind.value) + " holds cannot auto-expire and require an explicit release.";
+      expiry.setAttribute("aria-describedby", help.id);
+    }
+  }
+
   function openMediaHoldForm(id) {
     const summary = mediaSummaryById(id);
     if (!summary) return;
     const version = currentMediaStateVersion(id);
-    const body = '<form id="media-hold-form" data-media-id="' + esc(id) + '"><div class="media-modal-boundary warning"><span aria-hidden="true">!</span><div><strong>Hold ' + esc(label(mediaName(summary))) + ' against reuse</strong><p>Manual, legal, and archive holds remain visible in the cartridge dossier and are evaluated before any future write workflow.</p></div></div><div class="form-grid"><div class="form-field"><label for="media-hold-kind">Hold type</label><select class="select" id="media-hold-kind" name="kind" required><option value="manual">Manual</option><option value="legal">Legal</option><option value="archive">Archive</option></select></div><div class="form-field"><label for="media-hold-expiry">Expires at</label><input class="input" id="media-hold-expiry" name="expires_at" type="datetime-local"><small>Optional. Leave blank for no automatic expiry.</small></div><div class="form-field full"><label for="media-hold-reason">Reason</label><textarea class="textarea" id="media-hold-reason" name="reason" maxlength="1000" required placeholder="Why this cartridge must remain protected"></textarea></div><div class="form-field"><label for="media-hold-actor">Operator</label><input class="input" id="media-hold-actor" name="actor" maxlength="128" value="Web operator" required></div><div class="form-field"><label>Expected record state</label><input class="input input-mono" value="v' + version + '" disabled><input type="hidden" name="expected_state_version" value="' + version + '"></div></div><input type="hidden" name="idempotency_key" value="' + esc(operationKey("media-hold")) + '"><p class="notice danger" id="media-hold-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Add hold</button></div></form>';
+    const body = '<form id="media-hold-form" data-media-id="' + esc(id) + '"><div class="media-modal-boundary warning"><span aria-hidden="true">!</span><div><strong>Hold ' + esc(label(mediaName(summary))) + ' against reuse</strong><p>Manual, legal, and archive holds remain visible in the cartridge dossier and are evaluated before any future write workflow.</p></div></div><div class="form-grid"><div class="form-field"><label for="media-hold-kind">Hold type</label><select class="select" id="media-hold-kind" name="kind" required><option value="manual">Manual</option><option value="legal">Legal</option><option value="archive">Archive</option></select></div><div class="form-field"><label for="media-hold-expiry">Expires at</label><input class="input" id="media-hold-expiry" name="expires_at" type="datetime-local"><small>Only manual holds can auto-expire. Leave blank to require an explicit release.</small></div><div class="form-field full"><label for="media-hold-reason">Reason</label><textarea class="textarea" id="media-hold-reason" name="reason" maxlength="1000" required placeholder="Why this cartridge must remain protected"></textarea></div><div class="form-field"><label for="media-hold-actor">Operator</label><input class="input" id="media-hold-actor" name="actor" maxlength="128" value="Web operator" required></div><div class="form-field"><label>Expected record state</label><input class="input input-mono" value="v' + version + '" disabled><input type="hidden" name="expected_state_version" value="' + version + '"></div></div><input type="hidden" name="idempotency_key" value="' + esc(operationKey("media-hold")) + '"><p class="notice danger" id="media-hold-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Add hold</button></div></form>';
     openModal("Add cartridge hold", body);
+    updateMediaHoldExpiry(document.querySelector("#media-hold-form"));
     document.querySelector("#media-hold-kind").focus();
   }
 
@@ -2701,14 +2787,15 @@
     submit.textContent = "Recording…";
     errorBox.hidden = true;
     const expires = String(values.get("expires_at") || "");
+    const kind = String(values.get("kind"));
     try {
       await request(endpoints.media + "/" + encodeURIComponent(id) + "/holds", {
         method: "POST",
         headers: { Accept: "application/json", "Content-Type": "application/json" },
         body: JSON.stringify({
-          kind: String(values.get("kind")),
+          kind,
           reason: String(values.get("reason") || "").trim(),
-          expires_at: expires ? new Date(expires).toISOString() : null,
+          expires_at: kind === "manual" && expires ? new Date(expires).toISOString() : null,
           expected_state_version: Number(values.get("expected_state_version")),
           idempotency_key: String(values.get("idempotency_key")),
           actor: String(values.get("actor") || "").trim() || null
@@ -2792,9 +2879,16 @@
     errorBox.hidden = true;
     state.mediaReuseDriveByMedia[id] = driveId;
     state.mediaReuseLoading.add(key);
+    delete state.data.mediaReuseEvaluations[key];
+    delete state.mediaReuseEvaluatedAt[key];
     try {
       const payload = await request(endpoints.media + "/" + encodeURIComponent(id) + "/reuse-evaluation?drive_id=" + encodeURIComponent(driveId));
       state.data.mediaReuseEvaluations[key] = payload && typeof payload === "object" ? payload : {};
+      const evaluatedAt = Date.now();
+      state.mediaReuseEvaluatedAt[key] = evaluatedAt;
+      window.setTimeout(() => {
+        if (state.mediaReuseEvaluatedAt[key] === evaluatedAt && state.route === "tapes" && recordId(selectedMedia()) === id) render();
+      }, 90050);
       state.mediaReuseLoading.delete(key);
       closeModal();
       render();
@@ -3002,8 +3096,12 @@
   }
 
   function showActions() {
-    const actions = state.data.overview.actions;
-    const body = actions.length ? '<ul class="action-list">' + actions.map(renderActionItem).join("") + "</ul>" : '<p>No unresolved actions are reported.</p>';
+    const overview = state.data.overview;
+    const actions = overview.actions;
+    const boundedWarning = overview.actions_truncated
+      ? '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Showing the first ' + esc(actions.length) + " of " + esc(overview.actions_total) + ' required actions</strong><span>The total includes additional actions outside this bounded list.</span></div></div>'
+      : "";
+    const body = actions.length ? '<ul class="action-list">' + actions.map(renderActionItem).join("") + "</ul>" + boundedWarning : '<p>No unresolved actions are reported.</p>';
     openModal("Notifications", body);
   }
 
@@ -3134,6 +3232,7 @@
 
   document.addEventListener("change", (event) => {
     if (event.target.id === "qualification-cartridge") updateQualificationConfirmation(event.target);
+    if (event.target.id === "media-hold-kind") updateMediaHoldExpiry(event.target.form);
     if (event.target.id === "recovery-run-drive") updateRecoveryRunMediaOptions(event.target.form);
     if (["recovery-run-profile", "recovery-run-cartridge"].includes(event.target.id)) updateRecoveryRunConfirmation(event.target.form);
     if (event.target.id === "vault-status-filter") {
@@ -3181,6 +3280,23 @@
   });
 
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Tab" && !modalLayer.hidden) {
+      const focusable = Array.from(modalLayer.querySelectorAll("a[href], button:not([disabled]), input:not([type='hidden']):not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"))
+        .filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true" && element.getClientRects().length > 0);
+      if (!focusable.length) {
+        event.preventDefault();
+      } else {
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && (document.activeElement === first || !modalLayer.contains(document.activeElement))) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || !modalLayer.contains(document.activeElement))) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    }
     if (event.key === "Escape") {
       closeModal();
       closeDrawer();

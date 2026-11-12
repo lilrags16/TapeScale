@@ -4,7 +4,9 @@
 # device mapping to /dev/nst1 so the container path matches Linux sysfs.
 # This lab stack exposes status, rewind, unload, an attended Bacula btape
 # qualification run, the G0.2 one-cartridge file recovery exercise, retained
-# recovery evidence/planning, and confirmed manual media-custody operations.
+# recovery evidence/planning, confirmed manual media-custody operations, and a
+# read-only fail-closed media-control/reuse-decision console. No general media
+# erase, relabel, recycle, overwrite, or override operation is exposed.
 # Both tape workflows deliberately overwrite the loaded tape. Use only a
 # registered cartridge that is physically designated as scratch.
 # Before installing, create /mnt/tapescale-restores as an isolated test dataset
@@ -17,11 +19,11 @@ name: tapescale
 
 x-tapescale-common: &tapescale-common
   build:
-    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-test.13
+    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-test.14
     args:
-      TAPESCALE_VERSION: 0.1.0-test.13
-      TAPESCALE_REVISION: v0.1.0-test.13
-  image: tapescale:0.1.0-test.13
+      TAPESCALE_VERSION: 0.1.0-test.14
+      TAPESCALE_REVISION: v0.1.0-test.14
+  image: tapescale:0.1.0-test.14
   pull_policy: build
   restart: unless-stopped
   read_only: true

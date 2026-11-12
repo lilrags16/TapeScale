@@ -22,6 +22,7 @@ TapeScale is a safety-first LTO backup control plane for TrueNAS. It is designed
 - A Recovery Vault that joins each recovery point to its ordered cartridges, locations, engine record boundaries, dependencies, holds, verification history, originating run, event trail, and content-addressed artifacts
 - Downloadable bounded recovery-evidence reports plus durable, audited restore-readiness plans with explicit media, drive, location, key, destination, capacity, and verification blockers
 - Transactional off-site custody operations with named locations, exact cartridge reservations, partial departure/arrival/direct confirmations, append-only corrections, idempotent receipts, and overdue notifications
+- A Media Control Center with searchable cartridge inventory, pool assignment, bounded cartridge dossiers with explicit truncation flags, manual/legal/archive holds, audited hold release, and a selected-drive reuse evaluation that fails closed on every uncertain or protected condition
 - A deterministic engine simulator that cannot report physical qualification
 - A purpose-built responsive storage-operations console
 - Hardened Docker Compose packaging with separate API, worker, and PostgreSQL services
@@ -69,6 +70,10 @@ After the exercise passes, open **Restore → Recovery vault**. Select the retai
 
 Use **Movements** to establish the cartridge's first confirmed location and manage later on-site/off-site handling. Create named locations, plan an exact cartridge set, then confirm a direct move or the separate departure and arrival steps. A plan or due date never changes physical custody. Partial confirmations keep the task open, each mutation is idempotent and audited, and overdue work remains overdue until every required cartridge arrives or the task is explicitly cancelled.
 
+Use **Tapes & pools** as the media control center. Its inventory can be searched and filtered by pool, location, identity, health, protection, and attention state. Open a cartridge dossier to review identity, content coordinates, retained recovery points, dependency protection, verifications, holds, custody, reservations, and audit history. Pool assignment and manual, legal, or archive holds use the displayed cartridge version so a stale browser cannot overwrite newer state; safe retries return the original idempotent result. Hold release requires a reason and appends evidence rather than deleting history.
+
+The dossier can evaluate reuse against one selected drive. This is a read-only, fail-closed decision: unknown or conflicting identity, catalog disagreement, retention/dependencies, holds, archives, reservations, pending custody, WORM state, health uncertainty, unknown location, or an incompatible drive keeps the cartridge blocked and lists the affected recovery points and corrective actions. TapeScale does **not** expose a general erase, relabel, recycle, reuse execution, or administrative override endpoint in this release. An `allowed` evaluation is information, not permission to destroy media.
+
 The closed G0.2 path starts the pinned Bacula Director, Storage Daemon, and File Daemon only on worker loopback under the singleton worker's fenced run. It does not expose an operator console or arbitrary engine commands. The current laboratory fixture limit is 100,000 manifest entries and 100 GiB logical data; larger datasets are rejected before tape writing. It is limited to one full file backup on one standalone drive and one cartridge. Spanning, incrementals, changers, native ZFS streams, encryption/key recovery, and clean-catalog recovery remain blocked.
 
 To update the TrueNAS custom app, open the installed `tapescale` app for editing, replace its YAML with the latest raw [`compose.truenas.yaml`](https://raw.githubusercontent.com/lilrags16/TapeScale/main/compose.truenas.yaml), and save. Each physical-test file pins its Git build context and OCI revision to a release tag; `pull_policy: build` rebuilds that exact source instead of silently moving with `main`.
@@ -90,7 +95,7 @@ cargo test --all-targets
 cargo build --release --locked
 ```
 
-The current suite exercises SAS VPD identity/status parsing, allowlisted motion commands, durable drive-operation leases and audit state, device replacement, reset-position recovery, uncertain-motion gates, compatibility discontinuities, overwrite blockers, retention graphs, incremental-base selection, job transitions, restore prerequisites, path/link containment, RBAC, custody confirmation, engine claim boundaries, and safe process execution.
+The current suite exercises SAS VPD identity/status parsing, allowlisted motion commands, durable drive-operation leases and audit state, device replacement, reset-position recovery, uncertain-motion gates, compatibility discontinuities, overwrite blockers, cartridge-version conflicts, pool/hold idempotency, retention graphs, incremental-base selection, job transitions, restore prerequisites, path/link containment, RBAC, custody confirmation, engine claim boundaries, and safe process execution.
 
 ## Runtime boundaries
 
@@ -134,7 +139,7 @@ Please do not report vulnerabilities in a public issue. Follow the private proce
 
 ## Project status
 
-SAS discovery, narrowly allowlisted lab rewind/unload, the Bacula 15.0.3 destructive drive test, the G0.2 single-volume full-file roundtrip, Recovery Vault/evidence export, durable restore-readiness planning, and confirmed media-custody operations are implemented. A G0.2 pass can create a verified recovery point only for its exact immutable source, physical tape readback, isolated restore, and manifest comparison. A readiness plan is not reusable restore execution. This does not promote the product to production or prove TrueNAS NFSv4 ACL fidelity, multi-volume/EOM behavior, wrong-media handling, interruption recovery, encryption, native ZFS, clean-host catalog reconstruction, or a second independent tape restore after restart.
+SAS discovery, narrowly allowlisted lab rewind/unload, the Bacula 15.0.3 destructive drive test, the G0.2 single-volume full-file roundtrip, Recovery Vault/evidence export, durable restore-readiness planning, confirmed media-custody operations, and read-only fail-closed media reuse decisions are implemented. A G0.2 pass can create a verified recovery point only for its exact immutable source, physical tape readback, isolated restore, and manifest comparison. A readiness plan is not reusable restore execution, and a safe reuse decision does not erase, relabel, recycle, or overwrite a tape. This does not promote the product to production or prove TrueNAS NFSv4 ACL fidelity, multi-volume/EOM behavior, wrong-media handling, interruption recovery, encryption, native ZFS, clean-host catalog reconstruction, or a second independent tape restore after restart.
 
 ## License
 
