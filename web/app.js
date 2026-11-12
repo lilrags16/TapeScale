@@ -50,13 +50,20 @@
       qualificationRuns: [],
       recoveryProfiles: [],
       recoveryExercises: [],
-      recoveryExerciseDetails: {}
+      recoveryExerciseDetails: {},
+      recoveryPointDetails: {}
     },
     received: new Set(),
     errors: {},
     qualificationPollTimer: null,
     recoveryExercisePollTimer: null,
-    selectedRecoveryExerciseId: null
+    selectedRecoveryExerciseId: null,
+    selectedRecoveryPointId: null,
+    recoveryPointQuery: "",
+    recoveryPointStatus: "all",
+    recoveryPointRepresentation: "all",
+    recoveryPointDetailLoading: new Set(),
+    restorePlanDrafts: {}
   };
 
   const main = document.querySelector("#main-content");
@@ -212,6 +219,10 @@
       const exercise = selectedRecoveryExercise();
       if (exercise && recordId(exercise)) await loadRecoveryExerciseDetail(recordId(exercise));
     }
+    if (state.route === "restore") {
+      const point = selectedRecoveryPoint();
+      if (point && recordId(point)) await loadRecoveryPointDetail(recordId(point), !initial);
+    }
     state.loading = false;
     state.refreshing = false;
     updateChrome();
@@ -344,12 +355,287 @@
     return html + table(["Cartridge", "Generation", "Format", "Pool", "Location", "Health"], rows);
   }
 
+  function recoveryPointState(point) {
+    return String(pick(point, "status", "state", "verification") || "unknown").toLowerCase();
+  }
+
+  function recoveryPointRepresentation(point) {
+    return String(pick(point, "representation", "kind", "mode") || "unknown").toLowerCase();
+  }
+
+  function recoveryPointMediaLabels(point) {
+    const labels = pick(point, "media_labels", "tape_labels", "cartridges");
+    return Array.isArray(labels) ? labels.filter(Boolean).map(String) : [];
+  }
+
+  function recoveryPointRouteId() {
+    const parts = location.hash.slice(1).split("/");
+    if (parts[0] !== "restore" || !parts[1]) return null;
+    try {
+      return decodeURIComponent(parts.slice(1).join("/"));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function orderedRecoveryPoints() {
+    return state.data.recoveryPoints.slice().sort((left, right) => {
+      const timeDifference = new Date(pick(right, "recovery_time", "created_at") || 0) - new Date(pick(left, "recovery_time", "created_at") || 0);
+      return timeDifference || recordId(right).localeCompare(recordId(left));
+    });
+  }
+
+  function selectedRecoveryPoint() {
+    const points = orderedRecoveryPoints();
+    const requestedId = recoveryPointRouteId() || state.selectedRecoveryPointId;
+    const selected = requestedId && points.find((point) => recordId(point) === requestedId);
+    const point = selected || points[0] || null;
+    if (point) state.selectedRecoveryPointId = recordId(point);
+    return point;
+  }
+
+  function recoveryPointDetail(id) {
+    return id ? state.data.recoveryPointDetails[id] || null : null;
+  }
+
+  async function loadRecoveryPointDetail(id, force) {
+    if (!id || state.recoveryPointDetailLoading.has(id) || (!force && recoveryPointDetail(id))) return;
+    const errorKey = "recoveryPoint:" + id;
+    state.recoveryPointDetailLoading.add(id);
+    delete state.errors[errorKey];
+    try {
+      const detail = await request(endpoints.recoveryPoints + "/" + encodeURIComponent(id));
+      state.data.recoveryPointDetails[id] = detail && typeof detail === "object" ? detail : {};
+      delete state.errors[errorKey];
+    } catch (error) {
+      state.errors[errorKey] = error;
+    } finally {
+      state.recoveryPointDetailLoading.delete(id);
+    }
+    if (state.route === "restore" && recordId(selectedRecoveryPoint()) === id) render();
+  }
+
+  async function selectRecoveryPoint(id) {
+    if (!id) return;
+    state.selectedRecoveryPointId = id;
+    const targetHash = "#restore/" + encodeURIComponent(id);
+    if (location.hash !== targetHash) location.hash = targetHash;
+    else render();
+    await loadRecoveryPointDetail(id);
+  }
+
+  function recoveryPointMatches(point) {
+    const query = state.recoveryPointQuery.trim().toLowerCase();
+    const pointState = recoveryPointState(point);
+    const representation = recoveryPointRepresentation(point);
+    if (state.recoveryPointStatus !== "all" && pointState !== state.recoveryPointStatus) return false;
+    if (state.recoveryPointRepresentation !== "all" && representation !== state.recoveryPointRepresentation) return false;
+    if (!query) return true;
+    const searchable = [
+      recordId(point),
+      pick(point, "dataset_name", "source", "dataset", "logical_root"),
+      pick(point, "level"),
+      representation,
+      pointState,
+      pick(point, "manifest_digest"),
+      ...recoveryPointMediaLabels(point)
+    ].filter(Boolean).join(" ").toLowerCase();
+    return searchable.includes(query);
+  }
+
+  function applyRecoveryPointFilters() {
+    const catalog = document.querySelector("#recovery-vault-catalog");
+    if (!catalog) return;
+    let visible = 0;
+    catalog.querySelectorAll(".vault-point").forEach((button) => {
+      const matchesQuery = !state.recoveryPointQuery.trim() || String(button.dataset.search || "").includes(state.recoveryPointQuery.trim().toLowerCase());
+      const matchesStatus = state.recoveryPointStatus === "all" || button.dataset.status === state.recoveryPointStatus;
+      const matchesRepresentation = state.recoveryPointRepresentation === "all" || button.dataset.representation === state.recoveryPointRepresentation;
+      button.hidden = !(matchesQuery && matchesStatus && matchesRepresentation);
+      if (!button.hidden) visible += 1;
+    });
+    const countNode = document.querySelector("#vault-filter-count");
+    if (countNode) countNode.textContent = visible + " of " + state.data.recoveryPoints.length + " recovery point" + (state.data.recoveryPoints.length === 1 ? "" : "s");
+    const emptyNode = document.querySelector("#vault-filter-empty");
+    if (emptyNode) emptyNode.hidden = visible !== 0;
+  }
+
+  function recoveryPointLogicalBytes(point) {
+    const coverage = point && point.coverage && typeof point.coverage === "object" ? point.coverage : {};
+    return pick(point, "logical_bytes", "source_bytes") ?? pick(coverage, "logical_bytes", "source_bytes", "bytes");
+  }
+
+  function recoveryPointVolumes(detail, point) {
+    const volumes = detail ? list(detail, "volumes") : [];
+    if (volumes.length) {
+      return volumes.slice().sort((left, right) => Number(pick(left, "volume_order", "order") || 0) - Number(pick(right, "volume_order", "order") || 0));
+    }
+    return recoveryPointMediaLabels(point).map((mediaLabel, index) => ({ volume_order: index + 1, media_label: mediaLabel }));
+  }
+
+  function volumeCartridge(volume) {
+    return volume && volume.cartridge && typeof volume.cartridge === "object" ? volume.cartridge : {};
+  }
+
+  function volumeLabel(volume) {
+    const cartridge = volumeCartridge(volume);
+    return pick(volume, "media_label", "cartridge_label", "internal_label", "barcode") || pick(cartridge, "internal_label", "label", "barcode", "id") || "Unidentified cartridge";
+  }
+
+  function renderRecoveryPointCatalog(points, selected) {
+    const statuses = Array.from(new Set(points.map(recoveryPointState))).sort();
+    const representations = Array.from(new Set(points.map(recoveryPointRepresentation))).sort();
+    const statusOptions = ['<option value="all">All states</option>'].concat(statuses.map((value) => '<option value="' + esc(value) + '"' + (state.recoveryPointStatus === value ? " selected" : "") + ">" + esc(human(value)) + "</option>"));
+    const representationOptions = ['<option value="all">All formats</option>'].concat(representations.map((value) => '<option value="' + esc(value) + '"' + (state.recoveryPointRepresentation === value ? " selected" : "") + ">" + esc(human(value)) + "</option>"));
+    const visibleCount = points.filter(recoveryPointMatches).length;
+    const cards = points.map((point) => {
+      const id = recordId(point);
+      const pointState = recoveryPointState(point);
+      const representation = recoveryPointRepresentation(point);
+      const media = recoveryPointMediaLabels(point);
+      const search = [id, pick(point, "dataset_name", "source", "dataset"), pick(point, "level"), representation, pointState, pick(point, "manifest_digest"), ...media].filter(Boolean).join(" ").toLowerCase();
+      const hidden = recoveryPointMatches(point) ? "" : " hidden";
+      return '<button class="vault-point' + (selected && id === recordId(selected) ? " active" : "") + '" type="button" data-action="select-recovery-point" data-id="' + esc(id) + '" data-status="' + esc(pointState) + '" data-representation="' + esc(representation) + '" data-search="' + esc(search) + '"' + hidden + '><span class="vault-point-head"><strong>' + esc(label(pick(point, "dataset_name", "source", "dataset"))) + '</strong>' + status(pointState) + '</span><span class="vault-point-meta">' + esc(human(pick(point, "level") || "unknown")) + " · " + esc(human(representation)) + " · " + esc(date(pick(point, "recovery_time", "created_at"))) + '</span><span class="vault-point-media">' + (media.length ? esc(media.join(" → ")) : "No media recorded") + '</span><code>' + esc(id) + "</code></button>";
+    }).join("");
+    return '<aside class="panel vault-catalog" id="recovery-vault-catalog"><div class="panel-head"><div><h2>Recovery catalog</h2><p id="vault-filter-count">' + visibleCount + " of " + points.length + " recovery point" + (points.length === 1 ? "" : "s") + '</p></div></div><div class="vault-catalog-tools"><label class="search-field"><span class="sr-only">Search recovery points</span><input id="vault-search" type="search" value="' + esc(state.recoveryPointQuery) + '" placeholder="Dataset, tape, manifest…" autocomplete="off"></label><div class="vault-filter-row"><select class="select compact" id="vault-status-filter" aria-label="Filter by recovery state">' + statusOptions.join("") + '</select><select class="select compact" id="vault-representation-filter" aria-label="Filter by representation">' + representationOptions.join("") + '</select></div></div><div class="vault-point-list">' + cards + '<div class="vault-filter-empty" id="vault-filter-empty"' + (visibleCount ? " hidden" : "") + '><strong>No matching recovery points</strong><span>Clear the search or choose another filter.</span></div></div></aside>';
+  }
+
+  function evidenceOutcome(verifications, kind) {
+    const match = verifications.find((item) => String(pick(item, "kind", "verification_kind") || "").toLowerCase() === kind);
+    return match ? String(pick(match, "outcome", "status", "state") || "unknown") : "not recorded";
+  }
+
+  function renderVaultProof(name, value, detail) {
+    const normalized = String(value || "unknown").toLowerCase();
+    const symbol = ["passed", "verified", "ready", "finalized"].includes(normalized) ? "✓" : ["failed", "blocked", "missing"].includes(normalized) ? "!" : "·";
+    return '<div class="vault-proof ' + esc(normalized.replace(/[^a-z]+/g, "-")) + '"><span class="vault-proof-icon" aria-hidden="true">' + symbol + '</span><div><small>' + esc(name) + '</small><strong>' + esc(human(value || "unknown")) + '</strong><span>' + esc(detail) + "</span></div></div>";
+  }
+
+  function renderRecoveryVolumes(volumes) {
+    if (!volumes.length) return '<div class="vault-section-empty">No volume map is recorded for this recovery point.</div>';
+    return '<ol class="vault-volume-list">' + volumes.map((volume, index) => {
+      const cartridge = volumeCartridge(volume);
+      const order = Number(pick(volume, "volume_order", "order") || index + 1);
+      const finalized = pick(volume, "finalized");
+      const recordStart = pick(volume, "first_record", "record_start");
+      const recordEnd = pick(volume, "last_record", "record_end");
+      const location = pick(volume, "location_name", "confirmed_location", "location") || pick(cartridge, "location_name", "confirmed_location", "location");
+      const available = pick(volume, "available");
+      const compatibleDrives = pick(volume, "compatible_qualified_drives", "compatible_drives");
+      const driveText = Array.isArray(compatibleDrives) && compatibleDrives.length
+        ? compatibleDrives.map((drive) => typeof drive === "object" ? pick(drive, "stable_id", "name", "id") : drive).filter(Boolean).join(", ")
+        : "No qualified drive reported";
+      return '<li><span class="vault-volume-order">' + order + '</span><div class="vault-volume-main"><div class="vault-volume-title"><strong>' + esc(volumeLabel(volume)) + '</strong><span class="vault-volume-statuses">' + status(available === true ? "available" : available === false ? "unavailable" : "availability unknown") + status(finalized === true ? "finalized" : finalized === false ? "not finalized" : "recorded") + '</span></div><div class="vault-volume-facts"><span><small>Record span</small><strong>' + esc(recordStart || recordEnd ? label(recordStart) + " → " + label(recordEnd) : "Not reported") + '</strong></span><span><small>Encoded</small><strong>' + esc(bytes(pick(volume, "encoded_bytes", "bytes"))) + '</strong></span><span><small>Location</small><strong>' + esc(label(location)) + '</strong></span><span><small>Qualified reader</small><strong class="mono">' + esc(driveText) + '</strong></span><span><small>Engine record</small><strong class="mono">' + esc(label(pick(volume, "engine_record_id", "engine_volume_id"))) + "</strong></span></div></div></li>";
+    }).join("") + "</ol>";
+  }
+
+  function conciseEvidence(value) {
+    if (value == null || value === "") return "No detail reported";
+    if (typeof value !== "object") return String(value);
+    const preferred = pick(value, "detail", "message", "manifest_digest", "sha256", "bytes_read", "files_compared", "result");
+    if (preferred !== null) return String(preferred);
+    const text = JSON.stringify(value);
+    return text.length > 260 ? text.slice(0, 257) + "…" : text;
+  }
+
+  function renderRecoveryVerifications(verifications) {
+    if (!verifications.length) return '<div class="vault-section-empty">No verification evidence is recorded.</div>';
+    return '<div class="vault-verification-grid">' + verifications.map((item) => {
+      const media = pick(item, "media_labels", "tape_labels");
+      const mediaText = Array.isArray(media) ? media.join(" → ") : label(pick(item, "media_label"));
+      return '<article class="vault-verification"><div class="vault-verification-head"><div><small>' + esc(date(pick(item, "finished_at", "started_at"))) + '</small><h4>' + esc(human(pick(item, "kind", "verification_kind") || "verification")) + '</h4></div>' + status(pick(item, "outcome", "status", "state")) + '</div><dl><dt>Drive</dt><dd class="mono">' + esc(label(pick(item, "drive_stable_id", "drive_id"))) + '</dd><dt>Media</dt><dd>' + esc(mediaText) + '</dd><dt>Evidence</dt><dd>' + esc(conciseEvidence(pick(item, "evidence", "detail"))) + "</dd></dl></article>";
+    }).join("") + "</div>";
+  }
+
+  function renderDependencyList(items, emptyMessage) {
+    if (!items.length) return '<div class="vault-section-empty compact">' + esc(emptyMessage) + "</div>";
+    return '<ul class="vault-contract-list">' + items.map((item) => {
+      const title = pick(item, "dataset_name", "depends_on_id", "recovery_point_id", "kind", "id") || "Recorded item";
+      const detail = pick(item, "dependency_kind", "reason", "status", "expires_at") || conciseEvidence(item);
+      return '<li><strong>' + esc(title) + '</strong><span>' + esc(detail) + "</span></li>";
+    }).join("") + "</ul>";
+  }
+
+  function renderRecoveryArtifacts(artifacts) {
+    if (!artifacts.length) return '<div class="vault-section-empty compact">No retained artifact metadata was returned.</div>';
+    return '<ul class="vault-artifact-list">' + artifacts.map((artifact) => '<li><div><strong>' + esc(human(pick(artifact, "artifact_kind", "kind") || "artifact")) + '</strong><span>' + esc(pick(artifact, "size_bytes") == null ? "Retained evidence" : bytes(pick(artifact, "size_bytes"))) + '</span></div><code>' + esc(label(pick(artifact, "sha256", "digest"))) + "</code></li>").join("") + "</ul>";
+  }
+
+  function renderOrigin(origin, point) {
+    const facts = [
+      ["Product run", pick(origin, "job_run_id", "run_id") || pick(point, "run_id")],
+      ["Physical exercise", pick(origin, "single_tape_data_run_id", "recovery_exercise_id", "exercise_id")],
+      ["Correlation", pick(origin, "correlation_id")],
+      ["Engine job", pick(origin, "engine_job_id", "bacula_job_id")],
+      ["Engine", pick(origin, "engine_name")],
+      ["Adapter", pick(origin, "adapter_version")]
+    ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "");
+    if (!facts.length) return '<div class="vault-section-empty compact">No originating-run metadata was returned.</div>';
+    return '<dl class="vault-facts compact">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + "</dl>";
+  }
+
+  function renderRecoveryEventsForVault(events) {
+    if (!events.length) return "";
+    return '<details class="vault-events"><summary>Append-only run activity <span>' + events.length + ' events</span></summary><ol>' + events.map((event) => {
+      const evidence = event && event.evidence && typeof event.evidence === "object" ? event.evidence : {};
+      return '<li><time>' + esc(date(pick(event, "occurred_at", "created_at"))) + '</time><div><strong>' + esc(human(pick(event, "event_type", "to_state", "phase") || "event")) + '</strong><span>' + esc(conciseEvidence(pick(evidence, "detail", "message") || evidence)) + "</span></div></li>";
+    }).join("") + "</ol></details>";
+  }
+
+  function renderRecoveryPointDossier(summary) {
+    const id = recordId(summary);
+    const detail = recoveryPointDetail(id);
+    const point = detail && detail.recovery_point && typeof detail.recovery_point === "object" ? detail.recovery_point : summary;
+    const volumes = recoveryPointVolumes(detail, point);
+    const verifications = detail ? list(detail, "verifications") : [];
+    const dependencies = detail ? list(detail, "dependencies") : [];
+    const holds = detail ? list(detail, "holds") : [];
+    const artifacts = detail ? list(detail, "artifacts") : [];
+    const events = detail ? list(detail, "events") : [];
+    const origin = detail && detail.origin && typeof detail.origin === "object" ? detail.origin : {};
+    const detailError = state.errors["recoveryPoint:" + id];
+    const loadingDetail = state.recoveryPointDetailLoading.has(id) || (!detail && !detailError);
+    const dataset = pick(point, "dataset_name", "source", "dataset", "logical_root");
+    const representation = recoveryPointRepresentation(point);
+    const fullReadback = evidenceOutcome(verifications, "full_readback");
+    const restoreTest = evidenceOutcome(verifications, "restore_test");
+    const coverage = point && point.coverage && typeof point.coverage === "object" ? point.coverage : {};
+    const facts = [
+      ["Recovery time", date(pick(point, "recovery_time", "created_at"))],
+      ["Representation", human(representation)],
+      ["Backup level", human(pick(point, "level") || "unknown")],
+      ["Format version", pick(point, "format_version")],
+      ["Source scope", pick(point, "source_scope_hash")],
+      ["Manifest SHA-256", pick(point, "manifest_digest")],
+      ["Logical size", (() => { const value = recoveryPointLogicalBytes(point); return value == null ? null : bytes(value); })()],
+      ["Expires", pick(point, "indefinite") === true ? "Indefinite retention" : date(pick(point, "expires_at"))],
+      ["Key lineage", pick(point, "key_lineage_id") || "No key lineage recorded"]
+    ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "");
+    let feedback = "";
+    if (loadingDetail) feedback = '<div class="notice info vault-detail-notice"><span class="notice-icon" aria-hidden="true">↻</span><div class="notice-copy"><strong>Loading durable recovery evidence</strong><span>The summary is visible while TapeScale assembles the ordered media and verification record.</span></div></div>';
+    if (detailError) feedback = '<div class="notice danger vault-detail-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load the recovery dossier</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="retry-recovery-point" data-id="' + esc(id) + '">Retry</button></div>';
+    return '<article class="panel vault-dossier"><header class="vault-dossier-hero"><div><span class="vault-kicker">Recovery point · ' + esc(human(representation)) + '</span><div class="vault-dossier-title"><h2>' + esc(label(dataset)) + '</h2>' + status(recoveryPointState(point)) + '</div><p class="mono">' + esc(id) + '</p><span>' + esc(date(pick(point, "recovery_time", "created_at"))) + " · " + esc(human(pick(point, "level") || "unknown")) + ' backup</span></div><div class="vault-dossier-actions"><button class="button button-quiet" type="button" data-action="download-recovery-evidence" data-id="' + esc(id) + '">Download evidence</button><button class="button button-primary" type="button" data-action="open-restore-plan" data-id="' + esc(id) + '">Plan restore</button></div></header><div class="vault-plan-boundary"><strong>Readiness planning only</strong><span>Planning does not move a tape, start Bacula, create a destination, or restore data.</span></div>' + feedback + '<section class="vault-proof-grid">' + renderVaultProof("Full media readback", fullReadback, verifications.length ? "Recorded independently of write completion" : "Loading verification evidence") + renderVaultProof("Isolated restore test", restoreTest, verifications.length ? "Application recovery evidence" : "Loading verification evidence") + renderVaultProof("Required media", volumes.length ? "recorded" : "missing", volumes.length + " cartridge" + (volumes.length === 1 ? "" : "s") + " in read order") + renderVaultProof("Dependencies", dependencies.length ? "required" : "ready", dependencies.length ? dependencies.length + " prerequisite recovery point(s)" : "No earlier recovery point required") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Required media in read order</h3><p>Load cartridges in this exact volume sequence. Engine record boundaries are retained for reconstruction.</p></div><span>' + volumes.length + " volume" + (volumes.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVolumes(volumes) + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Verification evidence</h3><p>Write completion, full readback, and restore testing remain separate claims.</p></div><span>' + verifications.length + " record" + (verifications.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVerifications(verifications) + '</section><div class="vault-two-column"><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Recovery contract</h3><p>The durable identity and retention boundary.</p></div></div><dl class="vault-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="' + (/hash|manifest|lineage|format/i.test(name) ? "mono" : "") + '">' + esc(value) + "</dd>").join("") + '</dl>' + (Object.keys(coverage).length ? '<details class="vault-json"><summary>Recorded coverage</summary><pre>' + esc(JSON.stringify(coverage, null, 2)) + "</pre></details>" : "") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Dependencies & holds</h3><p>Every prerequisite remains visible before planning.</p></div></div><h4>Dependencies</h4>' + renderDependencyList(dependencies, "This is a self-contained full recovery point.") + '<h4>Active holds</h4>' + renderDependencyList(holds, "No active hold was returned.") + '</section></div><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Origin & retained evidence</h3><p>Correlation data for the job, physical exercise, catalog, and content-addressed artifacts.</p></div></div><div class="vault-origin-grid"><div><h4>Origin</h4>' + renderOrigin(origin, point) + '</div><div><h4>Artifacts</h4>' + renderRecoveryArtifacts(artifacts) + "</div></div>" + renderRecoveryEventsForVault(events) + "</section></article>";
+  }
+
   function renderRestore() {
-    const points = state.data.recoveryPoints;
-    let html = pageHead("Restore", "Recovery points returned by TapeScale.", refreshButton()) + noticeFor("recoveryPoints");
-    if (!points.length) return html + empty("No recovery points", state.errors.recoveryPoints ? "Recovery points could not be loaded." : "A restore can be planned after a recovery point is available.");
-    const rows = points.map((point) => '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="recoveryPoints" data-id="' + esc(recordId(point)) + '"><td class="primary-cell"><strong>' + esc(label(pick(point, "name", "id"))) + '</strong><small>' + esc(label(pick(point, "level", "kind", "representation"))) + "</small></td>" + cell(pick(point, "dataset_name", "source", "dataset")) + cell(date(pick(point, "recovery_time", "time", "created_at"))) + "<td>" + status(pick(point, "verification", "status", "state")) + "</td></tr>");
-    return html + table(["Recovery point", "Source", "Created", "Verification"], rows);
+    const points = orderedRecoveryPoints();
+    let html = pageHead("Recovery vault", "Search durable recovery points, inspect exact media and verification evidence, and generate a non-executing restore readiness plan.", refreshButton()) + noticeFor("recoveryPoints");
+    if (!points.length) return html + empty("No recovery points", state.errors.recoveryPoints ? "Recovery points could not be loaded." : "A verified physical recovery exercise will create the first durable recovery point.", '<a class="button button-primary" href="#recovery-lab">Open recovery laboratory</a>');
+    const selected = selectedRecoveryPoint();
+    const verified = points.filter((point) => recoveryPointState(point) === "verified").length;
+    const tapes = new Set(points.flatMap(recoveryPointMediaLabels));
+    const logicalBytes = points.reduce((total, point) => {
+      const value = Number(recoveryPointLogicalBytes(point));
+      return total + (Number.isFinite(value) && value >= 0 ? value : 0);
+    }, 0);
+    const lastVerified = points.find((point) => recoveryPointState(point) === "verified");
+    html += '<section class="panel metric-strip vault-metrics"><div class="metric"><span>Recovery points</span><strong>' + points.length + '</strong><small>All retained outcomes</small></div><div class="metric"><span>Verified</span><strong>' + verified + '</strong><small>Ready for prerequisite planning</small></div><div class="metric"><span>Cataloged media</span><strong>' + tapes.size + '</strong><small>Unique cartridge labels</small></div><div class="metric"><span>Protected data</span><strong>' + (logicalBytes ? esc(bytes(logicalBytes)) : "—") + '</strong><small>' + (lastVerified ? "Latest verified " + esc(date(pick(lastVerified, "recovery_time", "created_at"))) : "No verified point yet") + "</small></div></section>";
+    html += '<div class="vault-layout section">' + renderRecoveryPointCatalog(points, selected) + renderRecoveryPointDossier(selected) + "</div>";
+    const selectedId = recordId(selected);
+    if (selectedId && !recoveryPointDetail(selectedId) && !state.recoveryPointDetailLoading.has(selectedId) && !state.errors["recoveryPoint:" + selectedId]) {
+      window.setTimeout(() => loadRecoveryPointDetail(selectedId), 0);
+    }
+    return html;
   }
 
   function orderedRecoveryExercises() {
@@ -630,12 +916,14 @@
     const detail = recoveryExerciseDetail(exercise);
     const profileName = recoveryExerciseProfileName(exercise);
     const terminal = recoveryExercisePassed(exercise) || recoveryExerciseFailed(exercise);
+    const recoveryPointId = recoveryEvidenceValue(exercise, "recovery_point_id");
+    const vaultAction = recoveryPointId ? '<button class="button button-small button-quiet" type="button" data-action="select-recovery-point" data-id="' + esc(recoveryPointId) + '">Open recovery point</button>' : "";
     const detailError = state.errors["recoveryExercise:" + recordId(exercise)];
     const progressRaw = recoveryEvidenceValue(exercise, "progress_percent", "percent_complete");
     const progressValue = progressRaw == null ? NaN : Number(progressRaw);
     let outcome = "";
     if (recoveryExercisePassed(exercise)) {
-      outcome = '<div class="notice success"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Physical recovery exercise passed</strong><span>The full single-tape write was decoded from media, restored into isolation, and validated. This is retained G0.2 evidence, not production qualification.</span></div></div>';
+      outcome = '<div class="notice success"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Physical recovery exercise passed</strong><span>The full single-tape write was decoded from media, restored into isolation, and validated. This is retained G0.2 evidence, not production qualification.</span></div>' + vaultAction + "</div>";
     } else if (recoveryExerciseFailed(exercise)) {
       outcome = '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Recovery exercise ' + esc(stateValue) + '</strong><span>' + esc(detail || "Open the durable activity record for the exact terminal evidence.") + "</span></div></div>";
     } else {
@@ -776,7 +1064,11 @@
     const items = state.data.verification;
     let html = pageHead("Verification", "Verification evidence returned by TapeScale.", refreshButton()) + noticeFor("verification");
     if (!items.length) return html + empty("No verification records", state.errors.verification ? "Verification records could not be loaded." : "No verification work or evidence has been reported.");
-    const rows = items.map((item) => '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="verification" data-id="' + esc(recordId(item)) + '"><td class="primary-cell"><strong>' + esc(label(pick(item, "kind", "name", "id"))) + '</strong><small>' + esc(label(pick(item, "dataset_name", "media_label", "job_name", "source"))) + "</small></td><td>" + status(pick(item, "outcome", "state", "status", "result")) + "</td>" + cell(date(pick(item, "finished_at", "started_at", "completed_at", "updated_at", "time"))) + cell(pick(item, "detail", "message", "drive_stable_id")) + "</tr>");
+    const rows = items.map((item) => {
+      const pointId = pick(item, "recovery_point_id");
+      const action = pointId ? 'data-action="select-recovery-point" data-id="' + esc(pointId) + '"' : 'data-action="open-record" data-kind="verification" data-id="' + esc(recordId(item)) + '"';
+      return '<tr class="row-action" tabindex="0" ' + action + '><td class="primary-cell"><strong>' + esc(label(pick(item, "kind", "name", "id"))) + '</strong><small>' + esc(label(pick(item, "dataset_name", "media_label", "job_name", "source"))) + (pointId ? " · open recovery point" : "") + "</small></td><td>" + status(pick(item, "outcome", "state", "status", "result")) + "</td>" + cell(date(pick(item, "finished_at", "started_at", "completed_at", "updated_at", "time"))) + cell(pick(item, "detail", "message", "drive_stable_id")) + "</tr>";
+    });
     return html + table(["Verification", "Status", "Activity", "Evidence"], rows);
   }
 
@@ -926,6 +1218,224 @@
   function closeModal() {
     modalLayer.hidden = true;
     modalLayer.innerHTML = "";
+  }
+
+  function recoveryPointPlanDraft(point) {
+    const id = recordId(point);
+    if (state.restorePlanDrafts[id]) return state.restorePlanDrafts[id];
+    const representation = recoveryPointRepresentation(point);
+    const dataset = String(pick(point, "dataset_name", "source", "dataset") || "recovery");
+    const slug = dataset.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "recovery";
+    const recoveryTime = new Date(pick(point, "recovery_time", "created_at") || Date.now());
+    const stamp = Number.isNaN(recoveryTime.getTime()) ? "restore" : recoveryTime.toISOString().slice(0, 10);
+    const logicalBytes = Number(recoveryPointLogicalBytes(point));
+    return {
+      recovery_point_id: id,
+      mode: representation === "native_zfs" ? "native_dataset" : "file_archive",
+      destination: "restores/" + stamp + "-" + slug,
+      conflict_policy: "skip",
+      key_available: !pick(point, "key_lineage_id"),
+      key_recovery_package_tested: !pick(point, "key_lineage_id"),
+      destination_approved: true,
+      is_new_destination: true,
+      conflicts_found: 0,
+      acl_semantics_supported: true,
+      identity_mapping_complete: true,
+      estimated_required_bytes: Number.isFinite(logicalBytes) && logicalBytes >= 0 ? logicalBytes : null,
+      available_bytes: null,
+      required_free_reserve_bytes: 0,
+      administrator_reauthenticated: false,
+      destructive_preview_accepted: false,
+      automatic_publication_requested: false
+    };
+  }
+
+  function checked(value) {
+    return value ? " checked" : "";
+  }
+
+  function selectedOption(actual, expected) {
+    return actual === expected ? " selected" : "";
+  }
+
+  function openRestorePlan(id) {
+    const summary = state.data.recoveryPoints.find((point) => recordId(point) === id);
+    if (!summary) return;
+    const detail = recoveryPointDetail(id);
+    const point = detail && detail.recovery_point && typeof detail.recovery_point === "object" ? detail.recovery_point : summary;
+    const draft = recoveryPointPlanDraft(point);
+    const media = recoveryPointVolumes(detail, point).map(volumeLabel);
+    const keyLineage = pick(point, "key_lineage_id");
+    const body = '<form id="restore-plan-form" data-recovery-point-id="' + esc(id) + '"><div class="restore-plan-banner"><span aria-hidden="true">◇</span><div><strong>Generate a readiness plan</strong><p>This evaluates durable catalog evidence and your destination assessment. It cannot read tape or restore data.</p></div></div><div class="restore-plan-point"><div><small>Recovery point</small><strong>' + esc(label(pick(point, "dataset_name", "source", "dataset"))) + '</strong><code>' + esc(id) + '</code></div>' + status(recoveryPointState(point)) + '</div><div class="restore-plan-media"><span>Required media</span><strong>' + esc(media.length ? media.join(" → ") : "No ordered media returned") + '</strong></div><div class="form-grid restore-plan-fields"><div class="form-field"><label for="restore-plan-mode">Recovery mode</label><select class="select" id="restore-plan-mode" name="mode"><option value="file_archive"' + selectedOption(draft.mode, "file_archive") + '>File archive</option><option value="native_dataset"' + selectedOption(draft.mode, "native_dataset") + '>Native ZFS dataset</option><option value="files_from_native"' + selectedOption(draft.mode, "files_from_native") + '>Files from native stream</option></select><small>Native extraction may require temporary staging capacity.</small></div><div class="form-field"><label for="restore-conflict-policy">Existing-file behavior</label><select class="select" id="restore-conflict-policy" name="conflict_policy"><option value="skip"' + selectedOption(draft.conflict_policy, "skip") + '>Skip conflicts (safe default)</option><option value="rename"' + selectedOption(draft.conflict_policy, "rename") + '>Rename recovered files</option><option value="replace"' + selectedOption(draft.conflict_policy, "replace") + '>Replace existing data</option></select><small>Replacement stays blocked without administrator reauthentication and a destructive preview.</small></div><div class="form-field full"><label for="restore-destination">Destination inside the configured recovery root</label><input class="input input-mono" id="restore-destination" name="destination" value="' + esc(draft.destination) + '" maxlength="512" required placeholder="restores/2026-11-12-dataset"><small>Use a contained relative path. Absolute paths and parent traversal are rejected.</small></div><div class="form-field"><label for="restore-available-bytes">Available destination bytes</label><input class="input input-mono" id="restore-available-bytes" name="available_bytes" type="number" min="0" step="1" value="' + esc(draft.available_bytes == null ? "" : draft.available_bytes) + '" placeholder="Optional"><small>Leave blank to retain an explicit capacity-estimate warning.</small></div><div class="form-field"><label for="restore-reserve-bytes">Required free-space reserve</label><input class="input input-mono" id="restore-reserve-bytes" name="required_free_reserve_bytes" type="number" min="0" step="1" value="' + esc(draft.required_free_reserve_bytes) + '"><small>Logical recovery estimate: ' + esc(draft.estimated_required_bytes == null ? "not reported" : bytes(draft.estimated_required_bytes)) + '.</small></div><div class="form-field full"><fieldset class="restore-assessment"><legend>Destination assessment</legend><label class="check-option"><input type="checkbox" name="is_new_destination"' + checked(draft.is_new_destination) + '> This is a new, isolated destination.</label><label class="check-option"><input type="checkbox" name="destination_approved"' + checked(draft.destination_approved) + '> The path is inside the approved recovery area.</label><label class="check-option"><input type="checkbox" name="acl_semantics_supported"' + checked(draft.acl_semantics_supported) + '> The destination preserves the required ACL and metadata semantics.</label><label class="check-option"><input type="checkbox" name="identity_mapping_complete"' + checked(draft.identity_mapping_complete) + '> User and group identity mapping has been reviewed.</label>' + (keyLineage ? '<label class="check-option"><input type="checkbox" name="key_available"' + checked(draft.key_available) + '> Required key lineage <code>' + esc(keyLineage) + '</code> is available.</label><label class="check-option"><input type="checkbox" name="key_recovery_package_tested"' + checked(draft.key_recovery_package_tested) + '> The independent key recovery package has been tested.</label>' : '<div class="restore-no-key"><span aria-hidden="true">✓</span>No encryption key lineage is recorded for this point.</div>') + '</fieldset></div></div><div class="notice warning restore-replace-warning" id="restore-replace-warning"' + (draft.conflict_policy === "replace" ? "" : " hidden") + '><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Replacement cannot be authorized here</strong><span>The resulting plan will retain reauthentication and destructive-preview blockers. This form never executes the replacement.</span></div></div><p class="notice danger" id="restore-plan-error" hidden></p><div class="modal-foot restore-plan-submit"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Generate readiness plan</button></div></form>';
+    openModal("Plan a restore", body);
+    const modal = modalLayer.querySelector(".modal");
+    if (modal) modal.classList.add("restore-plan-modal");
+    const destination = document.querySelector("#restore-destination");
+    if (destination) destination.focus();
+  }
+
+  function optionalFormNumber(values, name) {
+    const raw = String(values.get(name) || "").trim();
+    if (!raw) return null;
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  }
+
+  function planIssueText(issue) {
+    if (issue == null) return "Unspecified prerequisite";
+    if (typeof issue === "string") return human(issue.replace(/([a-z])([A-Z])/g, "$1_$2"));
+    if (typeof issue !== "object") return String(issue);
+    const code = pick(issue, "code", "kind", "type", "name", "blocker", "warning");
+    const detail = pick(issue, "detail", "message", "reason", "tape_id", "key_id", "dependency_id");
+    if (code && detail) return human(String(code).replace(/([a-z])([A-Z])/g, "$1_$2")) + ": " + detail;
+    if (code) return human(String(code).replace(/([a-z])([A-Z])/g, "$1_$2"));
+    const entries = Object.entries(issue).filter(([, value]) => value !== null && value !== undefined);
+    if (entries.length === 1) {
+      const [key, value] = entries[0];
+      return human(key.replace(/([a-z])([A-Z])/g, "$1_$2")) + (value === true ? "" : ": " + (typeof value === "object" ? JSON.stringify(value) : value));
+    }
+    return conciseEvidence(issue);
+  }
+
+  function planArray(plan, ...keys) {
+    const value = pick(plan, ...keys);
+    return Array.isArray(value) ? value : [];
+  }
+
+  function renderPlanRequirements(title, values, emptyText) {
+    return '<section class="restore-result-section"><h3>' + esc(title) + '</h3>' + (values.length ? '<ul class="restore-result-list">' + values.map((value) => '<li>' + esc(typeof value === "object" ? planIssueText(value) : value) + "</li>").join("") + "</ul>" : '<p class="restore-result-empty">' + esc(emptyText) + "</p>") + "</section>";
+  }
+
+  function planObjectFacts(value) {
+    if (!value || typeof value !== "object") return [];
+    return Object.entries(value)
+      .filter(([, item]) => item !== null && item !== undefined && item !== "" && !Array.isArray(item))
+      .map(([key, item]) => human(key) + ": " + (typeof item === "object" ? conciseEvidence(item) : item));
+  }
+
+  function renderRestorePlanResult(plan, point) {
+    const ready = plan && plan.ready === true;
+    const blockers = planArray(plan, "blockers");
+    const warnings = planArray(plan, "warnings");
+    const tapes = planArray(plan, "required_tape_ids", "required_tapes", "tapes");
+    const dependencies = planArray(plan, "dependency_chain", "required_dependencies", "dependencies");
+    const keys = planArray(plan, "required_key_ids", "required_keys", "keys");
+    const verification = planArray(plan, "verification_prerequisites");
+    const destination = planObjectFacts(pick(plan, "destination"));
+    const estimates = planObjectFacts(pick(plan, "estimates"));
+    const planId = pick(plan, "id", "plan_id");
+    const previewHash = pick(plan, "preview_hash", "sha256", "digest");
+    const expiresAt = pick(plan, "expires_at");
+    const resultNotice = ready
+      ? '<div class="restore-result-hero ready"><span aria-hidden="true">✓</span><div><small>Readiness result</small><h3>Prerequisites satisfied</h3><p>This point can advance to an attended restore workflow when execution support is enabled.</p></div></div>'
+      : '<div class="restore-result-hero blocked"><span aria-hidden="true">!</span><div><small>Readiness result</small><h3>Restore remains blocked</h3><p>' + blockers.length + " prerequisite" + (blockers.length === 1 ? "" : "s") + " must be resolved before any execution workflow.</p></div></div>";
+    const facts = [
+      ["Plan ID", planId],
+      ["Preview SHA-256", previewHash],
+      ["Generated", date(pick(plan, "created_at", "generated_at"))],
+      ["Expires", date(expiresAt)],
+      ["Plan status", pick(plan, "status")],
+      ["Recovery point", recordId(point)]
+    ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "Not reported");
+    return resultNotice + '<div class="restore-result-boundary"><strong>Plan retained; nothing executed</strong><span>TapeScale did not move media, invoke Bacula, create a destination, or write recovered data.</span></div><dl class="restore-result-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-result-grid">' + renderPlanRequirements("Required media", tapes, "No media requirement was returned.") + renderPlanRequirements("Dependency chain", dependencies, "No earlier recovery point is required.") + renderPlanRequirements("Required keys", keys, "No recovery key requirement was returned.") + renderPlanRequirements("Verification gates", verification, "No verification prerequisite was returned.") + renderPlanRequirements("Destination", destination, "No destination assessment was returned.") + renderPlanRequirements("Read & staging estimate", estimates, "No work estimate was returned.") + renderPlanRequirements("Blockers", blockers.map(planIssueText), "No blocking prerequisite remains.") + renderPlanRequirements("Warnings", warnings.map(planIssueText), "No planning warning was returned.") + '</div>' + (pick(plan, "execution_supported") === false ? '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Execution is not exposed in this build</strong><span>The readiness plan is durable evidence, not a restore command.</span></div></div>' : "");
+  }
+
+  async function submitRestorePlan(form) {
+    const id = form.dataset.recoveryPointId;
+    const point = state.data.recoveryPoints.find((item) => recordId(item) === id);
+    if (!point) return;
+    const values = new FormData(form);
+    const destination = String(values.get("destination") || "").trim();
+    const errorBox = form.querySelector("#restore-plan-error");
+    const submit = form.querySelector('[type="submit"]');
+    if (!destination || destination.startsWith("/") || destination.split(/[\\/]+/).includes("..") || /[\u0000-\u001f]/.test(destination)) {
+      errorBox.textContent = "Destination must be a contained relative path without parent traversal.";
+      errorBox.hidden = false;
+      return;
+    }
+    const current = recoveryPointPlanDraft(point);
+    const payload = {
+      recovery_point_id: id,
+      mode: String(values.get("mode") || "file_archive"),
+      destination,
+      conflict_policy: String(values.get("conflict_policy") || "skip"),
+      key_available: values.get("key_available") === "on" || !pick(point, "key_lineage_id"),
+      key_recovery_package_tested: values.get("key_recovery_package_tested") === "on" || !pick(point, "key_lineage_id"),
+      destination_approved: values.get("destination_approved") === "on",
+      is_new_destination: values.get("is_new_destination") === "on",
+      conflicts_found: current.conflicts_found || 0,
+      acl_semantics_supported: values.get("acl_semantics_supported") === "on",
+      identity_mapping_complete: values.get("identity_mapping_complete") === "on",
+      estimated_required_bytes: current.estimated_required_bytes,
+      available_bytes: optionalFormNumber(values, "available_bytes"),
+      required_free_reserve_bytes: optionalFormNumber(values, "required_free_reserve_bytes") || 0,
+      administrator_reauthenticated: false,
+      destructive_preview_accepted: false,
+      automatic_publication_requested: false
+    };
+    state.restorePlanDrafts[id] = payload;
+    submit.disabled = true;
+    submit.textContent = "Evaluating prerequisites…";
+    errorBox.hidden = true;
+    try {
+      const response = await request("/restores/plan", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const plan = response && response.plan && typeof response.plan === "object" ? response.plan : response;
+      openModal("Restore readiness plan", renderRestorePlanResult(plan || {}, point), '<button class="button button-quiet" type="button" data-action="revise-restore-plan" data-id="' + esc(id) + '">Revise assessment</button><button class="button button-primary" type="button" data-action="close-modal">Done</button>');
+      const modal = modalLayer.querySelector(".modal");
+      if (modal) modal.classList.add("restore-plan-modal", "restore-plan-result-modal");
+      live.textContent = plan && plan.ready ? "Restore readiness plan has no blockers. No restore was executed." : "Restore readiness plan retained with blocking prerequisites. No restore was executed.";
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Generate readiness plan";
+    }
+  }
+
+  async function downloadRecoveryEvidence(button) {
+    const id = button.dataset.id;
+    if (!id) return;
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = "Preparing evidence…";
+    try {
+      const response = await fetch(API + endpoints.recoveryPoints + "/" + encodeURIComponent(id) + "/evidence", {
+        headers: { Accept: "application/json" },
+        cache: "no-store"
+      });
+      const textBody = await response.text();
+      if (!response.ok) {
+        let payload = null;
+        try { payload = JSON.parse(textBody); } catch (_) { payload = null; }
+        const error = new Error("Request failed with HTTP " + response.status);
+        error.payload = payload || { message: textBody };
+        throw error;
+      }
+      let content = textBody;
+      try { content = JSON.stringify(JSON.parse(textBody), null, 2) + "\n"; } catch (_) { /* Preserve a valid server-provided JSON stream as received. */ }
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const match = disposition.match(/filename\*?=(?:UTF-8''|\")?([^\";]+)/i);
+      const suggested = match ? decodeURIComponent(match[1].replace(/^\"|\"$/g, "")) : "tapescale-recovery-evidence-" + id + ".json";
+      const filename = suggested.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+/, "") || "tapescale-recovery-evidence.json";
+      const url = URL.createObjectURL(new Blob([content], { type: "application/json;charset=utf-8" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast("Evidence downloaded", "The canonical recovery report was saved as " + filename + ".");
+    } catch (error) {
+      toast("Evidence download failed", errorMessage(error));
+    } finally {
+      button.disabled = false;
+      button.textContent = original;
+    }
   }
 
   function rememberRecoveryProfile(profile) {
@@ -1392,6 +1902,10 @@
     if (action === "open-recovery-profile") openRecoveryProfile();
     if (action === "open-recovery-run") openRecoveryRun(target.dataset.profileId || null);
     if (action === "select-recovery-exercise") selectRecoveryExercise(target.dataset.id);
+    if (action === "select-recovery-point") selectRecoveryPoint(target.dataset.id);
+    if (action === "retry-recovery-point") loadRecoveryPointDetail(target.dataset.id, true);
+    if (action === "download-recovery-evidence") downloadRecoveryEvidence(target);
+    if (action === "open-restore-plan" || action === "revise-restore-plan") openRestorePlan(target.dataset.id);
     if (action === "open-qualification") openQualification(target);
     if (action === "reconcile-drive") reconcileDrive(target);
     if (action === "drive-motion") queueDriveMotion(target);
@@ -1426,12 +1940,35 @@
       event.preventDefault();
       submitQualification(event.target);
     }
+    if (event.target.id === "restore-plan-form") {
+      event.preventDefault();
+      submitRestorePlan(event.target);
+    }
+  });
+
+  document.addEventListener("input", (event) => {
+    if (event.target.id === "vault-search") {
+      state.recoveryPointQuery = event.target.value;
+      applyRecoveryPointFilters();
+    }
   });
 
   document.addEventListener("change", (event) => {
     if (event.target.id === "qualification-cartridge") updateQualificationConfirmation(event.target);
     if (event.target.id === "recovery-run-drive") updateRecoveryRunMediaOptions(event.target.form);
     if (["recovery-run-profile", "recovery-run-cartridge"].includes(event.target.id)) updateRecoveryRunConfirmation(event.target.form);
+    if (event.target.id === "vault-status-filter") {
+      state.recoveryPointStatus = event.target.value;
+      applyRecoveryPointFilters();
+    }
+    if (event.target.id === "vault-representation-filter") {
+      state.recoveryPointRepresentation = event.target.value;
+      applyRecoveryPointFilters();
+    }
+    if (event.target.id === "restore-conflict-policy") {
+      const warning = document.querySelector("#restore-replace-warning");
+      if (warning) warning.hidden = event.target.value !== "replace";
+    }
   });
 
   document.addEventListener("keydown", (event) => {
@@ -1440,7 +1977,7 @@
       closeDrawer();
       shell.classList.remove("nav-open");
     }
-    if ((event.key === "Enter" || event.key === " ") && event.target.matches("tr[data-action='open-record'], tr[data-action='select-recovery-exercise']")) event.target.click();
+    if ((event.key === "Enter" || event.key === " ") && event.target.matches("tr[data-action='open-record'], tr[data-action='select-recovery-exercise'], tr[data-action='select-recovery-point']")) event.target.click();
   });
 
   modalLayer.addEventListener("click", (event) => {
@@ -1464,6 +2001,11 @@
           }
         });
       }
+    }
+    if (state.route === "restore") {
+      const point = selectedRecoveryPoint();
+      const id = recordId(point);
+      if (id && !state.data.recoveryPointDetails[id]) loadRecoveryPointDetail(id);
     }
   });
 
