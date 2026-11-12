@@ -575,6 +575,14 @@ svg {
   margin-top: 6px;
 }
 
+.drive-motion-reason {
+  display: block;
+  max-width: 260px;
+  margin-top: 5px;
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+
 .button[disabled],
 .icon-button[disabled] {
   cursor: not-allowed;

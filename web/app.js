@@ -330,8 +330,14 @@
     let html = pageHead("Drives & libraries", "Hardware inventory returned by TapeScale.", refreshButton()) + noticeFor("drives");
     if (motionEnabled) {
       html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Scratch-media lab motion enabled</strong><span>Rewind and unload physically move tape. Linux can finalize a prior write with a filemark before moving it. Use designated scratch media only; this does not qualify the drive for backup.</span></div></div>';
+    } else {
+      html += '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Lab tape motion is disabled</strong><span>Rewind and Unload remain visible for discovered drives, but cannot run until the API and worker use TAPESCALE_LAB_TAPE_MOTION_ENABLED=true.</span></div></div>';
     }
-    if (!state.data.drives.length && !state.data.slots.length) return html + empty("No hardware inventory", state.errors.drives ? "Drive and slot inventory could not be loaded." : "No drives or library slots have been reported.");
+    if (!state.data.drives.length) {
+      const noDriveDetail = state.errors.drives ? "Drive and slot inventory could not be loaded." : "No SAS tape drive has been reported. Rewind and Unload appear after the worker discovers the exact mapped /dev/nstN device.";
+      if (!state.data.slots.length) return html + empty("No hardware inventory", noDriveDetail);
+      html += '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>No tape drive discovered</strong><span>' + esc(noDriveDetail) + "</span></div></div>";
+    }
     if (state.data.drives.length) {
       const rows = state.data.drives.map((drive) => {
         const health = drive.health && typeof drive.health === "object" ? drive.health : {};
@@ -345,12 +351,28 @@
         const canReconcile = current && !drive.reconciled && health.present === true && health.accessible === true && health.position_lost === false && health.motion_position_uncertain !== true && health.immediate_mode === false && health.in_flight === 0 && health.identity_verified === true && health.identity_conflict !== true;
         const action = canReconcile ? '<button class="button button-small" type="button" data-action="reconcile-drive" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '">Trust identity</button>' : status(drive.reconciled ? "reconciled" : "unreconciled");
         const access = current ? pick(health, "status") || pick(drive, "qualification_status") : "stale";
-        const canMove = motionEnabled && current && drive.reconciled === true && health.present === true && health.accessible === true && health.ready === true && health.position_lost === false && health.motion_position_uncertain !== true && health.immediate_mode === false && health.in_flight === 0 && health.identity_verified === true && health.identity_conflict !== true && health.medium_loaded === true && !activeOperation;
+        const motionBlocker = activeOperation ? "A tape motion request is already " + String(pick(activeOperation, "state") || "active") + "."
+          : !motionEnabled ? "Lab tape motion is disabled in this deployment."
+            : !current ? "The drive observation is stale; refresh and wait for the worker."
+              : health.present !== true ? "The configured tape device is not present."
+                : health.accessible !== true ? "The worker cannot access the configured tape device."
+                  : health.identity_verified !== true ? "The drive does not have a verified stable SCSI identity."
+                    : health.identity_conflict === true ? "The stable identity is present at more than one configured path."
+                      : health.motion_position_uncertain === true ? "A prior motion result requires fresh reconciliation."
+                        : health.position_lost !== false ? "The kernel has not confirmed a known tape position."
+                          : health.immediate_mode !== false ? "Kernel immediate tape motion is enabled or unknown."
+                            : health.in_flight !== 0 ? "The kernel reports outstanding or unknown tape I/O."
+                              : drive.reconciled !== true ? "Trust this exact drive identity before requesting tape motion."
+                                : health.medium_loaded !== true ? "No cartridge is reported as loaded."
+                                  : health.ready !== true ? "The loaded tape drive is not ready."
+                                    : null;
+        const canMove = motionBlocker === null;
         let motion = motionEnabled ? status(activeOperation ? pick(activeOperation, "state") : health.medium_loaded === true ? "ready" : "no loaded tape") : status("disabled");
         if (latestOperation && !activeOperation) motion = status(pick(latestOperation, "state"));
-        if (canMove) {
-          motion += '<div class="drive-actions"><button class="button button-small button-quiet" type="button" data-action="drive-motion" data-motion="rewind" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '" data-drive-label="' + esc(pick(drive, "model", "observed_path", "stable_id")) + '">Rewind</button><button class="button button-small" type="button" data-action="drive-motion" data-motion="unload" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '" data-drive-label="' + esc(pick(drive, "model", "observed_path", "stable_id")) + '">Unload</button></div>';
-        }
+        const disabled = canMove ? "" : ' disabled aria-disabled="true" title="' + esc(motionBlocker) + '"';
+        const motionAttributes = ' data-action="drive-motion" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '" data-drive-label="' + esc(pick(drive, "model", "observed_path", "stable_id")) + '"';
+        motion += '<div class="drive-actions"><button class="button button-small button-quiet" type="button" data-motion="rewind"' + motionAttributes + disabled + '>Rewind</button><button class="button button-small" type="button" data-motion="unload"' + motionAttributes + disabled + '>Unload</button></div>';
+        if (motionBlocker) motion += '<small class="drive-motion-reason">' + esc(motionBlocker) + "</small>";
         return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="drives" data-id="' + esc(recordId(drive)) + '"><td class="primary-cell"><strong>' + esc(label(pick(drive, "stable_id", "name", "id", "device"))) + '</strong><small>' + esc(label(pick(drive, "model", "serial", "observed_path"))) + "</small></td>" + cell(pick(drive, "generation", "model")) + "<td>" + status(access) + "</td><td>" + status(pick(drive, "qualification_status")) + "</td><td>" + action + "</td><td>" + motion + "</td></tr>";
       });
       html += table(["Drive", "Generation / model", "Access", "Qualification", "Identity", "Lab motion"], rows);
