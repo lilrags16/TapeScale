@@ -18,19 +18,19 @@ This is an initial engineering ledger. Automated test references should be added
 
 | ID | Acceptance case | Software status | Physical/operational evidence | Release note |
 |---|---|---|---|---|
-| AT-01 | Clean installation and preflight | Implemented/Simulated | Not run | Read-only SAS discovery and identity reconciliation exist; named TrueNAS/device proof and remaining dependencies are pending. |
+| AT-01 | Clean installation and preflight | Implemented/Simulated | Not run | SAS discovery, identity reconciliation, and gated lab motion exist; named TrueNAS/device proof and remaining dependencies are pending. |
 | AT-02 | LTO-1 through LTO-10 compatibility | Simulated | Not run | Rules can be unit-tested; no generation is physically qualified. |
 | AT-03 | Manual multi-volume job | Simulated | Not run | Requires physical EOM and wrong continuation media. |
 | AT-04 | Automated inventory and movement | Simulated | Not run | Requires a named changer and import/export-slot evidence. |
-| AT-05 | Concurrent compatible drives | Simulated | Not run | Lease/routing tests do not prove two-drive hardware behavior. |
+| AT-05 | Concurrent compatible drives | Implemented/Simulated | Not run | Durable per-drive motion leases and fencing are tested in PostgreSQL; two-drive hardware and engine routing remain unproven. |
 | AT-06 | Snapshot protection and cleanup | Simulated | Not run | Requires real TrueNAS snapshots, holds, hooks, and pressure cases. |
 | AT-07 | File content and metadata round trip | Not run | Not run | Requires real POSIX and TrueNAS NFSv4 ACL fixtures. |
 | AT-08 | Native dataset reconstruction | Not run | Not run | Requires actual `zfs send`/`receive` path and alternate pool. |
 | AT-09 | Explicit zvol coverage | Not run | Not run | UI/model treatment alone is insufficient. |
 | AT-10 | Exact selected recovery point | Simulated | Not run | Namespace model may be tested; engine and snapshot-path proof remains. |
 | AT-11 | Object larger than one cartridge | Simulated | Not run | Requires file and native-stream physical spanning. |
-| AT-12 | Cancellation and host/process failure | Simulated | Not run | Controlled engine/tape interruptions remain. |
-| AT-13 | Unknown media/device loss/position | Implemented/Simulated | Not run | Missing/path-changed SAS devices are blocked in software; physical reset/disconnect and tape-position evidence remain. |
+| AT-12 | Cancellation and host/process failure | Implemented/Simulated | Not run | Expired motion leases become blocked and revoke reconciliation without retry; controlled physical interruption and engine evidence remain. |
+| AT-13 | Unknown media/device loss/position | Implemented/Simulated | Not run | Missing/path-changed SAS devices, position loss, stale identity, and unverifiable motion postconditions are blocked in software; physical reset/disconnect evidence remains. |
 | AT-14 | Compression modes restore | Not run | Not run | Each supported resolved pipeline requires byte-exact restore evidence. |
 | AT-15 | Corrupt/reordered/truncated content | Simulated | Not run | Record/authentication fault injection must be tied to selected engine. |
 | AT-16 | Media read-back and restore tests | Not run | Not run | Cached or source rereads do not count. |
@@ -45,9 +45,9 @@ This is an initial engineering ledger. Automated test references should be added
 | AT-25 | Backpressure/exhausted capacity | Simulated | Not run | Real spool, destination, snapshot, and staging pressure remain. |
 | AT-26 | Representative workloads | Not run | Not run | Targets must be measured, not invented. |
 | AT-27 | Source errors/existing destinations | Simulated | Not run | Requires actual engine/source error and metadata coverage. |
-| AT-28 | Durable events/actionable status | Simulated | Not run | Schema/domain scaffolding exists; end-to-end restart and delivery-channel evidence is pending. |
+| AT-28 | Durable events/actionable status | Implemented/Simulated | Not run | Drive-motion intents, claims, results, and audit evidence are durable; broader end-to-end restart and delivery-channel evidence is pending. |
 | AT-29 | Rust boundary/Linux dependency audit | Implemented (source boundary) | Not run | Rust custom binaries exist; runtime/SBOM/dependency audit remains before release. |
-| AT-30 | Safe external-tool execution | Simulated | Not run | Automated hostile-input tests plus selected-tool integration are required. |
+| AT-30 | Safe external-tool execution | Implemented/Simulated | Not run | `mt-st` rewind/unload use a closed argv mapping, bounded output, and a process deadline; a stuck kernel tape ioctl may outlive that deadline, and selected engine/physical interruption evidence remains. |
 | AT-31 | Product-specific visual/workflow review | Implemented | Not run | Product-owner desktop/phone review must be recorded. |
 
 `Implemented/Simulated` means an implementation exists but its present evidence uses simulated dependencies. A qualified backend may still be absent. `Implemented (source boundary)` is narrower than a completed runtime audit. Neither status may be shortened to Qualified.

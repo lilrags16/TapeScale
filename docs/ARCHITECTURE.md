@@ -29,7 +29,7 @@ The architecture separates three custom Rust runtime responsibilities. The engin
 - The worker performs privileged orchestration and is the only component allowed to touch approved source mounts, restore destinations, tape/changer devices, ZFS integration, or the engine control interface. Worker authorization is checked again at execution time.
 - The recovery CLI is a separate Rust binary intended to inspect recovery bundles, identify media, rebuild/import catalog information through supported interfaces, and initiate recovery without the original TapeScale database.
 
-The current binaries are `tapescale-api` on port 8080, `tapescale-scheduler`, `tapescale-worker`, and `tapescale-recovery`. PostgreSQL 16 is the durable product store and coordination boundary. The only available engine adapter is the simulator; production tape operations remain gated.
+The current binaries are `tapescale-api` on port 8080, `tapescale-scheduler`, `tapescale-worker`, and `tapescale-recovery`. PostgreSQL 16 is the durable product store and coordination boundary. The only available engine adapter is the simulator; production tape operations remain gated. An explicit lab flag can enable durable rewind and unload requests, but those motions never create recovery data or physical-qualification evidence.
 
 Browser JavaScript or TypeScript and build tooling are permitted. Runtime API, scheduling, policy, workers, adapters, helpers, and recovery logic must remain Rust. PostgreSQL, OpenZFS, the selected tape engine, and qualified tape utilities are existing Linux components rather than custom TapeScale backend code.
 
@@ -63,7 +63,7 @@ The durable model is grouped by responsibility:
 - Policy: protection policies, schedules, retention rules, verification rules, archives, key lineages, and approved restore destinations.
 - Orchestration: job definitions, runs, attempts, transitions, leases, resource requests, media requests, and cancellation intents.
 - Recovery: recovery points, backup records, dependency edges, volume records, manifests, file metadata and digests, native streams, verification runs, restore plans, and restore results.
-- Hardware: drives, changers, slots, stable device identities, capability observations, and reconciliation state.
+- Hardware: drives, changers, slots, stable device identities, capability observations, reconciliation state, and durable non-data motion requests.
 - Media: cartridges, formats, pools, reservations, locations, custody events, holds, and reuse evaluations.
 - Operations: rotation plans, movement tasks, confirmations, notifications, audit events, catalog exports, recovery bundles, and component-version evidence.
 
@@ -86,6 +86,8 @@ queued -> preparing -> waiting-for-media -> writing -> written -> verifying -> v
 - Cancellation preserves prior valid recovery points and cleans up only TapeScale-owned snapshots and holds when dependency rules permit.
 
 The scheduler persists due occurrences and dispatchable work in PostgreSQL; the worker claims durable execution and device leases there. A drive has one controller at a time; changer actions are serialized. Lease expiry after a crash is not permission to resume writing: the new worker first reconciles physical position and engine state.
+
+Lab drive motion follows the same separation: the API records an exact stable-identity-bound `rewind` or `unload` intent with a designated-scratch-media acknowledgement, and only the singleton worker can claim the drive lease and invoke an allowlisted `mt-st` argument vector. The worker rechecks current identity, path, firmware, access, kernel immediate-mode/outstanding-I/O state, loaded media, and position before execution and records bounded output plus before/after evidence. No arbitrary command string crosses the API boundary. Any other motion, tape data read/write, explicit filemark, seek, retension, label, format, or erase command is unavailable. Linux may nevertheless finalize another controller's prior write with a filemark before rewind/offline, which is why this unqualified path is scratch-only.
 
 ## Backup representations
 
@@ -159,4 +161,4 @@ Generation compatibility rules are data, separate from physical qualification ev
 
 ## Preview implementation versus target contract
 
-Normative language in this document describes the release contract, not a claim that every path is complete. The preview implements Rust API/scheduler/worker/recovery process boundaries, PostgreSQL schema and coordination primitives, read-only SAS identity/status discovery, simulator-backed workflows, LTO capability rules, retention/overwrite policy, core state machines, safe argument-based process execution, and a browser prototype. Production authentication/MFA, TrueNAS control and streaming, a qualified engine, tape motion/data operations, encryption/key lifecycle, actual backup/restore, notification delivery, and clean-host media reconstruction remain incomplete or unqualified. The acceptance ledger is authoritative for evidence status.
+Normative language in this document describes the release contract, not a claim that every path is complete. The preview implements Rust API/scheduler/worker/recovery process boundaries, PostgreSQL schema and coordination primitives, SAS identity/status discovery, explicitly enabled lab-only rewind/unload, simulator-backed workflows, LTO capability rules, retention/overwrite policy, core state machines, safe argument-based process execution, and a browser prototype. Production authentication/MFA, TrueNAS control and streaming, a qualified engine, remaining tape motion and all tape data operations, encryption/key lifecycle, actual backup/restore, notification delivery, and clean-host media reconstruction remain incomplete or unqualified. The acceptance ledger is authoritative for evidence status.

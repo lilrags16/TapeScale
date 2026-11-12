@@ -17,6 +17,7 @@ x-tapescale-common: &tapescale-common
     - postgres_password
   environment: &tapescale-environment
     TAPESCALE_DEMO_MODE: ${TAPESCALE_DEMO_MODE:-false}
+    TAPESCALE_LAB_TAPE_MOTION_ENABLED: ${TAPESCALE_LAB_TAPE_MOTION_ENABLED:-false}
     TAPESCALE_DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
     TAPESCALE_DATABASE_HOST: postgres
     TAPESCALE_DATABASE_PORT: 5432
@@ -53,6 +54,7 @@ services:
   worker:
     <<: *tapescale-common
     entrypoint: [/usr/local/bin/tapescale-worker]
+    stop_grace_period: 30s
     environment:
       <<: *tapescale-environment
       TAPESCALE_WORKER_POLL_SECS: ${TAPESCALE_WORKER_POLL_SECS:-5}

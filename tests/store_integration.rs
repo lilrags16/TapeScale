@@ -3,8 +3,11 @@ use std::time::Duration;
 use chrono::Utc;
 use serde_json::json;
 use tapescale::{
-    device::{MissingSasDrive, SasDriveObservation},
-    store::{self, NewMedia, ReconcileDriveResult},
+    device::{MissingSasDrive, SasDriveObservation, SasMotionOperation},
+    store::{
+        self, ClaimDriveOperationResult, DriveOperationTerminalState, NewMedia,
+        QueueDriveOperationResult, ReconcileDriveResult,
+    },
 };
 
 #[tokio::test]
@@ -17,6 +20,15 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     let pool = store::connect(&database_url, Duration::from_secs(10))
         .await
         .expect("test database should connect and migrate");
+
+    let mut worker_lock = store::acquire_worker_singleton(&pool)
+        .await
+        .expect("first worker should acquire the singleton lock");
+    assert!(store::acquire_worker_singleton(&pool).await.is_err());
+    store::release_worker_singleton(&mut worker_lock)
+        .await
+        .expect("worker lock should release cleanly");
+    drop(worker_lock);
 
     let overview = store::overview_counts(&pool)
         .await
@@ -112,9 +124,15 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         firmware: Some("A1B2".to_owned()),
         generation: None,
         observed_path: "/dev/nst0".to_owned(),
+        device_major: 9,
+        device_minor: 128,
         scsi_address: Some("1:0:0:0".to_owned()),
         generic_path: None,
         sysfs_state: Some("running".to_owned()),
+        driver_options: Some(0),
+        immediate_mode: Some(false),
+        in_flight: Some(0),
+        at_bot: None,
         accessible: true,
         ready: Some(false),
         medium_loaded: Some(false),
@@ -160,6 +178,113 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         .expect("unchanged observation should persist");
     assert!(observed_again.reconciled);
 
+    observation.ready = Some(true);
+    observation.medium_loaded = Some(true);
+    observation.at_bot = Some(false);
+    observation.status = "ready".to_owned();
+    observation.observed_at = Utc::now();
+    store::record_drive_observation(&pool, &observation)
+        .await
+        .expect("loaded-media observation should persist");
+    assert!(matches!(
+        store::queue_drive_operation(
+            &pool,
+            drive_id,
+            "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+            SasMotionOperation::Rewind,
+            false
+        )
+        .await
+        .expect("scratch-media gate should be a domain outcome"),
+        QueueDriveOperationResult::Blocked(_)
+    ));
+    let malformed_request = sqlx::query(
+        "INSERT INTO drive_operations
+            (id, drive_id, expected_stable_id, expected_path, action,
+             scratch_media_confirmed, requested_by_label, correlation_id)
+         VALUES ($1, $2, $3, '/dev/nst0', 'rewind', false, 'test', $4)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(drive_id)
+    .bind("serial:IBM:ULTRIUM-HH9:DRIVE-001")
+    .bind(uuid::Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .expect_err("database must reject motion without scratch-media confirmation");
+    assert_eq!(
+        malformed_request
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("23514")
+    );
+    assert!(matches!(
+        store::queue_drive_operation(
+            &pool,
+            drive_id,
+            "wrong-stable-id",
+            SasMotionOperation::Rewind,
+            true
+        )
+        .await
+        .expect("identity mismatch should be a domain outcome"),
+        QueueDriveOperationResult::Blocked(_)
+    ));
+    let queued = store::queue_drive_operation(
+        &pool,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        SasMotionOperation::Rewind,
+        true,
+    )
+    .await
+    .expect("motion request should persist");
+    let QueueDriveOperationResult::Queued(queued) = queued else {
+        panic!("eligible motion request should queue");
+    };
+    assert_eq!(queued.action, "rewind");
+    assert_eq!(queued.state, "queued");
+
+    let claimed = store::claim_next_drive_operation(&pool, uuid::Uuid::now_v7())
+        .await
+        .expect("worker claim should succeed");
+    let ClaimDriveOperationResult::Claimed(claimed) = claimed else {
+        panic!("queued motion should be claimed");
+    };
+    assert_eq!(claimed.operation.state, "running");
+    assert_eq!(
+        store::running_drive_operation_paths(&pool)
+            .await
+            .expect("running paths should query"),
+        vec!["/dev/nst0".to_owned()]
+    );
+    assert!(store::finish_drive_operation(
+        &pool,
+        &claimed,
+        DriveOperationTerminalState::Succeeded,
+        json!({"detail":"integration postcondition","position_uncertain":false})
+    )
+    .await
+    .expect("motion completion should persist"));
+    assert!(store::running_drive_operation_paths(&pool)
+        .await
+        .expect("completed path should no longer be active")
+        .is_empty());
+    let operations = store::list_drive_operations(&pool)
+        .await
+        .expect("motion history should reload");
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].state, "succeeded");
+    let motion_audit = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM audit_events
+         WHERE object_type = 'drive_operation' AND object_id = $1",
+    )
+    .bind(queued.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("motion audit query should succeed");
+    assert_eq!(motion_audit, 3);
+
     let inventory = store::inventory_counts(&pool)
         .await
         .expect("inventory counts should succeed");
@@ -176,6 +301,80 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     .await
     .expect("drive audit query should succeed");
     assert_eq!(reconcile_audit, 1);
+
+    let queued_for_expiry = store::queue_drive_operation(
+        &pool,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        SasMotionOperation::Unload,
+        true,
+    )
+    .await
+    .expect("second motion request should persist");
+    assert!(matches!(
+        queued_for_expiry,
+        QueueDriveOperationResult::Queued(_)
+    ));
+    let claimed_for_expiry = store::claim_next_drive_operation(&pool, uuid::Uuid::now_v7())
+        .await
+        .expect("second worker claim should succeed");
+    let ClaimDriveOperationResult::Claimed(claimed_for_expiry) = claimed_for_expiry else {
+        panic!("second motion should be claimed");
+    };
+    sqlx::query(
+        "UPDATE resource_leases SET expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(claimed_for_expiry.lease_id)
+    .execute(&pool)
+    .await
+    .expect("lease expiry fixture should update");
+    assert!(!store::finish_drive_operation(
+        &pool,
+        &claimed_for_expiry,
+        DriveOperationTerminalState::Succeeded,
+        json!({"detail":"late success must not commit"})
+    )
+    .await
+    .expect("expired fencing check should be a domain outcome"));
+    assert_eq!(
+        store::recover_expired_drive_operations(&pool)
+            .await
+            .expect("expired motion should recover safely"),
+        1
+    );
+    let expired = store::list_drive_operations(&pool)
+        .await
+        .expect("expired motion should reload")
+        .into_iter()
+        .find(|operation| operation.id == claimed_for_expiry.operation.id)
+        .expect("expired motion remains in history");
+    assert_eq!(expired.state, "blocked");
+    assert_eq!(expired.result["position_uncertain"], json!(true));
+    let uncertain_drive = store::list_drives(&pool)
+        .await
+        .expect("uncertain drive should reload")
+        .pop()
+        .expect("drive remains present");
+    assert!(!uncertain_drive.reconciled);
+    assert!(matches!(
+        store::reconcile_drive(&pool, drive_id, "serial:IBM:ULTRIUM-HH9:DRIVE-001")
+            .await
+            .expect("stale post-expiry state should be a domain outcome"),
+        ReconcileDriveResult::Blocked
+    ));
+
+    observation.observed_at = Utc::now();
+    store::record_drive_observation(&pool, &observation)
+        .await
+        .expect("post-expiry observation should persist");
+    let recovered_identity =
+        store::reconcile_drive(&pool, drive_id, "serial:IBM:ULTRIUM-HH9:DRIVE-001")
+            .await
+            .expect("post-expiry identity can be rechecked");
+    assert!(matches!(
+        recovered_identity,
+        ReconcileDriveResult::Reconciled(_)
+    ));
 
     observation.position_lost = Some(true);
     observation.status = "position_lost".to_owned();
@@ -198,6 +397,9 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
 
     observation.position_lost = Some(false);
     observation.status = "no_media".to_owned();
+    observation.ready = Some(false);
+    observation.medium_loaded = Some(false);
+    observation.at_bot = None;
     observation.observed_at = Utc::now();
     store::record_drive_observation(&pool, &observation)
         .await

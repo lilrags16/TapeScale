@@ -27,6 +27,7 @@
       media: [],
       drives: [],
       slots: [],
+      driveOperations: [],
       movements: [],
       verification: [],
       recoveryPoints: [],
@@ -122,7 +123,7 @@
     if (key === "verification") return list(payload, "verification");
     if (key === "recoveryPoints") return list(payload, "recovery_points");
     if (key === "drives") {
-      return { drives: list(payload, "drives"), slots: list(payload, "slots") };
+      return { drives: list(payload, "drives"), slots: list(payload, "slots"), operations: list(payload, "operations") };
     }
     return payload && typeof payload === "object" ? payload : null;
   }
@@ -163,6 +164,7 @@
       if (key === "drives") {
         state.data.drives = normalized.drives;
         state.data.slots = normalized.slots;
+        state.data.driveOperations = normalized.operations;
       } else {
         state.data[key] = normalized;
       }
@@ -324,19 +326,34 @@
   }
 
   function renderDrives() {
+    const motionEnabled = pick(state.data.system, "lab_tape_motion_enabled") === true;
     let html = pageHead("Drives & libraries", "Hardware inventory returned by TapeScale.", refreshButton()) + noticeFor("drives");
+    if (motionEnabled) {
+      html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Scratch-media lab motion enabled</strong><span>Rewind and unload physically move tape. Linux can finalize a prior write with a filemark before moving it. Use designated scratch media only; this does not qualify the drive for backup.</span></div></div>';
+    }
     if (!state.data.drives.length && !state.data.slots.length) return html + empty("No hardware inventory", state.errors.drives ? "Drive and slot inventory could not be loaded." : "No drives or library slots have been reported.");
     if (state.data.drives.length) {
       const rows = state.data.drives.map((drive) => {
         const health = drive.health && typeof drive.health === "object" ? drive.health : {};
         const observedAt = new Date(pick(drive, "last_observed_at") || 0).getTime();
         const current = Number.isFinite(observedAt) && Date.now() - observedAt <= 120000;
-        const canReconcile = current && !drive.reconciled && health.present === true && health.accessible === true && health.position_lost !== true && health.identity_verified === true && health.identity_conflict !== true;
+        const operations = state.data.driveOperations
+          .filter((operation) => String(pick(operation, "drive_id")) === recordId(drive))
+          .sort((left, right) => new Date(pick(right, "created_at") || 0) - new Date(pick(left, "created_at") || 0));
+        const latestOperation = operations[0] || null;
+        const activeOperation = operations.find((operation) => ["queued", "running"].includes(String(pick(operation, "state"))));
+        const canReconcile = current && !drive.reconciled && health.present === true && health.accessible === true && health.position_lost === false && health.motion_position_uncertain !== true && health.immediate_mode === false && health.in_flight === 0 && health.identity_verified === true && health.identity_conflict !== true;
         const action = canReconcile ? '<button class="button button-small" type="button" data-action="reconcile-drive" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '">Trust identity</button>' : status(drive.reconciled ? "reconciled" : "unreconciled");
         const access = current ? pick(health, "status") || pick(drive, "qualification_status") : "stale";
-        return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="drives" data-id="' + esc(recordId(drive)) + '"><td class="primary-cell"><strong>' + esc(label(pick(drive, "stable_id", "name", "id", "device"))) + '</strong><small>' + esc(label(pick(drive, "model", "serial", "observed_path"))) + "</small></td>" + cell(pick(drive, "generation", "model")) + "<td>" + status(access) + "</td><td>" + status(pick(drive, "qualification_status")) + "</td><td>" + action + "</td></tr>";
+        const canMove = motionEnabled && current && drive.reconciled === true && health.present === true && health.accessible === true && health.ready === true && health.position_lost === false && health.motion_position_uncertain !== true && health.immediate_mode === false && health.in_flight === 0 && health.identity_verified === true && health.identity_conflict !== true && health.medium_loaded === true && !activeOperation;
+        let motion = motionEnabled ? status(activeOperation ? pick(activeOperation, "state") : health.medium_loaded === true ? "ready" : "no loaded tape") : status("disabled");
+        if (latestOperation && !activeOperation) motion = status(pick(latestOperation, "state"));
+        if (canMove) {
+          motion += '<div class="drive-actions"><button class="button button-small button-quiet" type="button" data-action="drive-motion" data-motion="rewind" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '" data-drive-label="' + esc(pick(drive, "model", "observed_path", "stable_id")) + '">Rewind</button><button class="button button-small" type="button" data-action="drive-motion" data-motion="unload" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '" data-drive-label="' + esc(pick(drive, "model", "observed_path", "stable_id")) + '">Unload</button></div>';
+        }
+        return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="drives" data-id="' + esc(recordId(drive)) + '"><td class="primary-cell"><strong>' + esc(label(pick(drive, "stable_id", "name", "id", "device"))) + '</strong><small>' + esc(label(pick(drive, "model", "serial", "observed_path"))) + "</small></td>" + cell(pick(drive, "generation", "model")) + "<td>" + status(access) + "</td><td>" + status(pick(drive, "qualification_status")) + "</td><td>" + action + "</td><td>" + motion + "</td></tr>";
       });
-      html += table(["Drive", "Generation / model", "Access", "Qualification", "Identity"], rows);
+      html += table(["Drive", "Generation / model", "Access", "Qualification", "Identity", "Lab motion"], rows);
     }
     if (state.data.slots.length) {
       const rows = state.data.slots.map((slot) => "<tr>" + cell(pick(slot, "element_address", "name", "id", "slot")) + cell(pick(slot, "type", "kind")) + cell(pick(slot, "state", "status")) + cell(pick(slot, "observed_barcode", "media_label", "barcode", "cartridge")) + "</tr>");
@@ -530,6 +547,46 @@
     }
   }
 
+  async function queueDriveMotion(button) {
+    const id = button.dataset.id;
+    const stableId = button.dataset.stableId;
+    const action = String(button.dataset.motion || "").toLowerCase();
+    const driveLabel = button.dataset.driveLabel || stableId;
+    if (!id || !stableId || !["rewind", "unload"].includes(action)) return;
+    const description = action === "unload"
+      ? "UNLOAD will rewind and put the loaded tape offline in " + driveLabel + "; the drive may physically eject it."
+      : "REWIND will physically move the loaded tape to beginning-of-tape in " + driveLabel + ".";
+    const warning = " Linux may finalize a prior write by writing a filemark before this motion. Continue only with a designated scratch cartridge. TapeScale issues no data-write command, but cannot promise unchanged media.";
+    if (!window.confirm(description + warning + " Continue?")) return;
+    button.disabled = true;
+    button.textContent = "Queueing…";
+    try {
+      await request("/drives/" + encodeURIComponent(id) + "/actions", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stable_id: stableId,
+          action,
+          confirmation: action.toUpperCase() + " SCRATCH MEDIA; PRIOR WRITE MAY BE FINALIZED",
+          scratch_media_confirmed: true
+        })
+      });
+      await loadOne("drives");
+      updateChrome();
+      render();
+      toast(human(action) + " queued", "The worker will recheck the exact drive identity and execute this lab-only motion request.");
+      window.setTimeout(async () => {
+        await loadOne("drives");
+        updateChrome();
+        render();
+      }, 6500);
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = human(action);
+      toast(human(action) + " was not queued", errorMessage(error));
+    }
+  }
+
   function toast(title, message) {
     const region = document.querySelector("#toast-region");
     const element = document.createElement("div");
@@ -558,6 +615,7 @@
     if (action === "refresh") loadAll(false);
     if (action === "add-media") openAddMedia();
     if (action === "reconcile-drive") reconcileDrive(target);
+    if (action === "drive-motion") queueDriveMotion(target);
     if (action === "close-modal") closeModal();
     if (action === "close-drawer") closeDrawer();
     if (action === "open-record") openRecord(target.dataset.kind, target.dataset.id);

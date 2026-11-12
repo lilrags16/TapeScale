@@ -1,6 +1,6 @@
 # Operator guide
 
-This guide describes the intended TapeScale operating model. The current release is an engineering preview with read-only SAS discovery and a simulator-only engine adapter. It must not be represented as protecting real tape until G0/G1 qualification is complete.
+This guide describes the intended TapeScale operating model. The current release is an engineering preview with SAS discovery, lab-only rewind/unload, and a simulator-only engine adapter. It must not be represented as protecting real tape until G0/G1 qualification is complete.
 
 Procedures below are the operator acceptance target. The preview can exercise console, policy, scheduler, custody, restore-planning, and failure states with simulated data, but it cannot perform or verify a physical backup, restore, movement, encryption recovery, or catalog-loss recovery. Controls that lack a qualified backend are demonstrations, not operational authorization.
 
@@ -44,7 +44,17 @@ Never satisfy a media request with a tape chosen only by matching its paper labe
 
 ## Manual tape handling
 
-Before handling media, verify the intended drive under **Drives & libraries**. A newly discovered drive is untrusted. Compare its physical model, serial/WWN, firmware, and non-rewinding device path, then select **Trust identity**. TapeScale revokes that reconciliation when the path, identity, firmware, or access state changes. This setup action authorizes observation only—not tape motion or data writes.
+Before handling media, verify the intended drive under **Drives & libraries**. A newly discovered drive is untrusted. Compare its physical model, serial/WWN, firmware, and non-rewinding device path, then select **Trust identity**. TapeScale revokes that reconciliation when the path, identity, firmware, or access state changes. This setup action binds the observed identity; it does not by itself authorize motion or data writes.
+
+### Lab-only rewind and unload
+
+The disposable test Compose enables `TAPESCALE_LAB_TAPE_MOTION_ENABLED=true`. With a current reconciled drive and a reported loaded medium, **Rewind** and **Unload** create durable worker requests. Confirm that the loaded cartridge is designated scratch media, acknowledge the prior-write warning, then wait for the request to leave `queued`/`running` and verify the resulting drive status. Unload uses the device's rewind-and-offline operation; it puts the device offline and may physically eject the cartridge.
+
+Linux may write a filemark before rewind/offline when the previous tape operation was a write. TapeScale exposes no data-write or explicit filemark command here, but it cannot promise unchanged media after another controller wrote to the drive. Never use retained, production, unknown, or foreign media with this unqualified lab control.
+
+TapeScale leases one drive controller, rechecks its exact stable identity and safety state, executes only the fixed allowlisted command, and appends audit evidence. A missing/stale drive, identity change, conflict, uncertain position, absent medium, or existing active request blocks execution. Do not run another tape controller against the same drive during this lab workflow.
+
+This gate does not expose load, seek, spacing, retension, an explicit filemark, read, write, label, format, or erase command. A successful rewind/unload does not identify the cartridge, prove restoration, qualify hardware, or enable backup. Designated scratch media and a selected engine remain required for the write qualification gate.
 
 For a standalone drive:
 

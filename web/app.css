@@ -568,6 +568,13 @@ svg {
   font-size: 12px;
 }
 
+.drive-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
 .button[disabled],
 .icon-button[disabled] {
   cursor: not-allowed;
@@ -1118,6 +1125,7 @@ svg {
 }
 
 .status.success,
+.status.succeeded,
 .status.verified,
 .status.writing {
   color: var(--teal-strong);
@@ -1140,6 +1148,7 @@ svg {
 
 .status.info,
 .status.queued,
+.status.running,
 .status.preparing {
   color: var(--blue);
   background: var(--blue-soft);

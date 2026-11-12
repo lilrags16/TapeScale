@@ -16,7 +16,7 @@ TapeScale is a safety-first LTO backup control plane for TrueNAS. It is designed
 - Deny-by-default overwrite evaluation and dependency-aware retention
 - Truthful job/verification state machines and safe restore preflight
 - A constrained external-tool runner with literal arguments, timeouts, cancellation, bounded output, and failure propagation
-- Worker-only SAS tape discovery and read-only status using explicitly mapped non-rewinding devices
+- Worker-only SAS discovery/status plus durable, audited lab-only rewind and unload using explicitly mapped non-rewinding devices
 - A deterministic engine simulator that cannot report physical qualification
 - A purpose-built responsive storage-operations console
 - Hardened Docker Compose packaging with separate API, worker, and PostgreSQL services
@@ -34,7 +34,7 @@ docker compose up --build
 
 Open `http://localhost:8080`. A fresh deployment starts without embedded operational fixtures: PostgreSQL and the console are empty until real records are created. Manual cartridge registration is the first durable workflow, and each cartridge remains in PostgreSQL across container restarts.
 
-For a self-contained TrueNAS test deployment, paste [`compose.truenas.yaml`](compose.truenas.yaml) into **Apps → Discover Apps → ⋮ → Install via YAML** and open `http://TRUENAS-IP:18080`. The test file intentionally embeds its disposable database password and uses Docker-managed volumes, but it does not enable demo fixtures. It maps only `/dev/nst0` to the worker for read-only SAS identity/status discovery; change both documented `/dev/nst0` entries before deployment if the host uses another non-rewinding node.
+For a self-contained TrueNAS test deployment, paste [`compose.truenas.yaml`](compose.truenas.yaml) into **Apps → Discover Apps → ⋮ → Install via YAML** and open `http://TRUENAS-IP:18080`. The test file intentionally embeds its disposable database password and uses Docker-managed volumes, but it does not enable demo fixtures. It maps only `/dev/nst0` read-only to the worker and explicitly enables the scratch-media lab motion gate for status, rewind, and unload. If the host uses `/dev/nst1`, set `TAPESCALE_TAPE_DEVICES` and both sides of the device mapping to `/dev/nst1`; the container node name must match Linux sysfs. TapeScale exposes no data-read/write, label, format, erase, backup, or restore command, but Linux can finalize a prior write with a filemark before motion. Use only designated scratch cartridges.
 
 To rebuild a TrueNAS custom app from the latest public `main`, open the installed `tapescale` app for editing, replace its YAML with the latest raw [`compose.truenas.yaml`](https://raw.githubusercontent.com/lilrags16/TapeScale/main/compose.truenas.yaml), and save. Its `pull_policy: build` and Git build context cause Compose to fetch and rebuild the current source rather than reuse an older application image.
 
@@ -55,7 +55,7 @@ cargo test --all-targets
 cargo build --release --locked
 ```
 
-The current suite exercises SAS VPD identity/status parsing, device replacement and position-loss gates, compatibility discontinuities, overwrite blockers, retention graphs, incremental-base selection, job transitions, restore prerequisites, path/link containment, RBAC, custody confirmation, engine claim boundaries, and safe process execution.
+The current suite exercises SAS VPD identity/status parsing, allowlisted motion commands, durable drive-operation leases and audit state, device replacement and position-loss gates, compatibility discontinuities, overwrite blockers, retention graphs, incremental-base selection, job transitions, restore prerequisites, path/link containment, RBAC, custody confirmation, engine claim boundaries, and safe process execution.
 
 ## Runtime boundaries
 
@@ -63,12 +63,12 @@ The current suite exercises SAS VPD identity/status parsing, device replacement 
 |---|---|---|
 | `tapescale-api` | Web/API, restore planning, operator workflows | No devices, Docker socket, host root, or blanket privilege |
 | `tapescale-scheduler` | Timezone-aware occurrences, catch-up/coalescing, durable queue policy | No source, restore, or device access |
-| `tapescale-worker` | Durable orchestration, read-only SAS discovery, and engine/device adapter boundary | Only explicitly mapped non-rewinding tape nodes; motion and data writes remain blocked |
+| `tapescale-worker` | Durable orchestration, SAS discovery, lab-only rewind/unload, and engine/device adapter boundary | Only explicitly mapped non-rewinding tape nodes; no data read/write, label, format, or erase path |
 | `tapescale-recovery` | Clean-host bundle inspection and recovery workflow | Runs independently of the original database |
 | PostgreSQL 16 | Product state, history, leases, evidence, audit/outbox | Private Compose network and persistent volume |
 | Engine adapter | Physical records, spanning, positioning, read-back | Simulator only until G0 selects and qualifies an engine/format |
 
-The web and worker containers drop all Linux capabilities in the preview. The TrueNAS test worker runs as container root solely so the exact read-only `/dev/nst0` mapping can be inspected; it is not privileged and has no broad `/dev`, host-root, or Docker-socket mount. A qualified deployment should instead use the host tape group where possible and must map only named tape/changer devices, read-only source snapshots, and approved restore destinations.
+The web and worker containers drop all Linux capabilities in the preview. The TrueNAS test worker runs as container root solely so the exact read-only `/dev/nst0` mapping can be inspected and, behind the explicit scratch-media lab gate, rewound or unloaded; it is not privileged and has no broad `/dev`, host-root, or Docker-socket mount. A qualified deployment should instead use the host tape group where possible and must map only named tape/changer devices, read-only source snapshots, and approved restore destinations.
 
 ## Recovery CLI
 
@@ -99,7 +99,7 @@ Please do not report vulnerabilities in a public issue. Follow the private proce
 
 ## Project status
 
-Read-only SAS discovery is implemented, but it is not a backup engine or physical qualification. The next release gate requires a designated TrueNAS 25.10.8 qualification host, real drives/changer and scratch media, a pinned mature engine and on-tape format, reproducible fixtures, and retained test evidence. Simulated or discovery-only coverage is useful engineering evidence, but it is never labeled as a physical pass.
+SAS discovery and narrowly allowlisted lab rewind/unload are implemented, but they are not a backup engine or physical qualification. The next release gate requires a designated TrueNAS 25.10.8 qualification host, real drives/changer and scratch media, a pinned mature engine and on-tape format, reproducible fixtures, and retained test evidence. Detection or a successful motion command is useful engineering evidence, but it is never labeled as a physical pass.
 
 ## License
 

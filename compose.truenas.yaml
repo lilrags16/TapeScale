@@ -1,6 +1,9 @@
 # Test-only TrueNAS deployment. Credentials are intentionally embedded.
-# The worker expects one standalone SAS tape drive at /dev/nst0. Change both
-# /dev/nst0 values below if TrueNAS exposes the non-rewinding node elsewhere.
+# The worker expects one standalone SAS tape drive at /dev/nst0. If TrueNAS
+# exposes /dev/nst1 instead, set TAPESCALE_TAPE_DEVICES and both sides of the
+# device mapping to /dev/nst1 so the container path matches Linux sysfs.
+# This lab stack exposes only status, rewind, and unload. Linux may finalize a
+# prior write with a filemark before motion, so use designated scratch media.
 # Paste this entire file into Apps > Discover Apps > Install via YAML.
 
 name: tapescale
@@ -21,6 +24,7 @@ x-tapescale-common: &tapescale-common
     - /tmp:size=128m,mode=1777
   environment: &tapescale-environment
     TAPESCALE_DEMO_MODE: "false"
+    TAPESCALE_LAB_TAPE_MOTION_ENABLED: "true"
     DATABASE_URL: postgresql://tapescale:tapescale_test_only_password@postgres:5432/tapescale
     RUST_LOG: tapescale=info,tower_http=info
   networks:
@@ -53,10 +57,11 @@ services:
   worker:
     <<: *tapescale-common
     entrypoint: [/usr/local/bin/tapescale-worker]
+    stop_grace_period: 30s
     user: "0:0"
     environment:
       <<: *tapescale-environment
-      TAPESCALE_WORKER_POLL_SECS: "30"
+      TAPESCALE_WORKER_POLL_SECS: "5"
       TAPESCALE_TAPE_DEVICES: /dev/nst0
       TAPESCALE_SYSFS_ROOT: /sys
       TAPESCALE_MT_PATH: /usr/bin/mt-st

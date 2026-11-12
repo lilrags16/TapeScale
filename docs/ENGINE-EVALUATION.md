@@ -18,6 +18,18 @@ The Bacula 15 documentation referenced by the specification is the initial study
 - documented tape and changer support;
 - an independently installable recovery path.
 
+Research checkpoint (12 November 2026): **Bacula Community 15.0.3 is the first G0 laboratory candidate, not a production selection or qualification result.** The lab adapter should evaluate the supported Baculum API v2 and allowlisted JSON console surfaces, use `btape` for designated-scratch-media drive/EOM exercises, and retain `bscan` clean-catalog recovery evidence. TapeScale must keep Bacula Director, Storage Daemon, and the engine catalog isolated; only the Storage Daemon receives the qualified tape/changer devices. Bareos remains the comparison fallback if any mandatory Bacula result fails.
+
+The candidate has a release-blocking encryption question: the documented Storage Daemon volume-encryption construction and its metadata coverage must be tested against the authenticated-encryption and independent-recovery requirements. A successful `btape` result alone selects neither the security pipeline nor the product format.
+
+Primary candidate references:
+
+- [Bacula Community 15.0.3 release](https://www.bacula.org/bacula-community-15-0-3-released/)
+- [Bacula 15 new features and JSON interfaces](https://www.bacula.org/15.0.x-manuals/en/main/New_Features_in_15_0_0.html)
+- [`btape` drive qualification](https://www.bacula.org/15.0.x-manuals/en/problems/Testing_Your_Tape_Drive_Wit.html)
+- [Baculum API](https://www.bacula.org/15.0.x-manuals/en/console/Baculum_API_Web_GUI_Tools.html)
+- [Bacula security behavior](https://www.bacula.org/15.0.x-manuals/en/main/Bacula_Security_Issues.html)
+
 Questions that must be answered with pinned-version evidence:
 
 - Is there a supported structured control surface for every required operation, or would critical state require parsing presentation-oriented `bconsole` output?

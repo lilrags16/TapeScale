@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
         None => anyhow::bail!("DATABASE_URL is required outside simulation mode"),
     };
 
-    let state = api::AppState::new(pool, config.demo_mode);
+    let state = api::AppState::new(pool, config.demo_mode, config.lab_tape_motion_enabled);
     let app = api::router(state, config.web_dir);
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await

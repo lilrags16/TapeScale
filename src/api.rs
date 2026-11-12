@@ -18,6 +18,7 @@ use tower_http::{
 use uuid::Uuid;
 
 use crate::{
+    device::SasMotionOperation,
     domain::path::validate_archive_path,
     engine::{simulator::SimulatorEngine, TapeEngine},
     error::AppError,
@@ -29,15 +30,17 @@ pub struct AppState {
     pub pool: Option<PgPool>,
     pub demo_mode: bool,
     pub engine: Arc<dyn TapeEngine>,
+    pub lab_tape_motion_enabled: bool,
 }
 
 impl AppState {
     #[must_use]
-    pub fn new(pool: Option<PgPool>, demo_mode: bool) -> Self {
+    pub fn new(pool: Option<PgPool>, demo_mode: bool, lab_tape_motion_enabled: bool) -> Self {
         Self {
             pool,
             demo_mode,
             engine: Arc::new(SimulatorEngine::new()),
+            lab_tape_motion_enabled,
         }
     }
 }
@@ -54,6 +57,7 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .route("/api/v1/media", get(media).post(create_media))
         .route("/api/v1/drives", get(drives))
         .route("/api/v1/drives/{id}/reconcile", post(reconcile_drive))
+        .route("/api/v1/drives/{id}/actions", post(queue_drive_action))
         .route("/api/v1/movements", get(movements))
         .route("/api/v1/movements/{id}/confirm", post(confirm_movement))
         .route("/api/v1/verification", get(verification))
@@ -121,6 +125,7 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
         "backend_language":"Rust",
         "engine":identity,
         "capabilities":capabilities,
+        "lab_tape_motion_enabled":state.lab_tape_motion_enabled,
         "operational_data":"postgresql_only"
     })))
 }
@@ -272,14 +277,17 @@ async fn create_media(
 }
 
 async fn drives(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let (drives, slots) = match state.pool.as_ref() {
+    let (drives, slots, operations) = match state.pool.as_ref() {
         Some(pool) => (
             store::list_drives(pool).await?,
             store::list_slots(pool).await?,
+            store::list_drive_operations(pool).await?,
         ),
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
-    Ok(Json(json!({"drives":drives,"slots":slots})))
+    Ok(Json(
+        json!({"drives":drives,"slots":slots,"operations":operations}),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,9 +321,89 @@ async fn reconcile_drive(
         }))),
         store::ReconcileDriveResult::NotFound => Err(AppError::NotFound),
         store::ReconcileDriveResult::Blocked => Err(AppError::Blocked(
-            "drive reconciliation requires the exact observed stable identity, current device access, no identity conflict, and a known tape position"
+            "drive reconciliation requires the exact observed stable identity, current device access, no identity conflict, no outstanding tape I/O, and a fresh known position"
                 .to_owned(),
         )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DriveActionRequest {
+    stable_id: String,
+    action: SasMotionOperation,
+    confirmation: String,
+    scratch_media_confirmed: bool,
+}
+
+impl DriveActionRequest {
+    fn expected_confirmation(&self) -> String {
+        format!(
+            "{} SCRATCH MEDIA; PRIOR WRITE MAY BE FINALIZED",
+            self.action.as_str().to_ascii_uppercase()
+        )
+    }
+
+    fn validate(&self) -> Result<&str, AppError> {
+        let stable_id = self.stable_id.trim();
+        if stable_id.is_empty()
+            || stable_id.chars().count() > 512
+            || stable_id.chars().any(char::is_control)
+        {
+            return Err(AppError::Invalid(
+                "stable_id must contain 1 to 512 characters".to_owned(),
+            ));
+        }
+        if !self.scratch_media_confirmed {
+            return Err(AppError::Invalid(
+                "scratch_media_confirmed must be true for unqualified lab motion".to_owned(),
+            ));
+        }
+        if self.confirmation != self.expected_confirmation() {
+            return Err(AppError::Invalid(format!(
+                "confirmation must exactly equal {}",
+                self.expected_confirmation()
+            )));
+        }
+        Ok(stable_id)
+    }
+}
+
+async fn queue_drive_action(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<DriveActionRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    if !state.lab_tape_motion_enabled {
+        return Err(AppError::Blocked(
+            "unqualified lab tape motion is disabled; set TAPESCALE_LAB_TAPE_MOTION_ENABLED=true on the API and worker only for an attended test host"
+                .to_owned(),
+        ));
+    }
+    let pool = require_pool(&state)?;
+    let drive_id = Uuid::parse_str(&id)
+        .map_err(|_| AppError::Invalid("drive id must be a UUID".to_owned()))?;
+    let stable_id = request.validate()?;
+    match store::queue_drive_operation(
+        pool,
+        drive_id,
+        stable_id,
+        request.action,
+        request.scratch_media_confirmed,
+    )
+    .await?
+    {
+        store::QueueDriveOperationResult::Queued(operation) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "operation": operation,
+                "durability": "postgresql",
+                "audit": "appended",
+                "qualification": "unqualified_lab_motion",
+                "data_operations": "blocked"
+            })),
+        )),
+        store::QueueDriveOperationResult::NotFound => Err(AppError::NotFound),
+        store::QueueDriveOperationResult::Blocked(reason) => Err(AppError::Blocked(reason)),
     }
 }
 
@@ -570,5 +658,25 @@ mod tests {
         let mut request = valid_request();
         request.barcode = Some("   ".to_owned());
         assert_eq!(request.validate().expect("request is valid").barcode, None);
+    }
+
+    #[test]
+    fn drive_motion_requires_exact_closed_confirmation() {
+        let request = DriveActionRequest {
+            stable_id: "scsi:naa.5001".to_owned(),
+            action: SasMotionOperation::Rewind,
+            confirmation: "REWIND SCRATCH MEDIA; PRIOR WRITE MAY BE FINALIZED".to_owned(),
+            scratch_media_confirmed: true,
+        };
+        assert_eq!(
+            request.validate().expect("valid confirmation"),
+            request.stable_id
+        );
+
+        let invalid = DriveActionRequest {
+            confirmation: "rewind".to_owned(),
+            ..request
+        };
+        assert!(matches!(invalid.validate(), Err(AppError::Invalid(_))));
     }
 }

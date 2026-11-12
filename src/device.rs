@@ -1,7 +1,8 @@
-//! Read-only discovery for explicitly mapped Linux SCSI tape devices.
+//! Discovery and constrained lab motion for explicitly mapped Linux SCSI tape devices.
 //!
-//! Only identity and `mt status` are observed here. Motion, format, erase, file-mark, and data
-//! commands remain behind the qualified tape-engine boundary.
+//! Identity and `mt status` are read-only. A separately gated worker path may issue the two
+//! closed non-data motion operations below. Format, erase, label, file-mark, seek, spacing,
+//! retension, read, and write commands are not exposed.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -12,14 +13,17 @@ use std::{
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::tool_runner::{self, ToolCommand, ToolError};
+use crate::tool_runner::{self, ToolCommand, ToolError, ToolOutput};
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const STATUS_OUTPUT_LIMIT: usize = 16 * 1024;
+const MOTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MOTION_OUTPUT_LIMIT: usize = 16 * 1024;
+const MT_ST_NOWAIT: u64 = 0x2000;
 
 #[derive(Clone, Debug)]
 pub struct SasDiscoveryConfig {
@@ -57,10 +61,16 @@ pub struct SasDriveObservation {
     pub firmware: Option<String>,
     pub generation: Option<i16>,
     pub observed_path: String,
+    pub device_major: u64,
+    pub device_minor: u64,
     pub scsi_address: Option<String>,
     pub generic_path: Option<String>,
     pub sysfs_state: Option<String>,
     pub position_lost: Option<bool>,
+    pub driver_options: Option<u64>,
+    pub immediate_mode: Option<bool>,
+    pub in_flight: Option<u64>,
+    pub at_bot: Option<bool>,
     pub accessible: bool,
     pub ready: Option<bool>,
     pub medium_loaded: Option<bool>,
@@ -84,10 +94,16 @@ impl SasDriveObservation {
             "identity_verified": self.identity_verified,
             "identity_conflict": self.identity_conflict,
             "identity_basis": self.identity_basis,
+            "device_major": self.device_major,
+            "device_minor": self.device_minor,
             "scsi_address": self.scsi_address,
             "generic_path": self.generic_path,
             "sysfs_state": self.sysfs_state,
             "position_lost": self.position_lost,
+            "driver_options": self.driver_options,
+            "immediate_mode": self.immediate_mode,
+            "in_flight": self.in_flight,
+            "at_bot": self.at_bot,
             "capabilities": ["read_only_discovery", "mt_status"],
             "observation_source": "linux_scsi_tape",
             "observed_at": self.observed_at
@@ -109,6 +125,94 @@ pub enum SasProbeResult {
     Missing(MissingSasDrive),
 }
 
+/// Constrained scratch-media motion that may be issued directly to a reconciled SAS drive.
+///
+/// This deliberately excludes positioning, media formatting, explicit file marks, erase, density,
+/// compression, and every data operation. Callers cannot supply an arbitrary `mt-st` operation.
+/// Linux may still finalize another controller's prior write with a filemark before motion.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SasMotionOperation {
+    Rewind,
+    Unload,
+}
+
+impl SasMotionOperation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rewind => "rewind",
+            Self::Unload => "unload",
+        }
+    }
+
+    const fn mt_operation(self) -> &'static str {
+        match self {
+            Self::Rewind => "rewind",
+            // `mt-st offline` rewinds and, when supported, unloads the cartridge.
+            Self::Unload => "offline",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SasMotionError {
+    #[error("tape motion is not allowed for unconfigured device {device}")]
+    DeviceNotConfigured { device: PathBuf },
+    #[error("tape device binding is unsafe for {device}: {reason}")]
+    DeviceBinding { device: PathBuf, reason: String },
+    #[error(transparent)]
+    Tool(#[from] ToolError),
+}
+
+/// Execute one allowlisted motion command against an exact configured non-rewinding device.
+///
+/// Identity reconciliation, resource leasing, media policy, and authorization remain caller
+/// responsibilities. This function supplies no shell and accepts neither free-form operations nor
+/// arguments.
+pub async fn execute_sas_motion(
+    config: &SasDiscoveryConfig,
+    device: &Path,
+    operation: SasMotionOperation,
+    cancellation: &CancellationToken,
+) -> Result<ToolOutput, SasMotionError> {
+    let command = build_motion_command(config, device, operation)?;
+    verify_device_binding(config, device).map_err(|reason| SasMotionError::DeviceBinding {
+        device: device.to_owned(),
+        reason,
+    })?;
+    tool_runner::run(&command, cancellation)
+        .await
+        .map_err(SasMotionError::from)
+}
+
+fn build_motion_command(
+    config: &SasDiscoveryConfig,
+    device: &Path,
+    operation: SasMotionOperation,
+) -> Result<ToolCommand, SasMotionError> {
+    if validate_tape_path(device).is_err()
+        || !config
+            .devices
+            .iter()
+            .any(|configured| configured.as_path() == device)
+    {
+        return Err(SasMotionError::DeviceNotConfigured {
+            device: device.to_owned(),
+        });
+    }
+
+    let mut command = ToolCommand::new(&config.mt_path)
+        .args([
+            "-f".to_owned(),
+            device.display().to_string(),
+            operation.mt_operation().to_owned(),
+        ])
+        .timeout(MOTION_TIMEOUT);
+    command.retained_output_bytes = MOTION_OUTPUT_LIMIT;
+    Ok(command)
+}
+
 #[derive(Debug, Default)]
 struct SysfsIdentity {
     vendor: Option<String>,
@@ -120,6 +224,15 @@ struct SysfsIdentity {
     generic_path: Option<String>,
     state: Option<String>,
     position_lost: Option<bool>,
+    driver_options: Option<u64>,
+    immediate_mode: Option<bool>,
+    in_flight: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeviceNumbers {
+    major: u64,
+    minor: u64,
 }
 
 #[derive(Debug)]
@@ -127,6 +240,7 @@ struct MtStatus {
     accessible: bool,
     ready: Option<bool>,
     medium_loaded: Option<bool>,
+    at_bot: Option<bool>,
     status: String,
     detail: Option<String>,
     raw: Option<String>,
@@ -143,28 +257,16 @@ pub async fn discover_sas_drives(config: &SasDiscoveryConfig) -> Vec<SasProbeRes
 
 async fn probe_one(config: &SasDiscoveryConfig, device: &Path) -> SasProbeResult {
     let observed_at = Utc::now();
-    let metadata = match fs::metadata(device) {
-        Ok(metadata) => metadata,
-        Err(error) => {
+    let device_numbers = match verify_device_binding(config, device) {
+        Ok(numbers) => numbers,
+        Err(reason) => {
             return SasProbeResult::Missing(MissingSasDrive {
                 observed_path: device.display().to_string(),
-                reason: format!("device node is unavailable: {error}"),
+                reason,
                 observed_at,
             });
         }
     };
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        if !metadata.file_type().is_char_device() {
-            return SasProbeResult::Missing(MissingSasDrive {
-                observed_path: device.display().to_string(),
-                reason: "configured path is not a character device".to_owned(),
-                observed_at,
-            });
-        }
-    }
 
     let device_name = device
         .file_name()
@@ -172,7 +274,21 @@ async fn probe_one(config: &SasDiscoveryConfig, device: &Path) -> SasProbeResult
         .expect("validated tape paths always have a UTF-8 file name");
     let identity = read_sysfs_identity(&config.sysfs_root, device_name);
     let (stable_id, identity_basis, identity_verified) = stable_identity(&identity, device);
-    let mut mt_status = observe_mt_status(&config.mt_path, device).await;
+    let mut mt_status = if identity.in_flight.is_some_and(|count| count > 0) {
+        MtStatus {
+            accessible: true,
+            ready: None,
+            medium_loaded: None,
+            at_bot: None,
+            status: "io_in_flight".to_owned(),
+            detail: Some(
+                "the kernel reports an outstanding tape I/O; status probing is deferred".to_owned(),
+            ),
+            raw: None,
+        }
+    } else {
+        observe_mt_status(&config.mt_path, device).await
+    };
     apply_position_loss(identity.position_lost, &mut mt_status);
 
     SasProbeResult::Observed(Box::new(SasDriveObservation {
@@ -188,10 +304,16 @@ async fn probe_one(config: &SasDiscoveryConfig, device: &Path) -> SasProbeResult
         // Model names are not authoritative generation evidence.
         generation: None,
         observed_path: device.display().to_string(),
+        device_major: device_numbers.major,
+        device_minor: device_numbers.minor,
         scsi_address: identity.scsi_address,
         generic_path: identity.generic_path,
         sysfs_state: identity.state,
         position_lost: identity.position_lost,
+        driver_options: identity.driver_options,
+        immediate_mode: identity.immediate_mode,
+        in_flight: identity.in_flight,
+        at_bot: mt_status.at_bot,
         accessible: mt_status.accessible,
         ready: mt_status.ready,
         medium_loaded: mt_status.medium_loaded,
@@ -200,6 +322,69 @@ async fn probe_one(config: &SasDiscoveryConfig, device: &Path) -> SasProbeResult
         raw_status: mt_status.raw,
         observed_at,
     }))
+}
+
+fn verify_device_binding(
+    config: &SasDiscoveryConfig,
+    device: &Path,
+) -> Result<DeviceNumbers, String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = fs::symlink_metadata(device)
+        .map_err(|error| format!("device node is unavailable: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("configured tape paths must be direct device nodes, not symlinks".to_owned());
+    }
+    if !metadata.file_type().is_char_device() {
+        return Err("configured path is not a character device".to_owned());
+    }
+
+    let device_name = device
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "configured tape path has no UTF-8 device name".to_owned())?;
+    let expected_path = config
+        .sysfs_root
+        .join("class")
+        .join("scsi_tape")
+        .join(device_name)
+        .join("dev");
+    let expected_raw = fs::read_to_string(&expected_path).map_err(|error| {
+        format!(
+            "cannot bind the device node to {}: {error}",
+            expected_path.display()
+        )
+    })?;
+    let expected = parse_sysfs_device_numbers(&expected_raw).ok_or_else(|| {
+        format!(
+            "{} does not contain a valid major:minor device number",
+            expected_path.display()
+        )
+    })?;
+    let actual = linux_device_numbers(metadata.rdev());
+    if actual != expected {
+        return Err(format!(
+            "device node major:minor {}:{} does not match sysfs {}:{} for {device_name}",
+            actual.major, actual.minor, expected.major, expected.minor
+        ));
+    }
+    Ok(actual)
+}
+
+fn parse_sysfs_device_numbers(value: &str) -> Option<DeviceNumbers> {
+    let (major, minor) = value.trim().split_once(':')?;
+    Some(DeviceNumbers {
+        major: major.parse().ok()?,
+        minor: minor.parse().ok()?,
+    })
+}
+
+// Linux's userspace dev_t layout, matching the kernel's MAJOR/MINOR encoding.
+const fn linux_device_numbers(device: u64) -> DeviceNumbers {
+    DeviceNumbers {
+        major: ((device >> 8) & 0x0fff) | ((device >> 32) & 0xffff_f000),
+        minor: (device & 0x00ff) | ((device >> 12) & 0xffff_ff00),
+    }
 }
 
 fn parse_device_list(raw: &str) -> Result<Vec<PathBuf>> {
@@ -261,6 +446,18 @@ fn read_sysfs_identity(sysfs_root: &Path, device_name: &str) -> SysfsIdentity {
         .and_then(Result::ok)
         .and_then(|entry| entry.file_name().into_string().ok())
         .map(|name| format!("/dev/{name}"));
+    let driver_options =
+        read_trimmed(tape_class.join("options")).and_then(|value| parse_sysfs_u64(&value));
+    let mode_zero_name = device_name.strip_prefix('n').unwrap_or(device_name);
+    let in_flight = read_trimmed(
+        sysfs_root
+            .join("class")
+            .join("scsi_tape")
+            .join(mode_zero_name)
+            .join("stats")
+            .join("in_flight"),
+    )
+    .and_then(|value| parse_sysfs_u64(&value));
 
     SysfsIdentity {
         vendor: read_trimmed(device.join("vendor")),
@@ -273,6 +470,9 @@ fn read_sysfs_identity(sysfs_root: &Path, device_name: &str) -> SysfsIdentity {
         state: read_trimmed(device.join("state")),
         position_lost: read_trimmed(tape_class.join("position_lost_in_reset"))
             .and_then(|value| parse_sysfs_bool(&value)),
+        driver_options,
+        immediate_mode: driver_options.map(|options| options & MT_ST_NOWAIT != 0),
+        in_flight,
     }
 }
 
@@ -284,9 +484,21 @@ fn parse_sysfs_bool(value: &str) -> Option<bool> {
     }
 }
 
+fn parse_sysfs_u64(value: &str) -> Option<u64> {
+    let value = value.trim();
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse::<u64>().ok(),
+            |hex| u64::from_str_radix(hex, 16).ok(),
+        )
+}
+
 fn apply_position_loss(position_lost: Option<bool>, status: &mut MtStatus) {
     if position_lost == Some(true) {
         status.ready = Some(false);
+        status.at_bot = None;
         status.status = "position_lost".to_owned();
         status.detail = Some(
             "the kernel reports tape position was lost during reset; physical operations are blocked"
@@ -447,12 +659,30 @@ fn parse_mt_success(stdout: &str, stderr: &str) -> MtStatus {
     let uppercase = raw.to_ascii_uppercase();
     let no_media = uppercase.contains("NO MEDIUM") || uppercase.contains("DR_OPEN");
     let online = uppercase.contains("ONLINE") && !no_media;
+    let (ready, medium_loaded, status, detail) = if online {
+        (Some(true), Some(true), "ready", None)
+    } else if no_media {
+        (
+            Some(false),
+            Some(false),
+            "no_media",
+            Some("drive affirmatively reported no medium".to_owned()),
+        )
+    } else {
+        (
+            None,
+            None,
+            "status_unknown",
+            Some("drive responded without a recognized loaded or empty status".to_owned()),
+        )
+    };
     MtStatus {
         accessible: true,
-        ready: Some(online),
-        medium_loaded: Some(online),
-        status: if online { "ready" } else { "no_media" }.to_owned(),
-        detail: (!online).then(|| "drive responded but no ready medium was reported".to_owned()),
+        ready,
+        medium_loaded,
+        at_bot: online.then_some(uppercase.contains("BOT")),
+        status: status.to_owned(),
+        detail,
         raw: (!raw.is_empty()).then_some(raw),
     }
 }
@@ -491,6 +721,7 @@ fn parse_mt_error(error: ToolError) -> MtStatus {
         accessible: no_media,
         ready: no_media.then_some(false),
         medium_loaded: no_media.then_some(false),
+        at_bot: None,
         status: status.to_owned(),
         detail: Some(detail),
         raw: None,
@@ -529,6 +760,14 @@ fn mark_duplicate_identities(results: &mut [SasProbeResult]) {
 mod tests {
     use super::*;
 
+    fn motion_config(devices: &[&str], mt_path: &str) -> SasDiscoveryConfig {
+        SasDiscoveryConfig {
+            devices: devices.iter().map(PathBuf::from).collect(),
+            sysfs_root: PathBuf::from("/sys"),
+            mt_path: PathBuf::from(mt_path),
+        }
+    }
+
     #[test]
     fn only_explicit_non_rewinding_devices_are_accepted() {
         assert_eq!(
@@ -544,6 +783,83 @@ mod tests {
         ] {
             assert!(parse_device_list(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn motion_commands_are_a_closed_exact_allowlist() {
+        let config = motion_config(&["/dev/nst0"], "/usr/bin/mt-st");
+        for (operation, expected) in [
+            (SasMotionOperation::Rewind, "rewind"),
+            (SasMotionOperation::Unload, "offline"),
+        ] {
+            let command = build_motion_command(&config, Path::new("/dev/nst0"), operation)
+                .expect("configured motion command");
+            assert_eq!(command.program, PathBuf::from("/usr/bin/mt-st"));
+            assert_eq!(command.args, ["-f", "/dev/nst0", expected]);
+            assert_eq!(command.timeout, MOTION_TIMEOUT);
+            assert_eq!(command.retained_output_bytes, MOTION_OUTPUT_LIMIT);
+            assert!(command.working_dir.is_none());
+        }
+    }
+
+    #[test]
+    fn motion_rejects_every_path_outside_the_exact_configuration() {
+        let config = motion_config(&["/dev/nst0", "/dev/st0"], "/usr/bin/mt-st");
+        for rejected in [
+            "/dev/nst1",
+            "/dev/st0",
+            "/dev/nst0/other",
+            "/dev/../dev/nst0",
+        ] {
+            assert!(matches!(
+                build_motion_command(&config, Path::new(rejected), SasMotionOperation::Rewind),
+                Err(SasMotionError::DeviceNotConfigured { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn device_binding_rejects_symlinks_and_major_minor_mismatches() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let root = tempfile::tempdir().expect("temporary sysfs root");
+        let link = root.path().join("nst0");
+        symlink("/dev/null", &link).expect("device symlink");
+        let config = SasDiscoveryConfig {
+            devices: vec![link.clone()],
+            sysfs_root: root.path().to_owned(),
+            mt_path: PathBuf::from("/usr/bin/mt-st"),
+        };
+        assert!(verify_device_binding(&config, &link)
+            .expect_err("symlinks must be rejected")
+            .contains("not symlinks"));
+
+        let class = root.path().join("class/scsi_tape/null");
+        fs::create_dir_all(&class).expect("fake sysfs class");
+        fs::write(class.join("dev"), "999:999\n").expect("fake sysfs dev number");
+        let null_config = SasDiscoveryConfig {
+            devices: vec![PathBuf::from("/dev/null")],
+            sysfs_root: root.path().to_owned(),
+            mt_path: PathBuf::from("/usr/bin/mt-st"),
+        };
+        assert!(verify_device_binding(&null_config, Path::new("/dev/null"))
+            .expect_err("mismatched node must be rejected")
+            .contains("does not match sysfs"));
+
+        let actual = linux_device_numbers(
+            fs::symlink_metadata("/dev/null")
+                .expect("null metadata")
+                .rdev(),
+        );
+        fs::write(
+            class.join("dev"),
+            format!("{}:{}\n", actual.major, actual.minor),
+        )
+        .expect("matching sysfs dev number");
+        assert_eq!(
+            verify_device_binding(&null_config, Path::new("/dev/null")),
+            Ok(actual)
+        );
     }
 
     #[test]
@@ -600,11 +916,19 @@ mod tests {
         assert!(ready.accessible);
         assert_eq!(ready.ready, Some(true));
         assert_eq!(ready.medium_loaded, Some(true));
+        assert_eq!(ready.at_bot, Some(true));
 
         let empty = parse_mt_success("General status bits on:\n DR_OPEN IM_REP_EN\n", "");
         assert!(empty.accessible);
         assert_eq!(empty.status, "no_media");
         assert_eq!(empty.medium_loaded, Some(false));
+        assert_eq!(empty.at_bot, None);
+
+        let unknown = parse_mt_success("SCSI tape drive status unavailable", "");
+        assert!(unknown.accessible);
+        assert_eq!(unknown.status, "status_unknown");
+        assert_eq!(unknown.ready, None);
+        assert_eq!(unknown.medium_loaded, None);
     }
 
     #[test]
@@ -621,10 +945,16 @@ mod tests {
             firmware: None,
             generation: None,
             observed_path: "/dev/nst0".to_owned(),
+            device_major: 9,
+            device_minor: 128,
             scsi_address: None,
             generic_path: None,
             sysfs_state: None,
             position_lost: Some(false),
+            driver_options: Some(0),
+            immediate_mode: Some(false),
+            in_flight: Some(0),
+            at_bot: None,
             accessible: true,
             ready: Some(false),
             medium_loaded: Some(false),
@@ -659,10 +989,18 @@ mod tests {
         let tape_class = root.path().join("class/scsi_tape/nst0");
         let device = tape_class.join("device");
         fs::create_dir_all(device.join("scsi_generic")).expect("create fake sysfs tree");
+        fs::create_dir_all(root.path().join("class/scsi_tape/st0/stats"))
+            .expect("create fake stats tree");
         fs::write(device.join("vendor"), "IBM     \n").expect("vendor");
         fs::write(device.join("model"), "ULT3580-TD8     \n").expect("model");
         fs::write(device.join("rev"), "J6M1\n").expect("firmware");
         fs::write(tape_class.join("position_lost_in_reset"), "1\n").expect("position flag");
+        fs::write(tape_class.join("options"), "0x2000\n").expect("driver options");
+        fs::write(
+            root.path().join("class/scsi_tape/st0/stats/in_flight"),
+            "2\n",
+        )
+        .expect("in-flight count");
         let serial = b"IBM123456";
         let mut page80 = vec![0, 0x80, 0, serial.len() as u8];
         page80.extend_from_slice(serial);
@@ -674,6 +1012,9 @@ mod tests {
         assert_eq!(identity.serial.as_deref(), Some("IBM123456"));
         assert_eq!(identity.firmware.as_deref(), Some("J6M1"));
         assert_eq!(identity.position_lost, Some(true));
+        assert_eq!(identity.driver_options, Some(MT_ST_NOWAIT));
+        assert_eq!(identity.immediate_mode, Some(true));
+        assert_eq!(identity.in_flight, Some(2));
     }
 
     #[test]
@@ -687,5 +1028,6 @@ mod tests {
         apply_position_loss(Some(true), &mut status);
         assert_eq!(status.ready, Some(false));
         assert_eq!(status.status, "position_lost");
+        assert_eq!(status.at_bot, None);
     }
 }

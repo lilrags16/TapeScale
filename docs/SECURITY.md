@@ -57,6 +57,8 @@ Media is write-protected in policy unless every overwrite-gate condition in [ARC
 - Exported or active-job media remains reserved against conflicting writes.
 - Destructive exceptional overrides cannot suppress the resulting protection gap or audit event.
 
+The preview's optional rewind/unload path is an isolated-lab exception, not the production authorization model. It requires an exact reconciled drive, known zero-in-flight kernel state, a durable fenced lease, and an explicit designated-scratch-media acknowledgement. Linux can finalize another controller's prior write with a filemark before motion, so the control must never be used with retained, production, unknown, or foreign media. The preview API has no accounts yet; when the lab flag is enabled, its network must be isolated and attended.
+
 ## External command execution
 
 Rust integrations invoke programs with an executable path and an argument array. They must not use `sh -c`, interpolate user data into command strings, or inherit an uncontrolled environment.

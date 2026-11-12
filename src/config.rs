@@ -10,6 +10,7 @@ pub struct Config {
     pub web_dir: PathBuf,
     pub database_connect_timeout: Duration,
     pub worker_poll_interval: Duration,
+    pub lab_tape_motion_enabled: bool,
 }
 
 impl Config {
@@ -22,6 +23,7 @@ impl Config {
         let web_dir = PathBuf::from(value("TAPESCALE_WEB_DIR", "web"));
         let database_connect_timeout = Duration::from_secs(parse("TAPESCALE_DB_TIMEOUT_SECS", 10)?);
         let worker_poll_interval = Duration::from_secs(parse("TAPESCALE_WORKER_POLL_SECS", 5)?);
+        let lab_tape_motion_enabled = parse_bool("TAPESCALE_LAB_TAPE_MOTION_ENABLED", false)?;
 
         Ok(Self {
             bind,
@@ -30,6 +32,7 @@ impl Config {
             web_dir,
             database_connect_timeout,
             worker_poll_interval,
+            lab_tape_motion_enabled,
         })
     }
 }

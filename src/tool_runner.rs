@@ -85,6 +85,11 @@ pub async fn run(
     cancellation: &CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
     validate_program(&command.program)?;
+    if cancellation.is_cancelled() {
+        return Err(ToolError::Cancelled {
+            program: command.program.clone(),
+        });
+    }
     let started = Instant::now();
     let mut child = Command::new(&command.program);
     child
@@ -111,15 +116,19 @@ pub async fn run(
             program: command.program.clone(), source
         })?,
         () = tokio::time::sleep(command.timeout) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            stdout_reader.abort();
+            stderr_reader.abort();
             return Err(ToolError::Timeout {
                 program: command.program.clone(), timeout: command.timeout
             });
         },
         () = cancellation.cancelled() => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            stdout_reader.abort();
+            stderr_reader.abort();
             return Err(ToolError::Cancelled { program: command.program.clone() });
         }
     };
@@ -243,6 +252,20 @@ mod tests {
             run(&command, &CancellationToken::new()).await,
             Err(ToolError::Timeout { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_tool_never_starts() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let marker = temporary.path().join("cancelled-command-marker");
+        let command = ToolCommand::new("/usr/bin/touch").args([marker.display().to_string()]);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            run(&command, &cancellation).await,
+            Err(ToolError::Cancelled { .. })
+        ));
+        assert!(!marker.exists());
     }
 
     #[tokio::test]
