@@ -8,6 +8,7 @@ pub mod api;
 pub mod bacula_catalog;
 pub mod bacula_runtime;
 pub mod config;
+pub mod custody_ops;
 pub mod data_path;
 pub mod data_run;
 pub mod device;
