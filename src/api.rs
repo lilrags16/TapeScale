@@ -21,6 +21,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::{
+    custody_ops::{self, CustodyActor, CustodyOpsError},
     data_path::{isolated_restore_destination, resolve_existing_selection, verify_read_only_mount},
     device::SasMotionOperation,
     domain::{
@@ -85,8 +86,15 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .route("/api/v1/drives", get(drives))
         .route("/api/v1/drives/{id}/reconcile", post(reconcile_drive))
         .route("/api/v1/drives/{id}/actions", post(queue_drive_action))
-        .route("/api/v1/movements", get(movements))
+        .route("/api/v1/locations", get(locations).post(create_location))
+        .route("/api/v1/movements", get(movements).post(create_movement))
+        .route("/api/v1/movements/{id}", get(movement))
         .route("/api/v1/movements/{id}/confirm", post(confirm_movement))
+        .route("/api/v1/movements/{id}/cancel", post(cancel_movement))
+        .route(
+            "/api/v1/movements/{id}/corrections",
+            post(correct_movement_custody),
+        )
         .route("/api/v1/verification", get(verification))
         .route("/api/v1/recovery-points", get(recovery_points))
         .route("/api/v1/recovery-points/{id}", get(recovery_point))
@@ -203,10 +211,11 @@ async fn overview(State(state): State<AppState>) -> Result<Json<Value>, AppError
 
     let summary = store::overview_counts(pool).await?;
     let sources = store::list_sources(pool).await?;
+    let actions = store::list_required_actions(pool).await?;
     Ok(Json(json!({
         "summary": summary,
         "sources": sources,
-        "actions": [],
+        "actions": actions,
         "storage": "postgresql"
     })))
 }
@@ -468,21 +477,182 @@ async fn queue_drive_action(
     }
 }
 
+async fn locations(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let locations = match state.pool.as_ref() {
+        Some(pool) => custody_ops::list_locations(pool)
+            .await
+            .map_err(map_custody_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({"locations":locations})))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateLocationApiRequest {
+    name: String,
+    kind: custody_ops::LocationKind,
+    #[serde(default = "empty_json_object")]
+    details: Value,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+async fn create_location(
+    State(state): State<AppState>,
+    Json(request): Json<CreateLocationApiRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let pool = require_pool(&state)?;
+    let location = custody_ops::create_location(
+        pool,
+        custody_ops::CreateLocationRequest {
+            name: request.name,
+            kind: request.kind,
+            details: request.details,
+            actor: custody_actor(request.actor.as_deref()),
+            correlation_id: Uuid::now_v7(),
+        },
+    )
+    .await
+    .map_err(map_custody_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "location": location,
+            "durability": "postgresql",
+            "audit": "appended"
+        })),
+    ))
+}
+
 async fn movements(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let movements = match state.pool.as_ref() {
-        Some(pool) => store::list_movements(pool).await?,
+        Some(pool) => custody_ops::list_movements(pool, custody_ops::MovementListQuery::default())
+            .await
+            .map_err(map_custody_error)?,
         None => Vec::new(),
     };
     Ok(Json(json!({"movements":movements})))
 }
 
 #[derive(Debug, Deserialize)]
+struct CreateMovementApiRequest {
+    #[serde(default)]
+    external_id: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    kind: custody_ops::MovementKind,
+    #[serde(default)]
+    source_location_id: Option<Uuid>,
+    destination_location_id: Uuid,
+    #[serde(default)]
+    transit_location_id: Option<Uuid>,
+    cartridge_ids: Vec<Uuid>,
+    #[serde(default)]
+    readiness: Option<Value>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    assigned_user_id: Option<Uuid>,
+    due_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+async fn create_movement(
+    State(state): State<AppState>,
+    Json(request): Json<CreateMovementApiRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let pool = require_pool(&state)?;
+    let request_id = Uuid::now_v7();
+    let idempotency_key = request
+        .idempotency_key
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("movement-create:{request_id}"));
+    let external_id = request
+        .external_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| generated_movement_external_id(&idempotency_key));
+    let mut readiness = request.readiness.unwrap_or_else(empty_json_object);
+    if !readiness.is_object() {
+        return Err(AppError::Invalid(
+            "readiness must be a JSON object".to_owned(),
+        ));
+    }
+    if let Some(reason) = request
+        .reason
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        readiness
+            .as_object_mut()
+            .expect("readiness was checked as an object")
+            .insert("reason".to_owned(), json!(reason));
+    }
+    let result = custody_ops::create_movement(
+        pool,
+        custody_ops::CreateMovementRequest {
+            external_id,
+            idempotency_key,
+            kind: request.kind,
+            source_location_id: request.source_location_id,
+            destination_location_id: request.destination_location_id,
+            transit_location_id: request.transit_location_id,
+            cartridge_ids: request.cartridge_ids,
+            readiness,
+            assigned_user_id: request.assigned_user_id,
+            due_at: request.due_at,
+            actor: custody_actor(request.actor.as_deref()),
+            correlation_id: Uuid::now_v7(),
+        },
+    )
+    .await
+    .map_err(map_custody_error)?;
+    let detail = custody_ops::get_movement(pool, result.movement_task_id)
+        .await
+        .map_err(map_custody_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "movement": detail,
+            "receipt": result,
+            "durability": "postgresql",
+            "audit": "appended",
+            "custody_changed": false
+        })),
+    ))
+}
+
+async fn movement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let detail = resolve_movement(pool, &id).await?;
+    Ok(Json(json!({"movement": detail})))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MovementConfirmationAction {
+    Departure,
+    Arrival,
+    Direct,
+}
+
+#[derive(Debug, Deserialize)]
 struct MovementConfirmation {
-    actor: String,
-    destination: String,
-    tape_ids: Vec<String>,
+    action: MovementConfirmationAction,
+    cartridge_ids: Vec<Uuid>,
+    expected_confirmation_version: i64,
+    physically_confirmed: bool,
+    #[serde(default)]
+    idempotency_key: Option<String>,
     #[serde(default)]
     note: String,
+    #[serde(default)]
+    actor: Option<String>,
 }
 
 async fn confirm_movement(
@@ -490,29 +660,140 @@ async fn confirm_movement(
     Path(id): Path<String>,
     Json(confirmation): Json<MovementConfirmation>,
 ) -> Result<Json<Value>, AppError> {
-    if confirmation.actor.trim().is_empty() || confirmation.destination.trim().is_empty() {
-        return Err(AppError::Invalid(
-            "actor and destination are required".to_owned(),
-        ));
-    }
-    if confirmation.tape_ids.is_empty() {
-        return Err(AppError::Blocked(
-            "custody cannot advance without physically confirmed tape identities".to_owned(),
-        ));
-    }
     let pool = require_pool(&state)?;
-    let exists = store::list_movements(pool)
-        .await?
-        .into_iter()
-        .any(|movement| movement.external_id == id || movement.id.to_string() == id);
-    if !exists {
-        return Err(AppError::NotFound);
+    let movement_id = resolve_movement_id(pool, &id).await?;
+    let operation_id = Uuid::now_v7();
+    let request = custody_ops::PhysicalConfirmationRequest {
+        cartridge_ids: confirmation.cartridge_ids,
+        idempotency_key: confirmation
+            .idempotency_key
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("movement-confirm:{operation_id}")),
+        expected_confirmation_version: confirmation.expected_confirmation_version,
+        physically_confirmed: confirmation.physically_confirmed,
+        note: confirmation.note,
+        actor: custody_actor(confirmation.actor.as_deref()),
+        correlation_id: Uuid::now_v7(),
+    };
+    let receipt = match confirmation.action {
+        MovementConfirmationAction::Departure => {
+            custody_ops::confirm_departure(pool, movement_id, request).await
+        }
+        MovementConfirmationAction::Arrival => {
+            custody_ops::confirm_arrival(pool, movement_id, request).await
+        }
+        MovementConfirmationAction::Direct => {
+            custody_ops::confirm_direct_move(pool, movement_id, request).await
+        }
     }
+    .map_err(map_custody_error)?;
+    let detail = custody_ops::get_movement(pool, movement_id)
+        .await
+        .map_err(map_custody_error)?;
+    Ok(Json(json!({
+        "movement": detail,
+        "receipt": receipt,
+        "durability": "postgresql",
+        "audit": "appended",
+        "custody_changed": true
+    })))
+}
 
-    let _ = confirmation.note;
-    Err(AppError::Blocked(
-        "durable movement confirmation is not implemented yet; no custody state was changed"
-            .to_owned(),
+#[derive(Debug, Deserialize)]
+struct CancelMovementApiRequest {
+    expected_confirmation_version: i64,
+    reason: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+async fn cancel_movement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<CancelMovementApiRequest>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let movement_id = resolve_movement_id(pool, &id).await?;
+    let operation_id = Uuid::now_v7();
+    let receipt = custody_ops::cancel_movement(
+        pool,
+        movement_id,
+        custody_ops::CancelMovementRequest {
+            idempotency_key: request
+                .idempotency_key
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| format!("movement-cancel:{operation_id}")),
+            expected_confirmation_version: request.expected_confirmation_version,
+            reason: request.reason,
+            actor: custody_actor(request.actor.as_deref()),
+            correlation_id: Uuid::now_v7(),
+        },
+    )
+    .await
+    .map_err(map_custody_error)?;
+    let detail = custody_ops::get_movement(pool, movement_id)
+        .await
+        .map_err(map_custody_error)?;
+    Ok(Json(
+        json!({"movement":detail,"receipt":receipt,"custody_changed":false}),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct CorrectMovementCustodyApiRequest {
+    corrects_event_id: Uuid,
+    cartridge_id: Uuid,
+    #[serde(default)]
+    expected_current_location_id: Option<Uuid>,
+    confirmed_location_id: Uuid,
+    expected_confirmation_version: i64,
+    physically_confirmed: bool,
+    note: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+async fn correct_movement_custody(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<CorrectMovementCustodyApiRequest>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let movement_id = resolve_movement_id(pool, &id).await?;
+    let operation_id = Uuid::now_v7();
+    let receipt = custody_ops::append_custody_correction(
+        pool,
+        movement_id,
+        custody_ops::AppendCorrectionRequest {
+            corrects_event_id: request.corrects_event_id,
+            cartridge_id: request.cartridge_id,
+            expected_current_location_id: request.expected_current_location_id,
+            confirmed_location_id: request.confirmed_location_id,
+            idempotency_key: request
+                .idempotency_key
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| format!("movement-correction:{operation_id}")),
+            expected_confirmation_version: request.expected_confirmation_version,
+            physically_confirmed: request.physically_confirmed,
+            note: request.note,
+            actor: custody_actor(request.actor.as_deref()),
+            correlation_id: Uuid::now_v7(),
+        },
+    )
+    .await
+    .map_err(map_custody_error)?;
+    let detail = custody_ops::get_movement(pool, movement_id)
+        .await
+        .map_err(map_custody_error)?;
+    Ok(Json(
+        json!({"movement":detail,"receipt":receipt,"custody_changed":true}),
     ))
 }
 
@@ -1402,6 +1683,75 @@ fn require_pool(state: &AppState) -> Result<&PgPool, AppError> {
     })
 }
 
+fn empty_json_object() -> Value {
+    json!({})
+}
+
+fn generated_movement_external_id(idempotency_key: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(idempotency_key.as_bytes()));
+    format!("TS-MOVE-{}", &digest[..24])
+}
+
+fn custody_actor(label: Option<&str>) -> CustodyActor {
+    let label = label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local-operator")
+        .to_owned();
+    CustodyActor {
+        user_id: None,
+        label,
+    }
+}
+
+fn map_custody_error(error: CustodyOpsError) -> AppError {
+    match error {
+        CustodyOpsError::NotFound { .. } => AppError::NotFound,
+        CustodyOpsError::Invalid { field, message } => {
+            AppError::Invalid(format!("{field}: {message}"))
+        }
+        CustodyOpsError::Conflict { code, message } => {
+            AppError::Conflict(format!("{code}: {message}"))
+        }
+        CustodyOpsError::StaleVersion { expected, actual } => AppError::Conflict(format!(
+            "movement changed after it was opened (expected version {expected}, current version {actual}); refresh before confirming"
+        )),
+        CustodyOpsError::WrongSource {
+            cartridge_id,
+            expected_location_id,
+            actual_location_id,
+        } => AppError::Conflict(format!(
+            "cartridge {cartridge_id} is at {actual_location_id:?}, not the movement source {expected_location_id:?}"
+        )),
+        CustodyOpsError::ReservationConflict {
+            cartridge_id,
+            reserved_by,
+        } => AppError::Conflict(format!(
+            "cartridge {cartridge_id} is reserved by {reserved_by}"
+        )),
+        CustodyOpsError::IdempotencyConflict { key } => AppError::Conflict(format!(
+            "idempotency key {key:?} was already used for a different request"
+        )),
+        CustodyOpsError::Invariant(message) => AppError::Internal(message),
+        CustodyOpsError::Database(source) => AppError::Database(source),
+    }
+}
+
+async fn resolve_movement(
+    pool: &PgPool,
+    id: &str,
+) -> Result<custody_ops::MovementDetail, AppError> {
+    match Uuid::parse_str(id) {
+        Ok(id) => custody_ops::get_movement(pool, id).await,
+        Err(_) => custody_ops::get_movement_by_external_id(pool, id).await,
+    }
+    .map_err(map_custody_error)
+}
+
+async fn resolve_movement_id(pool: &PgPool, id: &str) -> Result<Uuid, AppError> {
+    Ok(resolve_movement(pool, id).await?.summary.id)
+}
+
 fn runtime_mode(state: &AppState) -> &'static str {
     if state.demo_mode {
         "simulation"
@@ -1771,5 +2121,17 @@ mod tests {
             String::from_utf8(encoded).expect("JSON is UTF-8"),
             r#"{"a":{"b":3,"y":2},"z":1}"#
         );
+    }
+
+    #[test]
+    fn generated_movement_reference_is_stable_for_idempotent_retries() {
+        let first = generated_movement_external_id("movement-create:browser-operation-42");
+        let retry = generated_movement_external_id("movement-create:browser-operation-42");
+        let other = generated_movement_external_id("movement-create:browser-operation-43");
+
+        assert_eq!(first, retry);
+        assert_ne!(first, other);
+        assert!(first.starts_with("TS-MOVE-"));
+        assert_eq!(first.len(), 32);
     }
 }

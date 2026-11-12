@@ -24,6 +24,16 @@ pub struct OverviewCounts {
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RequiredActionRecord {
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+    pub state: String,
+    pub due_at: Option<DateTime<Utc>>,
+    pub route: String,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
 pub struct SourceRecord {
     pub id: Uuid,
     pub dataset_name: String,
@@ -857,11 +867,66 @@ pub async fn overview_counts(pool: &PgPool) -> Result<OverviewCounts, sqlx::Erro
                AND finished_at IS NULL) AS active_jobs,
             ((SELECT count(*) FROM job_runs
               WHERE state IN ('waiting_for_media','blocked','interrupted','failed')
-                AND finished_at IS NULL) +
+                AND (finished_at IS NULL OR finished_at >= now() - interval '7 days')) +
              (SELECT count(*) FROM movement_tasks
               WHERE state IN ('ready','departed','partially_confirmed','overdue','blocked'))) AS required_actions",
     )
     .fetch_one(pool)
+    .await
+}
+
+pub async fn list_required_actions(
+    pool: &PgPool,
+) -> Result<Vec<RequiredActionRecord>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT action.id, action.title, action.detail, action.state,
+                action.due_at, action.route
+         FROM (
+             SELECT movement.id::text AS id,
+                    CASE movement.state
+                        WHEN 'overdue' THEN 'Overdue tape movement'
+                        WHEN 'blocked' THEN 'Blocked tape movement'
+                        WHEN 'departed' THEN 'Confirm tape arrival'
+                        WHEN 'partially_confirmed' THEN 'Complete partial tape delivery'
+                        ELSE 'Tape movement ready'
+                    END AS title,
+                    concat_ws(' · ',
+                        COALESCE(source.name, 'Unknown custody') || ' → ' || destination.name,
+                        movement.external_id,
+                        cardinality(movement.required_media_ids)::text || ' tape(s)') AS detail,
+                    movement.state,
+                    movement.due_at,
+                    'movements/' || movement.id::text AS route,
+                    movement.updated_at AS sort_at
+             FROM movement_tasks movement
+             LEFT JOIN locations source ON source.id = movement.source_location_id
+             JOIN locations destination ON destination.id = movement.destination_location_id
+             WHERE movement.state IN (
+                 'ready', 'departed', 'partially_confirmed', 'overdue', 'blocked'
+             )
+             UNION ALL
+             SELECT run.id::text,
+                    CASE run.state
+                        WHEN 'waiting_for_media' THEN 'Job is waiting for media'
+                        WHEN 'interrupted' THEN 'Job was interrupted'
+                        WHEN 'failed' THEN 'Job failed'
+                        ELSE 'Job is blocked'
+                    END,
+                    concat_ws(' · ', job.external_id, run.failure_class),
+                    run.state,
+                    NULL::timestamptz,
+                    'jobs'::text,
+                    COALESCE(run.finished_at, run.started_at, run.created_at)
+             FROM job_runs run
+             JOIN jobs job ON job.id = run.job_id
+             WHERE run.state IN ('waiting_for_media', 'blocked', 'interrupted', 'failed')
+               AND (run.finished_at IS NULL OR run.finished_at >= now() - interval '7 days')
+         ) action
+         ORDER BY (action.state = 'overdue') DESC,
+                  action.due_at NULLS LAST, action.sort_at DESC
+         LIMIT 100",
+    )
+    .fetch_all(pool)
     .await
 }
 

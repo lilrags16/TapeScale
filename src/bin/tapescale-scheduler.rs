@@ -2,7 +2,12 @@ use anyhow::Result;
 use chrono::Utc;
 use chrono_tz::Tz;
 use clap::Parser;
-use tapescale::{config::Config, domain::schedule::next_default_occurrence, store};
+use tapescale::{
+    config::Config,
+    custody_ops::{self, CustodyActor, ReconcileOverdueRequest},
+    domain::schedule::next_default_occurrence,
+    store,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -51,15 +56,32 @@ async fn main() -> Result<()> {
 
 async fn evaluate_once(pool: Option<&sqlx::PgPool>, timezone: Tz) -> Result<()> {
     let next = next_default_occurrence(Utc::now(), timezone);
-    let enabled_policies = if let Some(pool) = pool {
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM protection_policies WHERE enabled")
-            .fetch_one(pool)
-            .await?
+    let (enabled_policies, newly_overdue_movements) = if let Some(pool) = pool {
+        let enabled =
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM protection_policies WHERE enabled")
+                .fetch_one(pool)
+                .await?;
+        let overdue = custody_ops::reconcile_overdue_movements(
+            pool,
+            ReconcileOverdueRequest {
+                as_of: Utc::now(),
+                actor: CustodyActor {
+                    user_id: None,
+                    label: "tapescale-scheduler".to_owned(),
+                },
+                correlation_id: uuid::Uuid::now_v7(),
+            },
+        )
+        .await?
+        .newly_overdue_task_ids
+        .len();
+        (enabled, overdue)
     } else {
-        0
+        (0, 0)
     };
     info!(
         enabled_policies,
+        newly_overdue_movements,
         occurrence_id = %next.id,
         kind = ?next.kind,
         scheduled_for = %next.scheduled_for,

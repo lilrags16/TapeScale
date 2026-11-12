@@ -1073,6 +1073,287 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         1
     );
 
+    let onsite_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/locations".to_owned(),
+        Some(json!({
+            "name": "Integration library room",
+            "kind": "onsite",
+            "details": {"purpose":"primary tape storage"},
+            "actor": "integration operator"
+        })),
+    )
+    .await;
+    assert_eq!(onsite_response.status(), StatusCode::CREATED);
+    let onsite = response_json(onsite_response).await;
+    let onsite_id = uuid::Uuid::parse_str(
+        onsite["location"]["id"]
+            .as_str()
+            .expect("created location should have an id"),
+    )
+    .expect("onsite id should parse");
+    let vault_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/locations".to_owned(),
+        Some(json!({
+            "name": "Integration off-site vault",
+            "kind": "offsite",
+            "actor": "integration operator"
+        })),
+    )
+    .await;
+    assert_eq!(vault_response.status(), StatusCode::CREATED);
+    let vault = response_json(vault_response).await;
+    let vault_id = uuid::Uuid::parse_str(
+        vault["location"]["id"]
+            .as_str()
+            .expect("created vault should have an id"),
+    )
+    .expect("vault id should parse");
+
+    let onboarding_body = json!({
+        "idempotency_key": "integration-create-onboard-001",
+        "kind": "return",
+        "source_location_id": null,
+        "destination_location_id": onsite_id,
+        "cartridge_ids": [scratch.id, created.id],
+        "reason": "Establish confirmed custody for registered cartridges",
+        "due_at": Utc::now() + chrono::TimeDelta::hours(1),
+        "actor": "integration operator"
+    });
+    let onboarding_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/movements".to_owned(),
+        Some(onboarding_body.clone()),
+    )
+    .await;
+    assert_eq!(onboarding_response.status(), StatusCode::CREATED);
+    let onboarding = response_json(onboarding_response).await;
+    assert_eq!(onboarding["movement"]["summary"]["state"], "ready");
+    assert_eq!(
+        onboarding["movement"]["summary"]["source_name"],
+        Value::Null
+    );
+    assert_eq!(onboarding["movement"]["summary"]["media_total"], 2);
+    let onboarding_id = onboarding["movement"]["summary"]["id"]
+        .as_str()
+        .expect("onboarding movement should return an id")
+        .to_owned();
+    let onboarding_create_replay = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/movements".to_owned(),
+        Some(onboarding_body),
+    )
+    .await;
+    assert_eq!(onboarding_create_replay.status(), StatusCode::CREATED);
+    let onboarding_create_replay = response_json(onboarding_create_replay).await;
+    assert_eq!(
+        onboarding_create_replay["receipt"]["idempotent_replay"],
+        true
+    );
+    assert_eq!(
+        onboarding_create_replay["movement"]["summary"]["id"],
+        onboarding_id
+    );
+    let onboarding_confirm = json!({
+        "action": "direct",
+        "cartridge_ids": [scratch.id, created.id],
+        "expected_confirmation_version": 0,
+        "idempotency_key": "integration-confirm-onboard-001",
+        "physically_confirmed": true,
+        "note": "Both physical labels checked in the library room",
+        "actor": "integration operator"
+    });
+    let onboarding_confirmation = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/movements/{onboarding_id}/confirm"),
+        Some(onboarding_confirm.clone()),
+    )
+    .await;
+    assert_eq!(onboarding_confirmation.status(), StatusCode::OK);
+    let onboarding_confirmation = response_json(onboarding_confirmation).await;
+    assert_eq!(
+        onboarding_confirmation["movement"]["summary"]["state"],
+        "confirmed"
+    );
+    assert_eq!(
+        onboarding_confirmation["receipt"]["confirmation_version"],
+        1
+    );
+    assert_eq!(
+        onboarding_confirmation["receipt"]["idempotent_replay"],
+        false
+    );
+
+    let replay = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/movements/{onboarding_id}/confirm"),
+        Some(onboarding_confirm),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay = response_json(replay).await;
+    assert_eq!(replay["receipt"]["idempotent_replay"], true);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM custody_events
+             WHERE movement_task_id = $1 AND event_type = 'direct_move_confirmed'",
+        )
+        .bind(uuid::Uuid::parse_str(&onboarding_id).expect("movement id should parse"))
+        .fetch_one(&pool)
+        .await
+        .expect("idempotent custody event count should query"),
+        2
+    );
+
+    let offsite_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/movements".to_owned(),
+        Some(json!({
+            "external_id": "INT-MOVE-OFFSITE-001",
+            "idempotency_key": "integration-create-offsite-001",
+            "kind": "take_offsite",
+            "source_location_id": onsite_id,
+            "destination_location_id": vault_id,
+            "cartridge_ids": [scratch.id, created.id],
+            "reason": "Prove partial and complete off-site custody",
+            "due_at": Utc::now() + chrono::TimeDelta::hours(1),
+            "actor": "integration operator"
+        })),
+    )
+    .await;
+    assert_eq!(offsite_response.status(), StatusCode::CREATED);
+    let offsite = response_json(offsite_response).await;
+    let offsite_id = offsite["movement"]["summary"]["id"]
+        .as_str()
+        .expect("off-site movement should return an id")
+        .to_owned();
+
+    let first_delivery = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/movements/{offsite_id}/confirm"),
+        Some(json!({
+            "action": "direct",
+            "cartridge_ids": [scratch.id],
+            "expected_confirmation_version": 0,
+            "idempotency_key": "integration-offsite-partial-001",
+            "physically_confirmed": true,
+            "note": "First cartridge received at vault",
+            "actor": "vault operator"
+        })),
+    )
+    .await;
+    assert_eq!(first_delivery.status(), StatusCode::OK);
+    let first_delivery = response_json(first_delivery).await;
+    assert_eq!(
+        first_delivery["movement"]["summary"]["state"],
+        "partially_confirmed"
+    );
+    assert_eq!(first_delivery["movement"]["summary"]["media_confirmed"], 1);
+    assert_eq!(first_delivery["movement"]["summary"]["media_planned"], 1);
+    let locations_after_partial =
+        sqlx::query_as::<_, (uuid::Uuid, Option<uuid::Uuid>, Option<String>)>(
+            "SELECT id, confirmed_location_id, reserved_by
+         FROM cartridges WHERE id = ANY($1::uuid[]) ORDER BY id",
+        )
+        .bind(vec![scratch.id, created.id])
+        .fetch_all(&pool)
+        .await
+        .expect("partial custody projection should query");
+    assert!(locations_after_partial
+        .iter()
+        .any(|row| { row.0 == scratch.id && row.1 == Some(vault_id) && row.2.is_none() }));
+    assert!(locations_after_partial.iter().any(|row| {
+        row.0 == created.id
+            && row.1 == Some(onsite_id)
+            && row
+                .2
+                .as_deref()
+                .is_some_and(|reservation| reservation.starts_with("movement:"))
+    }));
+
+    let completed_delivery = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/movements/{offsite_id}/confirm"),
+        Some(json!({
+            "action": "direct",
+            "cartridge_ids": [created.id],
+            "expected_confirmation_version": 1,
+            "idempotency_key": "integration-offsite-complete-001",
+            "physically_confirmed": true,
+            "note": "Second cartridge received at vault",
+            "actor": "vault operator"
+        })),
+    )
+    .await;
+    assert_eq!(completed_delivery.status(), StatusCode::OK);
+    let completed_delivery = response_json(completed_delivery).await;
+    assert_eq!(
+        completed_delivery["movement"]["summary"]["state"],
+        "confirmed"
+    );
+    assert_eq!(
+        completed_delivery["movement"]["summary"]["media_confirmed"],
+        2
+    );
+
+    let ready_plan_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/restores/plan".to_owned(),
+        Some(json!({
+            "recovery_point_id": recovery_point_id,
+            "mode": "file_archive",
+            "destination": "planned-restores/integration-ready-recovery",
+            "conflict_policy": "skip",
+            "destination_approved": true,
+            "is_new_destination": true,
+            "acl_semantics_supported": true,
+            "identity_mapping_complete": true,
+            "estimated_required_bytes": 4096,
+            "available_bytes": 1048576,
+            "required_free_reserve_bytes": 4096,
+            "automatic_publication_requested": false
+        })),
+    )
+    .await;
+    assert_eq!(ready_plan_response.status(), StatusCode::CREATED);
+    let ready_plan = response_json(ready_plan_response).await;
+    assert_eq!(ready_plan["plan"]["ready"], true);
+    assert_eq!(ready_plan["plan"]["blockers"], json!([]));
+    assert_eq!(
+        ready_plan["plan"]["volumes"][0]["location_name"],
+        "Integration off-site vault"
+    );
+    assert!(
+        ready_plan["plan"]["volumes"][0]["compatible_qualified_drives"]
+            .as_array()
+            .is_some_and(|drives| !drives.is_empty())
+    );
+
+    let movement_actions = store::list_required_actions(&pool)
+        .await
+        .expect("required-action feed should query");
+    assert!(movement_actions
+        .iter()
+        .all(|action| action.id != offsite_id));
+    assert_eq!(
+        store::overview_counts(&pool)
+            .await
+            .expect("required-action summary should query")
+            .required_actions,
+        i64::try_from(movement_actions.len()).expect("fixture action count should fit in i64")
+    );
+
     let data_events = store::single_tape_data_events(&pool, queued_data_run.id)
         .await
         .expect("data-run events should reload");
