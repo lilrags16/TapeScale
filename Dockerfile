@@ -32,7 +32,7 @@ RUN echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/$
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 tapescale \
     && useradd --system --uid 10001 --gid tapescale --home-dir /var/lib/tapescale tapescale \
-    && install -d -o tapescale -g tapescale \
+    && install -d -m 0770 -o tapescale -g root \
          /var/lib/tapescale \
          /var/lib/tapescale/bacula \
          /var/lib/tapescale/bacula/qualifications \

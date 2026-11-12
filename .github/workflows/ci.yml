@@ -58,3 +58,16 @@ jobs:
           docker compose --file compose.truenas.yaml config --quiet
       - name: Build runtime image
         run: docker build --tag tapescale:ci .
+      - name: Verify capability-free worker state access
+        run: |
+          docker volume create tapescale-ci-engine-state
+          docker run --rm \
+            --entrypoint /bin/sh \
+            --user 0:0 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --read-only \
+            --volume tapescale-ci-engine-state:/var/lib/tapescale/bacula \
+            tapescale:ci \
+            -ec 'test "$(stat -c "%u:%g:%a" /var/lib/tapescale/bacula/qualifications)" = "10001:0:770"; mkdir /var/lib/tapescale/bacula/qualifications/ci-write-test; touch /var/lib/tapescale/bacula/qualifications/ci-write-test/bacula-sd.conf'
+          docker volume rm tapescale-ci-engine-state

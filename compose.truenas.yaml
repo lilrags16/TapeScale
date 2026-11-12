@@ -13,8 +13,8 @@ x-tapescale-common: &tapescale-common
   build:
     context: https://github.com/lilrags16/TapeScale.git#main
     args:
-      TAPESCALE_VERSION: 0.1.0-test.5
-  image: tapescale:0.1.0-test.5
+      TAPESCALE_VERSION: 0.1.0-test.6
+  image: tapescale:0.1.0-test.6
   pull_policy: build
   restart: unless-stopped
   read_only: true
@@ -75,9 +75,9 @@ services:
     devices:
       - /dev/nst0:/dev/nst0:rwm
     volumes:
-      - recovery_exports:/var/lib/tapescale/recovery
-      - spool:/var/lib/tapescale/spool
-      - engine_state:/var/lib/tapescale/bacula
+      - worker_recovery:/var/lib/tapescale/recovery
+      - worker_spool:/var/lib/tapescale/spool
+      - worker_engine_state:/var/lib/tapescale/bacula
     deploy:
       resources:
         limits:
@@ -136,9 +136,12 @@ services:
 
 volumes:
   postgres_data:
-  recovery_exports:
-  spool:
-  engine_state:
+  # These one-time replacement names force Docker to copy the corrected
+  # UID 10001/GID 0 mode-0770 ownership from the test.6 image. PostgreSQL is
+  # unchanged, so inventory and qualification history remain intact.
+  worker_recovery:
+  worker_spool:
+  worker_engine_state:
 
 networks:
   edge:
