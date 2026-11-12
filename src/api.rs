@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use axum::{
     extract::{Path, State},
@@ -10,20 +10,17 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use tokio::sync::RwLock;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
-use uuid::Uuid;
 
 use crate::{
-    demo,
     domain::path::validate_archive_path,
     engine::{simulator::SimulatorEngine, TapeEngine},
     error::AppError,
-    store, VERSION,
+    qualification, store, VERSION,
 };
 
 #[derive(Clone)]
@@ -31,7 +28,6 @@ pub struct AppState {
     pub pool: Option<PgPool>,
     pub demo_mode: bool,
     pub engine: Arc<dyn TapeEngine>,
-    confirmations: Arc<RwLock<HashMap<String, Vec<MovementConfirmation>>>>,
 }
 
 impl AppState {
@@ -41,7 +37,6 @@ impl AppState {
             pool,
             demo_mode,
             engine: Arc::new(SimulatorEngine::new()),
-            confirmations: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -55,13 +50,15 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/jobs", get(jobs))
         .route("/api/v1/jobs/{id}", get(job))
-        .route("/api/v1/media", get(media))
+        .route("/api/v1/media", get(media).post(create_media))
         .route("/api/v1/drives", get(drives))
         .route("/api/v1/movements", get(movements))
         .route("/api/v1/movements/{id}/confirm", post(confirm_movement))
+        .route("/api/v1/verification", get(verification))
+        .route("/api/v1/recovery-points", get(recovery_points))
         .route("/api/v1/restores/plan", post(plan_restore))
         .route("/api/v1/preflight", get(preflight))
-        .route("/api/v1/qualification", get(qualification));
+        .route("/api/v1/qualification", get(qualification_report));
 
     let static_files = ServeDir::new(&web_dir)
         .append_index_html_on_directories(true)
@@ -88,12 +85,17 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+    let database = match (&state.pool, database_ready) {
+        (Some(_), true) => "connected",
+        (Some(_), false) => "unavailable",
+        (None, _) => "not_configured",
+    };
     (
         status,
         Json(json!({
             "status": if database_ready {"ready"} else {"not_ready"},
-            "database": if state.pool.is_some() {"connected"} else {"demo_not_configured"},
-            "mode": if state.demo_mode {"simulation"} else {"production"},
+            "database": database,
+            "mode": runtime_mode(&state),
             "physical_qualification": "not_established"
         })),
     )
@@ -113,94 +115,193 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
     Ok(Json(json!({
         "product":"TapeScale",
         "version":VERSION,
-        "mode":if state.demo_mode{"simulation"}else{"production"},
+        "mode":runtime_mode(&state),
         "backend_language":"Rust",
         "engine":identity,
-        "capabilities":capabilities
+        "capabilities":capabilities,
+        "operational_data":"postgresql_only"
     })))
 }
 
-async fn overview() -> Json<Value> {
-    Json(demo::overview())
+async fn overview(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let Some(pool) = state.pool.as_ref() else {
+        return Ok(Json(json!({
+            "summary": empty_summary(),
+            "sources": [],
+            "actions": [],
+            "storage": "not_configured"
+        })));
+    };
+
+    let summary = store::overview_counts(pool).await?;
+    let sources = store::list_sources(pool).await?;
+    Ok(Json(json!({
+        "summary": summary,
+        "sources": sources,
+        "actions": [],
+        "storage": "postgresql"
+    })))
 }
 
-async fn jobs() -> Json<Value> {
-    Json(demo::jobs())
+async fn jobs(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let jobs = match state.pool.as_ref() {
+        Some(pool) => store::list_jobs(pool).await?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({"jobs": jobs})))
 }
 
-async fn job(Path(id): Path<String>) -> Result<Json<Value>, AppError> {
-    demo::job_detail(&id).map(Json).ok_or(AppError::NotFound)
+async fn job(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let job = store::get_job(pool, &id).await?.ok_or(AppError::NotFound)?;
+    let transitions = match job.run_id {
+        Some(run_id) => store::job_transitions(pool, run_id).await?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({"job":job,"transitions":transitions})))
 }
 
-async fn media() -> Json<Value> {
-    Json(demo::media())
+async fn media(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let records = match state.pool.as_ref() {
+        Some(pool) => store::list_media(pool).await?,
+        None => Vec::new(),
+    };
+    let media = records.iter().map(media_view).collect::<Vec<_>>();
+    Ok(Json(json!({"media":media})))
 }
 
-async fn drives() -> Json<Value> {
-    Json(demo::drives())
+#[derive(Debug, Deserialize)]
+struct CreateMediaRequest {
+    internal_label: String,
+    #[serde(default)]
+    barcode: Option<String>,
+    media_generation: i16,
+    #[serde(default)]
+    media_format: Option<String>,
+    #[serde(default)]
+    worm: bool,
 }
 
-async fn movements(State(state): State<AppState>) -> Json<Value> {
-    let mut response = demo::movements();
-    let confirmations = state.confirmations.read().await;
-    if let Some(tasks) = response["tasks"].as_array_mut() {
-        for task in tasks {
-            if let Some(recorded) = confirmations.get(task["id"].as_str().unwrap_or_default()) {
-                let newly_confirmed: std::collections::HashSet<&str> = recorded
-                    .iter()
-                    .flat_map(|confirmation| confirmation.tape_ids.iter().map(String::as_str))
-                    .collect();
-                let mut confirmed_count = 0_u64;
-                if let Some(tapes) = task["tapes"].as_array_mut() {
-                    for tape in tapes {
-                        if tape["confirmed"].as_bool().unwrap_or(false)
-                            || tape["id"]
-                                .as_str()
-                                .is_some_and(|id| newly_confirmed.contains(id))
-                        {
-                            tape["confirmed"] = json!(true);
-                            confirmed_count += 1;
-                        }
-                    }
-                }
-                let total = task["total_count"].as_u64().unwrap_or(0);
-                let complete = total > 0 && confirmed_count == total;
-                task["state"] = json!(if complete {
-                    "confirmed"
-                } else {
-                    "partially_confirmed"
-                });
-                task["state_label"] = json!(if complete {
-                    "Arrival confirmed"
-                } else {
-                    "Partial arrival · incomplete set"
-                });
-                task["confirmations"] = serde_json::to_value(recorded).unwrap_or(Value::Null);
-                task["confirmed_count"] = json!(confirmed_count);
-            }
+impl CreateMediaRequest {
+    fn validate(self) -> Result<store::NewMedia, AppError> {
+        let internal_label = self.internal_label.trim().to_owned();
+        if internal_label.is_empty() {
+            return Err(AppError::Invalid("internal_label is required".to_owned()));
         }
+        if internal_label.chars().count() > 128 {
+            return Err(AppError::Invalid(
+                "internal_label must be at most 128 characters".to_owned(),
+            ));
+        }
+        if !internal_label
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-._:".contains(character))
+        {
+            return Err(AppError::Invalid(
+                "internal_label may contain only letters, numbers, hyphen, underscore, period, and colon"
+                    .to_owned(),
+            ));
+        }
+
+        let barcode = self
+            .barcode
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if barcode
+            .as_ref()
+            .is_some_and(|value| value.chars().count() > 128)
+        {
+            return Err(AppError::Invalid(
+                "barcode must be at most 128 characters".to_owned(),
+            ));
+        }
+        if !(1..=10).contains(&self.media_generation) {
+            return Err(AppError::Invalid(
+                "media_generation must be between 1 and 10".to_owned(),
+            ));
+        }
+        let media_format = self
+            .media_format
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("LTO-{}", self.media_generation));
+        if media_format.chars().count() > 64 {
+            return Err(AppError::Invalid(
+                "media_format must be at most 64 characters".to_owned(),
+            ));
+        }
+
+        Ok(store::NewMedia {
+            internal_label,
+            barcode,
+            media_generation: self.media_generation,
+            media_format,
+            worm: self.worm,
+        })
     }
-    Json(response)
 }
 
-#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+async fn create_media(
+    State(state): State<AppState>,
+    Json(request): Json<CreateMediaRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let pool = require_pool(&state)?;
+    let media = request.validate()?;
+    let record = match store::create_media(pool, &media).await {
+        Ok(record) => record,
+        Err(error) if is_unique_violation(&error) => {
+            return Err(AppError::Conflict(
+                "a cartridge with this internal label or barcode already exists".to_owned(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "media":media_view(&record),
+            "durability":"postgresql",
+            "audit":"appended"
+        })),
+    ))
+}
+
+async fn drives(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let (drives, slots) = match state.pool.as_ref() {
+        Some(pool) => (
+            store::list_drives(pool).await?,
+            store::list_slots(pool).await?,
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+    Ok(Json(json!({"drives":drives,"slots":slots})))
+}
+
+async fn movements(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let movements = match state.pool.as_ref() {
+        Some(pool) => store::list_movements(pool).await?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({"movements":movements})))
+}
+
+#[derive(Debug, Deserialize)]
 struct MovementConfirmation {
     actor: String,
     destination: String,
     tape_ids: Vec<String>,
     #[serde(default)]
     note: String,
-    #[serde(default = "Uuid::now_v7")]
-    idempotency_key: Uuid,
-    #[serde(default = "chrono::Utc::now")]
-    confirmed_at: chrono::DateTime<chrono::Utc>,
 }
 
 async fn confirm_movement(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(confirmation): Json<MovementConfirmation>,
-) -> Result<(StatusCode, Json<Value>), AppError> {
+) -> Result<Json<Value>, AppError> {
     if confirmation.actor.trim().is_empty() || confirmation.destination.trim().is_empty() {
         return Err(AppError::Invalid(
             "actor and destination are required".to_owned(),
@@ -211,70 +312,36 @@ async fn confirm_movement(
             "custody cannot advance without physically confirmed tape identities".to_owned(),
         ));
     }
-    if id != "move-weekly-45" && id != "move-recall-l7m" {
+    let pool = require_pool(&state)?;
+    let exists = store::list_movements(pool)
+        .await?
+        .into_iter()
+        .any(|movement| movement.external_id == id || movement.id.to_string() == id);
+    if !exists {
         return Err(AppError::NotFound);
     }
 
-    let mut confirmations = state.confirmations.write().await;
-    let recorded = confirmations.entry(id.clone()).or_default();
-    if let Some(existing) = recorded
-        .iter()
-        .find(|existing| existing.idempotency_key == confirmation.idempotency_key)
-    {
-        return Ok((
-            StatusCode::OK,
-            Json(json!({"status":"already_confirmed","task_id":id,"confirmation":existing})),
-        ));
-    }
-
-    if let Some(pool) = &state.pool {
-        sqlx::query(
-            "INSERT INTO custody_events (id, movement_task_external_id, actor_label, destination_label, tape_ids, note, occurred_at, correlation_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(Uuid::now_v7())
-        .bind(&id)
-        .bind(&confirmation.actor)
-        .bind(&confirmation.destination)
-        .bind(&confirmation.tape_ids)
-        .bind(&confirmation.note)
-        .bind(confirmation.confirmed_at)
-        .bind(confirmation.idempotency_key)
-        .execute(pool)
-        .await?;
-    }
-    recorded.push(confirmation.clone());
-    let required: &[&str] = match id.as_str() {
-        "move-weekly-45" => &["TS-L9-004216"],
-        "move-recall-l7m" => &["TS-L7M-000112", "TS-L7M-000113"],
-        _ => &[],
-    };
-    let confirmed: std::collections::HashSet<&str> = recorded
-        .iter()
-        .flat_map(|item| item.tape_ids.iter().map(String::as_str))
-        .collect();
-    let complete = required.iter().all(|tape_id| confirmed.contains(tape_id));
-    let status = if complete {
-        StatusCode::CREATED
-    } else {
-        StatusCode::ACCEPTED
-    };
-    let durability = if state.pool.is_some() {
-        "postgresql"
-    } else {
-        "simulation_memory"
-    };
-    Ok((
-        status,
-        Json(json!({
-            "status":if complete{"confirmed"}else{"partially_confirmed"},
-            "task_id":id,
-            "confirmation":confirmation,
-            "remaining_tape_ids":required.iter().filter(|tape_id| !confirmed.contains(**tape_id)).collect::<Vec<_>>(),
-            "audit":if state.pool.is_some(){"appended"}else{"simulated"},
-            "durability":durability,
-            "physical_custody_evidence":false
-        })),
+    let _ = confirmation.note;
+    Err(AppError::Blocked(
+        "durable movement confirmation is not implemented yet; no custody state was changed"
+            .to_owned(),
     ))
+}
+
+async fn verification(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let verification = match state.pool.as_ref() {
+        Some(pool) => store::list_verification(pool).await?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({"verification":verification})))
+}
+
+async fn recovery_points(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let recovery_points = match state.pool.as_ref() {
+        Some(pool) => store::list_recovery_points(pool).await?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({"recovery_points":recovery_points})))
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,16 +360,160 @@ async fn plan_restore(Json(request): Json<RestorePlanRequest>) -> Result<Json<Va
             ));
         }
     }
-    Ok(Json(demo::restore_plan(
-        request.destination.as_deref(),
-        request.key_available,
-    )))
+    let _ = request.key_available;
+    Err(AppError::Blocked(
+        "restore planning requires a persisted recovery-point selection and is not implemented yet"
+            .to_owned(),
+    ))
 }
 
-async fn preflight(State(state): State<AppState>) -> Json<Value> {
-    Json(demo::preflight(state.pool.is_some()))
+async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let Some(pool) = state.pool.as_ref() else {
+        return Ok(Json(json!({
+            "status":"blocked",
+            "checked_at":chrono::Utc::now(),
+            "checks":[
+                preflight_check("database", "Database", "blocked", "PostgreSQL is not configured"),
+                preflight_check("engine", "Tape engine", "blocked", "Only the simulator adapter is available")
+            ],
+            "inventory":empty_inventory()
+        })));
+    };
+
+    let inventory = store::inventory_counts(pool).await?;
+    let truenas_status = if inventory.truenas_instances > 0 {
+        "registered"
+    } else {
+        "blocked"
+    };
+    let drive_status = if inventory.qualified_drives > 0 {
+        "passed"
+    } else {
+        "blocked"
+    };
+    let media_status = if inventory.cartridges > 0 {
+        "registered"
+    } else {
+        "blocked"
+    };
+    Ok(Json(json!({
+        "status":"blocked",
+        "checked_at":chrono::Utc::now(),
+        "checks":[
+            preflight_check("database", "Database", "passed", "PostgreSQL responded"),
+            preflight_check("truenas_registration", "TrueNAS registration", truenas_status,
+                if inventory.truenas_instances > 0 {"A registration exists; live connectivity is not checked yet"} else {"No TrueNAS system is registered"}),
+            preflight_check("physical_drive", "Qualified tape drive", drive_status,
+                if inventory.qualified_drives > 0 {"A physically qualified drive is recorded"} else {"No physically qualified drive is recorded"}),
+            preflight_check("media_inventory", "Media inventory", media_status,
+                if inventory.cartridges > 0 {"Cartridges are registered; on-tape identity still governs safe use"} else {"No cartridges are registered"}),
+            preflight_check("engine", "Tape engine", "blocked", "Only the simulator adapter is available")
+        ],
+        "inventory":inventory
+    })))
 }
 
-async fn qualification() -> Json<Value> {
-    Json(demo::qualification())
+async fn qualification_report() -> Json<Value> {
+    Json(qualification::report())
+}
+
+fn require_pool(state: &AppState) -> Result<&PgPool, AppError> {
+    state.pool.as_ref().ok_or_else(|| {
+        AppError::Blocked(
+            "PostgreSQL is required for this operation and is not configured".to_owned(),
+        )
+    })
+}
+
+fn runtime_mode(state: &AppState) -> &'static str {
+    if state.demo_mode {
+        "simulation"
+    } else {
+        "unqualified_preview"
+    }
+}
+
+fn media_view(record: &store::MediaRecord) -> Value {
+    let overwrite_blocker = match record.identity_status.as_str() {
+        "unknown" => "on-tape identity has not been reconciled",
+        "foreign" => "foreign media is protected",
+        "mismatch" => "catalog and on-tape identity do not match",
+        _ => "overwrite eligibility evaluation is not implemented",
+    };
+    let mut value = serde_json::to_value(record).expect("serializing a media record cannot fail");
+    if let Some(object) = value.as_object_mut() {
+        object.insert("overwrite_eligible".to_owned(), json!(false));
+        object.insert("overwrite_blockers".to_owned(), json!([overwrite_blocker]));
+    }
+    value
+}
+
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == "23505")
+}
+
+fn empty_summary() -> Value {
+    json!({"protected_sources":0,"active_jobs":0,"required_actions":0})
+}
+
+fn empty_inventory() -> Value {
+    json!({
+        "installations":0,
+        "truenas_instances":0,
+        "drives":0,
+        "qualified_drives":0,
+        "cartridges":0
+    })
+}
+
+fn preflight_check(id: &str, label: &str, status: &str, detail: &str) -> Value {
+    json!({"id":id,"label":label,"status":status,"detail":detail})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_request() -> CreateMediaRequest {
+        CreateMediaRequest {
+            internal_label: " TS-L9-000001 ".to_owned(),
+            barcode: Some(" L90001 ".to_owned()),
+            media_generation: 9,
+            media_format: None,
+            worm: false,
+        }
+    }
+
+    #[test]
+    fn media_registration_is_normalized_and_defaults_format() {
+        let media = valid_request().validate().expect("request is valid");
+        assert_eq!(media.internal_label, "TS-L9-000001");
+        assert_eq!(media.barcode.as_deref(), Some("L90001"));
+        assert_eq!(media.media_generation, 9);
+        assert_eq!(media.media_format, "LTO-9");
+    }
+
+    #[test]
+    fn media_registration_rejects_invalid_generation() {
+        let mut request = valid_request();
+        request.media_generation = 11;
+        assert!(matches!(request.validate(), Err(AppError::Invalid(_))));
+    }
+
+    #[test]
+    fn media_registration_rejects_ambiguous_label_characters() {
+        let mut request = valid_request();
+        request.internal_label = "../../tape".to_owned();
+        assert!(matches!(request.validate(), Err(AppError::Invalid(_))));
+    }
+
+    #[test]
+    fn blank_barcode_is_not_persisted() {
+        let mut request = valid_request();
+        request.barcode = Some("   ".to_owned());
+        assert_eq!(request.validate().expect("request is valid").barcode, None);
+    }
 }

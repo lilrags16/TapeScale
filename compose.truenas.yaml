@@ -18,7 +18,7 @@ x-tapescale-common: &tapescale-common
   tmpfs:
     - /tmp:size=128m,mode=1777
   environment: &tapescale-environment
-    TAPESCALE_DEMO_MODE: "true"
+    TAPESCALE_DEMO_MODE: "false"
     DATABASE_URL: postgresql://tapescale:tapescale_test_only_password@postgres:5432/tapescale
     RUST_LOG: tapescale=info,tower_http=info
   networks:

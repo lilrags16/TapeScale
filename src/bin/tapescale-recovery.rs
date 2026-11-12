@@ -70,7 +70,7 @@ fn main() -> Result<()> {
         Command::Qualification => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&tapescale::demo::qualification())?
+                serde_json::to_string_pretty(&tapescale::qualification::report())?
             );
             Ok(())
         }

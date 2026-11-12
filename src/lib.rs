@@ -6,10 +6,10 @@
 
 pub mod api;
 pub mod config;
-pub mod demo;
 pub mod domain;
 pub mod engine;
 pub mod error;
+pub mod qualification;
 pub mod store;
 pub mod tool_runner;
 pub mod truenas;

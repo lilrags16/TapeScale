@@ -13,6 +13,8 @@ pub enum AppError {
     NotFound,
     #[error("invalid request: {0}")]
     Invalid(String),
+    #[error("resource conflict: {0}")]
+    Conflict(String),
     #[error("operation is blocked: {0}")]
     Blocked(String),
     #[error("database operation failed")]
@@ -39,6 +41,7 @@ impl IntoResponse for AppError {
         let (status, code, message) = match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found", self.to_string()),
             Self::Invalid(message) => (StatusCode::BAD_REQUEST, "invalid_request", message),
+            Self::Conflict(message) => (StatusCode::CONFLICT, "conflict", message),
             Self::Blocked(message) => (StatusCode::CONFLICT, "operation_blocked", message),
             Self::Database(ref source) => {
                 error!(%correlation_id, error = %source, "database request failed");

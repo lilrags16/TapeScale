@@ -16,7 +16,7 @@ x-tapescale-common: &tapescale-common
   secrets:
     - postgres_password
   environment: &tapescale-environment
-    TAPESCALE_DEMO_MODE: ${TAPESCALE_DEMO_MODE:-true}
+    TAPESCALE_DEMO_MODE: ${TAPESCALE_DEMO_MODE:-false}
     TAPESCALE_DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
     TAPESCALE_DATABASE_HOST: postgres
     TAPESCALE_DATABASE_PORT: 5432

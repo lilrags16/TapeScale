@@ -43,6 +43,8 @@ Set quotas/reservations for spool, staging, and restore areas and preserve a con
 
 Provide database credentials, session/secret-encryption material, TrueNAS API credentials, and TLS keys through mounted secret files or the TrueNAS secret facility. Never commit them to `.env`, Compose YAML, shell history, or diagnostic output.
 
+The self-contained `compose.truenas.yaml` is an explicitly disposable test configuration and intentionally embeds its PostgreSQL password. Do not reuse that password or treat this convenience file as the production credential model.
+
 No shared default password is valid. A production first-run bootstrap must create a unique administrator, enroll MFA, issue one-time recovery codes, and invalidate the bootstrap secret. Store recovery codes away from the NAS. The preview does not yet provide a production authentication/MFA bootstrap; demo access must not be exposed as a qualified installation.
 
 ## TrueNAS API boundary
@@ -104,11 +106,15 @@ Before enabling a policy, the web preflight must report each item independently:
 - spool, staging, restore capacity, quotas, and free-space reserve;
 - compatible writable media and overwrite-gate result.
 
-The preview simulator can demonstrate UI/control states only. It cannot make device, ZFS, ACL, engine, or media checks pass.
+The fresh preview console starts without operational fixtures and reports only records stored in PostgreSQL. The engine adapter remains a simulator and cannot make device, ZFS, ACL, engine, or media checks pass.
 
 ## TrueNAS custom-app configuration
 
-Translate the same Compose boundaries into the TrueNAS custom-app editor:
+For the current fixture-free test deployment, copy the complete repository-root `compose.truenas.yaml` into **Apps > Discover Apps > Install via YAML**. It builds public `main`, exposes the console on host port 18080, keeps the intentionally inline test database password, and stores state in Docker-managed volumes. The initial UI is empty; manually registered cartridges are the first real durable records.
+
+To update this Git-context build, edit the installed custom app, replace its YAML with the latest raw `compose.truenas.yaml`, and save. Because the file uses `pull_policy: build`, the redeploy fetches and rebuilds the current `main` source. Verify the new commit and container logs before relying on any newly implemented workflow.
+
+For a future qualified deployment, translate the same Compose boundaries into explicit TrueNAS datasets and production credential facilities:
 
 - four services: API, scheduler, worker, PostgreSQL 16;
 - private application network and TLS ingress to API port 8080;

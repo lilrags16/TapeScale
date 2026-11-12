@@ -33,9 +33,9 @@
           <section>
             <h2>Operate</h2>
             <a class="nav-link" data-route="overview" href="#overview"><span class="nav-icon" aria-hidden="true">&#9632;</span><span>Overview</span></a>
-            <a class="nav-link" data-route="jobs" href="#jobs"><span class="nav-icon" aria-hidden="true">&#9654;</span><span>Jobs</span><span class="nav-count" id="nav-job-count">2</span></a>
+            <a class="nav-link" data-route="jobs" href="#jobs"><span class="nav-icon" aria-hidden="true">&#9654;</span><span>Jobs</span><span class="nav-count" id="nav-job-count" hidden>0</span></a>
             <a class="nav-link" data-route="restore" href="#restore"><span class="nav-icon" aria-hidden="true">&#8630;</span><span>Restore</span></a>
-            <a class="nav-link" data-route="movements" href="#movements"><span class="nav-icon" aria-hidden="true">&#8644;</span><span>Movements</span><span class="nav-count nav-count-alert" id="nav-move-count">3</span></a>
+            <a class="nav-link" data-route="movements" href="#movements"><span class="nav-icon" aria-hidden="true">&#8644;</span><span>Movements</span><span class="nav-count nav-count-alert" id="nav-move-count" hidden>0</span></a>
           </section>
           <section>
             <h2>Inventory</h2>
@@ -52,9 +52,9 @@
         <div class="sidebar-foot">
           <div class="service-health" id="service-health">
             <span class="health-dot" aria-hidden="true"></span>
-            <span><strong>Demo data</strong><small>API discovery in progress</small></span>
+            <span><strong>Connecting</strong><small>Waiting for API</small></span>
           </div>
-          <div class="version-line">TapeScale <span id="app-version">0.1.0-dev</span></div>
+          <div class="version-line">TapeScale <span id="app-version">—</span></div>
         </div>
       </aside>
 
@@ -68,22 +68,22 @@
             </button>
             <div class="site-context">
               <span class="eyebrow">Protection site</span>
-              <button class="site-select" type="button" data-action="site-menu" aria-haspopup="menu">
-                TrueNAS Primary <span aria-hidden="true">&#8964;</span>
+              <button class="site-select" type="button" data-action="site-menu" aria-haspopup="dialog">
+                <span id="site-name">Not configured</span> <span aria-hidden="true">&#8964;</span>
               </button>
             </div>
           </div>
           <div class="topbar-end">
             <button class="system-pill" type="button" data-action="show-preflight">
               <span class="health-dot" aria-hidden="true"></span>
-              <span>Preflight <strong>Preview</strong></span>
+              <span>Preflight <strong id="preflight-status">Setup pending</strong></span>
             </button>
-            <button class="icon-button notification-button" type="button" data-action="notifications" aria-label="Open notifications, 4 unresolved">
-              <span aria-hidden="true">&#9679;</span><span class="notification-badge">4</span>
+            <button class="icon-button notification-button" type="button" data-action="notifications" aria-label="Open notifications">
+              <span aria-hidden="true">&#9679;</span><span class="notification-badge" id="notification-badge" hidden>0</span>
             </button>
-            <button class="user-menu" type="button" data-action="user-menu" aria-label="Open preview profile">
-              <span class="avatar" aria-hidden="true">PV</span>
-              <span class="user-copy"><strong>Preview</strong><small>Simulation</small></span>
+            <button class="user-menu" type="button" data-action="user-menu" aria-label="Open account status">
+              <span class="avatar" aria-hidden="true">--</span>
+              <span class="user-copy"><strong>Setup</strong><small>Authentication pending</small></span>
             </button>
           </div>
         </header>

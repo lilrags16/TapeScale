@@ -31,17 +31,19 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Open `http://localhost:8080`. The default configuration is explicitly marked simulation mode but still persists platform state in PostgreSQL.
+Open `http://localhost:8080`. A fresh deployment starts without embedded operational fixtures: PostgreSQL and the console are empty until real records are created. Manual cartridge registration is the first durable workflow, and each cartridge remains in PostgreSQL across container restarts.
 
-For a self-contained TrueNAS test deployment, paste [`compose.truenas.yaml`](compose.truenas.yaml) into **Apps → Discover Apps → ⋮ → Install via YAML** and open `http://TRUENAS-IP:18080`. The test file intentionally embeds its database password and uses Docker-managed volumes.
+For a self-contained TrueNAS test deployment, paste [`compose.truenas.yaml`](compose.truenas.yaml) into **Apps → Discover Apps → ⋮ → Install via YAML** and open `http://TRUENAS-IP:18080`. The test file intentionally embeds its disposable database password and uses Docker-managed volumes, but it does not enable demo fixtures.
 
-To run only the console from a Rust checkout:
+To rebuild a TrueNAS custom app from the latest public `main`, open the installed `tapescale` app for editing, replace its YAML with the latest raw [`compose.truenas.yaml`](https://raw.githubusercontent.com/lilrags16/TapeScale/main/compose.truenas.yaml), and save. Its `pull_policy: build` and Git build context cause Compose to fetch and rebuild the current source rather than reuse an older application image.
+
+To run an empty, read-only console from a Rust checkout without PostgreSQL:
 
 ```sh
 TAPESCALE_DEMO_MODE=true cargo run --bin tapescale-api
 ```
 
-Then open `http://localhost:8080`.
+Then open `http://localhost:8080`. Use the Compose stack when you want durable writes such as cartridge registration.
 
 ## Validate the source
 
