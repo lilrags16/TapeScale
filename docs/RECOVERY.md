@@ -20,6 +20,12 @@ Retain the source manifest, restored manifest, comparison, engine JobIds/status,
 
 A G0.2 pass does not prove that the tape can be found or restored after loss of PostgreSQL, the Bacula catalog, the original host, or keys. Encryption is explicitly disabled for this laboratory deviation. No recovery bundle, clean-host import, multi-volume scan, NFSv4 ACL proof, native ZFS recovery, or independent key recovery is created by this gate.
 
+### Recovery Vault and readiness plans
+
+The online Recovery Vault exposes a bounded operator dossier for each retained recovery point: source identity, format and scope, ordered cartridge/record map, current confirmed custody, dependencies, holds, verification records, originating job/exercise, append-only activity, and artifact digests. Its JSON evidence download deliberately omits internal artifact storage paths, carries a SHA-256 ETag, and advertises any row or embedded-value truncation.
+
+The restore planner consumes that durable dossier and retains a 30-minute preview hash in PostgreSQL. A plan can become ready only when the complete chain is verified, required media is finalized/reconciled and has confirmed custody, the current drive matches the newest passed exact G0.1 drive/cartridge tuple, required keys are declared available, and the destination assessment has no blockers. The planner is evidence and prerequisite evaluation only. There is no general `execute` action in this release, and a ready plan must not be reported as a completed or attempted restore.
+
 ## Recovery bundle contract
 
 A versioned bundle contains no plaintext usable keys. It is expected to include:

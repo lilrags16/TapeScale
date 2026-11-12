@@ -19,6 +19,9 @@ TapeScale is a safety-first LTO backup control plane for TrueNAS. It is designed
 - Worker-only SAS discovery/status plus durable, audited lab-only rewind and unload using explicitly mapped non-rewinding devices
 - An attended, destructive Bacula Community 15.0.3 `btape test` harness with exact drive/cartridge binding, fencing, retained evidence, and a required rewind-to-BOT postcondition
 - An attended G0.2 recovery exercise that inventories an immutable mounted snapshot, writes one full file backup through Bacula, performs Bacula Data verification from tape, restores to an isolated destination, and compares independent SHA-256 manifests before creating a verified recovery point
+- A Recovery Vault that joins each recovery point to its ordered cartridges, locations, engine record boundaries, dependencies, holds, verification history, originating run, event trail, and content-addressed artifacts
+- Downloadable bounded recovery-evidence reports plus durable, audited restore-readiness plans with explicit media, drive, location, key, destination, capacity, and verification blockers
+- Transactional off-site custody operations with named locations, exact cartridge reservations, partial departure/arrival/direct confirmations, append-only corrections, idempotent receipts, and overdue notifications
 - A deterministic engine simulator that cannot report physical qualification
 - A purpose-built responsive storage-operations console
 - Hardened Docker Compose packaging with separate API, worker, and PostgreSQL services
@@ -61,6 +64,10 @@ After that exact drive/cartridge combination passes, run the first recoverable-t
 4. Type `WRITE <profile name> TO <cartridge label> AND RESTORE VERIFY` exactly and start the exercise.
 5. Leave the worker, database, drive, and mounts available. The run is not passed until Bacula completes the full write, a Data verification that rereads tape, a normal restore, and TapeScale's independent manifest comparison.
 6. Inspect the phase timeline, engine evidence, source/restored manifests, comparison, and final recovery point. Restored files remain isolated below `/mnt/tapescale-restores/<chosen subpath>/<run id>`; do not publish them as a share.
+
+After the exercise passes, open **Restore → Recovery vault**. Select the retained recovery point to inspect the exact tape and record range, full-readback and restore-test evidence, originating job, and artifact digests. **Download evidence** produces a bounded JSON attachment without exposing the worker's artifact paths. **Plan restore** persists a 30-minute readiness preview and reports every missing prerequisite. It does not yet dispatch a second tape read or write a restore destination; the result says this explicitly.
+
+Use **Movements** to establish the cartridge's first confirmed location and manage later on-site/off-site handling. Create named locations, plan an exact cartridge set, then confirm a direct move or the separate departure and arrival steps. A plan or due date never changes physical custody. Partial confirmations keep the task open, each mutation is idempotent and audited, and overdue work remains overdue until every required cartridge arrives or the task is explicitly cancelled.
 
 The closed G0.2 path starts the pinned Bacula Director, Storage Daemon, and File Daemon only on worker loopback under the singleton worker's fenced run. It does not expose an operator console or arbitrary engine commands. The current laboratory fixture limit is 100,000 manifest entries and 100 GiB logical data; larger datasets are rejected before tape writing. It is limited to one full file backup on one standalone drive and one cartridge. Spanning, incrementals, changers, native ZFS streams, encryption/key recovery, and clean-catalog recovery remain blocked.
 
@@ -127,7 +134,7 @@ Please do not report vulnerabilities in a public issue. Follow the private proce
 
 ## Project status
 
-SAS discovery, narrowly allowlisted lab rewind/unload, the Bacula 15.0.3 destructive drive test, and the G0.2 single-volume full-file roundtrip path are implemented. A G0.2 pass can create a verified recovery point only for its exact immutable source, physical tape readback, isolated restore, and manifest comparison. It does not promote the product to production or prove TrueNAS NFSv4 ACL fidelity, multi-volume/EOM behavior, wrong-media handling, interruption recovery, encryption, native ZFS, or clean-host catalog reconstruction.
+SAS discovery, narrowly allowlisted lab rewind/unload, the Bacula 15.0.3 destructive drive test, the G0.2 single-volume full-file roundtrip, Recovery Vault/evidence export, durable restore-readiness planning, and confirmed media-custody operations are implemented. A G0.2 pass can create a verified recovery point only for its exact immutable source, physical tape readback, isolated restore, and manifest comparison. A readiness plan is not reusable restore execution. This does not promote the product to production or prove TrueNAS NFSv4 ACL fidelity, multi-volume/EOM behavior, wrong-media handling, interruption recovery, encryption, native ZFS, clean-host catalog reconstruction, or a second independent tape restore after restart.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 This guide describes the intended TapeScale operating model. The current release is an engineering preview with SAS discovery, lab-only rewind/unload, a destructive Bacula `btape test` harness, and an attended G0.2 Bacula file roundtrip. It must not be represented as generally protecting production tape until G0/G1 qualification is complete.
 
-Procedures below are the operator acceptance target. The G0.2 path can write and restore one full file capture on one cartridge under explicit lab gates. General scheduled backup, movement, encryption recovery, catalog-loss recovery, spanning, incrementals, native ZFS, and production authorization remain simulated, incomplete, or unqualified.
+Procedures below are the operator acceptance target. The G0.2 path can write and restore one full file capture on one cartridge under explicit lab gates. The preview also exposes that retained point through the Recovery Vault, persists restore-readiness plans, and records confirmed manual custody movements. General scheduled backup, reusable restore execution, encryption recovery, catalog-loss recovery, spanning, incrementals, native ZFS, and production authorization remain simulated, incomplete, or unqualified.
 
 ## Daily overview
 
@@ -114,6 +114,10 @@ Interrupted verification cannot pass. New data defaults to full read-back before
 
 ## Plan and execute a restore
 
+The current console implements the planning half of this workflow. Open **Restore → Recovery vault**, search by source, tape, representation, status, or date, and select a point. The dossier joins the durable recovery contract to ordered volume records, confirmed locations, physical readback, isolated restore-test evidence, origin events, and retained artifact digests. The evidence download is bounded and omits internal artifact storage paths.
+
+Select **Plan restore**, choose a contained relative destination and conflict policy, and declare the destination/key/capacity facts that are actually known. TapeScale persists the preview for 30 minutes and reports required tapes, dependency order, exact compatible qualified drives, locations, keys, warnings, and blockers. An unverified point, unknown tape location, missing exact hardware qualification, unsafe destination, insufficient declared capacity, or unavailable key prevents a ready result. Planning does not move media, invoke Bacula, create the directory, or restore data in this release.
+
 Use the restore planner before loading media. It must show:
 
 - selected recovery point and scope;
@@ -131,6 +135,10 @@ File restore validation compares SHA-256 content and promised metadata. Native v
 Inspect the result before publishing or cutting over. Replacement of live data is an administrator destructive workflow.
 
 ## Off-site rotation
+
+The current manual-custody workflow supports named physical locations and exact take-off-site, return, swap, and recall tasks. A newly registered cartridge with no location can be established at its first endpoint only through a direct physical confirmation. A two-step move requires a confirmed source plus an explicit in-transit location.
+
+Each task reserves its exact cartridge set. Operators may confirm a subset, so a multi-tape delivery remains incomplete until every tape reaches the destination. Departure, arrival, direct confirmation, cancellation, and custody correction use optimistic versions and idempotency keys; retrying the same request cannot silently complete it twice. Cartridge location and reservation updates, append-only custody history, audit events, and in-app outbox records commit together. Missed work is durably marked overdue and remains overdue through partial progress.
 
 Movement tasks describe tape IDs, reason, source, destination, readiness, due time, dependencies, and assigned operator. A weekly group becomes export-ready only after finalized writes, committed recovery metadata, required verification, independent key-package recovery readiness, and absence of active writes.
 
