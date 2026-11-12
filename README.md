@@ -33,6 +33,8 @@ docker compose up --build
 
 Open `http://localhost:8080`. The default configuration is explicitly marked simulation mode but still persists platform state in PostgreSQL.
 
+For a self-contained TrueNAS test deployment, paste [`compose.truenas.yaml`](compose.truenas.yaml) into **Apps → Discover Apps → ⋮ → Install via YAML** and open `http://TRUENAS-IP:18080`. The test file intentionally embeds its database password and uses Docker-managed volumes.
+
 To run only the console from a Rust checkout:
 
 ```sh
