@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate Compose files
         run: |
-          docker compose config --quiet
+          TAPESCALE_POSTGRES_PASSWORD_FILE=./secrets/postgres_password.example docker compose config --quiet
           docker compose --file compose.truenas.yaml config --quiet
       - name: Build runtime image
         run: docker build --tag tapescale:ci .
