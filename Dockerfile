@@ -30,18 +30,20 @@ RUN echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/$
          dbconfig-no-thanks \
          mt-st \
          tzdata \
-    && install -d -m 0755 /usr/share/bacula-common \
-    && printf '%s\n' 'dbc_install=false' > /usr/share/bacula-common/dbc_database.conf \
-    && chmod 0644 /usr/share/bacula-common/dbc_database.conf \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
          -t bookworm-backports \
          bacula-bscan=15.0.3-3~bpo12+1 \
          bacula-common-pgsql=15.0.3-3~bpo12+1 \
          bacula-console=15.0.3-3~bpo12+1 \
-         bacula-director=15.0.3-3~bpo12+1 \
          bacula-director-pgsql=15.0.3-3~bpo12+1 \
          bacula-fd=15.0.3-3~bpo12+1 \
          bacula-sd=15.0.3-3~bpo12+1 \
+    && install -d -m 0755 /usr/share/bacula-common \
+    && printf '%s\n' 'dbc_install=false' > /usr/share/bacula-common/dbc_database.conf \
+    && chmod 0644 /usr/share/bacula-common/dbc_database.conf \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+         -t bookworm-backports \
+         bacula-director=15.0.3-3~bpo12+1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 tapescale \
     && useradd --system --uid 10001 --gid tapescale --home-dir /var/lib/tapescale tapescale \
