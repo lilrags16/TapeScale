@@ -720,6 +720,30 @@ fn fingerprint(value: &Value) -> Result<String, CustodyOpsError> {
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
+fn validate_movement_location_shape(
+    source_location_id: Option<Uuid>,
+    destination_location_id: Uuid,
+    transit_location_id: Option<Uuid>,
+) -> Result<(), CustodyOpsError> {
+    if source_location_id == Some(destination_location_id) {
+        return Err(CustodyOpsError::Invalid {
+            field: "destination_location_id",
+            message: "must differ from the source location".to_owned(),
+        });
+    }
+    if let Some(transit_location_id) = transit_location_id {
+        if Some(transit_location_id) == source_location_id
+            || transit_location_id == destination_location_id
+        {
+            return Err(CustodyOpsError::Invalid {
+                field: "transit_location_id",
+                message: "must differ from both movement endpoints".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// List all configured physical, transit, device, and unknown locations.
 pub async fn list_locations(pool: &PgPool) -> Result<Vec<LocationRecord>, CustodyOpsError> {
     let rows = sqlx::query_as::<_, LocationRow>(
@@ -814,20 +838,11 @@ pub async fn create_movement(
     validate_actor(&request.actor)?;
     validate_json("readiness", &request.readiness)?;
     let cartridge_ids = normalize_cartridge_ids(&request.cartridge_ids, "cartridge_ids")?;
-    if request.source_location_id == Some(request.destination_location_id) {
-        return Err(CustodyOpsError::Invalid {
-            field: "destination_location_id",
-            message: "must differ from the source location".to_owned(),
-        });
-    }
-    if request.transit_location_id == request.source_location_id
-        || request.transit_location_id == Some(request.destination_location_id)
-    {
-        return Err(CustodyOpsError::Invalid {
-            field: "transit_location_id",
-            message: "must differ from both movement endpoints".to_owned(),
-        });
-    }
+    validate_movement_location_shape(
+        request.source_location_id,
+        request.destination_location_id,
+        request.transit_location_id,
+    )?;
 
     let external_id = request.external_id.trim().to_owned();
     let idempotency_key = request.idempotency_key.trim().to_owned();
@@ -2561,6 +2576,42 @@ mod tests {
             normalize_cartridge_ids(&[high, low], "cartridge_ids").unwrap(),
             vec![low, high]
         );
+    }
+
+    #[test]
+    fn unknown_source_without_transit_is_a_valid_onboarding_shape() {
+        let destination = Uuid::from_u128(1);
+        assert!(validate_movement_location_shape(None, destination, None).is_ok());
+    }
+
+    #[test]
+    fn transit_must_be_distinct_from_present_endpoints() {
+        let source = Uuid::from_u128(1);
+        let destination = Uuid::from_u128(2);
+        let transit = Uuid::from_u128(3);
+        assert!(validate_movement_location_shape(Some(source), destination, None).is_ok());
+        assert!(validate_movement_location_shape(Some(source), destination, Some(transit)).is_ok());
+        assert!(matches!(
+            validate_movement_location_shape(Some(source), source, None),
+            Err(CustodyOpsError::Invalid {
+                field: "destination_location_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_movement_location_shape(Some(source), destination, Some(source)),
+            Err(CustodyOpsError::Invalid {
+                field: "transit_location_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_movement_location_shape(Some(source), destination, Some(destination)),
+            Err(CustodyOpsError::Invalid {
+                field: "transit_location_id",
+                ..
+            })
+        ));
     }
 
     #[test]
