@@ -7,6 +7,15 @@
 *.log
 *.tmp
 
+# Rust build output
+/target/
+
+# Local runtime data
+/data/
+/evidence/
+/secrets/*.txt
+!/secrets/*.example
+
 # Editor and operating-system files
 .DS_Store
 .idea/

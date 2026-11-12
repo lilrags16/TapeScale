@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#132522">
+    <meta name="description" content="TapeScale storage operations console for TrueNAS and LTO protection.">
+    <title>TapeScale Operations</title>
+    <link rel="stylesheet" href="app.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+
+    <div class="app-shell" id="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="Primary navigation">
+        <div class="brand">
+          <a class="brand-mark" href="#overview" aria-label="TapeScale overview">
+            <svg viewBox="0 0 36 36" aria-hidden="true">
+              <rect x="3" y="5" width="30" height="26" rx="5"></rect>
+              <circle cx="12" cy="18" r="4"></circle>
+              <circle cx="24" cy="18" r="4"></circle>
+              <path d="M12 18h12M8 27h20"></path>
+            </svg>
+            <span><strong>TapeScale</strong><small>Storage operations</small></span>
+          </a>
+          <button class="icon-button sidebar-close" type="button" data-action="close-nav" aria-label="Close navigation">
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>
+
+        <nav class="nav-groups" aria-label="TapeScale sections">
+          <section>
+            <h2>Operate</h2>
+            <a class="nav-link" data-route="overview" href="#overview"><span class="nav-icon" aria-hidden="true">&#9632;</span><span>Overview</span></a>
+            <a class="nav-link" data-route="jobs" href="#jobs"><span class="nav-icon" aria-hidden="true">&#9654;</span><span>Jobs</span><span class="nav-count" id="nav-job-count">2</span></a>
+            <a class="nav-link" data-route="restore" href="#restore"><span class="nav-icon" aria-hidden="true">&#8630;</span><span>Restore</span></a>
+            <a class="nav-link" data-route="movements" href="#movements"><span class="nav-icon" aria-hidden="true">&#8644;</span><span>Movements</span><span class="nav-count nav-count-alert" id="nav-move-count">3</span></a>
+          </section>
+          <section>
+            <h2>Inventory</h2>
+            <a class="nav-link" data-route="tapes" href="#tapes"><span class="nav-icon" aria-hidden="true">&#9638;</span><span>Tapes &amp; pools</span></a>
+            <a class="nav-link" data-route="drives" href="#drives"><span class="nav-icon" aria-hidden="true">&#9673;</span><span>Drives &amp; libraries</span></a>
+          </section>
+          <section>
+            <h2>Assurance</h2>
+            <a class="nav-link" data-route="verification" href="#verification"><span class="nav-icon" aria-hidden="true">&#10003;</span><span>Verification</span></a>
+            <a class="nav-link" data-route="settings" href="#settings"><span class="nav-icon" aria-hidden="true">&#9881;</span><span>System &amp; qualification</span></a>
+          </section>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="service-health" id="service-health">
+            <span class="health-dot" aria-hidden="true"></span>
+            <span><strong>Demo data</strong><small>API discovery in progress</small></span>
+          </div>
+          <div class="version-line">TapeScale <span id="app-version">0.1.0-dev</span></div>
+        </div>
+      </aside>
+
+      <div class="sidebar-scrim" data-action="close-nav" aria-hidden="true"></div>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div class="topbar-start">
+            <button class="icon-button menu-button" type="button" data-action="open-nav" aria-label="Open navigation">
+              <span aria-hidden="true">&#9776;</span>
+            </button>
+            <div class="site-context">
+              <span class="eyebrow">Protection site</span>
+              <button class="site-select" type="button" data-action="site-menu" aria-haspopup="menu">
+                TrueNAS Primary <span aria-hidden="true">&#8964;</span>
+              </button>
+            </div>
+          </div>
+          <div class="topbar-end">
+            <button class="system-pill" type="button" data-action="show-preflight">
+              <span class="health-dot" aria-hidden="true"></span>
+              <span>Preflight <strong>Preview</strong></span>
+            </button>
+            <button class="icon-button notification-button" type="button" data-action="notifications" aria-label="Open notifications, 4 unresolved">
+              <span aria-hidden="true">&#9679;</span><span class="notification-badge">4</span>
+            </button>
+            <button class="user-menu" type="button" data-action="user-menu" aria-label="Open preview profile">
+              <span class="avatar" aria-hidden="true">PV</span>
+              <span class="user-copy"><strong>Preview</strong><small>Simulation</small></span>
+            </button>
+          </div>
+        </header>
+
+        <main class="main-content" id="main-content" tabindex="-1">
+          <div class="route-loading" role="status" aria-label="Loading TapeScale console">
+            <div class="loading-header"></div>
+            <div class="loading-grid"><span></span><span></span><span></span></div>
+            <div class="loading-table"></div>
+          </div>
+        </main>
+
+        <nav class="mobile-nav" aria-label="Mobile navigation">
+          <a data-route="overview" href="#overview"><span aria-hidden="true">&#9632;</span><small>Overview</small></a>
+          <a data-route="jobs" href="#jobs"><span aria-hidden="true">&#9654;</span><small>Jobs</small></a>
+          <a data-route="tapes" href="#tapes"><span aria-hidden="true">&#9638;</span><small>Tapes</small></a>
+          <a data-route="movements" href="#movements"><span aria-hidden="true">&#8644;</span><small>Moves</small></a>
+          <a data-route="settings" href="#settings"><span aria-hidden="true">&#8226;&#8226;&#8226;</span><small>More</small></a>
+        </nav>
+      </div>
+    </div>
+
+    <div class="drawer-layer" id="drawer-layer" hidden></div>
+    <div class="modal-layer" id="modal-layer" hidden></div>
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="false"></div>
+    <div class="sr-only" id="live-region" role="status" aria-live="polite"></div>
+
+    <noscript>
+      <div class="noscript-message">TapeScale requires JavaScript to operate the storage console.</div>
+    </noscript>
+  </body>
+</html>

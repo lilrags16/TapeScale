@@ -1,0 +1,124 @@
+# Security and media-safety model
+
+TapeScale protects offline recovery data, credentials, encryption keys, and destructive hardware. Security failures can destroy the final usable copy, so the system defaults to denial when identity or state is uncertain.
+
+This document is the required production security contract. The preview implements core RBAC/destructive-action policy, overwrite denial, restore-path validation, simulator claim boundaries, and a constrained external-tool runner. It does not yet constitute a production authentication, MFA, encrypted-secret, TLS, key-management, or device-security implementation. Those requirements remain release blockers even where the UI demonstrates the intended workflow.
+
+## Threat model
+
+The design considers:
+
+- a compromised browser session or insufficiently authorized operator;
+- malicious source filenames, archive paths, link targets, metadata, and native properties;
+- lost, foreign, mislabeled, or unexpectedly loaded media;
+- stale catalogs, replayed events, worker crashes, device resets, and split ownership;
+- a compromised source NAS and loss of the original application database;
+- secrets leaking through logs, diagnostics, notifications, environment variables, or exports;
+- shell metacharacters and hostile values passed to external utilities;
+- an attacker attempting to reduce retention, relabel, erase, export keys, or overwrite live destinations.
+
+## Trust boundaries
+
+- Browser and API inputs are untrusted, even for administrators.
+- Tape labels, barcodes, engine output, manifests recovered from media, and archive paths are untrusted until authenticated and reconciled.
+- The API service cannot access devices or source data.
+- The privileged worker receives only explicit intents already authorized by the API, then independently rechecks policy, object versions, lease ownership, and current physical state.
+- PostgreSQL is durable product state, not proof that a physical write completed.
+- Engine state is authoritative for its records but does not override TapeScale retention or authorization.
+
+## Identity and authorization
+
+Default roles are:
+
+- Administrator: configure hardware, policies, identities, keys, updates, retention, and destructive actions.
+- Operator: run permitted jobs, satisfy media requests, confirm assigned movements, and restore to approved destinations.
+- Viewer: inspect authorized status, inventory, verification evidence, and coverage.
+
+The API and worker enforce the same permissions. Unique accounts and protected sessions are required. Administrators enroll MFA by default and receive one-time recovery codes. No image ships a shared default password. Session cookies must be `Secure`, `HttpOnly`, and `SameSite`; state-changing browser requests require origin/CSRF protection. Login, MFA, and reauthentication endpoints are rate-limited.
+
+Erase, relabel, retention reduction, key export, destruction of protection, and overwrite of existing data require:
+
+1. an administrator role;
+2. a server-generated preview listing every affected recovery point, dependency, tape, and destination;
+3. recent MFA-backed reauthentication;
+4. an execution token bound to the preview digest and current object versions;
+5. an immutable audit result.
+
+## Media safety
+
+Media is write-protected in policy unless every overwrite-gate condition in [ARCHITECTURE.md](ARCHITECTURE.md) passes. Additional rules are:
+
+- Unknown or foreign media begins protected.
+- A barcode or printed label is never sufficient identity.
+- Labeling, format import, erasing, and reuse are separate operations.
+- A reset or disconnect makes position and pending writes uncertain.
+- Off-site return changes custody only; it does not change retention.
+- WORM status cannot be overridden by software.
+- Exported or active-job media remains reserved against conflicting writes.
+- Destructive exceptional overrides cannot suppress the resulting protection gap or audit event.
+
+## External command execution
+
+Rust integrations invoke programs with an executable path and an argument array. They must not use `sh -c`, interpolate user data into command strings, or inherit an uncontrolled environment.
+
+The tool runner:
+
+- allowlists executable and operation combinations;
+- validates dataset, snapshot, device, and destination arguments;
+- sets an explicit working directory, environment, uid/gid, and timeout where available;
+- bounds captured output and redacts configured secrets;
+- records executable version, argv classification, exit status, timeout, and correlation ID;
+- treats a failed producer, consumer, or pipeline endpoint as failure;
+- handles cancellation at operation-specific safe boundaries;
+- turns missing tools and hung commands into actionable durable states.
+
+Acceptance AT-30 includes shell metacharacters, failed producers, timeouts, cancellation, and missing dependencies.
+
+## Restore containment
+
+Restored names and metadata are hostile. File restoration must anchor all resolution to an already approved destination and reject absolute paths, `..`, alternate separators, NULs, device paths, and platform-specific escape forms. Directory traversal checks alone are insufficient.
+
+Creation uses descriptor-relative operations or an equivalent race-resistant mechanism that refuses unexpected symlinks. Symlink and hard-link targets are validated before creation; a hard link cannot target an inode outside the restore root. Special files require an explicit policy and isolated destination. Native receives rewrite mountpoints and dataset names into an approved restore hierarchy, do not mount over live paths, do not enable recovered shares, and restrict imported properties.
+
+Existing destinations default to skip conflicts. Rename and replace are explicit. Dataset replacement and deletion reconciliation are destructive administrator operations with preview and reauthentication.
+
+## Encryption and keys
+
+Encryption is enabled by default for new policies and covers content plus sensitive filenames, paths, metadata, and exported catalogs. Use an established authenticated-encryption format or a qualified encryption-plus-authentication construction. Compression occurs before application encryption. Hardware encryption is optional; a qualified software path is required for older drives.
+
+Key records refer to lineages and identifiers. Usable key material is encrypted at rest and never written to ordinary manifests, logs, or diagnostics. Historical keys remain protected while retained records depend on them.
+
+Catalog recovery and key recovery are independent. A portable encrypted key package is stored away from the source NAS and application catalog, and its recovery is verified before media becomes ordinarily export-ready. Raw ZFS encryption can require original dataset keys and does not automatically conceal all outer metadata; the recovery plan lists these dependencies explicitly.
+
+An administrator can opt out only with a recorded reason and visible deviation. Tape identity, record integrity, manifest authentication, truthful status, retention, and overwrite gates cannot be disabled.
+
+## Secrets and transport
+
+- Browser/API traffic uses HTTPS.
+- TrueNAS control uses authenticated secure WebSocket JSON-RPC with certificate verification and negotiated supported version.
+- Internal service communication is authenticated and protected; database and engine control ports remain private.
+- Long-lived secrets are mounted from secret files or a platform secret provider, not committed configuration.
+- Diagnostics use an allowlist and redact credentials, recovery codes, usable keys, cookies, authorization headers, and sensitive path inventories.
+- Notifications contain the minimum operational context and link an authenticated user to details.
+
+## Audit and event integrity
+
+Security, media, custody, retention, verification, and destructive actions append audit records containing actor, authenticated method, correlation ID, object versions, request/preview digest, decision, result, and timestamp. Corrections append a superseding event and preserve the prior record.
+
+Notifications use durable event identities. Replay may retry delivery but cannot silently duplicate movement confirmation or destructive execution.
+
+The preview database schema and domain rules establish this contract; full authenticated end-to-end audit/outbox delivery evidence remains pending in AT-28.
+
+## Container hardening
+
+- Run as non-root whenever device access permits; use explicit uid/gid and supplementary device groups.
+- Drop all capabilities, then add only a documented minimum to the worker or constrained host helper.
+- Prefer read-only root filesystems and writable named volumes for exact state paths.
+- Mount source data read-only and approved restore destinations narrowly.
+- Do not mount `/`, the Docker socket, arbitrary `/dev`, or broad host configuration.
+- Apply CPU, memory, process, and spool/staging limits.
+- Generate an SBOM and scan the release image; pin base images and dependencies.
+
+## Incident behavior
+
+When identity, position, catalog agreement, key availability, or integrity is uncertain, TapeScale preserves media and recoverable state, blocks destructive continuation, raises an actionable condition, and retains evidence. Operators should not bypass this state at the engine console; follow reconciliation in [OPERATIONS.md](OPERATIONS.md).

@@ -1,0 +1,62 @@
+[package]
+name = "tapescale"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89.0"
+description = "Safety-first LTO backup control plane for TrueNAS"
+repository = "https://github.com/lilrags16/TapeScale"
+publish = false
+
+[lib]
+name = "tapescale"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tapescale-api"
+path = "src/bin/tapescale-api.rs"
+
+[[bin]]
+name = "tapescale-worker"
+path = "src/bin/tapescale-worker.rs"
+
+[[bin]]
+name = "tapescale-scheduler"
+path = "src/bin/tapescale-scheduler.rs"
+
+[[bin]]
+name = "tapescale-recovery"
+path = "src/bin/tapescale-recovery.rs"
+
+[dependencies]
+anyhow = "1.0.97"
+async-trait = "0.1.87"
+axum = { version = "0.8.1", features = ["http1", "json", "macros", "tokio"] }
+chrono = { version = "0.4.40", features = ["serde"] }
+chrono-tz = "0.10.3"
+clap = { version = "4.5.32", features = ["derive", "env"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.8"
+sqlx = { version = "0.8.3", default-features = false, features = ["chrono", "macros", "migrate", "postgres", "runtime-tokio-rustls", "uuid"] }
+thiserror = "2.0.12"
+tokio = { version = "1.44.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7.14"
+tower-http = { version = "0.6.2", features = ["compression-gzip", "cors", "fs", "request-id", "trace"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+url = "2.5.4"
+uuid = { version = "1.16.0", features = ["serde", "v4", "v7"] }
+
+[dev-dependencies]
+tempfile = "3.19.1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
