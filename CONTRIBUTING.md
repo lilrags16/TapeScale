@@ -4,6 +4,8 @@ Thank you for helping build TapeScale. The project welcomes focused bug fixes, t
 
 TapeScale controls workflows that can overwrite media and determine whether backups are recoverable. Contributions must preserve the distinction between modeled capability, simulated evidence, and physical qualification.
 
+Participation in this project is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Before opening a change
 
 - Search existing issues and pull requests for related work.

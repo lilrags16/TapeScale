@@ -88,7 +88,7 @@ Bundle inspection validates format, size, contained artifact paths, SHA-256 decl
 
 ## Contributing and security
 
-Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), which explains the safety and evidence standards expected for changes.
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), which explains the safety and evidence standards expected for changes, and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 Please do not report vulnerabilities in a public issue. Follow the private process in [SECURITY.md](SECURITY.md). The product threat model and production security contract remain documented separately in [docs/SECURITY.md](docs/SECURITY.md).
 
