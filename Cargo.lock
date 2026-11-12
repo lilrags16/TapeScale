@@ -1941,6 +1941,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

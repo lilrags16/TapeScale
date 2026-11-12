@@ -1,8 +1,14 @@
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
+use axum::{
+    body::{to_bytes, Body},
+    http::{header, Method, Request, StatusCode},
+    Router,
+};
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{json, Value};
 use tapescale::{
+    api::{self, AppState},
     device::{MissingSasDrive, SasDriveObservation, SasMotionOperation},
     store::{
         self, ClaimDriveOperationResult, ClaimQualificationRunResult, ClaimSingleTapeDataRunResult,
@@ -13,6 +19,39 @@ use tapescale::{
         SingleTapePassEvidence,
     },
 };
+use tower::ServiceExt;
+
+async fn api_request(
+    application: &Router,
+    method: Method,
+    uri: String,
+    body: Option<Value>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    let request_body = match body {
+        Some(body) => {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(serde_json::to_vec(&body).expect("test request should serialize"))
+        }
+        None => Body::empty(),
+    };
+    application
+        .clone()
+        .oneshot(
+            builder
+                .body(request_body)
+                .expect("test request should build"),
+        )
+        .await
+        .expect("API request should complete")
+}
+
+async fn response_json(response: axum::response::Response) -> Value {
+    let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("API response body should be readable");
+    serde_json::from_slice(&body).expect("API response should be JSON")
+}
 
 #[tokio::test]
 async fn fresh_database_persists_inventory_and_sas_identity_safely() {
@@ -833,6 +872,204 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     assert_eq!(job_state, "verified");
     assert!(job_finished);
     assert_eq!(engine_operation_id.as_deref(), Some("bacula-job-1001"));
+
+    let web_directory = tempfile::tempdir().expect("temporary web directory should be created");
+    let application = api::router(
+        AppState::new(
+            Some(pool.clone()),
+            false,
+            true,
+            true,
+            true,
+            PathBuf::from("/source"),
+            PathBuf::from("/restore"),
+        ),
+        web_directory.path().to_path_buf(),
+    );
+
+    let detail_response = api_request(
+        &application,
+        Method::GET,
+        format!("/api/v1/recovery-points/{recovery_point_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(detail_response.status(), StatusCode::OK);
+    let detail = response_json(detail_response).await;
+    assert_eq!(detail["recovery_point"]["id"], json!(recovery_point_id));
+    assert_eq!(detail["recovery_point"]["status"], "verified");
+    assert_eq!(detail["volumes"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        detail["volumes"][0]["internal_label"],
+        "INTEGRATION-SCRATCH-L9-000001"
+    );
+    assert_eq!(detail["volumes"][0]["volume_order"], 1);
+    assert_eq!(detail["volumes"][0]["finalized"], true);
+    assert_eq!(detail["verifications"].as_array().map(Vec::len), Some(2));
+    assert_eq!(detail["origin"]["run_id"], json!(data_claim.run.job_run_id));
+    assert_eq!(detail["origin"]["data_run_id"], json!(data_claim.run.id));
+    assert!(detail["events"]
+        .as_array()
+        .is_some_and(|events| !events.is_empty()));
+    assert!(detail["artifacts"]
+        .as_array()
+        .is_some_and(|artifacts| artifacts.len() >= 3));
+    assert!(
+        !serde_json::to_string(&detail)
+            .expect("detail should serialize")
+            .contains("storage_ref"),
+        "public recovery detail must never expose artifact storage paths"
+    );
+
+    let evidence_response = api_request(
+        &application,
+        Method::GET,
+        format!("/api/v1/recovery-points/{recovery_point_id}/evidence"),
+        None,
+    )
+    .await;
+    assert_eq!(evidence_response.status(), StatusCode::OK);
+    assert_eq!(
+        evidence_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json; charset=utf-8")
+    );
+    assert!(evidence_response
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.contains(&format!(
+                "tapescale-recovery-point-{recovery_point_id}-evidence.json"
+            ))
+        }));
+    assert!(evidence_response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("\"sha256-") && value.ends_with('"')));
+    let evidence_bytes = to_bytes(evidence_response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("evidence response should be bounded and readable");
+    let evidence_text = std::str::from_utf8(&evidence_bytes).expect("evidence should be UTF-8");
+    assert!(!evidence_text.contains("storage_ref"));
+    assert!(
+        !evidence_text.contains('\n'),
+        "canonical JSON should be compact"
+    );
+    let evidence: Value =
+        serde_json::from_slice(&evidence_bytes).expect("evidence should be valid JSON");
+    assert_eq!(evidence["format"], "tapescale.recovery-point-evidence.v1");
+    assert_eq!(evidence["recovery_point"]["id"], json!(recovery_point_id));
+
+    let plans_before = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM restore_plans")
+        .fetch_one(&pool)
+        .await
+        .expect("restore-plan count should query");
+    let traversal_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/restores/plan".to_owned(),
+        Some(json!({
+            "recovery_point_id": recovery_point_id,
+            "destination": "../outside-the-recovery-root"
+        })),
+    )
+    .await;
+    assert_eq!(traversal_response.status(), StatusCode::BAD_REQUEST);
+    let traversal_error = response_json(traversal_response).await;
+    assert_eq!(traversal_error["error"]["code"], "invalid_request");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM restore_plans")
+            .fetch_one(&pool)
+            .await
+            .expect("rejected plan must not persist"),
+        plans_before
+    );
+
+    let plan_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/restores/plan".to_owned(),
+        Some(json!({
+            "recovery_point_id": recovery_point_id,
+            "mode": "file_archive",
+            "destination": "planned-restores/integration-recovery",
+            "conflict_policy": "skip",
+            "destination_approved": true,
+            "is_new_destination": true,
+            "acl_semantics_supported": true,
+            "identity_mapping_complete": true,
+            "estimated_required_bytes": 4096,
+            "available_bytes": 1048576,
+            "required_free_reserve_bytes": 4096,
+            "automatic_publication_requested": false
+        })),
+    )
+    .await;
+    assert_eq!(plan_response.status(), StatusCode::CREATED);
+    let plan_response = response_json(plan_response).await;
+    let plan = &plan_response["plan"];
+    assert_eq!(plan["execution_supported"], false);
+    assert_eq!(plan["ready"], false);
+    assert_eq!(
+        plan["required_tape_ids"],
+        json!(["INTEGRATION-SCRATCH-L9-000001"])
+    );
+    assert_eq!(
+        plan["verification_prerequisites"]["full_readback_passed"],
+        true
+    );
+    assert_eq!(
+        plan["verification_prerequisites"]["restore_test_passed"],
+        true
+    );
+    let blocker_codes = plan["blockers"]
+        .as_array()
+        .expect("blocked plan should return blocker objects")
+        .iter()
+        .filter_map(|blocker| blocker["code"].as_str())
+        .collect::<Vec<_>>();
+    assert!(blocker_codes.contains(&"tape_location_unknown"));
+    assert!(blocker_codes.contains(&"no_qualified_compatible_drive"));
+    assert!(plan["preview_hash"]
+        .as_str()
+        .is_some_and(|digest| digest.len() == 64));
+    assert!(plan["expires_at"].as_str().is_some());
+    let persisted_plan = sqlx::query_as::<_, (Value, Value, String, bool)>(
+        "SELECT selection, blockers, preview_hash,
+                expires_at > created_at AND expires_at <= created_at + interval '31 minutes'
+         FROM restore_plans WHERE id = $1",
+    )
+    .bind(
+        uuid::Uuid::parse_str(
+            plan["id"]
+                .as_str()
+                .expect("created plan should return a UUID"),
+        )
+        .expect("plan id should parse"),
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("restore plan should persist transactionally");
+    assert_eq!(persisted_plan.0["execution_supported"], false);
+    assert_eq!(persisted_plan.1, plan["blockers"]);
+    assert_eq!(persisted_plan.2, plan["preview_hash"]);
+    assert!(persisted_plan.3);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM audit_events
+             WHERE action = 'restore.plan' AND object_id = $1",
+        )
+        .bind(plan["id"].as_str().expect("plan id should be text"))
+        .fetch_one(&pool)
+        .await
+        .expect("restore-plan audit should query"),
+        1
+    );
+
     let data_events = store::single_tape_data_events(&pool, queued_data_run.id)
         .await
         .expect("data-run events should reload");
