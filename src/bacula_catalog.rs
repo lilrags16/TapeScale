@@ -8,6 +8,15 @@ use crate::engine::bacula::{
     VERIFY_JOB_NAME,
 };
 
+// Bacula 15.0.3 persists these one-byte JCR codes in the catalog Job table.
+// In particular, L_VERIFY_DATA is 'A'; 'D' is the unrelated differential
+// backup level. Restore commands are promoted to L_FULL before cataloging.
+const BACULA_BACKUP_JOB_TYPE: &str = "B";
+const BACULA_VERIFY_JOB_TYPE: &str = "V";
+const BACULA_RESTORE_JOB_TYPE: &str = "R";
+const BACULA_FULL_LEVEL: &str = "F";
+const BACULA_VERIFY_DATA_LEVEL: &str = "A";
+
 #[derive(Debug, thiserror::Error)]
 pub enum BaculaCatalogEvidenceError {
     #[error("Bacula catalog query failed: {0}")]
@@ -197,7 +206,13 @@ pub async fn validate_backup_job(
     pool: &BaculaPoolName,
 ) -> Result<BaculaBackupCatalogEvidence, BaculaCatalogEvidenceError> {
     let job = load_job(database, job_id).await?;
-    validate_job_common(&job, BACKUP_JOB_NAME, "B", "F", pool)?;
+    validate_job_common(
+        &job,
+        BACKUP_JOB_NAME,
+        BACULA_BACKUP_JOB_TYPE,
+        BACULA_FULL_LEVEL,
+        pool,
+    )?;
     expect_optional(
         "backup.write_storage",
         STORAGE_NAME,
@@ -241,7 +256,25 @@ pub async fn validate_verify_job(
     pool: &BaculaPoolName,
 ) -> Result<BaculaVerifyCatalogEvidence, BaculaCatalogEvidenceError> {
     let job = load_job(database, verify_job_id).await?;
-    validate_job_common(&job, VERIFY_JOB_NAME, "V", "D", pool)?;
+    validate_verify_job_record(&job, backup_job_id, pool)?;
+    Ok(BaculaVerifyCatalogEvidence {
+        job,
+        source_backup_job_id: backup_job_id,
+    })
+}
+
+fn validate_verify_job_record(
+    job: &BaculaCatalogJobEvidence,
+    backup_job_id: BaculaJobId,
+    pool: &BaculaPoolName,
+) -> Result<(), BaculaCatalogEvidenceError> {
+    validate_job_common(
+        job,
+        VERIFY_JOB_NAME,
+        BACULA_VERIFY_JOB_TYPE,
+        BACULA_VERIFY_DATA_LEVEL,
+        pool,
+    )?;
     expect_number(
         "verify.prior_job_id",
         i64::from(job_id_i32(backup_job_id)?),
@@ -254,10 +287,7 @@ pub async fn validate_verify_job(
         STORAGE_NAME,
         job.read_storage_name.as_deref(),
     )?;
-    Ok(BaculaVerifyCatalogEvidence {
-        job,
-        source_backup_job_id: backup_job_id,
-    })
+    Ok(())
 }
 
 pub async fn validate_restore_job(
@@ -267,7 +297,13 @@ pub async fn validate_restore_job(
     pool: &BaculaPoolName,
 ) -> Result<BaculaRestoreCatalogEvidence, BaculaCatalogEvidenceError> {
     let job = load_job(database, restore_job_id).await?;
-    validate_job_common(&job, RESTORE_JOB_NAME, "R", "F", pool)?;
+    validate_job_common(
+        &job,
+        RESTORE_JOB_NAME,
+        BACULA_RESTORE_JOB_TYPE,
+        BACULA_FULL_LEVEL,
+        pool,
+    )?;
     expect_optional(
         "restore.read_storage",
         STORAGE_NAME,
@@ -565,5 +601,37 @@ mod tests {
             write_storage_name: Some(STORAGE_NAME.to_owned()),
         };
         assert!(validate_job_common(&job, BACKUP_JOB_NAME, "B", "F", &pool()).is_err());
+    }
+
+    #[test]
+    fn accepts_bacula_data_verify_catalog_code_and_rejects_differential_code() {
+        let backup_job_id = BaculaJobId::new(41).expect("backup id");
+        let mut job = BaculaCatalogJobEvidence {
+            job_id: BaculaJobId::new(42).expect("verify id"),
+            name: VERIFY_JOB_NAME.to_owned(),
+            job_type: BACULA_VERIFY_JOB_TYPE.to_owned(),
+            level: BACULA_VERIFY_DATA_LEVEL.to_owned(),
+            status: "T".to_owned(),
+            prior_job_id: backup_job_id.get(),
+            files: 746,
+            job_bytes: 1_064_353_177,
+            errors: 0,
+            pool_name: Some(pool().as_str().to_owned()),
+            read_storage_name: Some(STORAGE_NAME.to_owned()),
+            write_storage_name: None,
+        };
+
+        validate_verify_job_record(&job, backup_job_id, &pool())
+            .expect("Bacula Level=Data catalogs Job.Level as A");
+
+        job.level = "D".to_owned();
+        assert!(matches!(
+            validate_verify_job_record(&job, backup_job_id, &pool()),
+            Err(BaculaCatalogEvidenceError::Mismatch {
+                field: "job.level",
+                expected,
+                actual,
+            }) if expected == "A" && actual == "D"
+        ));
     }
 }
