@@ -33,7 +33,7 @@ This is an initial engineering ledger. Automated test references should be added
 | AT-13 | Unknown media/device loss/position | Implemented/Simulated | Not run | Missing/path-changed SAS devices, stale identity, protected/foreign/WORM inventory, and unverifiable postconditions are blocked. Rewind/offline recovery and the post-`btape` cleanup require affirmative physical postconditions. Physical reset/disconnect evidence remains. |
 | AT-14 | Compression modes restore | Not run | Not run | Each supported resolved pipeline requires byte-exact restore evidence. |
 | AT-15 | Corrupt/reordered/truncated content | Simulated | Not run | Record/authentication fault injection must be tied to selected engine. |
-| AT-16 | Media read-back and restore tests | Implemented (G0.2 path) | Not run | The path requires Bacula `Level=Data` verification from the volume plus a normal restore and independent comparison; named physical evidence is still required. |
+| AT-16 | Media read-back and restore tests | Implemented (G0.2 path); complete file-backed Bacula roundtrip runs in CI | Not run | CI proves label, Full backup, `Level=Data`, restore, byte comparison, and catalog contracts without hardware; named physical SAS/LTO evidence is still required. |
 | AT-17 | Loss of original host and catalog | Not run | Not run | Requires clean replacement installation and independently recovered keys. |
 | AT-18 | Independent keys and rotation | Simulated | Not run | Real encrypted historical backups and portable-key recovery remain. |
 | AT-19 | Dependencies/shared tapes/archives | Implemented/Simulated | Not run | Dependency and overwrite-gate tests are control-plane evidence. |
