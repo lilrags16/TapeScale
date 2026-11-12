@@ -58,6 +58,53 @@ jobs:
           docker compose --file compose.truenas.yaml config --quiet
       - name: Build runtime image
         run: docker build --tag tapescale:ci .
+      - name: Validate packaged Bacula schema
+        run: >-
+          docker run --rm
+          --entrypoint /usr/local/bin/tapescale-worker
+          tapescale:ci
+          --validate-bacula-schema
+      - name: Bootstrap fresh Bacula catalog
+        run: |
+          set -euo pipefail
+          catalog_network="tapescale-ci-catalog-${GITHUB_RUN_ID}"
+          catalog_postgres="tapescale-ci-postgres-${GITHUB_RUN_ID}"
+          cleanup() {
+            docker rm --force "$catalog_postgres" >/dev/null 2>&1 || true
+            docker network rm "$catalog_network" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker network create "$catalog_network"
+          docker run --detach \
+            --name "$catalog_postgres" \
+            --network "$catalog_network" \
+            --network-alias postgres \
+            --env POSTGRES_DB=tapescale \
+            --env POSTGRES_USER=tapescale \
+            --env POSTGRES_PASSWORD=tapescale_ci \
+            postgres:16.15-bookworm
+          for attempt in $(seq 1 30); do
+            if docker exec "$catalog_postgres" pg_isready --username tapescale --dbname tapescale; then
+              break
+            fi
+            if test "$attempt" = 30; then
+              docker logs "$catalog_postgres"
+              exit 1
+            fi
+            sleep 1
+          done
+          docker run --rm \
+            --network "$catalog_network" \
+            --env DATABASE_URL=postgresql://tapescale:tapescale_ci@postgres:5432/tapescale \
+            --entrypoint /usr/local/bin/tapescale-worker \
+            tapescale:ci \
+            --prepare-bacula-catalog
+          catalog_result="$(docker exec \
+            --env PGPASSWORD=tapescale_ci \
+            "$catalog_postgres" \
+            psql --username tapescale --dbname tapescale --tuples-only --no-align \
+            --command "SELECT versionid || '|' || (to_regclass('public.job') IS NOT NULL)::text || '|' || (to_regclass('public.media') IS NOT NULL)::text FROM public.version")"
+          test "$catalog_result" = "1026|true|true"
       - name: Verify capability-free worker state access
         run: |
           docker volume create tapescale-ci-engine-state

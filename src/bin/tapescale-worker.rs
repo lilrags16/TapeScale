@@ -5,6 +5,7 @@ use clap::Parser;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tapescale::{
+    bacula_runtime::{validate_packaged_catalog_schema, BaculaRuntime},
     config::Config,
     data_run,
     device::{
@@ -29,20 +30,47 @@ use uuid::Uuid;
 )]
 struct Arguments {
     /// Perform one reconciliation pass and exit.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["validate_bacula_schema", "prepare_bacula_catalog"])]
     once: bool,
+
+    /// Validate the digest and SQL payload of the packaged Bacula schema, then exit.
+    #[arg(long, conflicts_with = "prepare_bacula_catalog")]
+    validate_bacula_schema: bool,
+
+    /// Initialize and validate the Bacula catalog in DATABASE_URL, then exit.
+    #[arg(long)]
+    prepare_bacula_catalog: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let arguments = Arguments::parse();
+    if arguments.validate_bacula_schema {
+        validate_packaged_catalog_schema()?;
+        info!("packaged Bacula catalog schema passed digest and SQL validation");
+        return Ok(());
+    }
     let config = Config::from_env()?;
     let pool = match &config.database_url {
         Some(url) => Some(store::connect(url, config.database_connect_timeout).await?),
         None if config.demo_mode => None,
         None => anyhow::bail!("DATABASE_URL is required outside simulation mode"),
     };
+    if arguments.prepare_bacula_catalog {
+        let database_url = config
+            .database_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("DATABASE_URL is required for catalog preparation"))?;
+        let database = pool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PostgreSQL is required for catalog preparation"))?;
+        let version =
+            BaculaRuntime::prepare_catalog(database, database_url, &CancellationToken::new())
+                .await?;
+        info!(catalog_schema_version = version, "Bacula catalog is ready");
+        return Ok(());
+    }
     let sas_config = SasDiscoveryConfig::from_env()?;
     let mut worker_singleton_lock = match pool.as_ref() {
         Some(pool) => Some(store::acquire_worker_singleton(pool).await?),

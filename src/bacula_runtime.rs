@@ -261,6 +261,14 @@ impl BaculaRuntime {
     }
 }
 
+/// Validate the exact packaged Bacula catalog script without connecting to PostgreSQL.
+///
+/// The container CI and operational diagnostics use this entry point so a package/script parser
+/// mismatch cannot remain hidden until the first physical recovery exercise.
+pub fn validate_packaged_catalog_schema() -> Result<(), BaculaRuntimeError> {
+    load_packaged_catalog_schema().map(drop)
+}
+
 async fn ensure_catalog_schema(
     pool: &PgPool,
     catalog: &BaculaCatalogConnection,
@@ -282,27 +290,7 @@ async fn ensure_catalog_schema(
             .await
             .map_err(|error| BaculaRuntimeError::CatalogInitialization(error.to_string()))?;
     if relation.is_none() {
-        let script = fs::read(CATALOG_SCHEMA_PROGRAM).map_err(|error| {
-            BaculaRuntimeError::CatalogInitialization(format!(
-                "could not read the pinned Bacula schema script: {error}"
-            ))
-        })?;
-        let script_digest = digest(&script);
-        if script_digest != CATALOG_SCHEMA_SCRIPT_SHA256 {
-            return Err(BaculaRuntimeError::CatalogInitialization(format!(
-                "Bacula schema script digest {script_digest} did not match the pinned package digest"
-            )));
-        }
-        let script = std::str::from_utf8(&script).map_err(|error| {
-            BaculaRuntimeError::CatalogInitialization(format!(
-                "Bacula schema script was not UTF-8: {error}"
-            ))
-        })?;
-        let schema_sql = extract_catalog_schema_sql(script).ok_or_else(|| {
-            BaculaRuntimeError::CatalogInitialization(
-                "Bacula schema script did not contain its expected SQL heredoc".to_owned(),
-            )
-        })?;
+        let schema_sql = load_packaged_catalog_schema()?;
         let command = ToolCommand::new(PSQL_PROGRAM)
             .args([
                 "-h".to_owned(),
@@ -430,11 +418,40 @@ async fn validate_catalog_fingerprint(
     Ok(())
 }
 
+fn load_packaged_catalog_schema() -> Result<String, BaculaRuntimeError> {
+    let script = fs::read(CATALOG_SCHEMA_PROGRAM).map_err(|error| {
+        BaculaRuntimeError::CatalogInitialization(format!(
+            "could not read the pinned Bacula schema script: {error}"
+        ))
+    })?;
+    let script_digest = digest(&script);
+    if script_digest != CATALOG_SCHEMA_SCRIPT_SHA256 {
+        return Err(BaculaRuntimeError::CatalogInitialization(format!(
+            "Bacula schema script digest {script_digest} did not match the pinned package digest"
+        )));
+    }
+    let script = std::str::from_utf8(&script).map_err(|error| {
+        BaculaRuntimeError::CatalogInitialization(format!(
+            "Bacula schema script was not UTF-8: {error}"
+        ))
+    })?;
+    extract_catalog_schema_sql(script)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            BaculaRuntimeError::CatalogInitialization(
+                "Bacula schema script did not contain its expected SQL heredoc".to_owned(),
+            )
+        })
+}
+
 fn extract_catalog_schema_sql(script: &str) -> Option<&str> {
     let (_, heredoc) = script.split_once("<<END-OF-DATA\n")?;
     let (sql, _) = heredoc.rsplit_once("\nEND-OF-DATA\n")?;
     (sql.len() <= 4 * 1024 * 1024
-        && sql.contains("CREATE TABLE Version")
+        // The pinned Bacula 15.0.3 PostgreSQL script spells the declaration
+        // with a lowercase, unquoted table name, while its later INSERT uses
+        // `Version`. PostgreSQL folds both to the same public relation.
+        && sql.contains("\nCREATE TABLE version\n")
         && sql.contains("INSERT INTO Version (VersionId) VALUES (1026);")
         && sql.contains("\nCOMMIT;"))
     .then_some(sql)
@@ -705,9 +722,18 @@ mod tests {
 
     #[test]
     fn extracts_schema_without_expanding_postgresql_dollar_quotes() {
-        let script = "#!/bin/sh\npsql -f - <<END-OF-DATA\nBEGIN;\ndo $$ begin perform 1; end $$;\nCREATE TABLE Version (VersionId integer);\nINSERT INTO Version (VersionId) VALUES (1026);\nCOMMIT;\nEND-OF-DATA\nexit $?\n";
+        // Preserve the declaration/INSERT capitalization used by the exact
+        // Bacula 15.0.3 package script (digest-pinned above).
+        let script = "#!/bin/sh\npsql -f - <<END-OF-DATA\nBEGIN;\ndo $$ begin perform 1; end $$;\nCREATE TABLE version\n(\n    versionid integer not null\n);\nINSERT INTO Version (VersionId) VALUES (1026);\nCOMMIT;\nEND-OF-DATA\nexit $?\n";
         let sql = extract_catalog_schema_sql(script).expect("pinned heredoc");
         assert!(sql.contains("do $$ begin"));
         assert!(sql.contains("end $$;"));
+        assert!(sql.contains("CREATE TABLE version"));
+    }
+
+    #[test]
+    fn rejects_a_schema_heredoc_without_the_pinned_version_declaration() {
+        let script = "#!/bin/sh\npsql -f - <<END-OF-DATA\nBEGIN;\nCREATE TABLE other (id integer);\nINSERT INTO Version (VersionId) VALUES (1026);\nCOMMIT;\nEND-OF-DATA\n";
+        assert!(extract_catalog_schema_sql(script).is_none());
     }
 }
