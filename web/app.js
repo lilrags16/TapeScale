@@ -1173,15 +1173,15 @@
   function renderDependencySettings() {
     return `<section class="panel table-panel"><div class="panel-head"><div><h2>Runtime component inventory</h2><p>Custom backend components remain Rust; established Linux dependencies retain their implementations</p></div>${statusTag("Audit current", "success")}</div><div class="table-scroll"><table class="data-table responsive-table"><thead><tr><th>Component</th><th>Version / pin</th><th>Boundary</th><th>License</th><th>Recovery availability</th></tr></thead><tbody>
       ${[
-        ["TapeScale API", "Rust 1.89.0", "Custom Rust HTTP/API service", "Repository license not selected", "Release image + source"],
-        ["TapeScale scheduler", "Rust 1.89.0", "Custom Rust orchestration boundary", "Repository license not selected", "Release image + source"],
-        ["TapeScale worker", "Rust 1.89.0", "Custom Rust worker process", "Repository license not selected", "Release image + source"],
-        ["TapeScale recovery CLI", "Rust 1.89.0", "Custom Rust command-line tool", "Repository license not selected", "Release image; independent bundle pending"],
+        ["TapeScale API", "Rust 1.89.0", "Custom Rust HTTP/API service", "Apache-2.0", "Release image + source"],
+        ["TapeScale scheduler", "Rust 1.89.0", "Custom Rust orchestration boundary", "Apache-2.0", "Release image + source"],
+        ["TapeScale worker", "Rust 1.89.0", "Custom Rust worker process", "Apache-2.0", "Release image + source"],
+        ["TapeScale recovery CLI", "Rust 1.89.0", "Custom Rust command-line tool", "Apache-2.0", "Release image; independent bundle pending"],
         ["Bacula Community", "15.x candidate · unselected", "Existing tape-engine candidate", "Upstream license applies", "Not packaged"],
         ["PostgreSQL", "16.15", "Existing durable database", "PostgreSQL License", "Pinned Compose image"],
         ["OpenZFS utilities", "Host-provided · unpinned", "Existing host tool", "Upstream license applies", "Not packaged"],
         ["mtx / sg3_utils", "Not packaged", "Existing device-tool candidates", "Upstream licenses apply", "Not yet available"],
-        ["Static web console", "ES2022", "Browser-side JavaScript", "Repository license not selected", "Embedded in API image"]
+        ["Static web console", "ES2022", "Browser-side JavaScript", "Apache-2.0", "Embedded in API image"]
       ].map((row) => `<tr><td class="primary-cell" data-label="Component"><strong>${escapeHtml(row[0])}</strong></td><td data-label="Version / pin"><span class="mono">${escapeHtml(row[1])}</span></td><td data-label="Boundary">${escapeHtml(row[2])}</td><td data-label="License">${escapeHtml(row[3])}</td><td data-label="Recovery availability">${escapeHtml(row[4])}</td></tr>`).join("")}
     </tbody></table></div></section>
     <div class="notice info section"><span class="notice-icon">i</span><div class="notice-copy"><strong>Safe external-tool execution</strong><span>Rust adapters invoke explicit arguments without shell interpolation, validate identifiers, enforce timeouts and cancellation, and propagate producer failures into durable job state.</span></div></div>`;

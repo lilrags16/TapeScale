@@ -1,0 +1,75 @@
+name: Bug report
+description: Report reproducible incorrect behavior in TapeScale
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        TapeScale is an engineering preview. Never include credentials, customer data, private paths, recovery keys, or unsanitized logs. Report security issues through the private link below instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Provide the image tag, digest, release, or Git commit.
+      placeholder: "For example: main at abc1234"
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - API or web console
+        - Scheduler
+        - Worker or engine adapter
+        - Recovery CLI
+        - PostgreSQL or migration
+        - Docker or TrueNAS deployment
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include relevant OS, TrueNAS, browser, drive, changer, and simulator details. Redact private identifiers.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest safe reproduction.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety or recovery impact
+      description: State whether data, media, custody, verification, restore, or qualification claims may be affected.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I removed secrets, private paths, customer data, and recovery material.
+          required: true
+        - label: I am not reporting a security vulnerability publicly.
+          required: true
+        - label: I have not labeled simulator output as physical qualification.
+          required: true

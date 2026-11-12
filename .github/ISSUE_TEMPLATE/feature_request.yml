@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose a focused TapeScale improvement
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What operator or recovery problem should TapeScale solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: Describe the desired behavior without prescribing implementation unless necessary.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and recovery considerations
+      description: Consider overwrite, retention, privileges, evidence, offline recovery, and failure behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: This request does not include credentials, customer data, private paths, or recovery material.
+          required: true
+        - label: I understand that a modeled capability is not physical qualification.
+          required: true

@@ -12,7 +12,8 @@ ARG TAPESCALE_VERSION=0.1.0
 LABEL org.opencontainers.image.title="TapeScale" \
       org.opencontainers.image.description="Safety-first LTO backup control plane for TrueNAS" \
       org.opencontainers.image.version="${TAPESCALE_VERSION}" \
-      org.opencontainers.image.source="https://github.com/lilrags16/TapeScale"
+      org.opencontainers.image.source="https://github.com/lilrags16/TapeScale" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl tzdata \

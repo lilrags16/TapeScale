@@ -1,5 +1,8 @@
 # TapeScale
 
+[![CI](https://github.com/lilrags16/TapeScale/actions/workflows/ci.yml/badge.svg)](https://github.com/lilrags16/TapeScale/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 TapeScale is a safety-first LTO backup control plane for TrueNAS. It is designed to manage file and native ZFS protection, media, restores, verification evidence, and confirmed off-site custody without making the application catalog a single point of recovery failure.
 
 > [!IMPORTANT]
@@ -83,6 +86,16 @@ Bundle inspection validates format, size, contained artifact paths, SHA-256 decl
 - [Operator workflows](docs/OPERATIONS.md)
 - [Product design system](docs/design-system.md)
 
+## Contributing and security
+
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), which explains the safety and evidence standards expected for changes.
+
+Please do not report vulnerabilities in a public issue. Follow the private process in [SECURITY.md](SECURITY.md). The product threat model and production security contract remain documented separately in [docs/SECURITY.md](docs/SECURITY.md).
+
 ## Project status
 
 The next release gate requires a designated TrueNAS 25.10.8 qualification host, real drives/changer and scratch media, a pinned engine candidate, reproducible fixtures, and retained test evidence. Simulated acceptance coverage is useful engineering evidence, but it is never labeled as a physical pass.
+
+## License
+
+TapeScale is licensed under the [Apache License 2.0](LICENSE).

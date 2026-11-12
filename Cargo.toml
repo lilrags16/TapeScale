@@ -5,6 +5,8 @@ edition = "2021"
 rust-version = "1.89.0"
 description = "Safety-first LTO backup control plane for TrueNAS"
 repository = "https://github.com/lilrags16/TapeScale"
+license = "Apache-2.0"
+readme = "README.md"
 publish = false
 
 [lib]
