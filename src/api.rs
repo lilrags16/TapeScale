@@ -1,14 +1,16 @@
 use std::{path::PathBuf, sync::Arc};
 
 use axum::{
+    body::Body,
     extract::{Path, State},
-    http::{HeaderName, StatusCode},
-    response::IntoResponse,
+    http::{header, HeaderName, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
@@ -21,7 +23,14 @@ use uuid::Uuid;
 use crate::{
     data_path::{isolated_restore_destination, resolve_existing_selection, verify_read_only_mount},
     device::SasMotionOperation,
-    domain::path::validate_archive_path,
+    domain::{
+        path::validate_archive_path,
+        restore::{
+            preflight_restore, ConflictPolicy, DestinationAssessment, KeyPrerequisite,
+            RestoreBlocker, RestoreMode, RestoreRequest, RestoreWarning, TapePrerequisite,
+            VerificationEvidence,
+        },
+    },
     engine::{simulator::SimulatorEngine, TapeEngine},
     error::AppError,
     qualification, store, VERSION,
@@ -80,6 +89,11 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .route("/api/v1/movements/{id}/confirm", post(confirm_movement))
         .route("/api/v1/verification", get(verification))
         .route("/api/v1/recovery-points", get(recovery_points))
+        .route("/api/v1/recovery-points/{id}", get(recovery_point))
+        .route(
+            "/api/v1/recovery-points/{id}/evidence",
+            get(recovery_point_evidence),
+        )
         .route(
             "/api/v1/recovery-exercises/profiles",
             get(recovery_exercise_profiles).post(create_recovery_exercise_profile),
@@ -518,6 +532,70 @@ async fn recovery_points(State(state): State<AppState>) -> Result<Json<Value>, A
     Ok(Json(json!({"recovery_points":recovery_points})))
 }
 
+async fn recovery_point(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let id = parse_uuid_path(&id, "recovery point")?;
+    let aggregate = store::get_recovery_point_aggregate(pool, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(
+        serde_json::to_value(aggregate).map_err(|error| AppError::Internal(error.to_string()))?,
+    ))
+}
+
+async fn recovery_point_evidence(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    const MAX_EXPORT_BYTES: usize = 4 * 1024 * 1024;
+
+    let pool = require_pool(&state)?;
+    let id = parse_uuid_path(&id, "recovery point")?;
+    let aggregate = store::get_recovery_point_aggregate(pool, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let evidence = json!({
+        "format": "tapescale.recovery-point-evidence.v1",
+        "canonicalization": "UTF-8 compact JSON with lexicographically ordered object keys",
+        "execution_claim": "none; this export records retained recovery evidence and prerequisites",
+        "bounds": {
+            "maximum_serialized_bytes": MAX_EXPORT_BYTES,
+            "row_and_value_caps": aggregate.caps
+        },
+        "recovery_point": aggregate.recovery_point,
+        "volumes": aggregate.volumes,
+        "dependencies": aggregate.dependencies,
+        "holds": aggregate.holds,
+        "verifications": aggregate.verifications,
+        "origin": aggregate.origin,
+        "events": aggregate.events,
+        "artifacts": aggregate.artifacts
+    });
+    let body = canonical_json(&evidence)?;
+    if body.len() > MAX_EXPORT_BYTES {
+        return Err(AppError::Blocked(format!(
+            "the bounded evidence export is {} bytes, exceeding the {} byte response limit",
+            body.len(),
+            MAX_EXPORT_BYTES
+        )));
+    }
+    let digest = format!("{:x}", Sha256::digest(&body));
+    let disposition =
+        format!("attachment; filename=\"tapescale-recovery-point-{id}-evidence.json\"");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::ETAG, format!("\"sha256-{digest}\""))
+        .header("x-content-type-options", "nosniff")
+        .body(Body::from(body))
+        .map_err(|error| AppError::Internal(error.to_string()))
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateRecoveryExerciseProfileRequest {
     name: String,
@@ -749,23 +827,371 @@ fn require_file_roundtrip(state: &AppState) -> Result<(), AppError> {
 #[derive(Debug, Deserialize)]
 struct RestorePlanRequest {
     #[serde(default)]
+    recovery_point_id: Option<Uuid>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
     destination: Option<String>,
     #[serde(default)]
+    conflict_policy: Option<String>,
+    #[serde(default)]
     key_available: bool,
+    #[serde(default)]
+    key_recovery_package_tested: bool,
+    #[serde(default)]
+    destination_approved: bool,
+    #[serde(default = "default_true", alias = "destination_is_new")]
+    is_new_destination: bool,
+    #[serde(default)]
+    conflicts_found: usize,
+    #[serde(default)]
+    acl_semantics_supported: bool,
+    #[serde(default)]
+    identity_mapping_complete: bool,
+    #[serde(default)]
+    estimated_required_bytes: Option<u64>,
+    #[serde(default)]
+    available_bytes: Option<u64>,
+    #[serde(default)]
+    required_free_reserve_bytes: u64,
+    #[serde(default)]
+    administrator_reauthenticated: bool,
+    #[serde(default)]
+    destructive_preview_accepted: bool,
+    #[serde(default)]
+    automatic_publication_requested: bool,
 }
 
-async fn plan_restore(Json(request): Json<RestorePlanRequest>) -> Result<Json<Value>, AppError> {
-    if let Some(destination) = &request.destination {
-        if validate_archive_path(std::path::Path::new(destination)).is_err() {
-            return Err(AppError::Invalid(
-                "destination must be a contained dataset-relative path".to_owned(),
+async fn plan_restore(
+    State(state): State<AppState>,
+    Json(request): Json<RestorePlanRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let pool = require_pool(&state)?;
+    let recovery_point_id = request.recovery_point_id.ok_or_else(|| {
+        AppError::Invalid("recovery_point_id is required and must be a UUID".to_owned())
+    })?;
+    let destination = request
+        .destination
+        .as_deref()
+        .ok_or_else(|| AppError::Invalid("destination is required".to_owned()))?;
+    let destination = validate_archive_path(std::path::Path::new(destination))
+        .map_err(|_| {
+            AppError::Invalid(
+                "destination must be a non-empty contained dataset-relative path".to_owned(),
+            )
+        })?
+        .as_path()
+        .to_str()
+        .ok_or_else(|| AppError::Invalid("destination must be valid UTF-8".to_owned()))?
+        .to_owned();
+
+    let mut aggregate = store::get_recovery_point_aggregate(pool, recovery_point_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let mode = parse_restore_mode(
+        request.mode.as_deref(),
+        &aggregate.recovery_point.representation,
+    )?;
+    ensure_restore_mode_matches(mode, &aggregate.recovery_point.representation)?;
+    let conflict_policy = parse_conflict_policy(request.conflict_policy.as_deref())?;
+
+    let chain_ids = dedupe_preserving_order(
+        aggregate
+            .dependencies
+            .iter()
+            .map(|dependency| dependency.id)
+            .chain(std::iter::once(recovery_point_id)),
+    );
+    aggregate.volumes.sort_by_key(|volume| {
+        (
+            chain_ids
+                .iter()
+                .position(|id| *id == volume.recovery_point_id)
+                .unwrap_or(usize::MAX),
+            volume.volume_order,
+            volume.id,
+        )
+    });
+
+    let mut missing_dependencies = Vec::new();
+    if aggregate.caps.dependencies_truncated {
+        missing_dependencies
+            .push("dependency graph exceeds the 128-node planning bound".to_owned());
+    }
+    if aggregate.caps.volumes_truncated {
+        missing_dependencies
+            .push("required media exceeds the 256-volume planning bound".to_owned());
+    }
+    for dependency in &aggregate.dependencies {
+        if dependency.status != "verified" {
+            missing_dependencies.push(format!(
+                "recovery point {} is {}",
+                dependency.id, dependency.status
             ));
         }
     }
-    let _ = request.key_available;
-    Err(AppError::Blocked(
-        "restore planning requires a persisted recovery-point selection and is not implemented yet"
-            .to_owned(),
+    if aggregate.recovery_point.status != "verified" {
+        missing_dependencies.push(format!(
+            "selected recovery point {} is {}",
+            aggregate.recovery_point.id, aggregate.recovery_point.status
+        ));
+    }
+    for chain_id in &chain_ids {
+        if !aggregate
+            .volumes
+            .iter()
+            .any(|volume| volume.recovery_point_id == *chain_id && volume.finalized)
+        {
+            missing_dependencies.push(format!(
+                "recovery point {chain_id} has no finalized media record"
+            ));
+        }
+    }
+    missing_dependencies.sort();
+    missing_dependencies.dedup();
+
+    let mut seen_tape_ids = Vec::new();
+    let tapes = aggregate
+        .volumes
+        .iter()
+        .filter(|volume| {
+            if seen_tape_ids.contains(&volume.cartridge_id) {
+                false
+            } else {
+                seen_tape_ids.push(volume.cartridge_id);
+                true
+            }
+        })
+        .map(|volume| TapePrerequisite {
+            tape_id: volume.internal_label.clone(),
+            available: volume.available,
+            confirmed_location: volume.location_name.clone(),
+            compatible_qualified_drive_ids: volume
+                .compatible_qualified_drives
+                .iter()
+                .map(|drive| drive.stable_id.clone())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut key_lineage_ids = aggregate
+        .dependencies
+        .iter()
+        .filter_map(|dependency| dependency.key_lineage_id.clone())
+        .collect::<Vec<_>>();
+    if let Some(key) = &aggregate.recovery_point.key_lineage_id {
+        key_lineage_ids.push(key.clone());
+    }
+    key_lineage_ids.sort();
+    key_lineage_ids.dedup();
+    let keys = key_lineage_ids
+        .iter()
+        .map(|key_id| KeyPrerequisite {
+            key_id: key_id.clone(),
+            available: request.key_available,
+            recovery_package_tested: request.key_recovery_package_tested,
+        })
+        .collect::<Vec<_>>();
+
+    let all_chain_full_readback = chain_ids.iter().all(|id| {
+        aggregate.verifications.iter().any(|verification| {
+            verification.recovery_point_id == *id
+                && verification.kind == "full_readback"
+                && verification.outcome == "passed"
+        })
+    });
+    let restore_test_passed = aggregate.verifications.iter().any(|verification| {
+        verification.recovery_point_id == recovery_point_id
+            && verification.kind == "restore_test"
+            && verification.outcome == "passed"
+    });
+    let native_stream_validation_available = chain_ids.iter().all(|id| {
+        aggregate.verifications.iter().any(|verification| {
+            verification.recovery_point_id == *id
+                && verification.outcome == "passed"
+                && (verification
+                    .evidence
+                    .get("native_stream_validated")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                    || verification
+                        .scope
+                        .get("native_stream_validated")
+                        .and_then(Value::as_bool)
+                        == Some(true))
+        })
+    });
+    let per_file_digests_available = aggregate.recovery_point.manifest_digest.is_some()
+        && aggregate
+            .dependencies
+            .iter()
+            .all(|dependency| dependency.manifest_digest.is_some());
+
+    let destination_assessment = DestinationAssessment {
+        approved: request.destination_approved,
+        is_new_destination: request.is_new_destination,
+        conflicts_found: request.conflicts_found,
+        conflict_policy,
+        acl_semantics_supported: request.acl_semantics_supported,
+        identity_mapping_complete: request.identity_mapping_complete,
+        estimated_required_bytes: request.estimated_required_bytes,
+        available_bytes: request.available_bytes,
+        required_free_reserve_bytes: request.required_free_reserve_bytes,
+        administrator_reauthenticated: request.administrator_reauthenticated,
+        destructive_preview_accepted: request.destructive_preview_accepted,
+    };
+    let restore_request = RestoreRequest {
+        recovery_point_id: recovery_point_id.to_string(),
+        mode,
+        dependency_chain: chain_ids.iter().map(ToString::to_string).collect(),
+        missing_dependencies,
+        tapes,
+        keys,
+        verification: VerificationEvidence {
+            full_readback_passed: all_chain_full_readback,
+            restore_test_passed,
+            native_stream_validation_available,
+            per_file_digests_available,
+        },
+        destination: destination_assessment,
+        automatic_publication_requested: request.automatic_publication_requested,
+    };
+    let verification_prerequisites = json!({
+        "full_readback_passed": restore_request.verification.full_readback_passed,
+        "restore_test_passed": restore_request.verification.restore_test_passed,
+        "native_stream_validation_available": restore_request.verification.native_stream_validation_available,
+        "per_file_digests_available": restore_request.verification.per_file_digests_available
+    });
+    let preflight = preflight_restore(&restore_request);
+    let blockers = preflight
+        .blockers
+        .iter()
+        .map(restore_blocker_view)
+        .collect::<Vec<_>>();
+    let warnings = preflight
+        .warnings
+        .iter()
+        .map(restore_warning_view)
+        .collect::<Vec<_>>();
+    let required_media_ids =
+        dedupe_preserving_order(aggregate.volumes.iter().map(|volume| volume.cartridge_id));
+    let required_tape_ids = dedupe_preserving_order(
+        aggregate
+            .volumes
+            .iter()
+            .map(|volume| volume.internal_label.clone()),
+    );
+    let encoded_bytes = aggregate
+        .volumes
+        .iter()
+        .filter_map(|volume| volume.encoded_bytes)
+        .filter_map(|bytes| u64::try_from(bytes).ok())
+        .fold(0_u64, u64::saturating_add);
+    let estimates = json!({
+        "encoded_bytes": encoded_bytes,
+        "media_count": required_media_ids.len(),
+        "dependency_count": aggregate.dependencies.len(),
+        "destination_required_bytes": request.estimated_required_bytes,
+        "available_bytes": request.available_bytes,
+        "required_free_reserve_bytes": request.required_free_reserve_bytes,
+        "estimate_only": true
+    });
+    let destination_view = json!({
+        "path": destination,
+        "approved": request.destination_approved,
+        "is_new_destination": request.is_new_destination,
+        "conflicts_found": request.conflicts_found,
+        "conflict_policy": conflict_policy_name(conflict_policy),
+        "acl_semantics_supported": request.acl_semantics_supported,
+        "identity_mapping_complete": request.identity_mapping_complete,
+        "estimated_required_bytes": request.estimated_required_bytes,
+        "available_bytes": request.available_bytes,
+        "required_free_reserve_bytes": request.required_free_reserve_bytes,
+        "administrator_reauthenticated": request.administrator_reauthenticated,
+        "destructive_preview_accepted": request.destructive_preview_accepted,
+        "automatic_publication_requested": request.automatic_publication_requested
+    });
+    let selection = json!({
+        "recovery_point_id": recovery_point_id,
+        "mode": restore_mode_name(mode),
+        "representation": aggregate.recovery_point.representation.clone(),
+        "scope": aggregate.recovery_point.coverage.clone()
+    });
+    let preview = json!({
+        "selection": selection,
+        "dependency_chain": chain_ids,
+        "required_media_ids": required_media_ids,
+        "required_tape_ids": required_tape_ids,
+        "key_lineage_ids": key_lineage_ids,
+        "destination": destination_view,
+        "blockers": blockers,
+        "warnings": warnings,
+        "estimates": estimates,
+        "verification": verification_prerequisites,
+        "execution_supported": false
+    });
+    let preview_hash = format!("{:x}", Sha256::digest(canonical_json(&preview)?));
+    let persisted_selection = json!({
+        "request": selection,
+        "ready": preflight.ready(),
+        "execution_supported": false,
+        "dependencies": &aggregate.dependencies,
+        "volumes": &aggregate.volumes,
+        "verifications": &aggregate.verifications,
+        "verification_prerequisites": verification_prerequisites,
+        "warnings": warnings,
+        "caps": &aggregate.caps
+    });
+    let record = store::create_restore_plan(
+        pool,
+        &store::NewRestorePlan {
+            selection: persisted_selection,
+            dependency_chain: chain_ids.clone(),
+            required_media_ids: required_media_ids.clone(),
+            key_lineage_ids: key_lineage_ids.clone(),
+            destination: destination_view.clone(),
+            conflict_policy: conflict_policy_name(conflict_policy).to_owned(),
+            blockers: Value::Array(blockers.clone()),
+            estimates: estimates.clone(),
+            preview_hash,
+        },
+    )
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "plan": {
+                "id": record.id,
+                "preview_hash": record.preview_hash,
+                "created_at": record.created_at,
+                "expires_at": record.expires_at,
+                "ready": preflight.ready(),
+                "status": if preflight.ready() { "ready" } else { "blocked" },
+                "execution_supported": false,
+                "execution_detail": "This release persists and audits restore planning only; it does not dispatch tape reads or write a destination.",
+                "selection": selection,
+                "recovery_point": aggregate.recovery_point,
+                "dependencies": aggregate.dependencies,
+                "dependency_chain": chain_ids,
+                "volumes": aggregate.volumes,
+                "required_tape_ids": required_tape_ids,
+                "required_media_ids": required_media_ids,
+                "required_key_ids": key_lineage_ids,
+                "keys": key_lineage_ids.iter().map(|key_id| json!({
+                    "key_id": key_id,
+                    "available": request.key_available,
+                    "recovery_package_tested": request.key_recovery_package_tested
+                })).collect::<Vec<_>>(),
+                "verifications": aggregate.verifications,
+                "verification_prerequisites": verification_prerequisites,
+                "destination": destination_view,
+                "blockers": blockers,
+                "warnings": warnings,
+                "estimates": estimates,
+                "caps": aggregate.caps
+            }
+        })),
     ))
 }
 
@@ -986,6 +1412,205 @@ fn runtime_mode(state: &AppState) -> &'static str {
     }
 }
 
+const fn default_true() -> bool {
+    true
+}
+
+fn parse_uuid_path(value: &str, label: &str) -> Result<Uuid, AppError> {
+    Uuid::parse_str(value).map_err(|_| AppError::Invalid(format!("{label} id must be a UUID")))
+}
+
+fn canonical_json(value: &Value) -> Result<Vec<u8>, AppError> {
+    serde_json::to_vec(value).map_err(|error| AppError::Internal(error.to_string()))
+}
+
+fn dedupe_preserving_order<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
+    let mut unique = Vec::new();
+    for item in items {
+        if !unique.contains(&item) {
+            unique.push(item);
+        }
+    }
+    unique
+}
+
+fn parse_restore_mode(value: Option<&str>, representation: &str) -> Result<RestoreMode, AppError> {
+    match value {
+        Some("file_archive") => Ok(RestoreMode::FileArchive),
+        Some("native_dataset") => Ok(RestoreMode::NativeDataset),
+        Some("files_from_native") => Ok(RestoreMode::FilesFromNative),
+        Some(_) => Err(AppError::Invalid(
+            "mode must be file_archive, native_dataset, or files_from_native".to_owned(),
+        )),
+        None if representation == "file" => Ok(RestoreMode::FileArchive),
+        None if representation == "native_zfs" => Ok(RestoreMode::NativeDataset),
+        None => Err(AppError::Invalid(format!(
+            "recovery-point representation {representation} has no supported restore mode"
+        ))),
+    }
+}
+
+fn ensure_restore_mode_matches(mode: RestoreMode, representation: &str) -> Result<(), AppError> {
+    let matches = matches!(
+        (mode, representation),
+        (RestoreMode::FileArchive, "file")
+            | (
+                RestoreMode::NativeDataset | RestoreMode::FilesFromNative,
+                "native_zfs"
+            )
+    );
+    if matches {
+        Ok(())
+    } else {
+        Err(AppError::Invalid(format!(
+            "restore mode {} is incompatible with {representation} recovery media",
+            restore_mode_name(mode)
+        )))
+    }
+}
+
+fn parse_conflict_policy(value: Option<&str>) -> Result<ConflictPolicy, AppError> {
+    match value.unwrap_or("skip") {
+        "skip" => Ok(ConflictPolicy::Skip),
+        "rename" => Ok(ConflictPolicy::Rename),
+        "replace" => Ok(ConflictPolicy::Replace),
+        _ => Err(AppError::Invalid(
+            "conflict_policy must be skip, rename, or replace".to_owned(),
+        )),
+    }
+}
+
+const fn restore_mode_name(mode: RestoreMode) -> &'static str {
+    match mode {
+        RestoreMode::FileArchive => "file_archive",
+        RestoreMode::NativeDataset => "native_dataset",
+        RestoreMode::FilesFromNative => "files_from_native",
+    }
+}
+
+const fn conflict_policy_name(policy: ConflictPolicy) -> &'static str {
+    match policy {
+        ConflictPolicy::Skip => "skip",
+        ConflictPolicy::Rename => "rename",
+        ConflictPolicy::Replace => "replace",
+    }
+}
+
+fn restore_blocker_view(blocker: &RestoreBlocker) -> Value {
+    match blocker {
+        RestoreBlocker::MissingRecoveryDependency(dependency) => json!({
+            "code": "missing_recovery_dependency",
+            "message": format!("Resolve required recovery dependency: {dependency}."),
+            "dependency": dependency
+        }),
+        RestoreBlocker::TapeUnavailable(tape) => json!({
+            "code": "tape_unavailable",
+            "message": format!("Reconcile and make tape {tape} available before restore."),
+            "tape_id": tape
+        }),
+        RestoreBlocker::TapeLocationUnknown(tape) => json!({
+            "code": "tape_location_unknown",
+            "message": format!("Confirm the physical location of tape {tape}."),
+            "tape_id": tape
+        }),
+        RestoreBlocker::NoQualifiedCompatibleDrive(tape) => json!({
+            "code": "no_qualified_compatible_drive",
+            "message": format!("Connect, reconcile, and qualify a read-compatible drive for tape {tape}."),
+            "tape_id": tape
+        }),
+        RestoreBlocker::RequiredKeyUnavailable(key) => json!({
+            "code": "required_key_unavailable",
+            "message": format!("Make encryption key lineage {key} available."),
+            "key_id": key
+        }),
+        RestoreBlocker::DestinationNotApproved => json!({
+            "code": "destination_not_approved",
+            "message": "Confirm that the isolated destination is approved for recovery output."
+        }),
+        RestoreBlocker::DestinationAclSemanticsUnsupported => json!({
+            "code": "destination_acl_semantics_unsupported",
+            "message": "Use a destination whose ACL semantics can represent the recorded metadata."
+        }),
+        RestoreBlocker::IdentityMappingIncomplete => json!({
+            "code": "identity_mapping_incomplete",
+            "message": "Complete the destination user and group identity mapping."
+        }),
+        RestoreBlocker::InsufficientDestinationCapacity {
+            required_with_reserve,
+            available,
+        } => json!({
+            "code": "insufficient_destination_capacity",
+            "message": format!("Provide at least {required_with_reserve} bytes including reserve; {available} bytes were declared available."),
+            "required_with_reserve": required_with_reserve,
+            "available": available
+        }),
+        RestoreBlocker::DestructiveReplacementRequiresAdministratorReauthentication => json!({
+            "code": "administrator_reauthentication_required",
+            "message": "Reauthenticate as an administrator before planning replacement in an existing destination."
+        }),
+        RestoreBlocker::DestructiveReplacementRequiresPreview => json!({
+            "code": "destructive_preview_required",
+            "message": "Review and accept the destructive replacement preview."
+        }),
+        RestoreBlocker::NativeDestinationMustBeNewOrExplicitlyReplaced => json!({
+            "code": "native_destination_must_be_new_or_replaced",
+            "message": "Choose a new native destination or explicitly select replacement."
+        }),
+        RestoreBlocker::AutomaticNativePublicationForbidden => json!({
+            "code": "automatic_native_publication_forbidden",
+            "message": "Disable automatic publication; recovered datasets must remain isolated for review."
+        }),
+        RestoreBlocker::FileDigestEvidenceUnavailable => json!({
+            "code": "file_digest_evidence_unavailable",
+            "message": "Select a recovery point with retained per-file digest evidence."
+        }),
+        RestoreBlocker::NativeStreamValidationUnavailable => json!({
+            "code": "native_stream_validation_unavailable",
+            "message": "Select a recovery chain with validated native stream evidence."
+        }),
+    }
+}
+
+fn restore_warning_view(warning: &RestoreWarning) -> Value {
+    match warning {
+        RestoreWarning::FullReadbackNotPassed => json!({
+            "code": "full_readback_not_passed",
+            "message": "No complete passing physical-media readback covers this recovery chain."
+        }),
+        RestoreWarning::RestoreTestNotPassed => json!({
+            "code": "restore_test_not_passed",
+            "message": "The selected recovery point has no passing isolated restore test."
+        }),
+        RestoreWarning::RecoveryKeyPackageNotTested(key) => json!({
+            "code": "recovery_key_package_not_tested",
+            "message": format!("Recovery packaging for key lineage {key} has not been declared tested."),
+            "key_id": key
+        }),
+        RestoreWarning::CapacityEstimateUnavailable => json!({
+            "code": "capacity_estimate_unavailable",
+            "message": "Destination capacity was not fully declared; verify capacity before execution."
+        }),
+        RestoreWarning::CapacityIsAnEstimate => json!({
+            "code": "capacity_is_an_estimate",
+            "message": "Capacity values are planning estimates, not an execution-time reservation."
+        }),
+        RestoreWarning::ExistingConflictsWillBeSkipped(count) => json!({
+            "code": "existing_conflicts_will_be_skipped",
+            "message": format!("{count} declared destination conflicts will be skipped."),
+            "count": count
+        }),
+        RestoreWarning::ExistingConflictsWillBeRenamed(count) => json!({
+            "code": "existing_conflicts_will_be_renamed",
+            "message": format!("{count} declared destination conflicts will be renamed."),
+            "count": count
+        }),
+        RestoreWarning::NativeExtractionHasStreamLevelEvidenceOnly => json!({
+            "code": "native_extraction_has_stream_level_evidence_only",
+            "message": "Native extraction has stream-level evidence but no independent per-file digest proof."
+        }),
+    }
+}
+
 fn media_view(record: &store::MediaRecord) -> Value {
     let overwrite_blocker = match record.identity_status.as_str() {
         "unknown" => "on-tape identity has not been reconciled",
@@ -1110,5 +1735,41 @@ mod tests {
             ..request
         };
         assert!(matches!(invalid.validate(), Err(AppError::Invalid(_))));
+    }
+
+    #[test]
+    fn restore_contract_uses_explicit_modes_and_safe_defaults() {
+        assert_eq!(
+            parse_restore_mode(None, "file").expect("file mode"),
+            RestoreMode::FileArchive
+        );
+        assert_eq!(
+            parse_restore_mode(Some("files_from_native"), "native_zfs")
+                .expect("native extraction mode"),
+            RestoreMode::FilesFromNative
+        );
+        assert!(ensure_restore_mode_matches(RestoreMode::FileArchive, "native_zfs").is_err());
+        assert_eq!(
+            parse_conflict_policy(None).expect("safe conflict default"),
+            ConflictPolicy::Skip
+        );
+    }
+
+    #[test]
+    fn restore_prerequisite_ids_are_deduplicated_without_reordering() {
+        assert_eq!(
+            dedupe_preserving_order(["tape-b", "tape-a", "tape-b", "tape-c"]),
+            vec!["tape-b", "tape-a", "tape-c"]
+        );
+    }
+
+    #[test]
+    fn canonical_evidence_json_is_compact_and_key_sorted() {
+        let encoded =
+            canonical_json(&json!({"z": 1, "a": {"y": 2, "b": 3}})).expect("JSON should serialize");
+        assert_eq!(
+            String::from_utf8(encoded).expect("JSON is UTF-8"),
+            r#"{"a":{"b":3,"y":2},"z":1}"#
+        );
     }
 }

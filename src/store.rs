@@ -7,10 +7,14 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{pool::PoolConnection, postgres::PgPoolOptions, FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::device::{MissingSasDrive, SasDriveObservation, SasMotionOperation};
+use crate::{
+    device::{MissingSasDrive, SasDriveObservation, SasMotionOperation},
+    domain::lto::{can_read, DriveGeneration, MediaFormat},
+};
 
 #[derive(Clone, Debug, FromRow, Serialize)]
 pub struct OverviewCounts {
@@ -162,6 +166,251 @@ pub struct RecoveryPointRecord {
     pub manifest_digest: Option<String>,
     pub dataset_name: String,
     pub media_labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RecoveryPointDetailRecord {
+    pub id: Uuid,
+    pub source_id: Uuid,
+    pub run_id: Uuid,
+    pub representation: String,
+    pub level: String,
+    pub source_scope_hash: String,
+    pub format_version: String,
+    pub key_lineage_id: Option<String>,
+    pub status: String,
+    pub recovery_time: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub indefinite: bool,
+    pub coverage: Value,
+    pub manifest_digest: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub dataset_name: String,
+    pub source_type: String,
+    pub logical_root: String,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RecoveryDependencyRecord {
+    pub id: Uuid,
+    pub representation: String,
+    pub level: String,
+    pub status: String,
+    pub recovery_time: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub indefinite: bool,
+    pub format_version: String,
+    pub key_lineage_id: Option<String>,
+    pub manifest_digest: Option<String>,
+    pub dependency_kind: String,
+    pub depth: i32,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct RecoveryVolumeRow {
+    id: Uuid,
+    recovery_point_id: Uuid,
+    volume_order: i32,
+    first_record: String,
+    last_record: Option<String>,
+    encoded_bytes: Option<i64>,
+    finalized: bool,
+    engine_record_id: String,
+    cartridge_id: Uuid,
+    internal_label: String,
+    barcode: Option<String>,
+    media_generation: Option<i16>,
+    media_format: Option<String>,
+    on_tape_identity: Option<String>,
+    identity_status: String,
+    health_status: String,
+    worm: bool,
+    reserved_by: Option<String>,
+    location_id: Option<Uuid>,
+    location_name: Option<String>,
+    location_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct RecoveryDriveRow {
+    id: Uuid,
+    stable_id: String,
+    generation: Option<i16>,
+    vendor: Option<String>,
+    model: Option<String>,
+    serial: Option<String>,
+    wwn: Option<String>,
+    firmware: Option<String>,
+    observed_path: Option<String>,
+    last_observed_at: Option<DateTime<Utc>>,
+    qualified_media: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecoveryDrivePrerequisite {
+    pub id: Uuid,
+    pub stable_id: String,
+    pub generation: Option<i16>,
+    pub vendor: Option<String>,
+    pub model: Option<String>,
+    pub serial: Option<String>,
+    pub wwn: Option<String>,
+    pub firmware: Option<String>,
+    pub observed_path: Option<String>,
+    pub last_observed_at: Option<DateTime<Utc>>,
+    pub compatibility_basis: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecoveryVolumeRecord {
+    pub id: Uuid,
+    pub recovery_point_id: Uuid,
+    pub volume_order: i32,
+    pub first_record: String,
+    pub last_record: Option<String>,
+    pub encoded_bytes: Option<i64>,
+    pub finalized: bool,
+    pub engine_record_id: String,
+    pub cartridge_id: Uuid,
+    pub internal_label: String,
+    pub barcode: Option<String>,
+    pub media_generation: Option<i16>,
+    pub media_format: Option<String>,
+    pub on_tape_identity: Option<String>,
+    pub identity_status: String,
+    pub health_status: String,
+    pub worm: bool,
+    pub reserved_by: Option<String>,
+    pub location_id: Option<Uuid>,
+    pub location_name: Option<String>,
+    pub location_kind: Option<String>,
+    pub available: bool,
+    pub compatible_qualified_drives: Vec<RecoveryDrivePrerequisite>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RecoveryHoldRecord {
+    pub id: Uuid,
+    pub cartridge_id: Option<Uuid>,
+    pub recovery_point_id: Option<Uuid>,
+    pub kind: String,
+    pub reason: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub released_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RecoveryVerificationRecord {
+    pub id: Uuid,
+    pub recovery_point_id: Uuid,
+    pub kind: String,
+    pub scope: Value,
+    pub outcome: String,
+    pub evidence: Value,
+    pub correlation_id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub drive_id: Option<Uuid>,
+    pub drive_stable_id: Option<String>,
+    pub media_ids: Vec<Uuid>,
+    pub media_labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RecoveryOriginRecord {
+    pub job_id: Uuid,
+    pub job_external_id: String,
+    pub job_kind: String,
+    pub run_id: Uuid,
+    pub run_state: String,
+    pub attempt: i32,
+    pub correlation_id: Uuid,
+    pub engine_operation_id: Option<String>,
+    pub run_created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub data_run_id: Option<Uuid>,
+    pub profile_name: Option<String>,
+    pub engine_name: Option<String>,
+    pub engine_version: Option<String>,
+    pub adapter_version: Option<String>,
+    pub data_run_result: Option<Value>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RecoveryEventRecord {
+    pub source: String,
+    pub event_id: String,
+    pub event_type: String,
+    pub detail: String,
+    pub evidence: Value,
+    pub correlation_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RecoveryArtifactRecord {
+    pub id: i64,
+    pub artifact_kind: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub metadata: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecoveryAggregateCaps {
+    pub dependencies_truncated: bool,
+    pub volumes_truncated: bool,
+    pub holds_truncated: bool,
+    pub verifications_truncated: bool,
+    pub events_truncated: bool,
+    pub artifacts_truncated: bool,
+    pub values_truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecoveryPointAggregate {
+    pub recovery_point: RecoveryPointDetailRecord,
+    pub volumes: Vec<RecoveryVolumeRecord>,
+    pub dependencies: Vec<RecoveryDependencyRecord>,
+    pub holds: Vec<RecoveryHoldRecord>,
+    pub verifications: Vec<RecoveryVerificationRecord>,
+    pub origin: RecoveryOriginRecord,
+    pub events: Vec<RecoveryEventRecord>,
+    pub artifacts: Vec<RecoveryArtifactRecord>,
+    pub caps: RecoveryAggregateCaps,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewRestorePlan {
+    pub selection: Value,
+    pub dependency_chain: Vec<Uuid>,
+    pub required_media_ids: Vec<Uuid>,
+    pub key_lineage_ids: Vec<String>,
+    pub destination: Value,
+    pub conflict_policy: String,
+    pub blockers: Value,
+    pub estimates: Value,
+    pub preview_hash: String,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RestorePlanRecord {
+    pub id: Uuid,
+    pub selection: Value,
+    pub dependency_chain: Vec<Uuid>,
+    pub required_media_ids: Vec<Uuid>,
+    pub key_lineage_ids: Vec<String>,
+    pub destination: Value,
+    pub conflict_policy: String,
+    pub blockers: Value,
+    pub estimates: Value,
+    pub preview_hash: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -4176,6 +4425,592 @@ pub async fn list_recovery_points(pool: &PgPool) -> Result<Vec<RecoveryPointReco
     .await
 }
 
+pub const RECOVERY_DEPENDENCY_LIMIT: usize = 128;
+pub const RECOVERY_VOLUME_LIMIT: usize = 256;
+pub const RECOVERY_HOLD_LIMIT: usize = 256;
+pub const RECOVERY_VERIFICATION_LIMIT: usize = 64;
+pub const RECOVERY_EVENT_LIMIT: usize = 128;
+pub const RECOVERY_ARTIFACT_LIMIT: usize = 32;
+pub const RECOVERY_JSON_VALUE_LIMIT_BYTES: usize = 8 * 1024;
+
+/// Loads the bounded, operator-facing recovery-point aggregate used for both
+/// inspection and restore planning. Artifact payloads remain in their durable
+/// storage locations; this aggregate exposes only their content-addressed
+/// metadata.
+pub async fn get_recovery_point_aggregate(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<RecoveryPointAggregate>, sqlx::Error> {
+    let Some(mut recovery_point) = sqlx::query_as::<_, RecoveryPointDetailRecord>(
+        "SELECT rp.id, rp.source_id, rp.run_id, rp.representation, rp.level,
+                rp.source_scope_hash, rp.format_version, rp.key_lineage_id,
+                rp.status, rp.recovery_time, rp.expires_at, rp.indefinite,
+                rp.coverage, rp.manifest_digest, rp.created_at,
+                s.dataset_name, s.source_type, s.logical_root
+         FROM recovery_points rp
+         JOIN sources s ON s.id = rp.source_id
+         WHERE rp.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let mut dependencies = sqlx::query_as::<_, RecoveryDependencyRecord>(
+        "WITH RECURSIVE dependency_walk(id, dependency_kind, depth, path) AS (
+             SELECT rd.depends_on_id, rd.dependency_kind, 1::integer,
+                    ARRAY[$1, rd.depends_on_id]::uuid[]
+             FROM recovery_dependencies rd
+             WHERE rd.recovery_point_id = $1
+             UNION ALL
+             SELECT rd.depends_on_id, rd.dependency_kind, walk.depth + 1,
+                    walk.path || rd.depends_on_id
+             FROM dependency_walk walk
+             JOIN recovery_dependencies rd ON rd.recovery_point_id = walk.id
+             WHERE walk.depth < 128 AND NOT rd.depends_on_id = ANY(walk.path)
+         ), unique_walk AS (
+             SELECT DISTINCT ON (id) id, dependency_kind, depth
+             FROM dependency_walk
+             ORDER BY id, depth DESC
+         )
+         SELECT rp.id, rp.representation, rp.level, rp.status,
+                rp.recovery_time, rp.expires_at, rp.indefinite,
+                rp.format_version, rp.key_lineage_id, rp.manifest_digest,
+                walk.dependency_kind, walk.depth
+         FROM unique_walk walk
+         JOIN recovery_points rp ON rp.id = walk.id
+         ORDER BY walk.depth DESC, rp.recovery_time, rp.id
+         LIMIT $2",
+    )
+    .bind(id)
+    .bind(i64::try_from(RECOVERY_DEPENDENCY_LIMIT + 1).expect("small fixed limit"))
+    .fetch_all(pool)
+    .await?;
+    let dependencies_truncated = truncate_rows(&mut dependencies, RECOVERY_DEPENDENCY_LIMIT);
+
+    let mut recovery_ids = dependencies
+        .iter()
+        .map(|dependency| dependency.id)
+        .collect::<Vec<_>>();
+    recovery_ids.push(id);
+    recovery_ids.sort_unstable();
+    recovery_ids.dedup();
+
+    let mut volume_rows = sqlx::query_as::<_, RecoveryVolumeRow>(
+        "SELECT vr.id, vr.recovery_point_id, vr.volume_order,
+                vr.first_record, vr.last_record, vr.encoded_bytes,
+                vr.finalized, vr.engine_record_id,
+                c.id AS cartridge_id, c.internal_label, c.barcode,
+                c.media_generation, c.media_format, c.on_tape_identity,
+                c.identity_status, c.health_status, c.worm, c.reserved_by,
+                l.id AS location_id, l.name AS location_name, l.kind AS location_kind
+         FROM volume_records vr
+         JOIN cartridges c ON c.id = vr.cartridge_id
+         LEFT JOIN locations l ON l.id = c.confirmed_location_id
+         WHERE vr.recovery_point_id = ANY($1::uuid[])
+         ORDER BY vr.recovery_point_id, vr.volume_order, vr.id
+         LIMIT $2",
+    )
+    .bind(&recovery_ids)
+    .bind(i64::try_from(RECOVERY_VOLUME_LIMIT + 1).expect("small fixed limit"))
+    .fetch_all(pool)
+    .await?;
+    let volumes_truncated = truncate_rows(&mut volume_rows, RECOVERY_VOLUME_LIMIT);
+
+    let drive_rows = sqlx::query_as::<_, RecoveryDriveRow>(
+        "SELECT d.id, d.stable_id, d.generation, d.vendor, d.model,
+                d.serial, d.wwn, d.firmware, d.observed_path, d.last_observed_at,
+                COALESCE(
+                    jsonb_agg(DISTINCT jsonb_build_object(
+                        'cartridge_id', q.cartridge_id,
+                        'generation', q.expected_media_generation,
+                        'format', q.expected_media_format
+                    )) FILTER (WHERE q.id IS NOT NULL),
+                    '[]'::jsonb
+                ) AS qualified_media
+         FROM drives d
+         LEFT JOIN LATERAL (
+             SELECT latest.*
+             FROM (
+                 SELECT DISTINCT ON (
+                            candidate.cartridge_id,
+                            candidate.expected_media_generation,
+                            candidate.expected_media_format
+                        )
+                        candidate.*
+                 FROM qualification_runs candidate
+                 JOIN cartridges qualified_cartridge
+                   ON qualified_cartridge.id = candidate.cartridge_id
+                 WHERE candidate.drive_id = d.id
+                   AND candidate.expected_cartridge_label = qualified_cartridge.internal_label
+                   AND candidate.expected_media_generation
+                       IS NOT DISTINCT FROM qualified_cartridge.media_generation
+                   AND candidate.expected_media_format
+                       IS NOT DISTINCT FROM qualified_cartridge.media_format
+                   AND candidate.engine_name = 'Bacula Community'
+                   AND candidate.engine_version = '15.0.3'
+                   AND candidate.test_kind = 'btape_test'
+                   AND candidate.attempt > 0
+                 ORDER BY candidate.cartridge_id,
+                          candidate.expected_media_generation,
+                          candidate.expected_media_format,
+                          candidate.created_at DESC, candidate.id DESC
+             ) latest
+             WHERE latest.state = 'passed'
+               AND latest.expected_stable_id = d.stable_id
+               AND latest.expected_path IS NOT DISTINCT FROM d.observed_path
+               AND latest.expected_vendor IS NOT DISTINCT FROM d.vendor
+               AND latest.expected_model IS NOT DISTINCT FROM d.model
+               AND latest.expected_serial IS NOT DISTINCT FROM d.serial
+               AND latest.expected_wwn IS NOT DISTINCT FROM d.wwn
+               AND latest.expected_firmware IS NOT DISTINCT FROM d.firmware
+         ) q ON true
+         WHERE d.reconciled
+           AND d.health->>'present' = 'true'
+           AND d.health->>'accessible' = 'true'
+           AND d.health->>'identity_verified' = 'true'
+           AND COALESCE(d.health->>'identity_conflict', 'false') <> 'true'
+           AND COALESCE(d.health->>'motion_position_uncertain', 'false') <> 'true'
+           AND d.health->>'immediate_mode' = 'false'
+           AND d.health->>'in_flight' = '0'
+           AND d.last_observed_at >= now() - interval '2 minutes'
+         GROUP BY d.id
+         ORDER BY d.stable_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let volumes = volume_rows
+        .into_iter()
+        .map(|volume| recovery_volume_with_drives(volume, &drive_rows))
+        .collect::<Vec<_>>();
+    let media_ids = volumes
+        .iter()
+        .map(|volume| volume.cartridge_id)
+        .collect::<Vec<_>>();
+
+    let mut holds = sqlx::query_as::<_, RecoveryHoldRecord>(
+        "SELECT h.id, h.cartridge_id, h.recovery_point_id, h.kind, h.reason,
+                h.expires_at, h.released_at, h.created_at,
+                (h.released_at IS NULL AND
+                 (h.expires_at IS NULL OR h.expires_at > now())) AS active
+         FROM holds h
+         WHERE h.recovery_point_id = ANY($1::uuid[])
+            OR h.cartridge_id = ANY($2::uuid[])
+         ORDER BY active DESC, h.created_at DESC, h.id
+         LIMIT $3",
+    )
+    .bind(&recovery_ids)
+    .bind(&media_ids)
+    .bind(i64::try_from(RECOVERY_HOLD_LIMIT + 1).expect("small fixed limit"))
+    .fetch_all(pool)
+    .await?;
+    let holds_truncated = truncate_rows(&mut holds, RECOVERY_HOLD_LIMIT);
+
+    let mut verifications = sqlx::query_as::<_, RecoveryVerificationRecord>(
+        "SELECT vr.id, vr.recovery_point_id, vr.kind, vr.scope, vr.outcome,
+                vr.evidence, vr.correlation_id, vr.started_at, vr.finished_at,
+                vr.drive_id, d.stable_id AS drive_stable_id, vr.media_ids,
+                COALESCE(ARRAY(
+                    SELECT cartridge.internal_label
+                    FROM unnest(vr.media_ids) AS media(cartridge_id)
+                    JOIN cartridges cartridge ON cartridge.id = media.cartridge_id
+                    ORDER BY cartridge.internal_label
+                ), '{}'::text[]) AS media_labels
+         FROM verification_records vr
+         LEFT JOIN drives d ON d.id = vr.drive_id
+         WHERE vr.recovery_point_id = ANY($1::uuid[])
+         ORDER BY vr.recovery_point_id, vr.started_at, vr.id
+         LIMIT $2",
+    )
+    .bind(&recovery_ids)
+    .bind(i64::try_from(RECOVERY_VERIFICATION_LIMIT + 1).expect("small fixed limit"))
+    .fetch_all(pool)
+    .await?;
+    let verifications_truncated = truncate_rows(&mut verifications, RECOVERY_VERIFICATION_LIMIT);
+
+    let mut origin = sqlx::query_as::<_, RecoveryOriginRecord>(
+        "SELECT j.id AS job_id, j.external_id AS job_external_id,
+                j.kind AS job_kind, jr.id AS run_id, jr.state AS run_state,
+                jr.attempt, jr.correlation_id, jr.engine_operation_id,
+                jr.created_at AS run_created_at, jr.started_at, jr.finished_at,
+                data_run.id AS data_run_id, profile.name AS profile_name,
+                data_run.engine_name, data_run.engine_version,
+                data_run.adapter_version, data_run.result AS data_run_result
+         FROM job_runs jr
+         JOIN jobs j ON j.id = jr.job_id
+         LEFT JOIN single_tape_data_runs data_run ON data_run.job_run_id = jr.id
+         LEFT JOIN single_tape_data_profiles profile ON profile.id = data_run.profile_id
+         WHERE jr.id = $1",
+    )
+    .bind(recovery_point.run_id)
+    .fetch_one(pool)
+    .await?;
+
+    let mut events = sqlx::query_as::<_, RecoveryEventRecord>(
+        "SELECT event.source, event.event_id, event.event_type, event.detail,
+                event.evidence, event.correlation_id, event.occurred_at
+         FROM (
+             SELECT 'job_transition'::text AS source, jt.id::text AS event_id,
+                    jt.to_state AS event_type, jt.reason AS detail,
+                    jt.evidence, jt.correlation_id, jt.occurred_at
+             FROM job_transitions jt
+             WHERE jt.run_id = $1
+             UNION ALL
+             SELECT 'recovery_exercise'::text AS source, event.id::text AS event_id,
+                    event.event_type, ''::text AS detail,
+                    event.evidence, event.correlation_id, event.occurred_at
+             FROM single_tape_data_events event
+             JOIN single_tape_data_runs data_run
+               ON data_run.id = event.single_tape_data_run_id
+             WHERE data_run.job_run_id = $1
+         ) event
+         ORDER BY event.occurred_at, event.source, event.event_id
+         LIMIT $2",
+    )
+    .bind(recovery_point.run_id)
+    .bind(i64::try_from(RECOVERY_EVENT_LIMIT + 1).expect("small fixed limit"))
+    .fetch_all(pool)
+    .await?;
+    let events_truncated = truncate_rows(&mut events, RECOVERY_EVENT_LIMIT);
+
+    let mut artifacts = sqlx::query_as::<_, RecoveryArtifactRecord>(
+        "SELECT artifact.id, artifact.artifact_kind,
+                artifact.sha256, artifact.size_bytes, artifact.metadata,
+                artifact.created_at
+         FROM single_tape_data_artifacts artifact
+         JOIN single_tape_data_runs data_run
+           ON data_run.id = artifact.single_tape_data_run_id
+         WHERE data_run.job_run_id = $1
+         ORDER BY artifact.created_at, artifact.id
+         LIMIT $2",
+    )
+    .bind(recovery_point.run_id)
+    .bind(i64::try_from(RECOVERY_ARTIFACT_LIMIT + 1).expect("small fixed limit"))
+    .fetch_all(pool)
+    .await?;
+    let artifacts_truncated = truncate_rows(&mut artifacts, RECOVERY_ARTIFACT_LIMIT);
+
+    let mut values_truncated = false;
+    bound_value_in_place(&mut recovery_point.coverage, &mut values_truncated);
+    for verification in &mut verifications {
+        bound_value_in_place(&mut verification.scope, &mut values_truncated);
+        bound_value_in_place(&mut verification.evidence, &mut values_truncated);
+    }
+    if let Some(result) = &mut origin.data_run_result {
+        bound_value_in_place(result, &mut values_truncated);
+    }
+    for event in &mut events {
+        bound_value_in_place(&mut event.evidence, &mut values_truncated);
+    }
+    for artifact in &mut artifacts {
+        bound_value_in_place(&mut artifact.metadata, &mut values_truncated);
+    }
+
+    Ok(Some(RecoveryPointAggregate {
+        recovery_point,
+        volumes,
+        dependencies,
+        holds,
+        verifications,
+        origin,
+        events,
+        artifacts,
+        caps: RecoveryAggregateCaps {
+            dependencies_truncated,
+            volumes_truncated,
+            holds_truncated,
+            verifications_truncated,
+            events_truncated,
+            artifacts_truncated,
+            values_truncated,
+        },
+    }))
+}
+
+pub async fn create_restore_plan(
+    pool: &PgPool,
+    plan: &NewRestorePlan,
+) -> Result<RestorePlanRecord, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let id = Uuid::now_v7();
+    let record = sqlx::query_as::<_, RestorePlanRecord>(
+        "INSERT INTO restore_plans
+            (id, selection, dependency_chain, required_media_ids,
+             key_lineage_ids, destination, conflict_policy, blockers,
+             estimates, preview_hash, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                 now() + interval '30 minutes')
+         RETURNING id, selection, dependency_chain, required_media_ids,
+                   key_lineage_ids, destination, conflict_policy, blockers,
+                   estimates, preview_hash, created_at, expires_at",
+    )
+    .bind(id)
+    .bind(&plan.selection)
+    .bind(&plan.dependency_chain)
+    .bind(&plan.required_media_ids)
+    .bind(&plan.key_lineage_ids)
+    .bind(&plan.destination)
+    .bind(&plan.conflict_policy)
+    .bind(&plan.blockers)
+    .bind(&plan.estimates)
+    .bind(&plan.preview_hash)
+    .fetch_one(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO audit_events
+            (id, actor_label, action, object_type, object_id,
+             requested, result, correlation_id)
+         VALUES ($1, 'local-api', 'restore.plan', 'restore_plan', $2,
+                 $3, $4, $5)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(id.to_string())
+    .bind(json!({
+        "selection": plan.selection,
+        "destination": plan.destination,
+        "conflict_policy": plan.conflict_policy,
+        "preview_hash": plan.preview_hash
+    }))
+    .bind(if plan.blockers.as_array().is_some_and(Vec::is_empty) {
+        "ready"
+    } else {
+        "blocked"
+    })
+    .bind(Uuid::now_v7())
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(record)
+}
+
+fn truncate_rows<T>(rows: &mut Vec<T>, limit: usize) -> bool {
+    let truncated = rows.len() > limit;
+    rows.truncate(limit);
+    truncated
+}
+
+fn recovery_volume_with_drives(
+    volume: RecoveryVolumeRow,
+    drives: &[RecoveryDriveRow],
+) -> RecoveryVolumeRecord {
+    let compatible_qualified_drives = drives
+        .iter()
+        .filter_map(|drive| compatible_recovery_drive(drive, &volume))
+        .collect();
+    let available = volume.finalized
+        && volume.identity_status == "reconciled"
+        && matches!(
+            volume.health_status.as_str(),
+            "written_verified" | "healthy" | "verified"
+        )
+        && volume.reserved_by.is_none();
+    RecoveryVolumeRecord {
+        id: volume.id,
+        recovery_point_id: volume.recovery_point_id,
+        volume_order: volume.volume_order,
+        first_record: volume.first_record,
+        last_record: volume.last_record,
+        encoded_bytes: volume.encoded_bytes,
+        finalized: volume.finalized,
+        engine_record_id: volume.engine_record_id,
+        cartridge_id: volume.cartridge_id,
+        internal_label: volume.internal_label,
+        barcode: volume.barcode,
+        media_generation: volume.media_generation,
+        media_format: volume.media_format,
+        on_tape_identity: volume.on_tape_identity,
+        identity_status: volume.identity_status,
+        health_status: volume.health_status,
+        worm: volume.worm,
+        reserved_by: volume.reserved_by,
+        location_id: volume.location_id,
+        location_name: volume.location_name,
+        location_kind: volume.location_kind,
+        available,
+        compatible_qualified_drives,
+    }
+}
+
+fn compatible_recovery_drive(
+    drive: &RecoveryDriveRow,
+    volume: &RecoveryVolumeRow,
+) -> Option<RecoveryDrivePrerequisite> {
+    let matrix_compatible = drive
+        .generation
+        .and_then(drive_generation)
+        .zip(media_format(
+            volume.media_generation,
+            volume.media_format.as_deref(),
+        ))
+        .is_some_and(|(drive, media)| can_read(drive, media));
+    let physically_qualified_for_media =
+        drive.qualified_media.as_array().is_some_and(|qualified| {
+            qualified.iter().any(|entry| {
+                let cartridge_id = entry
+                    .get("cartridge_id")
+                    .and_then(Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok());
+                let generation = entry.get("generation").and_then(Value::as_i64);
+                let format = entry.get("format").and_then(Value::as_str);
+                cartridge_id == Some(volume.cartridge_id)
+                    && generation == volume.media_generation.map(i64::from)
+                    && formats_equivalent(format, volume.media_format.as_deref())
+            })
+        });
+    if !physically_qualified_for_media {
+        return None;
+    }
+    let mut compatibility_basis = Vec::new();
+    if matrix_compatible {
+        compatibility_basis.push("explicit_lto_read_matrix".to_owned());
+    }
+    if physically_qualified_for_media {
+        compatibility_basis.push("exact_g0_1_pair".to_owned());
+    }
+    Some(RecoveryDrivePrerequisite {
+        id: drive.id,
+        stable_id: drive.stable_id.clone(),
+        generation: drive.generation,
+        vendor: drive.vendor.clone(),
+        model: drive.model.clone(),
+        serial: drive.serial.clone(),
+        wwn: drive.wwn.clone(),
+        firmware: drive.firmware.clone(),
+        observed_path: drive.observed_path.clone(),
+        last_observed_at: drive.last_observed_at,
+        compatibility_basis,
+    })
+}
+
+fn formats_equivalent(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => normalize_media_format(left) == normalize_media_format(right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn normalize_media_format(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+const fn drive_generation(generation: i16) -> Option<DriveGeneration> {
+    match generation {
+        1 => Some(DriveGeneration::Lto1),
+        2 => Some(DriveGeneration::Lto2),
+        3 => Some(DriveGeneration::Lto3),
+        4 => Some(DriveGeneration::Lto4),
+        5 => Some(DriveGeneration::Lto5),
+        6 => Some(DriveGeneration::Lto6),
+        7 => Some(DriveGeneration::Lto7),
+        8 => Some(DriveGeneration::Lto8),
+        9 => Some(DriveGeneration::Lto9),
+        10 => Some(DriveGeneration::Lto10),
+        _ => None,
+    }
+}
+
+fn media_format(generation: Option<i16>, format: Option<&str>) -> Option<MediaFormat> {
+    if format.is_some_and(|value| {
+        matches!(
+            normalize_media_format(value).as_str(),
+            "LTO7TYPEM" | "LTO7M" | "M8"
+        )
+    }) {
+        return Some(MediaFormat::Lto7TypeM);
+    }
+    match generation {
+        Some(1) => Some(MediaFormat::Lto1),
+        Some(2) => Some(MediaFormat::Lto2),
+        Some(3) => Some(MediaFormat::Lto3),
+        Some(4) => Some(MediaFormat::Lto4),
+        Some(5) => Some(MediaFormat::Lto5),
+        Some(6) => Some(MediaFormat::Lto6),
+        Some(7) => Some(MediaFormat::Lto7),
+        Some(8) => Some(MediaFormat::Lto8),
+        Some(9) => Some(MediaFormat::Lto9),
+        Some(10) => Some(MediaFormat::Lto10),
+        _ => None,
+    }
+}
+
+fn bound_value_in_place(value: &mut Value, truncated: &mut bool) {
+    let original = std::mem::take(value);
+    let original_bytes = serde_json::to_vec(&original).expect("a JSON value always serializes");
+    let original_sha256 = format!("{:x}", Sha256::digest(&original_bytes));
+    let bounded = bounded_json_value(original, 0, truncated);
+    let bounded_size = serde_json::to_vec(&bounded)
+        .expect("a JSON value always serializes")
+        .len();
+    if bounded_size > RECOVERY_JSON_VALUE_LIMIT_BYTES {
+        *truncated = true;
+        *value = json!({
+            "_tapescale_truncated": "value exceeded the evidence export bound",
+            "original_size_bytes": original_bytes.len(),
+            "original_sha256": original_sha256
+        });
+    } else {
+        *value = bounded;
+    }
+}
+
+fn bounded_json_value(value: Value, depth: usize, truncated: &mut bool) -> Value {
+    const MAX_DEPTH: usize = 8;
+    const MAX_MEMBERS: usize = 64;
+    const MAX_STRING_CHARS: usize = 4 * 1024;
+
+    if depth >= MAX_DEPTH {
+        *truncated = true;
+        return json!({"_tapescale_truncated": "maximum JSON depth reached"});
+    }
+    match value {
+        Value::String(value) if value.chars().count() > MAX_STRING_CHARS => {
+            *truncated = true;
+            let mut bounded = value.chars().take(MAX_STRING_CHARS).collect::<String>();
+            bounded.push_str("…[truncated]");
+            Value::String(bounded)
+        }
+        Value::Array(values) => {
+            let original_len = values.len();
+            let mut bounded = values
+                .into_iter()
+                .take(MAX_MEMBERS)
+                .map(|value| bounded_json_value(value, depth + 1, truncated))
+                .collect::<Vec<_>>();
+            if original_len > MAX_MEMBERS {
+                *truncated = true;
+                bounded.push(json!({
+                    "_tapescale_truncated_items": original_len - MAX_MEMBERS
+                }));
+            }
+            Value::Array(bounded)
+        }
+        Value::Object(values) => {
+            let original_len = values.len();
+            let mut bounded = serde_json::Map::new();
+            for (key, value) in values.into_iter().take(MAX_MEMBERS) {
+                bounded.insert(key, bounded_json_value(value, depth + 1, truncated));
+            }
+            if original_len > MAX_MEMBERS {
+                *truncated = true;
+                bounded.insert(
+                    "_tapescale_truncated_members".to_owned(),
+                    Value::from(original_len - MAX_MEMBERS),
+                );
+            }
+            Value::Object(bounded)
+        }
+        value => value,
+    }
+}
+
 pub async fn inventory_counts(pool: &PgPool) -> Result<InventoryCounts, sqlx::Error> {
     sqlx::query_as(
         "SELECT
@@ -4199,4 +5034,85 @@ pub async fn inventory_counts(pool: &PgPool) -> Result<InventoryCounts, sqlx::Er
     )
     .fetch_one(pool)
     .await
+}
+
+#[cfg(test)]
+mod recovery_vault_tests {
+    use super::*;
+
+    fn volume(cartridge_id: Uuid) -> RecoveryVolumeRow {
+        RecoveryVolumeRow {
+            id: Uuid::now_v7(),
+            recovery_point_id: Uuid::now_v7(),
+            volume_order: 1,
+            first_record: "file=0:block=0".to_owned(),
+            last_record: Some("file=1:block=1".to_owned()),
+            encoded_bytes: Some(1024),
+            finalized: true,
+            engine_record_id: "media-1".to_owned(),
+            cartridge_id,
+            internal_label: "TS-L9-001".to_owned(),
+            barcode: None,
+            media_generation: Some(9),
+            media_format: Some("LTO-9".to_owned()),
+            on_tape_identity: Some("TS-L9-001".to_owned()),
+            identity_status: "reconciled".to_owned(),
+            health_status: "written_verified".to_owned(),
+            worm: false,
+            reserved_by: None,
+            location_id: None,
+            location_name: None,
+            location_kind: None,
+        }
+    }
+
+    fn drive(qualified_media: Value) -> RecoveryDriveRow {
+        RecoveryDriveRow {
+            id: Uuid::now_v7(),
+            stable_id: "scsi:naa.5001".to_owned(),
+            generation: Some(9),
+            vendor: Some("IBM".to_owned()),
+            model: Some("ULTRIUM-HH9".to_owned()),
+            serial: Some("DRIVE-001".to_owned()),
+            wwn: Some("naa.5001".to_owned()),
+            firmware: Some("A1".to_owned()),
+            observed_path: Some("/dev/nst0".to_owned()),
+            last_observed_at: Some(Utc::now()),
+            qualified_media,
+        }
+    }
+
+    #[test]
+    fn lto_matrix_never_substitutes_for_exact_physical_pair() {
+        let volume = volume(Uuid::now_v7());
+        assert!(compatible_recovery_drive(&drive(json!([])), &volume).is_none());
+    }
+
+    #[test]
+    fn exact_physical_pair_is_exposed_with_an_explicit_basis() {
+        let cartridge_id = Uuid::now_v7();
+        let volume = volume(cartridge_id);
+        let compatible = compatible_recovery_drive(
+            &drive(json!([{
+                "cartridge_id": cartridge_id,
+                "generation": 9,
+                "format": "LTO-9"
+            }])),
+            &volume,
+        )
+        .expect("the exact passed G0.1 pair should be eligible");
+        assert!(compatible
+            .compatibility_basis
+            .contains(&"exact_g0_1_pair".to_owned()));
+    }
+
+    #[test]
+    fn evidence_json_values_are_bounded_and_marked() {
+        let mut truncated = false;
+        let bounded = bounded_json_value(Value::String("x".repeat(20_000)), 0, &mut truncated);
+        assert!(truncated);
+        assert!(bounded
+            .as_str()
+            .is_some_and(|value| value.ends_with("…[truncated]")));
+    }
 }
