@@ -8,6 +8,7 @@
     jobs: "/jobs",
     media: "/media",
     drives: "/drives",
+    locations: "/locations",
     movements: "/movements",
     verification: "/verification",
     recoveryPoints: "/recovery-points",
@@ -42,7 +43,9 @@
       drives: [],
       slots: [],
       driveOperations: [],
+      locations: [],
       movements: [],
+      movementDetails: {},
       verification: [],
       recoveryPoints: [],
       preflight: null,
@@ -59,10 +62,12 @@
     recoveryExercisePollTimer: null,
     selectedRecoveryExerciseId: null,
     selectedRecoveryPointId: null,
+    selectedMovementId: null,
     recoveryPointQuery: "",
     recoveryPointStatus: "all",
     recoveryPointRepresentation: "all",
     recoveryPointDetailLoading: new Set(),
+    movementDetailLoading: new Set(),
     restorePlanDrafts: {}
   };
 
@@ -147,6 +152,7 @@
     }
     if (key === "jobs") return list(payload, "jobs");
     if (key === "media") return list(payload, "media");
+    if (key === "locations") return list(payload, "locations");
     if (key === "movements") return list(payload, "movements");
     if (key === "verification") return list(payload, "verification");
     if (key === "recoveryPoints") return list(payload, "recovery_points");
@@ -223,6 +229,10 @@
       const point = selectedRecoveryPoint();
       if (point && recordId(point)) await loadRecoveryPointDetail(recordId(point), !initial);
     }
+    if (state.route === "movements") {
+      const movement = selectedMovement();
+      if (movement && recordId(movement)) await loadMovementDetail(recordId(movement), !initial);
+    }
     state.loading = false;
     state.refreshing = false;
     updateChrome();
@@ -263,7 +273,7 @@
     if (preflightDot) preflightDot.className = "health-dot" + (/fail|block|error/.test(preflightState) ? " failed" : /warn|attention|pending/.test(preflightState) ? " warning" : "");
     const summary = state.data.overview.summary || {};
     setBadge("#nav-job-count", state.data.jobs.length);
-    setBadge("#nav-move-count", state.data.movements.length);
+    setBadge("#nav-move-count", state.data.movements.filter((movement) => !movementTerminal(movement)).length);
     setBadge("#nav-recovery-count", state.data.recoveryExercises.filter(recoveryExerciseActive).length);
     const actionCount = Math.max(count(pick(summary, "required_actions")), state.data.overview.actions.length);
     setBadge("#notification-badge", actionCount);
@@ -303,6 +313,21 @@
     return '<div class="route-loading" role="status"><div class="loading-header"></div><div class="loading-grid"><span></span><span></span><span></span></div><div class="loading-table"></div></div>';
   }
 
+  function safeActionRoute(action) {
+    let value = String(pick(action, "route") || "").trim();
+    if (!value) return null;
+    value = value.replace(/^#?\/?/, "");
+    if (!routes.has(value.split("/")[0])) return null;
+    return "#" + value;
+  }
+
+  function renderActionItem(action) {
+    const route = safeActionRoute(action);
+    const stateValue = String(pick(action, "state", "status") || "attention");
+    const body = '<span class="action-symbol ' + esc(stateValue.toLowerCase()) + '" aria-hidden="true">!</span><span class="action-copy"><strong>' + esc(label(pick(action, "title", "label", "name"))) + '</strong><span>' + esc(label(pick(action, "detail", "message", "state"))) + '</span></span>' + (pick(action, "due_at", "due") ? '<time class="action-time">' + esc(date(pick(action, "due_at", "due"))) + "</time>" : "");
+    return route ? '<li class="action-item action-item-routed"><a class="action-item-link" href="' + esc(route) + '">' + body + "</a></li>" : '<li class="action-item">' + body + "</li>";
+  }
+
   function renderOverview() {
     const overview = state.data.overview;
     const summary = overview.summary || {};
@@ -324,7 +349,7 @@
     }
     html += '</div></section><section class="panel"><div class="panel-head"><div><h2>Required actions</h2><p>Actions returned by the overview API.</p></div></div><div class="panel-body">';
     if (overview.actions.length) {
-      html += '<ul class="action-list">' + overview.actions.map((action) => '<li class="action-item"><span class="action-symbol" aria-hidden="true">!</span><span class="action-copy"><strong>' + esc(label(pick(action, "title", "label", "name"))) + '</strong><span>' + esc(label(pick(action, "detail", "message", "state"))) + "</span></span></li>").join("") + "</ul>";
+      html += '<ul class="action-list">' + overview.actions.map(renderActionItem).join("") + "</ul>";
     } else {
       html += "<p>No actions are currently reported.</p>";
     }
@@ -967,12 +992,187 @@
     return html;
   }
 
+  function movementState(movement) {
+    return String(pick(movement, "state", "status") || "planned").toLowerCase();
+  }
+
+  function movementTerminal(movement) {
+    return ["confirmed", "cancelled", "canceled"].includes(movementState(movement));
+  }
+
+  function movementOverdue(movement) {
+    const due = new Date(pick(movement, "due_at") || 0).getTime();
+    return movementState(movement) === "overdue" || (!movementTerminal(movement) && Number.isFinite(due) && due > 0 && due < Date.now());
+  }
+
+  function movementRouteId() {
+    const parts = location.hash.slice(1).split("/");
+    if (parts[0] !== "movements" || !parts[1]) return null;
+    try {
+      return decodeURIComponent(parts.slice(1).join("/"));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function orderedMovements() {
+    return state.data.movements.slice().sort((left, right) => {
+      const leftTerminal = movementTerminal(left) ? 1 : 0;
+      const rightTerminal = movementTerminal(right) ? 1 : 0;
+      if (leftTerminal !== rightTerminal) return leftTerminal - rightTerminal;
+      const dueDifference = new Date(pick(left, "due_at") || 0) - new Date(pick(right, "due_at") || 0);
+      return dueDifference || new Date(pick(right, "updated_at", "created_at") || 0) - new Date(pick(left, "updated_at", "created_at") || 0);
+    });
+  }
+
+  function selectedMovement() {
+    const movements = orderedMovements();
+    const requested = movementRouteId() || state.selectedMovementId;
+    const selected = requested && movements.find((movement) => recordId(movement) === requested || String(pick(movement, "external_id")) === requested);
+    const movement = selected || movements[0] || null;
+    if (movement) state.selectedMovementId = recordId(movement);
+    return movement;
+  }
+
+  function movementDetail(id) {
+    return id ? state.data.movementDetails[id] || null : null;
+  }
+
+  async function loadMovementDetail(id, force) {
+    if (!id || state.movementDetailLoading.has(id) || (!force && movementDetail(id))) return;
+    const errorKey = "movement:" + id;
+    state.movementDetailLoading.add(id);
+    delete state.errors[errorKey];
+    try {
+      const payload = await request(endpoints.movements + "/" + encodeURIComponent(id));
+      const detail = payload && payload.movement && typeof payload.movement === "object" ? payload.movement : payload;
+      state.data.movementDetails[id] = detail && typeof detail === "object" ? detail : {};
+      delete state.errors[errorKey];
+    } catch (error) {
+      state.errors[errorKey] = error;
+    } finally {
+      state.movementDetailLoading.delete(id);
+    }
+    if (state.route === "movements" && recordId(selectedMovement()) === id) render();
+  }
+
+  async function selectMovement(id) {
+    if (!id) return;
+    state.selectedMovementId = id;
+    const target = "#movements/" + encodeURIComponent(id);
+    if (location.hash !== target) location.hash = target;
+    else render();
+    await loadMovementDetail(id);
+  }
+
+  function locationKind(locationRecord) {
+    return String(pick(locationRecord, "kind") || "unknown").toLowerCase();
+  }
+
+  function renderCustodyLocations() {
+    const locations = state.data.locations;
+    const cards = locations.map((item) => {
+      const details = item.details && typeof item.details === "object" ? item.details : {};
+      const description = pick(details, "address", "description", "contact", "notes") || (locationKind(item) === "offsite" ? "Confirmed off-site custody destination" : "Physical custody location");
+      return '<article class="custody-location"><span class="custody-location-icon" aria-hidden="true">' + (locationKind(item) === "offsite" ? "◇" : locationKind(item) === "in_transit" ? "→" : locationKind(item) === "unknown" ? "?" : "□") + '</span><div><small>' + esc(human(locationKind(item))) + '</small><strong>' + esc(label(pick(item, "name"))) + '</strong><span>' + esc(description) + "</span></div></article>";
+    }).join("");
+    return '<section class="panel custody-locations section"><div class="panel-head"><div><h2>Custody locations</h2><p>Only physical confirmations change a cartridge location.</p></div><button class="button button-small" type="button" data-action="add-location">Add location</button></div><div class="custody-location-grid">' + (cards || '<div class="vault-section-empty compact">Create an on-site or off-site location before planning routine movements.</div>') + "</div></section>";
+  }
+
+  function renderMovementTaskList(movements, selected) {
+    return '<aside class="panel movement-task-panel"><div class="panel-head"><div><h2>Movement tasks</h2><p>' + movements.length + " retained task" + (movements.length === 1 ? "" : "s") + '</p></div></div><div class="task-list custody-task-list">' + movements.map((movement) => {
+      const id = recordId(movement);
+      const source = pick(movement, "source_name") || "Unknown / unlocated";
+      const destination = pick(movement, "destination_name") || "Destination not reported";
+      const mediaTotal = count(pick(movement, "media_total"));
+      const confirmed = count(pick(movement, "media_confirmed"));
+      return '<button class="movement-task' + (selected && id === recordId(selected) ? " active" : "") + (movementOverdue(movement) ? " overdue" : "") + '" type="button" data-action="select-movement" data-id="' + esc(id) + '"><span class="movement-task-head"><strong>' + esc(label(pick(movement, "external_id", "id"))) + '</strong>' + status(movementOverdue(movement) ? "overdue" : movementState(movement)) + '</span><small>' + esc(human(pick(movement, "kind") || "movement")) + " · due " + esc(date(pick(movement, "due_at"))) + '</small><span class="task-route">' + esc(source) + " → " + esc(destination) + '</span><span class="custody-task-progress"><i style="width:' + (mediaTotal ? Math.round(confirmed / mediaTotal * 100) : 0) + '%"></i></span><span class="custody-task-count">' + confirmed + " of " + mediaTotal + " at destination</span></button>";
+    }).join("") + "</div></aside>";
+  }
+
+  function movementStageIndex(summary) {
+    const stateValue = movementState(summary);
+    if (stateValue === "confirmed") return 3;
+    if (["departed", "partially_confirmed"].includes(stateValue)) return 2;
+    if (["ready", "overdue"].includes(stateValue)) return 1;
+    return 0;
+  }
+
+  function renderMovementStages(summary) {
+    const current = movementStageIndex(summary);
+    const steps = ["Planned", "Ready", "In transit", "Confirmed"];
+    return '<div class="custody-stage" aria-label="Custody movement progress">' + steps.map((name, index) => '<div class="custody-step' + (index < current ? " done" : index === current ? " current" : "") + '"><span class="custody-dot" aria-hidden="true"></span><span>' + name + "</span></div>").join("") + "</div>";
+  }
+
+  function renderMovementReadiness(readiness) {
+    if (!readiness || typeof readiness !== "object" || !Object.keys(readiness).length) return '<div class="vault-section-empty compact">No additional readiness declaration was returned.</div>';
+    return '<div class="custody-readiness-grid">' + Object.entries(readiness).map(([key, value]) => {
+      const passing = value === true || ["ready", "passed", "available", "complete"].includes(String(value).toLowerCase());
+      const display = typeof value === "object" ? conciseEvidence(value) : value;
+      return '<div class="readiness-item' + (passing ? "" : " blocked") + '"><span class="gate-icon" aria-hidden="true">' + (passing ? "✓" : "!") + '</span><div><strong>' + esc(human(key)) + '</strong><span>' + esc(display) + "</span></div></div>";
+    }).join("") + "</div>";
+  }
+
+  function renderMovementMedia(detail, summary) {
+    const media = detail ? list(detail, "media") : [];
+    if (!media.length) return '<div class="vault-section-empty">No cartridge manifest was returned for this movement.</div>';
+    const sourceUnknown = !pick(summary, "source_location_id");
+    const hasTransit = Boolean(pick(summary, "transit_location_id"));
+    return '<div class="custody-media"><div class="custody-media-head"><label><input type="checkbox" id="custody-select-all"> Select all actionable tapes</label><span>Check the exact physical labels in hand.</span></div><div class="custody-media-list">' + media.map((item) => {
+      const stage = String(pick(item, "stage") || "planned").toLowerCase();
+      const actionable = ["planned", "departed"].includes(stage);
+      const location = pick(item, "confirmed_location_name") || "Unknown / unlocated";
+      return '<label class="custody-media-row ' + esc(stage) + '"><input type="checkbox" name="movement_cartridge" value="' + esc(pick(item, "cartridge_id")) + '" data-label="' + esc(pick(item, "internal_label")) + '" data-stage="' + esc(stage) + '"' + (actionable ? "" : " disabled") + '><span class="custody-tape-glyph" aria-hidden="true">▦</span><span class="custody-media-copy"><strong>' + esc(label(pick(item, "internal_label"))) + '</strong><small>' + esc(pick(item, "barcode") ? "Barcode " + pick(item, "barcode") : "No barcode") + " · confirmed " + esc(location) + '</small></span>' + status(stage) + "</label>";
+    }).join("") + '</div><div class="custody-confirm-actions" data-no-print><button class="button" type="button" data-action="confirm-custody" data-confirm-action="departure" data-id="' + esc(recordId(summary)) + '" disabled' + (sourceUnknown || !hasTransit ? " hidden" : "") + '>Confirm departure</button><button class="button" type="button" data-action="confirm-custody" data-confirm-action="arrival" data-id="' + esc(recordId(summary)) + '" disabled' + (!hasTransit ? " hidden" : "") + '>Confirm arrival</button><button class="button button-primary" type="button" data-action="confirm-custody" data-confirm-action="direct" data-id="' + esc(recordId(summary)) + '" disabled>Confirm direct handoff</button></div></div>';
+  }
+
+  function renderCustodyTimeline(events) {
+    if (!events.length) return '<div class="vault-section-empty compact">No physical custody event has been appended yet.</div>';
+    return '<ol class="custody-timeline">' + events.map((event) => {
+      const corrected = pick(event, "corrects_event_id");
+      const eventType = String(pick(event, "event_type") || "").toLowerCase();
+      const route = [pick(event, "source_name"), pick(event, "destination_name")].filter(Boolean).join(" → ");
+      const canCorrect = pick(event, "cartridge_id") && ["departure_confirmed", "arrival_confirmed", "direct_move_confirmed", "custody_corrected"].includes(eventType);
+      return '<li><time>' + esc(date(pick(event, "occurred_at"))) + '</time><span class="custody-event-dot" aria-hidden="true"></span><div><div class="custody-event-head"><strong>' + esc(human(pick(event, "event_type") || "custody event")) + '</strong>' + (canCorrect ? '<button class="button button-small button-quiet" type="button" data-action="correct-custody" data-event-id="' + esc(recordId(event)) + '" data-cartridge-id="' + esc(pick(event, "cartridge_id")) + '">Append correction</button>' : "") + '</div><span>' + esc(label(pick(event, "internal_label"))) + (route ? " · " + esc(route) : "") + '</span><p>' + esc(pick(event, "note") || "No operator note") + "</p><small>Actor " + esc(label(pick(event, "actor_label"))) + (corrected ? " · corrects " + esc(corrected) : "") + "</small></div></li>";
+    }).join("") + "</ol>";
+  }
+
+  function renderMovementDetail(summary) {
+    const id = recordId(summary);
+    const detail = movementDetail(id);
+    const resolvedSummary = detail && detail.summary && typeof detail.summary === "object" ? detail.summary : summary;
+    const events = detail ? list(detail, "custody_events") : [];
+    const readiness = detail && detail.readiness && typeof detail.readiness === "object" ? detail.readiness : {};
+    const error = state.errors["movement:" + id];
+    const source = pick(resolvedSummary, "source_name") || "Unknown / unlocated";
+    const destination = pick(resolvedSummary, "destination_name") || "Destination not reported";
+    const transit = pick(resolvedSummary, "transit_name");
+    const confirmed = count(pick(resolvedSummary, "media_confirmed"));
+    const total = count(pick(resolvedSummary, "media_total"));
+    const terminal = movementTerminal(resolvedSummary);
+    let feedback = "";
+    if (!detail && !error) feedback = '<div class="notice info custody-detail-feedback"><span class="notice-icon" aria-hidden="true">↻</span><div class="notice-copy"><strong>Loading custody manifest</strong><span>Fetching the exact cartridge stages and append-only physical history.</span></div></div>';
+    if (error) feedback = '<div class="notice danger custody-detail-feedback"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load custody detail</strong><span>' + esc(errorMessage(error)) + '</span></div><button class="button button-small" data-action="retry-movement" data-id="' + esc(id) + '">Retry</button></div>';
+    return '<article class="panel movement-detail custody-print-manifest"><header class="movement-hero"><div class="movement-hero-head"><div><span class="custody-kicker">' + esc(human(pick(resolvedSummary, "kind") || "movement")) + '</span><h2>' + esc(label(pick(resolvedSummary, "external_id", "id"))) + '</h2><code>' + esc(id) + '</code></div>' + status(movementOverdue(resolvedSummary) ? "overdue" : movementState(resolvedSummary)) + '</div><div class="movement-route"><div class="location-node"><span>Planned source</span><strong>' + esc(source) + '</strong></div><span class="movement-arrow" aria-hidden="true">→</span>' + (transit ? '<div class="location-node transit"><span>Transit</span><strong>' + esc(transit) + '</strong></div><span class="movement-arrow" aria-hidden="true">→</span>' : "") + '<div class="location-node"><span>Planned destination</span><strong>' + esc(destination) + '</strong></div></div><div class="movement-hero-meta"><span><small>Due</small><strong>' + esc(date(pick(resolvedSummary, "due_at"))) + '</strong></span><span><small>Confirmation version</small><strong>' + esc(label(pick(resolvedSummary, "confirmation_version"))) + '</strong></span><span><small>At destination</small><strong>' + confirmed + " / " + total + '</strong></span></div><div class="movement-detail-actions" data-no-print><button class="button button-small" type="button" data-action="print-movement-manifest">Print manifest</button><button class="button button-small button-danger" type="button" data-action="cancel-movement" data-id="' + esc(id) + '"' + (terminal ? " disabled" : "") + '>Cancel task</button></div></header><div class="custody-intent ' + (movementState(resolvedSummary) === "confirmed" ? "confirmed" : "planned") + '"><strong>' + (movementState(resolvedSummary) === "confirmed" ? "Physical custody confirmed" : "Movement intent only") + '</strong><span>' + (movementState(resolvedSummary) === "confirmed" ? "The selected cartridges have append-only arrival or direct-handoff evidence at the destination." : "This task reserves cartridges but does not change their confirmed location until an operator physically confirms them.") + "</span></div>" + renderMovementStages(resolvedSummary) + feedback + '<section class="custody-detail-section"><div class="vault-section-head"><div><h3>Exact cartridge checklist</h3><p>Partial confirmation is supported; unchecked tapes remain at their prior durable stage.</p></div><span>' + total + " tape" + (total === 1 ? "" : "s") + "</span></div>" + renderMovementMedia(detail, resolvedSummary) + '</section><section class="custody-detail-section"><div class="vault-section-head"><div><h3>Readiness declaration</h3><p>Planned prerequisites do not prove physical movement.</p></div></div>' + renderMovementReadiness(readiness) + '</section><section class="custody-detail-section"><div class="vault-section-head"><div><h3>Durable custody timeline</h3><p>Physical confirmations and corrections are append-only.</p></div><span>' + events.length + " event" + (events.length === 1 ? "" : "s") + "</span></div>" + renderCustodyTimeline(events) + "</section></article>";
+  }
+
   function renderMovements() {
-    const movements = state.data.movements;
-    let html = pageHead("Movements", "Custody movements returned by TapeScale.", refreshButton()) + noticeFor("movements");
-    if (!movements.length) return html + empty("No movements", state.errors.movements ? "Movements could not be loaded." : "No custody movements are pending or recorded.");
-    const rows = movements.map((movement) => '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="movements" data-id="' + esc(recordId(movement)) + '"><td class="primary-cell"><strong>' + esc(label(pick(movement, "external_id", "name", "id"))) + '</strong><small>' + esc(label(pick(movement, "kind", "media_label", "tape", "barcode"))) + "</small></td>" + cell(pick(movement, "source_name", "from", "origin", "source")) + cell(pick(movement, "destination_name", "to", "destination")) + "<td>" + status(pick(movement, "state", "status")) + "</td>" + cell(date(pick(movement, "due_at", "updated_at", "created_at", "time"))) + "</tr>");
-    return html + table(["Movement", "From", "To", "Status", "Activity"], rows);
+    const movements = orderedMovements();
+    const selected = selectedMovement();
+    const active = movements.filter((movement) => !movementTerminal(movement)).length;
+    const overdue = movements.filter(movementOverdue).length;
+    const inTransit = movements.reduce((sum, movement) => sum + count(pick(movement, "media_departed")), 0);
+    const confirmed = movements.reduce((sum, movement) => sum + count(pick(movement, "media_confirmed")), 0);
+    const canPlan = state.data.locations.some((item) => ["onsite", "offsite", "device"].includes(locationKind(item))) && state.data.media.length > 0;
+    const actions = refreshButton() + '<button class="button" type="button" data-action="add-location">Add location</button><button class="button button-primary" type="button" data-action="plan-movement"' + (canPlan ? "" : ' disabled title="Create a destination location and register at least one cartridge first."') + '>Plan movement</button>';
+    let html = pageHead("Off-site custody", "Plan cartridge movements, print exact manifests, and append physical handoff evidence without confusing intent for confirmed location.", actions) + noticeFor("locations") + noticeFor("movements") + noticeFor("media");
+    html += '<section class="panel metric-strip custody-metrics"><div class="metric"><span>Active tasks</span><strong>' + active + '</strong><small>Planned or in progress</small></div><div class="metric"><span>Overdue</span><strong>' + overdue + '</strong><small>Still requires operator action</small></div><div class="metric"><span>In transit</span><strong>' + inTransit + '</strong><small>Departure confirmed only</small></div><div class="metric"><span>At destination</span><strong>' + confirmed + '</strong><small>Arrival or direct handoff confirmed</small></div></section>';
+    html += renderCustodyLocations();
+    if (!movements.length) return html + empty("No movement tasks", state.errors.movements ? "Custody tasks could not be loaded." : "Plan an off-site delivery, return, swap, recall, or direct onboarding for currently unlocated media.", canPlan ? '<button class="button button-primary" type="button" data-action="plan-movement">Plan first movement</button>' : '<button class="button" type="button" data-action="add-location">Create destination</button>');
+    html += '<div class="movement-layout section">' + renderMovementTaskList(movements, selected) + renderMovementDetail(selected) + "</div>";
+    const selectedId = recordId(selected);
+    if (selectedId && !movementDetail(selectedId) && !state.movementDetailLoading.has(selectedId) && !state.errors["movement:" + selectedId]) window.setTimeout(() => loadMovementDetail(selectedId), 0);
+    return html;
   }
 
   function renderDrives() {
@@ -1438,6 +1638,320 @@
     }
   }
 
+  function operationKey(prefix) {
+    const suffix = window.crypto && typeof window.crypto.randomUUID === "function" ? window.crypto.randomUUID() : Date.now() + "-" + Math.random().toString(16).slice(2);
+    return prefix + "-" + suffix;
+  }
+
+  function openLocationForm() {
+    const body = '<form id="location-form"><div class="notice info"><span class="notice-icon" aria-hidden="true">◇</span><div class="notice-copy"><strong>Define a physical custody location</strong><span>Creating a location does not move any cartridge. Custody changes only after a physical confirmation.</span></div></div><div class="form-grid"><div class="form-field full"><label for="location-name">Location name</label><input class="input" id="location-name" name="name" maxlength="256" required placeholder="Iron Mountain · Vault B"></div><div class="form-field"><label for="location-kind">Location type</label><select class="select" id="location-kind" name="kind"><option value="onsite">On-site</option><option value="offsite">Off-site</option><option value="in_transit">In transit</option><option value="device">Tape device</option><option value="unknown">Unknown</option></select></div><div class="form-field"><label for="location-contact">Contact or carrier</label><input class="input" id="location-contact" name="contact" maxlength="256" placeholder="Optional"></div><div class="form-field full"><label for="location-address">Address / handling detail</label><textarea class="textarea" id="location-address" name="address" maxlength="2000" placeholder="Optional physical address, vault reference, or handling instructions"></textarea></div><div class="form-field full"><label for="location-actor">Operator label</label><input class="input" id="location-actor" name="actor" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="location-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Create location</button></div></form>';
+    openModal("Add custody location", body);
+    document.querySelector("#location-name").focus();
+  }
+
+  async function submitLocation(form) {
+    const values = new FormData(form);
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#location-error");
+    submit.disabled = true;
+    submit.textContent = "Creating…";
+    errorBox.hidden = true;
+    try {
+      await request(endpoints.locations, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: String(values.get("name") || "").trim(),
+          kind: String(values.get("kind") || "onsite"),
+          details: {
+            contact: String(values.get("contact") || "").trim() || null,
+            address: String(values.get("address") || "").trim() || null
+          },
+          actor: String(values.get("actor") || "").trim() || null
+        })
+      });
+      closeModal();
+      await loadOne("locations");
+      render();
+      toast("Location created", "The location is available for movement planning; no cartridge custody changed.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Create location";
+    }
+  }
+
+  function localDateTimeValue(value) {
+    const input = value instanceof Date ? value : new Date(value);
+    const adjusted = new Date(input.getTime() - input.getTimezoneOffset() * 60000);
+    return adjusted.toISOString().slice(0, 16);
+  }
+
+  function mediaMatchesMovementSource(item, sourceValue) {
+    if (sourceValue === "unknown") return !pick(item, "confirmed_location_id", "location_id", "location_name");
+    const locationRecord = state.data.locations.find((locationItem) => recordId(locationItem) === sourceValue);
+    if (!locationRecord) return false;
+    const mediaLocationId = pick(item, "confirmed_location_id", "location_id");
+    return mediaLocationId ? String(mediaLocationId) === sourceValue : String(pick(item, "location_name") || "") === String(pick(locationRecord, "name") || "");
+  }
+
+  function movementMediaChoices(sourceValue) {
+    const candidates = state.data.media.filter((item) => mediaMatchesMovementSource(item, sourceValue));
+    if (!candidates.length) return '<div class="vault-section-empty compact">' + (sourceValue === "unknown" ? "No unlocated cartridge is available for onboarding." : "No cartridge is confirmed at this source location.") + "</div>";
+    return candidates.map((item) => {
+      const reserved = Boolean(pick(item, "reserved_by"));
+      const blockers = reserved ? "Reserved by " + pick(item, "reserved_by") : count(pick(item, "active_holds")) ? pick(item, "active_holds") + " active hold(s); movement planning may be blocked" : "Available for exact-set planning";
+      return '<label class="movement-media-choice' + (reserved ? " blocked" : "") + '"><input type="checkbox" name="cartridge_ids" value="' + esc(recordId(item)) + '"' + (reserved ? " disabled" : "") + '><span class="custody-tape-glyph" aria-hidden="true">▦</span><span><strong>' + esc(mediaName(item)) + '</strong><small>' + esc(pick(item, "barcode") ? "Barcode " + pick(item, "barcode") + " · " + blockers : blockers) + "</small></span></label>";
+    }).join("");
+  }
+
+  function updateMovementMediaChoices(form) {
+    const source = String(new FormData(form).get("source_location_id") || "unknown");
+    const container = form.querySelector("#movement-media-choices");
+    if (container) container.innerHTML = movementMediaChoices(source);
+    const onboarding = form.querySelector("#unknown-onboarding-notice");
+    if (onboarding) onboarding.hidden = source !== "unknown";
+  }
+
+  function openMovementForm() {
+    if (!state.data.locations.length || !state.data.media.length) return;
+    const endpointLocations = state.data.locations.filter((item) => ["onsite", "offsite", "device"].includes(locationKind(item)));
+    if (!endpointLocations.length) return;
+    const unlocated = state.data.media.some((item) => mediaMatchesMovementSource(item, "unknown") && !pick(item, "reserved_by"));
+    const initialSource = unlocated ? "unknown" : recordId(endpointLocations[0]);
+    const locationOptions = endpointLocations.map((item) => '<option value="' + esc(recordId(item)) + '"' + (recordId(item) === initialSource ? " selected" : "") + '>' + esc(label(pick(item, "name"))) + " · " + esc(human(locationKind(item))) + "</option>");
+    const destinationOptions = endpointLocations.map((item) => '<option value="' + esc(recordId(item)) + '">' + esc(label(pick(item, "name"))) + " · " + esc(human(locationKind(item))) + "</option>");
+    const transitOptions = ['<option value="">No declared transit location</option>'].concat(state.data.locations.filter((item) => locationKind(item) === "in_transit").map((item) => '<option value="' + esc(recordId(item)) + '">' + esc(label(pick(item, "name"))) + "</option>"));
+    const due = localDateTimeValue(new Date(Date.now() + 24 * 60 * 60 * 1000));
+    const body = '<form id="movement-form" data-idempotency-key="' + esc(operationKey("movement")) + '"><div class="custody-plan-banner"><strong>Plan intent—not custody proof</strong><span>The selected cartridges will be reserved. Their confirmed locations remain unchanged until a physical handoff is appended.</span></div><div class="form-grid"><div class="form-field"><label for="movement-kind">Movement type</label><select class="select" id="movement-kind" name="kind"><option value="take_offsite">Take off-site</option><option value="return">Return on-site</option><option value="swap">Swap media</option><option value="recall">Emergency recall</option></select></div><div class="form-field"><label for="movement-external-id">Operator reference</label><input class="input" id="movement-external-id" name="external_id" maxlength="128" placeholder="Optional · NOV-2026-VAULT"></div><div class="form-field"><label for="movement-source">Confirmed source</label><select class="select" id="movement-source" name="source_location_id"><option value="unknown"' + (initialSource === "unknown" ? " selected" : "") + '>Unknown / unlocated onboarding</option>' + locationOptions.join("") + '</select></div><div class="form-field"><label for="movement-destination">Planned destination</label><select class="select" id="movement-destination" name="destination_location_id" required><option value="">Select destination</option>' + destinationOptions.join("") + '</select></div><div class="form-field"><label for="movement-transit">Transit location</label><select class="select" id="movement-transit" name="transit_location_id">' + transitOptions.join("") + '</select></div><div class="form-field"><label for="movement-due">Due</label><input class="input" id="movement-due" name="due_at" type="datetime-local" value="' + esc(due) + '" required></div><div class="form-field full"><label for="movement-reason">Reason and handling objective</label><textarea class="textarea" id="movement-reason" name="reason" maxlength="2000" required placeholder="Deliver the newest complete verified recovery point to off-site custody."></textarea></div><div class="form-field full"><div class="notice warning" id="unknown-onboarding-notice"' + (initialSource === "unknown" ? "" : " hidden") + '><span class="notice-icon" aria-hidden="true">?</span><div class="notice-copy"><strong>Unknown-location onboarding</strong><span>Only direct physical confirmation can advance unlocated media. Departure cannot be claimed without a confirmed source.</span></div></div><fieldset class="movement-media-fieldset"><legend>Exact cartridge set</legend><div id="movement-media-choices">' + movementMediaChoices(initialSource) + '</div></fieldset></div><div class="form-field full"><label for="movement-actor">Operator label</label><input class="input" id="movement-actor" name="actor" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="movement-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Reserve tapes and create plan</button></div></form>';
+    openModal("Plan custody movement", body);
+    const modal = modalLayer.querySelector(".modal");
+    if (modal) modal.classList.add("custody-modal");
+    document.querySelector("#movement-kind").focus();
+  }
+
+  async function submitMovement(form) {
+    const values = new FormData(form);
+    const cartridgeIds = values.getAll("cartridge_ids").map(String);
+    const errorBox = form.querySelector("#movement-error");
+    const submit = form.querySelector('[type="submit"]');
+    if (!cartridgeIds.length) {
+      errorBox.textContent = "Select at least one exact cartridge.";
+      errorBox.hidden = false;
+      return;
+    }
+    const source = String(values.get("source_location_id") || "unknown");
+    const due = new Date(String(values.get("due_at") || ""));
+    if (Number.isNaN(due.getTime())) {
+      errorBox.textContent = "Enter a valid due date and time.";
+      errorBox.hidden = false;
+      return;
+    }
+    const payload = {
+      idempotency_key: form.dataset.idempotencyKey,
+      kind: String(values.get("kind")),
+      source_location_id: source === "unknown" ? null : source,
+      destination_location_id: String(values.get("destination_location_id")),
+      transit_location_id: String(values.get("transit_location_id") || "") || null,
+      cartridge_ids: cartridgeIds,
+      reason: String(values.get("reason") || "").trim(),
+      due_at: due.toISOString(),
+      actor: String(values.get("actor") || "").trim() || null
+    };
+    const externalId = String(values.get("external_id") || "").trim();
+    if (externalId) payload.external_id = externalId;
+    submit.disabled = true;
+    submit.textContent = "Reserving exact tapes…";
+    errorBox.hidden = true;
+    try {
+      const response = await request(endpoints.movements, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      closeModal();
+      await Promise.all([loadOne("movements"), loadOne("media")]);
+      const createdId = String(
+        pick(response && response.receipt, "movement_task_id", "id")
+        || pick(response && response.movement && response.movement.summary, "id", "movement_task_id")
+        || pick(response, "movement_task_id", "id")
+        || ""
+      );
+      const created = state.data.movements.find((item) => recordId(item) === createdId || (externalId && String(pick(item, "external_id")) === externalId)) || state.data.movements[0];
+      if (created) await selectMovement(recordId(created));
+      else render();
+      toast("Movement planned", "The exact cartridges are reserved. Confirmed physical locations have not changed.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Reserve tapes and create plan";
+    }
+  }
+
+  function selectedCustodyCartridges(action) {
+    const allowed = action === "arrival" ? "departed" : "planned";
+    return Array.from(document.querySelectorAll('[name="movement_cartridge"]:checked')).filter((input) => input.dataset.stage === allowed);
+  }
+
+  function updateCustodyActionButtons() {
+    const checkedInputs = Array.from(document.querySelectorAll('[name="movement_cartridge"]:checked'));
+    document.querySelectorAll('[data-action="confirm-custody"]').forEach((button) => {
+      const allowed = button.dataset.confirmAction === "arrival" ? "departed" : "planned";
+      button.disabled = !checkedInputs.length || !checkedInputs.every((input) => input.dataset.stage === allowed);
+    });
+    const selectAll = document.querySelector("#custody-select-all");
+    const actionable = Array.from(document.querySelectorAll('[name="movement_cartridge"]:not(:disabled)'));
+    if (selectAll) {
+      selectAll.checked = actionable.length > 0 && actionable.every((input) => input.checked);
+      selectAll.indeterminate = actionable.some((input) => input.checked) && !selectAll.checked;
+    }
+  }
+
+  function openCustodyConfirmation(button) {
+    const action = button.dataset.confirmAction;
+    const movementId = button.dataset.id;
+    const selected = selectedCustodyCartridges(action);
+    const detail = movementDetail(movementId);
+    const summary = detail && detail.summary ? detail.summary : state.data.movements.find((item) => recordId(item) === movementId);
+    if (!selected.length || !summary) return;
+    const hiddenInputs = selected.map((input) => '<input type="hidden" name="cartridge_ids" value="' + esc(input.value) + '">').join("");
+    const labels = selected.map((input) => input.dataset.label);
+    const actionText = action === "departure" ? "departure into transit" : action === "arrival" ? "arrival at the destination" : "direct handoff to the destination";
+    const itemCountText = "This append-only event applies to " + selected.length + " exact cartridge" + (selected.length === 1 ? "" : "s") + ". Unselected cartridges remain unchanged.";
+    const body = '<form id="custody-confirm-form" data-movement-id="' + esc(movementId) + '" data-action-name="' + esc(action) + '" data-idempotency-key="' + esc(operationKey("custody-" + action)) + '">' + hiddenInputs + '<input type="hidden" name="expected_confirmation_version" value="' + esc(pick(summary, "confirmation_version")) + '"><div class="custody-confirm-hero"><span aria-hidden="true">✓</span><div><strong>Physically confirm ' + esc(actionText) + '</strong><p>' + esc(itemCountText) + '</p></div></div><div class="custody-confirm-tapes">' + labels.map((item) => "<code>" + esc(item) + "</code>").join("") + '</div><div class="form-grid"><div class="form-field full"><label class="check-option custody-physical-check"><input type="checkbox" name="physically_confirmed" required> I am physically handling or directly witnessing these exact labeled cartridges at this custody boundary.</label></div><div class="form-field full"><label for="custody-confirm-note">Handoff note</label><textarea class="textarea" id="custody-confirm-note" name="note" maxlength="2000" placeholder="Courier reference, receiving person, seal condition, or exception detail"></textarea></div><div class="form-field full"><label for="custody-confirm-actor">Operator label</label><input class="input" id="custody-confirm-actor" name="actor" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="custody-confirm-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Append physical confirmation</button></div></form>';
+    openModal("Confirm physical custody", body);
+    const modal = modalLayer.querySelector(".modal");
+    if (modal) modal.classList.add("custody-modal");
+  }
+
+  async function submitCustodyConfirmation(form) {
+    const values = new FormData(form);
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#custody-confirm-error");
+    submit.disabled = true;
+    submit.textContent = "Appending custody evidence…";
+    errorBox.hidden = true;
+    try {
+      await request(endpoints.movements + "/" + encodeURIComponent(form.dataset.movementId) + "/confirm", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: form.dataset.actionName,
+          cartridge_ids: values.getAll("cartridge_ids").map(String),
+          expected_confirmation_version: Number(values.get("expected_confirmation_version")),
+          idempotency_key: form.dataset.idempotencyKey,
+          physically_confirmed: values.get("physically_confirmed") === "on",
+          note: String(values.get("note") || "").trim(),
+          actor: String(values.get("actor") || "").trim() || null
+        })
+      });
+      closeModal();
+      await Promise.all([loadOne("movements"), loadOne("media"), loadMovementDetail(form.dataset.movementId, true)]);
+      render();
+      toast("Physical custody appended", "Confirmed locations advanced only for the selected cartridges.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Append physical confirmation";
+    }
+  }
+
+  function openCancelMovement(id) {
+    const detail = movementDetail(id);
+    const summary = detail && detail.summary ? detail.summary : state.data.movements.find((item) => recordId(item) === id);
+    if (!summary) return;
+    const body = '<form id="cancel-movement-form" data-movement-id="' + esc(id) + '" data-idempotency-key="' + esc(operationKey("cancel-movement")) + '"><input type="hidden" name="expected_confirmation_version" value="' + esc(pick(summary, "confirmation_version")) + '"><div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Cancel the remaining movement intent</strong><span>Previously confirmed custody events remain durable. Cancellation releases only tapes that have not completed this task.</span></div></div><div class="form-field"><label for="cancel-movement-reason">Cancellation reason</label><textarea class="textarea" id="cancel-movement-reason" name="reason" maxlength="2000" required></textarea></div><div class="form-field section"><label for="cancel-movement-actor">Operator label</label><input class="input" id="cancel-movement-actor" name="actor" value="Web operator" maxlength="128" required></div><p class="notice danger" id="cancel-movement-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Keep task</button><button class="button button-danger" type="submit">Cancel remaining task</button></div></form>';
+    openModal("Cancel movement", body);
+  }
+
+  async function submitCancelMovement(form) {
+    const values = new FormData(form);
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#cancel-movement-error");
+    submit.disabled = true;
+    submit.textContent = "Cancelling…";
+    errorBox.hidden = true;
+    try {
+      await request(endpoints.movements + "/" + encodeURIComponent(form.dataset.movementId) + "/cancel", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          expected_confirmation_version: Number(values.get("expected_confirmation_version")),
+          idempotency_key: form.dataset.idempotencyKey,
+          reason: String(values.get("reason") || "").trim(),
+          actor: String(values.get("actor") || "").trim() || null
+        })
+      });
+      closeModal();
+      await Promise.all([loadOne("movements"), loadOne("media"), loadMovementDetail(form.dataset.movementId, true)]);
+      render();
+      toast("Movement cancelled", "Unfinished reservations were released; prior custody evidence was preserved.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Cancel remaining task";
+    }
+  }
+
+  function openCustodyCorrection(button) {
+    const movement = selectedMovement();
+    const id = recordId(movement);
+    const detail = movementDetail(id);
+    if (!detail) return;
+    const media = list(detail, "media").find((item) => String(pick(item, "cartridge_id")) === button.dataset.cartridgeId);
+    if (!media) return;
+    const options = state.data.locations.filter((item) => locationKind(item) !== "unknown").map((item) => '<option value="' + esc(recordId(item)) + '">' + esc(label(pick(item, "name"))) + " · " + esc(human(locationKind(item))) + "</option>");
+    const body = '<form id="custody-correction-form" data-movement-id="' + esc(id) + '" data-idempotency-key="' + esc(operationKey("custody-correction")) + '"><input type="hidden" name="corrects_event_id" value="' + esc(button.dataset.eventId) + '"><input type="hidden" name="cartridge_id" value="' + esc(button.dataset.cartridgeId) + '"><input type="hidden" name="expected_current_location_id" value="' + esc(pick(media, "confirmed_location_id") || "") + '"><input type="hidden" name="expected_confirmation_version" value="' + esc(pick(detail.summary, "confirmation_version")) + '"><div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Append a correction; never rewrite history</strong><span>The original custody event remains visible. Use this only after physically verifying the current cartridge location.</span></div></div><div class="form-grid"><div class="form-field full"><label>Cartridge</label><div class="static-field"><strong>' + esc(label(pick(media, "internal_label"))) + '</strong><small>Currently confirmed: ' + esc(pick(media, "confirmed_location_name") || "Unknown") + '</small></div></div><div class="form-field full"><label for="correction-location">Correct physical location</label><select class="select" id="correction-location" name="confirmed_location_id" required><option value="">Select verified location</option>' + options.join("") + '</select></div><div class="form-field full"><label class="check-option custody-physical-check"><input type="checkbox" name="physically_confirmed" required> I physically verified this exact cartridge at the corrected location.</label></div><div class="form-field full"><label for="correction-note">Correction reason and evidence</label><textarea class="textarea" id="correction-note" name="note" maxlength="2000" required></textarea></div><div class="form-field full"><label for="correction-actor">Operator label</label><input class="input" id="correction-actor" name="actor" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="custody-correction-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-danger" type="submit">Append correction</button></div></form>';
+    openModal("Correct custody evidence", body);
+    const modal = modalLayer.querySelector(".modal");
+    if (modal) modal.classList.add("custody-modal");
+  }
+
+  async function submitCustodyCorrection(form) {
+    const values = new FormData(form);
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#custody-correction-error");
+    submit.disabled = true;
+    submit.textContent = "Appending correction…";
+    errorBox.hidden = true;
+    try {
+      await request(endpoints.movements + "/" + encodeURIComponent(form.dataset.movementId) + "/corrections", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          corrects_event_id: String(values.get("corrects_event_id")),
+          cartridge_id: String(values.get("cartridge_id")),
+          expected_current_location_id: String(values.get("expected_current_location_id") || "") || null,
+          confirmed_location_id: String(values.get("confirmed_location_id")),
+          expected_confirmation_version: Number(values.get("expected_confirmation_version")),
+          idempotency_key: form.dataset.idempotencyKey,
+          physically_confirmed: values.get("physically_confirmed") === "on",
+          note: String(values.get("note") || "").trim(),
+          actor: String(values.get("actor") || "").trim() || null
+        })
+      });
+      closeModal();
+      await Promise.all([loadOne("movements"), loadOne("media"), loadMovementDetail(form.dataset.movementId, true)]);
+      render();
+      toast("Custody correction appended", "The original event remains visible beside the corrective evidence.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Append correction";
+    }
+  }
+
+  function printMovementManifest() {
+    document.body.classList.add("printing-custody-manifest");
+    window.print();
+    window.setTimeout(() => document.body.classList.remove("printing-custody-manifest"), 500);
+  }
+
   function rememberRecoveryProfile(profile) {
     if (!profile || typeof profile !== "object" || !recordId(profile)) return;
     state.data.recoveryProfiles = [profile].concat(state.data.recoveryProfiles.filter((item) => recordId(item) !== recordId(profile)));
@@ -1883,7 +2397,7 @@
 
   function showActions() {
     const actions = state.data.overview.actions;
-    const body = actions.length ? '<ul class="action-list">' + actions.map((action) => '<li class="action-item"><span class="action-symbol" aria-hidden="true">!</span><span class="action-copy"><strong>' + esc(label(pick(action, "title", "label", "name"))) + '</strong><span>' + esc(label(pick(action, "detail", "message", "state"))) + "</span></span></li>").join("") + "</ul>" : '<p>No unresolved actions are reported.</p>';
+    const body = actions.length ? '<ul class="action-list">' + actions.map(renderActionItem).join("") + "</ul>" : '<p>No unresolved actions are reported.</p>';
     openModal("Notifications", body);
   }
 
@@ -1903,6 +2417,14 @@
     if (action === "open-recovery-run") openRecoveryRun(target.dataset.profileId || null);
     if (action === "select-recovery-exercise") selectRecoveryExercise(target.dataset.id);
     if (action === "select-recovery-point") selectRecoveryPoint(target.dataset.id);
+    if (action === "add-location") openLocationForm();
+    if (action === "plan-movement") openMovementForm();
+    if (action === "select-movement") selectMovement(target.dataset.id);
+    if (action === "retry-movement") loadMovementDetail(target.dataset.id, true);
+    if (action === "confirm-custody") openCustodyConfirmation(target);
+    if (action === "cancel-movement") openCancelMovement(target.dataset.id);
+    if (action === "correct-custody") openCustodyCorrection(target);
+    if (action === "print-movement-manifest") printMovementManifest();
     if (action === "retry-recovery-point") loadRecoveryPointDetail(target.dataset.id, true);
     if (action === "download-recovery-evidence") downloadRecoveryEvidence(target);
     if (action === "open-restore-plan" || action === "revise-restore-plan") openRestorePlan(target.dataset.id);
@@ -1944,6 +2466,26 @@
       event.preventDefault();
       submitRestorePlan(event.target);
     }
+    if (event.target.id === "location-form") {
+      event.preventDefault();
+      submitLocation(event.target);
+    }
+    if (event.target.id === "movement-form") {
+      event.preventDefault();
+      submitMovement(event.target);
+    }
+    if (event.target.id === "custody-confirm-form") {
+      event.preventDefault();
+      submitCustodyConfirmation(event.target);
+    }
+    if (event.target.id === "cancel-movement-form") {
+      event.preventDefault();
+      submitCancelMovement(event.target);
+    }
+    if (event.target.id === "custody-correction-form") {
+      event.preventDefault();
+      submitCustodyCorrection(event.target);
+    }
   });
 
   document.addEventListener("input", (event) => {
@@ -1969,6 +2511,12 @@
       const warning = document.querySelector("#restore-replace-warning");
       if (warning) warning.hidden = event.target.value !== "replace";
     }
+    if (event.target.id === "movement-source") updateMovementMediaChoices(event.target.form);
+    if (event.target.name === "movement_cartridge") updateCustodyActionButtons();
+    if (event.target.id === "custody-select-all") {
+      document.querySelectorAll('[name="movement_cartridge"]:not(:disabled)').forEach((input) => { input.checked = event.target.checked; });
+      updateCustodyActionButtons();
+    }
   });
 
   document.addEventListener("keydown", (event) => {
@@ -1988,6 +2536,8 @@
   });
   window.addEventListener("hashchange", () => {
     shell.classList.remove("nav-open");
+    closeModal();
+    closeDrawer();
     render();
     main.focus();
     if (state.route === "recovery-lab") {
@@ -2006,6 +2556,11 @@
       const point = selectedRecoveryPoint();
       const id = recordId(point);
       if (id && !state.data.recoveryPointDetails[id]) loadRecoveryPointDetail(id);
+    }
+    if (state.route === "movements") {
+      const movement = selectedMovement();
+      const id = recordId(movement);
+      if (id && !state.data.movementDetails[id]) loadMovementDetail(id);
     }
   });
 
