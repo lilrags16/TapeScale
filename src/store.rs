@@ -507,8 +507,7 @@ pub async fn record_drive_observation(
                  AND NOT $12
                  AND $13
                  AND $14
-                 AND $15
-                 AND $16,
+                 AND $15,
              qualification_status = CASE
                  WHEN drives.vendor IS DISTINCT FROM EXCLUDED.vendor
                    OR drives.model IS DISTINCT FROM EXCLUDED.model
@@ -535,7 +534,6 @@ pub async fn record_drive_observation(
     .bind(observation.identity_verified)
     .bind(observation.identity_conflict)
     .bind(observation.accessible)
-    .bind(observation.position_lost != Some(true))
     .bind(observation.immediate_mode == Some(false))
     .bind(observation.in_flight == Some(0))
     .fetch_one(&mut *transaction)
@@ -590,7 +588,6 @@ pub async fn reconcile_drive(
            AND health->>'accessible' = 'true'
            AND health->>'identity_verified' = 'true'
            AND COALESCE(health->>'identity_conflict', 'false') <> 'true'
-           AND health->>'position_lost' = 'false'
            AND COALESCE(health->>'motion_position_uncertain', 'false') <> 'true'
            AND health->>'immediate_mode' = 'false'
            AND health->>'in_flight' = '0'
@@ -1134,9 +1131,6 @@ fn drive_motion_blocker(drive: &DriveRecord) -> Option<String> {
     if health.get("identity_conflict").and_then(Value::as_bool) == Some(true) {
         return Some("the stable identity is present at more than one configured path".to_owned());
     }
-    if health.get("position_lost").and_then(Value::as_bool) != Some(false) {
-        return Some("the kernel has not confirmed a known tape position".to_owned());
-    }
     if health
         .get("motion_position_uncertain")
         .and_then(Value::as_bool)
@@ -1288,7 +1282,6 @@ pub async fn inventory_counts(pool: &PgPool) -> Result<InventoryCounts, sqlx::Er
             (SELECT count(*) FROM drives
              WHERE health->>'present' = 'true'
                AND health->>'accessible' = 'true'
-               AND COALESCE(health->>'position_lost', 'false') <> 'true'
                AND last_observed_at >= now() - interval '2 minutes') AS accessible_drives,
             (SELECT count(*) FROM drives
              WHERE reconciled
@@ -1296,7 +1289,6 @@ pub async fn inventory_counts(pool: &PgPool) -> Result<InventoryCounts, sqlx::Er
                AND health->>'accessible' = 'true'
                AND health->>'identity_verified' = 'true'
                AND COALESCE(health->>'identity_conflict', 'false') <> 'true'
-               AND COALESCE(health->>'position_lost', 'false') <> 'true'
                AND last_observed_at >= now() - interval '2 minutes') AS reconciled_drives,
             (SELECT count(*) FROM drives
              WHERE qualification_status = 'physically_qualified') AS qualified_drives,

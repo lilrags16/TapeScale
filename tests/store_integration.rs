@@ -379,21 +379,41 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     observation.position_lost = Some(true);
     observation.status = "position_lost".to_owned();
     observation.observed_at = Utc::now();
-    let uncertain = store::record_drive_observation(&pool, &observation)
+    let reset_position = store::record_drive_observation(&pool, &observation)
         .await
         .expect("position loss should persist");
-    assert!(!uncertain.reconciled);
+    assert!(reset_position.reconciled);
     assert!(matches!(
         store::reconcile_drive(&pool, drive_id, "serial:IBM:ULTRIUM-HH9:DRIVE-001")
             .await
-            .expect("position-loss gate should be a domain outcome"),
-        ReconcileDriveResult::Blocked
+            .expect("identity trust is independent of current tape position"),
+        ReconcileDriveResult::Reconciled(_)
     ));
-    let uncertain_inventory = store::inventory_counts(&pool)
+    let reset_inventory = store::inventory_counts(&pool)
         .await
-        .expect("uncertain inventory counts should succeed");
-    assert_eq!(uncertain_inventory.accessible_drives, 0);
-    assert_eq!(uncertain_inventory.reconciled_drives, 0);
+        .expect("reset-position inventory counts should succeed");
+    assert_eq!(reset_inventory.accessible_drives, 1);
+    assert_eq!(reset_inventory.reconciled_drives, 1);
+
+    let recovery_motion = store::queue_drive_operation(
+        &pool,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        SasMotionOperation::Rewind,
+        true,
+    )
+    .await
+    .expect("rewind should remain available to recover from unknown position");
+    assert!(matches!(
+        recovery_motion,
+        QueueDriveOperationResult::Queued(_)
+    ));
+    assert_eq!(
+        store::block_queued_drive_operations(&pool, "integration cleanup")
+            .await
+            .expect("queued recovery motion should be cleanly terminalized"),
+        1
+    );
 
     observation.position_lost = Some(false);
     observation.status = "no_media".to_owned();

@@ -30,7 +30,7 @@ This is an initial engineering ledger. Automated test references should be added
 | AT-10 | Exact selected recovery point | Simulated | Not run | Namespace model may be tested; engine and snapshot-path proof remains. |
 | AT-11 | Object larger than one cartridge | Simulated | Not run | Requires file and native-stream physical spanning. |
 | AT-12 | Cancellation and host/process failure | Implemented/Simulated | Not run | Expired motion leases become blocked and revoke reconciliation without retry; controlled physical interruption and engine evidence remain. |
-| AT-13 | Unknown media/device loss/position | Implemented/Simulated | Not run | Missing/path-changed SAS devices, position loss, stale identity, and unverifiable motion postconditions are blocked in software; physical reset/disconnect evidence remains. |
+| AT-13 | Unknown media/device loss/position | Implemented/Simulated | Not run | Missing/path-changed SAS devices, stale identity, and unverifiable motion postconditions are blocked. Kernel-position loss remains a data-I/O blocker; Linux-supported rewind/offline recovery requires an affirmative BOT/no-media postcondition. Physical reset/disconnect evidence remains. |
 | AT-14 | Compression modes restore | Not run | Not run | Each supported resolved pipeline requires byte-exact restore evidence. |
 | AT-15 | Corrupt/reordered/truncated content | Simulated | Not run | Record/authentication fault injection must be tied to selected engine. |
 | AT-16 | Media read-back and restore tests | Not run | Not run | Cached or source rereads do not count. |

@@ -321,7 +321,7 @@ async fn reconcile_drive(
         }))),
         store::ReconcileDriveResult::NotFound => Err(AppError::NotFound),
         store::ReconcileDriveResult::Blocked => Err(AppError::Blocked(
-            "drive reconciliation requires the exact observed stable identity, current device access, no identity conflict, no outstanding tape I/O, and a fresh known position"
+            "drive reconciliation requires the exact observed stable identity, current device access, no identity conflict, and no outstanding tape I/O"
                 .to_owned(),
         )),
     }

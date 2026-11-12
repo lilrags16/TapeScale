@@ -55,7 +55,7 @@ cargo test --all-targets
 cargo build --release --locked
 ```
 
-The current suite exercises SAS VPD identity/status parsing, allowlisted motion commands, durable drive-operation leases and audit state, device replacement and position-loss gates, compatibility discontinuities, overwrite blockers, retention graphs, incremental-base selection, job transitions, restore prerequisites, path/link containment, RBAC, custody confirmation, engine claim boundaries, and safe process execution.
+The current suite exercises SAS VPD identity/status parsing, allowlisted motion commands, durable drive-operation leases and audit state, device replacement, reset-position recovery, uncertain-motion gates, compatibility discontinuities, overwrite blockers, retention graphs, incremental-base selection, job transitions, restore prerequisites, path/link containment, RBAC, custody confirmation, engine claim boundaries, and safe process execution.
 
 ## Runtime boundaries
 

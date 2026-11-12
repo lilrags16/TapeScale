@@ -348,7 +348,7 @@
           .sort((left, right) => new Date(pick(right, "created_at") || 0) - new Date(pick(left, "created_at") || 0));
         const latestOperation = operations[0] || null;
         const activeOperation = operations.find((operation) => ["queued", "running"].includes(String(pick(operation, "state"))));
-        const canReconcile = current && !drive.reconciled && health.present === true && health.accessible === true && health.position_lost === false && health.motion_position_uncertain !== true && health.immediate_mode === false && health.in_flight === 0 && health.identity_verified === true && health.identity_conflict !== true;
+        const canReconcile = current && !drive.reconciled && health.present === true && health.accessible === true && health.motion_position_uncertain !== true && health.immediate_mode === false && health.in_flight === 0 && health.identity_verified === true && health.identity_conflict !== true;
         const action = canReconcile ? '<button class="button button-small" type="button" data-action="reconcile-drive" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '">Trust identity</button>' : status(drive.reconciled ? "reconciled" : "unreconciled");
         const access = current ? pick(health, "status") || pick(drive, "qualification_status") : "stale";
         const motionBlocker = activeOperation ? "A tape motion request is already " + String(pick(activeOperation, "state") || "active") + "."
@@ -359,13 +359,12 @@
                   : health.identity_verified !== true ? "The drive does not have a verified stable SCSI identity."
                     : health.identity_conflict === true ? "The stable identity is present at more than one configured path."
                       : health.motion_position_uncertain === true ? "A prior motion result requires fresh reconciliation."
-                        : health.position_lost !== false ? "The kernel has not confirmed a known tape position."
-                          : health.immediate_mode !== false ? "Kernel immediate tape motion is enabled or unknown."
-                            : health.in_flight !== 0 ? "The kernel reports outstanding or unknown tape I/O."
-                              : drive.reconciled !== true ? "Trust this exact drive identity before requesting tape motion."
-                                : health.medium_loaded !== true ? "No cartridge is reported as loaded."
-                                  : health.ready !== true ? "The loaded tape drive is not ready."
-                                    : null;
+                        : health.immediate_mode !== false ? "Kernel immediate tape motion is enabled or unknown."
+                          : health.in_flight !== 0 ? "The kernel reports outstanding or unknown tape I/O."
+                            : drive.reconciled !== true ? "Trust this exact drive identity before requesting tape motion."
+                              : health.medium_loaded !== true ? "No cartridge is reported as loaded."
+                                : health.ready !== true ? "The loaded tape drive is not ready."
+                                  : null;
         const canMove = motionBlocker === null;
         let motion = motionEnabled ? status(activeOperation ? pick(activeOperation, "state") : health.medium_loaded === true ? "ready" : "no loaded tape") : status("disabled");
         if (latestOperation && !activeOperation) motion = status(pick(latestOperation, "state"));

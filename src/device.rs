@@ -497,11 +497,9 @@ fn parse_sysfs_u64(value: &str) -> Option<u64> {
 
 fn apply_position_loss(position_lost: Option<bool>, status: &mut MtStatus) {
     if position_lost == Some(true) {
-        status.ready = Some(false);
-        status.at_bot = None;
         status.status = "position_lost".to_owned();
         status.detail = Some(
-            "the kernel reports tape position was lost during reset; physical operations are blocked"
+            "the kernel reports tape position was lost during reset; data and relative positioning remain blocked, while rewind or unload may recover a known endpoint"
                 .to_owned(),
         );
     }
@@ -1018,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn position_loss_overrides_an_online_mt_result() {
+    fn position_loss_preserves_rewind_and_unload_recovery_evidence() {
         assert_eq!(parse_sysfs_bool("1\n"), Some(true));
         assert_eq!(parse_sysfs_bool("0\n"), Some(false));
         assert_eq!(parse_sysfs_bool("unknown"), None);
@@ -1026,8 +1024,8 @@ mod tests {
         let mut status = parse_mt_success("BOT ONLINE", "");
         assert_eq!(status.ready, Some(true));
         apply_position_loss(Some(true), &mut status);
-        assert_eq!(status.ready, Some(false));
+        assert_eq!(status.ready, Some(true));
         assert_eq!(status.status, "position_lost");
-        assert_eq!(status.at_bot, None);
+        assert_eq!(status.at_bot, Some(true));
     }
 }

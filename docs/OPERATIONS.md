@@ -52,7 +52,7 @@ The disposable test Compose enables `TAPESCALE_LAB_TAPE_MOTION_ENABLED=true`. Wi
 
 Linux may write a filemark before rewind/offline when the previous tape operation was a write. TapeScale exposes no data-write or explicit filemark command here, but it cannot promise unchanged media after another controller wrote to the drive. Never use retained, production, unknown, or foreign media with this unqualified lab control.
 
-TapeScale leases one drive controller, rechecks its exact stable identity and safety state, executes only the fixed allowlisted command, and appends audit evidence. A missing/stale drive, identity change, conflict, uncertain position, absent medium, or existing active request blocks execution. Do not run another tape controller against the same drive during this lab workflow.
+TapeScale leases one drive controller, rechecks its exact stable identity and safety state, executes only the fixed allowlisted command, and appends audit evidence. A missing/stale drive, identity change, conflict, TapeScale-uncertain prior motion result, absent medium, or existing active request blocks execution. The [Linux SCSI tape driver explicitly permits rewind/offline as recovery operations](https://github.com/torvalds/linux/blob/master/drivers/scsi/st.c#L3771-L3791) when its internal tape position was lost after reset; TapeScale still requires a ready scratch cartridge and verifies BOT after rewind or no-media after unload. Do not run another tape controller against the same drive during this lab workflow.
 
 This gate does not expose load, seek, spacing, retension, an explicit filemark, read, write, label, format, or erase command. A successful rewind/unload does not identify the cartridge, prove restoration, qualify hardware, or enable backup. Designated scratch media and a selected engine remain required for the write qualification gate.
 
@@ -66,7 +66,7 @@ For a standalone drive:
 
 For a library, use the inventory and slot view. Changer motion, drive ownership, and import/export operations remain serialized. An export-slot move is not off-site delivery.
 
-After a device reset, disconnect, manual removal, or unexpected slot change, stop and reconcile. Never continue an active write from an assumed position.
+After a device reset, disconnect, manual removal, or unexpected slot change, never continue an active write from an assumed position. Rewind/unload may recover an endpoint only in this scratch-media lab path; all future data I/O must still reconcile the engine position and media state first.
 
 ## Verification
 

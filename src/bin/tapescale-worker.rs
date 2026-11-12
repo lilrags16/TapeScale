@@ -451,9 +451,6 @@ fn observation_motion_blocker(
     if !observation.accessible {
         return Some("the current tape device is inaccessible");
     }
-    if observation.position_lost != Some(false) {
-        return Some("the kernel has not confirmed a known tape position");
-    }
     if observation.immediate_mode != Some(false) {
         return Some("kernel immediate tape motion is enabled or unknown");
     }
@@ -485,11 +482,13 @@ fn verified_motion_postcondition(
     if !observation.identity_verified
         || observation.identity_conflict
         || !observation.accessible
-        || observation.position_lost != Some(false)
         || observation.immediate_mode != Some(false)
         || observation.in_flight != Some(0)
     {
-        return Err("drive identity, access, or position was not safe after motion".to_owned());
+        return Err(
+            "drive identity, access, immediate mode, or I/O state was not safe after motion"
+                .to_owned(),
+        );
     }
     if observation.vendor != expected.expected_vendor
         || observation.model != expected.expected_model
@@ -636,6 +635,7 @@ mod tests {
         )
         .is_err());
         observed.at_bot = Some(true);
+        observed.position_lost = Some(true);
         assert!(verified_motion_postcondition(
             SasMotionOperation::Rewind,
             Some(&observed),
@@ -647,6 +647,7 @@ mod tests {
     #[test]
     fn unload_requires_an_affirmative_empty_postcondition() {
         let mut observed = observation();
+        observed.position_lost = None;
         observed.medium_loaded = None;
         observed.ready = None;
         assert!(verified_motion_postcondition(
@@ -678,5 +679,15 @@ mod tests {
         observed.in_flight = Some(0);
         observed.immediate_mode = Some(true);
         assert!(observation_motion_blocker(&observed, &expected).is_some());
+    }
+
+    #[test]
+    fn rewind_and_unload_can_recover_an_unknown_or_lost_position() {
+        let expected = operation();
+        let mut observed = observation();
+        observed.position_lost = None;
+        assert!(observation_motion_blocker(&observed, &expected).is_none());
+        observed.position_lost = Some(true);
+        assert!(observation_motion_blocker(&observed, &expected).is_none());
     }
 }
