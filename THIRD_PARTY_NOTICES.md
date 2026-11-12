@@ -9,8 +9,12 @@ The G0 laboratory image installs these Debian bookworm-backports packages from D
 - `bacula-sd=15.0.3-3~bpo12+1`
 - `bacula-bscan=15.0.3-3~bpo12+1`
 - `bacula-common-pgsql=15.0.3-3~bpo12+1`
+- `bacula-console=15.0.3-3~bpo12+1`
+- `bacula-director=15.0.3-3~bpo12+1`
+- `bacula-director-pgsql=15.0.3-3~bpo12+1`
+- `bacula-fd=15.0.3-3~bpo12+1`
 
-They provide the separately executed `/usr/sbin/btape` and future clean-catalog recovery utilities. Bacula Community is distributed under AGPLv3 with the additional terms and notices recorded by its authors and Debian maintainers. The installed authoritative notice is `/usr/share/doc/bacula-common/copyright` inside the image.
+They provide the separately executed Director, Storage Daemon, File Daemon, restricted Console client, `/usr/sbin/btape`, and clean-catalog recovery utilities. Bacula Community is distributed under AGPLv3 with the additional terms and notices recorded by its authors and Debian maintainers. The installed authoritative notice is `/usr/share/doc/bacula-common/copyright` inside the image.
 
 Corresponding source and Debian packaging for the exact build are available from the [Debian snapshot package record](https://snapshot.debian.org/package/bacula/15.0.3-3~bpo12%2B1/). The upstream release is available from the [Bacula Community source download center](https://www.bacula.org/source-download-center/).
 

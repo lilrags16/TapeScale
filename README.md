@@ -6,7 +6,7 @@
 TapeScale is a safety-first LTO backup control plane for TrueNAS. It is designed to manage file and native ZFS protection, media, restores, verification evidence, and confirmed off-site custody without making the application catalog a single point of recovery failure.
 
 > [!IMPORTANT]
-> This repository is a **G0-ready engineering preview**, not a production release. The control plane, safety rules, simulator, API, UI, schema, and recovery tooling are implemented and tested. No tape generation, drive, changer, TrueNAS data path, ACL round trip, engine, or on-tape format is claimed as physically qualified yet. See the [qualification ledger](docs/QUALIFICATION.md).
+> This repository is a **G0 engineering preview**, not a production release. It now includes an attended G0.2 single-cartridge Bacula file roundtrip, but no tape generation, drive, changer, TrueNAS data path, ACL roundtrip, engine, or on-tape format is claimed as generally qualified. A pass applies only to the exact recorded source snapshot, drive, firmware, cartridge, and run. See the [qualification ledger](docs/QUALIFICATION.md).
 
 ## What is here
 
@@ -18,6 +18,7 @@ TapeScale is a safety-first LTO backup control plane for TrueNAS. It is designed
 - A constrained external-tool runner with literal arguments, timeouts, cancellation, bounded output, and failure propagation
 - Worker-only SAS discovery/status plus durable, audited lab-only rewind and unload using explicitly mapped non-rewinding devices
 - An attended, destructive Bacula Community 15.0.3 `btape test` harness with exact drive/cartridge binding, fencing, retained evidence, and a required rewind-to-BOT postcondition
+- An attended G0.2 recovery exercise that inventories an immutable mounted snapshot, writes one full file backup through Bacula, performs Bacula Data verification from tape, restores to an isolated destination, and compares independent SHA-256 manifests before creating a verified recovery point
 - A deterministic engine simulator that cannot report physical qualification
 - A purpose-built responsive storage-operations console
 - Hardened Docker Compose packaging with separate API, worker, and PostgreSQL services
@@ -30,12 +31,15 @@ Docker Compose is the supported packaging path:
 ```sh
 cp .env.example .env
 ./scripts/init-secrets.sh
+mkdir -p restore
 docker compose up --build
 ```
 
 Open `http://localhost:8080`. A fresh deployment starts without embedded operational fixtures: PostgreSQL and the console are empty until real records are created. Manual cartridge registration is the first durable workflow, and each cartridge remains in PostgreSQL across container restarts.
 
-For a self-contained TrueNAS test deployment, paste [`compose.truenas.yaml`](compose.truenas.yaml) into **Apps → Discover Apps → ⋮ → Install via YAML** and open `http://TRUENAS-IP:18080`. The test file intentionally embeds its disposable database password and uses Docker-managed volumes, but it does not enable demo fixtures. It maps only `/dev/nst0` to the worker and explicitly enables the scratch-media lab gates for status, rewind, unload, and the destructive Bacula `btape test`. If the host uses `/dev/nst1`, set `TAPESCALE_TAPE_DEVICES` and both sides of the device mapping to `/dev/nst1`; the container node name must match Linux sysfs.
+The generic `compose.yaml` intentionally maps no tape device and keeps all physical lab flags disabled. Enabling those flags outside the TrueNAS test file also requires an explicit override that maps the exact non-rewinding `/dev/nstN` node into the worker; never enable a guessed `/dev/sg*` device or add blanket privilege.
+
+For a self-contained TrueNAS test deployment, first create the isolated dataset/path `/mnt/tapescale-restores` with a Generic/POSIX-compatible ACL preset and no share, then paste [`compose.truenas.yaml`](compose.truenas.yaml) into **Apps → Discover Apps → ⋮ → Install via YAML** and open `http://TRUENAS-IP:18080`. The test file intentionally embeds its disposable database password and uses Docker-managed state volumes, but it does not enable demo fixtures. It exposes host `/mnt` to the API and worker as read-only `/source`, exposes only `/mnt/tapescale-restores` as writable `/restore` to the worker, maps `/dev/nst0`, and enables the attended scratch-media gates. If the host uses `/dev/nst1`, set `TAPESCALE_TAPE_DEVICES` and both sides of the device mapping to `/dev/nst1`; the container node name must match Linux sysfs.
 
 > [!CAUTION]
 > `btape test` deliberately overwrites the loaded cartridge. Everything previously on that tape must be treated as permanently lost. The TrueNAS test Compose grants `rwm` access to the one named device for this reason. Never select production, retained, foreign, WORM, or irreplaceable media.
@@ -49,9 +53,18 @@ To run the first physical engine gate:
 5. Leave the app and drive running while the durable run is `queued` or `running`. TapeScale captures the bounded Bacula output and requires a final rewind with an observed ready-at-BOT postcondition.
 6. Review the result under **System & qualification → Qualification**. A pass is G0.1 drive/media evidence only; it is not a successful backup, restore, or completed G0 decision.
 
-The harness does not expose arbitrary commands, label, erase, `fill`, or general backup/restore operations. Bacula's Storage Daemon package is pinned in the image to supply `btape`, but no Storage Daemon is started and no production on-tape format is selected.
+After that exact drive/cartridge combination passes, run the first recoverable-tape exercise:
 
-To rebuild a TrueNAS custom app from the latest public `main`, open the installed `tapescale` app for editing, replace its YAML with the latest raw [`compose.truenas.yaml`](https://raw.githubusercontent.com/lilrags16/TapeScale/main/compose.truenas.yaml), and save. Its `pull_policy: build` and Git build context cause Compose to fetch and rebuild the current source rather than reuse an older application image.
+1. Create or select an immutable TrueNAS snapshot below `/mnt`, for example `pool/dataset/.zfs/snapshot/tapescale-g02`, and keep the same qualified scratch cartridge loaded.
+2. Open **Recovery lab**, create a profile with the snapshot path relative to `/mnt` and an isolated restore subpath below `/mnt/tapescale-restores`.
+3. Select the trusted drive and registered cartridge. Confirm scratch use, destructive overwrite, and the explicit G0.2 deviation that encryption is disabled.
+4. Type `WRITE <profile name> TO <cartridge label> AND RESTORE VERIFY` exactly and start the exercise.
+5. Leave the worker, database, drive, and mounts available. The run is not passed until Bacula completes the full write, a Data verification that rereads tape, a normal restore, and TapeScale's independent manifest comparison.
+6. Inspect the phase timeline, engine evidence, source/restored manifests, comparison, and final recovery point. Restored files remain isolated below `/mnt/tapescale-restores/<chosen subpath>/<run id>`; do not publish them as a share.
+
+The closed G0.2 path starts the pinned Bacula Director, Storage Daemon, and File Daemon only on worker loopback under the singleton worker's fenced run. It does not expose an operator console or arbitrary engine commands. The current laboratory fixture limit is 100,000 manifest entries and 100 GiB logical data; larger datasets are rejected before tape writing. It is limited to one full file backup on one standalone drive and one cartridge. Spanning, incrementals, changers, native ZFS streams, encryption/key recovery, and clean-catalog recovery remain blocked.
+
+To update the TrueNAS custom app, open the installed `tapescale` app for editing, replace its YAML with the latest raw [`compose.truenas.yaml`](https://raw.githubusercontent.com/lilrags16/TapeScale/main/compose.truenas.yaml), and save. Each physical-test file pins its Git build context and OCI revision to a release tag; `pull_policy: build` rebuilds that exact source instead of silently moving with `main`.
 
 To run an empty, read-only console from a Rust checkout without PostgreSQL:
 
@@ -76,14 +89,14 @@ The current suite exercises SAS VPD identity/status parsing, allowlisted motion 
 
 | Component | Responsibility | Privilege boundary |
 |---|---|---|
-| `tapescale-api` | Web/API, restore planning, operator workflows | No devices, Docker socket, host root, or blanket privilege |
+| `tapescale-api` | Web/API, restore planning, operator workflows | Read-only source/restore views and `DAC_READ_SEARCH` in the test stack; no devices, Docker socket, writable host path, or blanket privilege |
 | `tapescale-scheduler` | Timezone-aware occurrences, catch-up/coalescing, durable queue policy | No source, restore, or device access |
-| `tapescale-worker` | Durable orchestration, SAS discovery, lab-only rewind/unload, and attended `btape test` execution | Only explicitly mapped non-rewinding tape nodes; destructive data I/O exists solely inside the separately gated, typed-confirmation qualification run |
+| `tapescale-worker` | Durable orchestration, SAS discovery, rewind/unload, `btape`, and the fenced G0.2 Bacula write/readback/restore exercise | Exact tape node, read-only source tree, isolated writable restore root, and narrowly required metadata-preservation capabilities in the test stack |
 | `tapescale-recovery` | Clean-host bundle inspection and recovery workflow | Runs independently of the original database |
 | PostgreSQL 16 | Product state, history, leases, evidence, audit/outbox | Private Compose network and persistent volume |
-| Engine adapter | Physical records, spanning, positioning, read-back | Simulator only until G0 selects and qualifies an engine/format |
+| Engine adapter | Fixed Bacula 15.0.3 configuration, restricted console commands, physical write, Data verify, and restore correlation | G0.2 single-volume lab scope only; the general production engine/format gate remains open |
 
-The web and worker containers drop all Linux capabilities in the preview. The TrueNAS test worker runs as container root so the exact `/dev/nst0:rwm` mapping can be inspected, moved, and used by the separately gated destructive `btape` harness; it is not privileged and has no broad `/dev`, host-root, or Docker-socket mount. A qualified deployment should instead use the host tape group where possible and must map only named tape/changer devices, read-only source snapshots, and approved restore destinations.
+The scheduler drops all Linux capabilities. The TrueNAS test API runs as container root with only `DAC_READ_SEARCH` so profile preflight can traverse restrictive dataset ACLs through read-only mounts. The worker runs as container root with only `CHOWN`, `DAC_OVERRIDE`, `DAC_READ_SEARCH`, `FOWNER`, and `FSETID`, which Bacula needs to read protected source metadata and restore recorded ownership/mode bits. Neither service is privileged; only the worker has the exact `/dev/nst0:rwm` mapping, `/mnt` remains read-only, and neither has a host-root or Docker-socket mount. A qualified deployment should move filesystem proof into the worker, narrow the source bind to selected snapshots, and use the host tape group where possible.
 
 ## Recovery CLI
 
@@ -114,7 +127,7 @@ Please do not report vulnerabilities in a public issue. Follow the private proce
 
 ## Project status
 
-SAS discovery, narrowly allowlisted lab rewind/unload, and the first Bacula 15.0.3 destructive drive test are implemented. A passing `btape test` is retained as evidence for the exact drive, firmware, device path, and operator-asserted scratch cartridge, but it does not qualify a backup representation or promote the drive/product to `physically_qualified`. The remaining gate requires real file backup/readback/restore, TrueNAS metadata fidelity, multi-volume/EOM and wrong-media behavior, failure recovery, encryption, and clean-host catalog reconstruction.
+SAS discovery, narrowly allowlisted lab rewind/unload, the Bacula 15.0.3 destructive drive test, and the G0.2 single-volume full-file roundtrip path are implemented. A G0.2 pass can create a verified recovery point only for its exact immutable source, physical tape readback, isolated restore, and manifest comparison. It does not promote the product to production or prove TrueNAS NFSv4 ACL fidelity, multi-volume/EOM behavior, wrong-media handling, interruption recovery, encryption, native ZFS, or clean-host catalog reconstruction.
 
 ## License
 

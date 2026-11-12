@@ -1932,6 +1932,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

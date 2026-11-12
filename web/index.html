@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#132522">
     <meta name="description" content="TapeScale storage operations console for TrueNAS and LTO protection.">
     <title>TapeScale Operations</title>
-    <link rel="stylesheet" href="app.css?v=btape-qualification-5">
-    <script src="app.js?v=btape-qualification-5" defer></script>
+    <link rel="stylesheet" href="app.css?v=g0-2-recovery-1">
+    <script src="app.js?v=g0-2-recovery-1" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Skip to main content</a>
@@ -33,6 +33,7 @@
           <section>
             <h2>Operate</h2>
             <a class="nav-link" data-route="overview" href="#overview"><span class="nav-icon" aria-hidden="true">&#9632;</span><span>Overview</span></a>
+            <a class="nav-link" data-route="recovery-lab" href="#recovery-lab"><span class="nav-icon" aria-hidden="true">&#8634;</span><span>Recovery lab</span><span class="nav-count" id="nav-recovery-count" hidden>0</span></a>
             <a class="nav-link" data-route="jobs" href="#jobs"><span class="nav-icon" aria-hidden="true">&#9654;</span><span>Jobs</span><span class="nav-count" id="nav-job-count" hidden>0</span></a>
             <a class="nav-link" data-route="restore" href="#restore"><span class="nav-icon" aria-hidden="true">&#8630;</span><span>Restore</span></a>
             <a class="nav-link" data-route="movements" href="#movements"><span class="nav-icon" aria-hidden="true">&#8644;</span><span>Movements</span><span class="nav-count nav-count-alert" id="nav-move-count" hidden>0</span></a>
@@ -98,9 +99,9 @@
 
         <nav class="mobile-nav" aria-label="Mobile navigation">
           <a data-route="overview" href="#overview"><span aria-hidden="true">&#9632;</span><small>Overview</small></a>
+          <a data-route="recovery-lab" href="#recovery-lab"><span aria-hidden="true">&#8634;</span><small>Recovery</small></a>
           <a data-route="jobs" href="#jobs"><span aria-hidden="true">&#9654;</span><small>Jobs</small></a>
           <a data-route="tapes" href="#tapes"><span aria-hidden="true">&#9638;</span><small>Tapes</small></a>
-          <a data-route="movements" href="#movements"><span aria-hidden="true">&#8644;</span><small>Moves</small></a>
           <a data-route="settings" href="#settings"><span aria-hidden="true">&#8226;&#8226;&#8226;</span><small>More</small></a>
         </nav>
       </div>

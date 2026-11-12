@@ -1,8 +1,8 @@
 # Operator guide
 
-This guide describes the intended TapeScale operating model. The current release is an engineering preview with SAS discovery, lab-only rewind/unload, a destructive Bacula `btape test` harness, and a simulator-only backup adapter. It must not be represented as protecting real tape until G0/G1 qualification is complete.
+This guide describes the intended TapeScale operating model. The current release is an engineering preview with SAS discovery, lab-only rewind/unload, a destructive Bacula `btape test` harness, and an attended G0.2 Bacula file roundtrip. It must not be represented as generally protecting production tape until G0/G1 qualification is complete.
 
-Procedures below are the operator acceptance target. The preview can exercise console, policy, scheduler, custody, restore-planning, and failure states with simulated data, but it cannot perform or verify a physical backup, restore, movement, encryption recovery, or catalog-loss recovery. Controls that lack a qualified backend are demonstrations, not operational authorization.
+Procedures below are the operator acceptance target. The G0.2 path can write and restore one full file capture on one cartridge under explicit lab gates. General scheduled backup, movement, encryption recovery, catalog-loss recovery, spanning, incrementals, native ZFS, and production authorization remain simulated, incomplete, or unqualified.
 
 ## Daily overview
 
@@ -69,7 +69,23 @@ The API reserves the selected cartridge and creates append-only events before th
 
 `btape` overwrites media. A successful result demonstrates basic Bacula record/filemark/position/append/re-read behavior for the recorded tuple; it does not prove file backup, full readback, restore, metadata fidelity, spanning, encryption, catalog recovery, or G0 completion. The harness does not expose Bacula `fill`, label, erase, a console, or arbitrary command execution.
 
-The rewind/unload motion gate does not expose load, seek, spacing, retension, an explicit filemark, read, write, label, format, or erase command. A successful rewind/unload does not identify the cartridge, prove restoration, qualify hardware, or enable backup. The separate `btape` harness performs only its fixed destructive test and does not create a protected recovery point.
+### First recoverable tape (G0.2)
+
+Use **Recovery lab** only after the exact loaded drive/cartridge combination has a passed G0.1 `btape` run. This attended exercise deliberately overwrites that cartridge again.
+
+1. Create an immutable TrueNAS snapshot below the read-only host source mount. In the test Compose, enter its path relative to `/mnt`, such as `pool/dataset/.zfs/snapshot/tapescale-g02`.
+2. Ensure `/mnt/tapescale-restores` is a dedicated isolated dataset with a Generic/POSIX-compatible ACL preset and no shares. An SMB/NFSv4 `aclmode=restricted` destination can reject required metadata restoration. Choose a relative restore subpath that is not used by another run.
+3. Create a recovery profile. TapeScale resolves the selected source beneath `/source`, confirms its container mount is read-only, and records an operator assertion that it is an immutable snapshot.
+4. Select the same trusted drive and registered scratch cartridge. Confirm scratch designation, destructive overwrite, and the G0.2 encryption-disabled deviation.
+5. Type `WRITE <profile name> TO <cartridge label> AND RESTORE VERIFY` exactly. Keep the host, database, mounts, worker, drive, and tape available until the run reaches a terminal state.
+6. Follow the phase timeline: queued, preparing, writing, written, tape verification, restore, manifest comparison, and terminal result. Do not infer progress from drive motion alone.
+7. Review the retained source manifest, Bacula job evidence, restored manifest, comparison, and evidence report. A recovery point is created only after strict Bacula job success and an exact independent comparison.
+
+The source manifest records per-file SHA-256 and the explicitly covered namespace/metadata fields. This G0.2 harness accepts at most 100,000 manifest entries and 100 GiB logical data so the in-memory comparison remains bounded; larger fixtures are blocked before a tape write. Bacula Data verification rereads the physical volume; it is not satisfied by rereading the mounted source. The subsequent normal Bacula restore is written beneath `/restore/<profile restore subpath>/<run id>` and remains isolated for inspection. TapeScale then scans that restored tree independently. Any missing/extra path, content or covered-metadata difference, warning/error terminal state, lease loss, identity change, source mutability, or uncertain cleanup prevents a pass.
+
+This pass is deliberately narrow. It establishes recoverability only for the exact recorded run and does not qualify NFSv4 ACLs, encryption, incrementals, multiple volumes, EOM/wrong-media behavior, changers, native ZFS streams, interruption recovery, or clean-host catalog reconstruction. Do not move the cartridge off site or reuse it under a general policy on the strength of this exercise.
+
+The rewind/unload motion gate does not expose load, seek, spacing, retension, an explicit filemark, read, write, label, format, or erase command. A successful rewind/unload does not identify the cartridge or prove restoration. The separate `btape` harness performs only its fixed destructive test and creates no recovery point; only the fenced G0.2 workflow may invoke the fixed Bacula data path described above.
 
 For a standalone drive:
 

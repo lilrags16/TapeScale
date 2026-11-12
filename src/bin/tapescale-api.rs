@@ -27,6 +27,9 @@ async fn main() -> Result<()> {
         config.demo_mode,
         config.lab_tape_motion_enabled,
         config.lab_tape_qualification_enabled,
+        config.lab_file_roundtrip_enabled,
+        config.source_root,
+        config.restore_root,
     );
     let app = api::router(state, config.web_dir);
     let listener = tokio::net::TcpListener::bind(config.bind)

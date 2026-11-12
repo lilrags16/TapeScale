@@ -19,6 +19,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::{
+    data_path::{isolated_restore_destination, resolve_existing_selection, verify_read_only_mount},
     device::SasMotionOperation,
     domain::path::validate_archive_path,
     engine::{simulator::SimulatorEngine, TapeEngine},
@@ -33,6 +34,9 @@ pub struct AppState {
     pub engine: Arc<dyn TapeEngine>,
     pub lab_tape_motion_enabled: bool,
     pub lab_tape_qualification_enabled: bool,
+    pub lab_file_roundtrip_enabled: bool,
+    pub source_root: PathBuf,
+    pub restore_root: PathBuf,
 }
 
 impl AppState {
@@ -42,6 +46,9 @@ impl AppState {
         demo_mode: bool,
         lab_tape_motion_enabled: bool,
         lab_tape_qualification_enabled: bool,
+        lab_file_roundtrip_enabled: bool,
+        source_root: PathBuf,
+        restore_root: PathBuf,
     ) -> Self {
         Self {
             pool,
@@ -49,6 +56,9 @@ impl AppState {
             engine: Arc::new(SimulatorEngine::new()),
             lab_tape_motion_enabled,
             lab_tape_qualification_enabled,
+            lab_file_roundtrip_enabled,
+            source_root,
+            restore_root,
         }
     }
 }
@@ -70,6 +80,15 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .route("/api/v1/movements/{id}/confirm", post(confirm_movement))
         .route("/api/v1/verification", get(verification))
         .route("/api/v1/recovery-points", get(recovery_points))
+        .route(
+            "/api/v1/recovery-exercises/profiles",
+            get(recovery_exercise_profiles).post(create_recovery_exercise_profile),
+        )
+        .route(
+            "/api/v1/recovery-exercises",
+            get(recovery_exercises).post(queue_recovery_exercise),
+        )
+        .route("/api/v1/recovery-exercises/{id}", get(recovery_exercise))
         .route("/api/v1/restores/plan", post(plan_restore))
         .route("/api/v1/preflight", get(preflight))
         .route("/api/v1/qualification", get(qualification_report))
@@ -140,6 +159,20 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
         "capabilities":capabilities,
         "lab_tape_motion_enabled":state.lab_tape_motion_enabled,
         "lab_tape_qualification_enabled":state.lab_tape_qualification_enabled,
+        "lab_file_roundtrip_enabled":state.lab_file_roundtrip_enabled,
+        "file_roundtrip_scope": if state.lab_file_roundtrip_enabled {
+            "laboratory_single_tape_full_file_backup_and_physical_restore"
+        } else {
+            "disabled"
+        },
+        "laboratory_data_path": {
+            "enabled": state.lab_file_roundtrip_enabled,
+            "engine": "Bacula Community",
+            "engine_version": "15.0.3",
+            "adapter_version": "g0.2-lab-v1",
+            "production_eligible": false,
+            "encryption": "disabled_with_explicit_per_run_deviation"
+        },
         "operational_data":"postgresql_only"
     })))
 }
@@ -486,6 +519,234 @@ async fn recovery_points(State(state): State<AppState>) -> Result<Json<Value>, A
 }
 
 #[derive(Debug, Deserialize)]
+struct CreateRecoveryExerciseProfileRequest {
+    name: String,
+    source_subpath: String,
+    restore_subpath: String,
+    immutable_snapshot_confirmed: bool,
+}
+
+async fn recovery_exercise_profiles(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let profiles = match state.pool.as_ref() {
+        Some(pool) => store::list_single_tape_data_profiles(pool).await?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({
+        "profiles": profiles,
+        "scope": "laboratory_single_tape_full_file_roundtrip",
+        "production_eligible": false
+    })))
+}
+
+async fn create_recovery_exercise_profile(
+    State(state): State<AppState>,
+    Json(request): Json<CreateRecoveryExerciseProfileRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    require_file_roundtrip(&state)?;
+    let pool = require_pool(&state)?;
+    if !request.immutable_snapshot_confirmed {
+        return Err(AppError::Invalid(
+            "immutable_snapshot_confirmed must be true; mount an immutable TrueNAS snapshot beneath the configured source root"
+                .to_owned(),
+        ));
+    }
+    let name = request.name.trim();
+    if name.is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) {
+        return Err(AppError::Invalid(
+            "name must contain 1 to 128 printable characters".to_owned(),
+        ));
+    }
+    let source_subpath = normalized_relative_path(&request.source_subpath, "source_subpath")?;
+    let restore_subpath = normalized_relative_path(&request.restore_subpath, "restore_subpath")?;
+    let source_mount = resolve_existing_selection(&state.source_root, &source_subpath)
+        .map_err(|error| AppError::Blocked(error.to_string()))?;
+    verify_read_only_mount(&source_mount).map_err(|error| AppError::Blocked(error.to_string()))?;
+    let restore_probe =
+        isolated_restore_destination(&state.restore_root, &restore_subpath, Uuid::nil())
+            .map_err(|error| AppError::Blocked(error.to_string()))?;
+    let restore_root = restore_probe
+        .parent()
+        .ok_or_else(|| AppError::Invalid("restore_subpath is invalid".to_owned()))?;
+    let source_mount_path = utf8_path(&source_mount, "resolved source path")?;
+    let restore_root_path = utf8_path(restore_root, "resolved restore path")?;
+    let profile = store::NewSingleTapeDataProfile {
+        name: name.to_owned(),
+        source_subpath,
+        restore_subpath,
+        source_mount_path,
+        restore_root_path,
+        immutable_snapshot_confirmed: true,
+    };
+    match store::create_single_tape_data_profile(pool, &profile).await? {
+        store::CreateSingleTapeDataProfileResult::Created(profile) => Ok((
+            StatusCode::CREATED,
+            Json(json!({
+                "profile": profile,
+                "source_mount": "read_only_verified",
+                "scope": "laboratory_single_tape_full_file_roundtrip",
+                "production_eligible": false
+            })),
+        )),
+        store::CreateSingleTapeDataProfileResult::NotFound => Err(AppError::NotFound),
+        store::CreateSingleTapeDataProfileResult::Blocked(reason) => Err(AppError::Blocked(reason)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueRecoveryExerciseRequest {
+    profile_id: Uuid,
+    drive_id: Uuid,
+    stable_id: String,
+    cartridge_id: Uuid,
+    cartridge_label: String,
+    confirmation: String,
+    scratch_media_confirmed: bool,
+    destructive_overwrite_confirmed: bool,
+    encryption_deviation_confirmed: bool,
+}
+
+async fn recovery_exercises(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let exercises = match state.pool.as_ref() {
+        Some(pool) => store::list_single_tape_data_runs(pool).await?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({
+        "exercises": exercises,
+        "scope": "laboratory_single_tape_full_file_roundtrip",
+        "production_eligible": false
+    })))
+}
+
+async fn recovery_exercise(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let id = Uuid::parse_str(&id)
+        .map_err(|_| AppError::Invalid("recovery exercise id must be a UUID".to_owned()))?;
+    let exercise = store::get_single_tape_data_run(pool, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let events = store::single_tape_data_events(pool, id).await?;
+    let artifacts = store::single_tape_data_artifacts(pool, id).await?;
+    Ok(Json(json!({
+        "exercise": exercise,
+        "events": events,
+        "artifacts": artifacts,
+        "scope": "laboratory_single_tape_full_file_roundtrip",
+        "production_eligible": false
+    })))
+}
+
+async fn queue_recovery_exercise(
+    State(state): State<AppState>,
+    Json(request): Json<QueueRecoveryExerciseRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    require_file_roundtrip(&state)?;
+    let pool = require_pool(&state)?;
+    let profile = store::list_single_tape_data_profiles(pool)
+        .await?
+        .into_iter()
+        .find(|profile| profile.id == request.profile_id)
+        .ok_or(AppError::NotFound)?;
+    let stable_id = request.stable_id.trim();
+    if stable_id.is_empty()
+        || stable_id.chars().count() > 512
+        || stable_id.chars().any(char::is_control)
+    {
+        return Err(AppError::Invalid(
+            "stable_id must contain 1 to 512 characters".to_owned(),
+        ));
+    }
+    let cartridge_label = request.cartridge_label.trim();
+    if cartridge_label.is_empty()
+        || cartridge_label.chars().count() > 128
+        || cartridge_label.chars().any(char::is_control)
+    {
+        return Err(AppError::Invalid(
+            "cartridge_label must contain 1 to 128 printable characters".to_owned(),
+        ));
+    }
+    if !request.scratch_media_confirmed
+        || !request.destructive_overwrite_confirmed
+        || !request.encryption_deviation_confirmed
+    {
+        return Err(AppError::Invalid(
+            "scratch_media_confirmed, destructive_overwrite_confirmed, and encryption_deviation_confirmed must all be true"
+                .to_owned(),
+        ));
+    }
+    let expected_confirmation = format!(
+        "WRITE {} TO {} AND RESTORE VERIFY",
+        profile.name, cartridge_label
+    );
+    if request.confirmation != expected_confirmation {
+        return Err(AppError::Invalid(format!(
+            "confirmation must exactly equal {expected_confirmation}"
+        )));
+    }
+    match store::queue_single_tape_data_run(
+        pool,
+        request.profile_id,
+        request.drive_id,
+        stable_id,
+        request.cartridge_id,
+        cartridge_label,
+        request.scratch_media_confirmed,
+        request.destructive_overwrite_confirmed,
+        request.encryption_deviation_confirmed,
+    )
+    .await?
+    {
+        store::QueueSingleTapeDataRunResult::Queued(exercise) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "exercise": exercise,
+                "durability": "postgresql",
+                "audit": "appended",
+                "destructive": true,
+                "encryption": "explicitly_disabled_for_g0_2_lab_deviation",
+                "production_eligible": false
+            })),
+        )),
+        store::QueueSingleTapeDataRunResult::NotFound => Err(AppError::NotFound),
+        store::QueueSingleTapeDataRunResult::Blocked(reason) => Err(AppError::Blocked(reason)),
+    }
+}
+
+fn normalized_relative_path(value: &str, field: &str) -> Result<String, AppError> {
+    let trimmed = value.trim();
+    let safe = validate_archive_path(std::path::Path::new(trimmed)).map_err(|_| {
+        AppError::Invalid(format!(
+            "{field} must be a non-empty contained relative path without traversal"
+        ))
+    })?;
+    safe.as_path()
+        .to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| AppError::Invalid(format!("{field} must be valid UTF-8")))
+}
+
+fn utf8_path(path: &std::path::Path, label: &str) -> Result<String, AppError> {
+    path.to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| AppError::Blocked(format!("{label} must be valid UTF-8")))
+}
+
+fn require_file_roundtrip(state: &AppState) -> Result<(), AppError> {
+    if state.lab_file_roundtrip_enabled {
+        Ok(())
+    } else {
+        Err(AppError::Blocked(
+            "the laboratory file roundtrip is disabled; set TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED=true on the API and worker only for an attended single-tape recovery exercise"
+                .to_owned(),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct RestorePlanRequest {
     #[serde(default)]
     destination: Option<String>,
@@ -547,6 +808,11 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     } else {
         "blocked"
     };
+    let engine_status = if state.lab_file_roundtrip_enabled {
+        "passed"
+    } else {
+        "blocked"
+    };
     Ok(Json(json!({
         "status":"blocked",
         "checked_at":chrono::Utc::now(),
@@ -562,7 +828,8 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
                 if inventory.qualified_drives > 0 {"A physically qualified drive is recorded"} else {"No physically qualified drive is recorded"}),
             preflight_check("media_inventory", "Media inventory", media_status,
                 if inventory.cartridges > 0 {"Cartridges are registered; on-tape identity still governs safe use"} else {"No cartridges are registered"}),
-            preflight_check("engine", "Tape backup engine", "blocked", "Backup jobs still use the simulator; Bacula btape is qualification-only")
+            preflight_check("engine", "Tape backup engine", engine_status,
+                if state.lab_file_roundtrip_enabled {"Pinned Bacula 15.0.3 is enabled only for attended G0.2 single-tape recovery exercises; general backup scheduling remains blocked"} else {"General backup jobs use the simulator and the G0.2 Bacula data path is disabled"})
         ],
         "inventory":inventory
     })))
@@ -712,6 +979,8 @@ fn require_pool(state: &AppState) -> Result<&PgPool, AppError> {
 fn runtime_mode(state: &AppState) -> &'static str {
     if state.demo_mode {
         "simulation"
+    } else if state.lab_file_roundtrip_enabled {
+        "laboratory_recovery_exercise"
     } else {
         "unqualified_preview"
     }

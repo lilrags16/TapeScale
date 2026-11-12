@@ -5,9 +5,12 @@ use serde_json::json;
 use tapescale::{
     device::{MissingSasDrive, SasDriveObservation, SasMotionOperation},
     store::{
-        self, ClaimDriveOperationResult, ClaimQualificationRunResult, DriveOperationTerminalState,
-        NewMedia, QualificationTerminalState, QueueDriveOperationResult,
-        QueueQualificationRunResult, ReconcileDriveResult,
+        self, ClaimDriveOperationResult, ClaimQualificationRunResult, ClaimSingleTapeDataRunResult,
+        CreateSingleTapeDataProfileResult, DriveOperationTerminalState,
+        FinalizeSingleTapeDataResult, NewMedia, NewSingleTapeDataProfile,
+        QualificationTerminalState, QueueDriveOperationResult, QueueQualificationRunResult,
+        QueueSingleTapeDataRunResult, ReconcileDriveResult, SingleTapeDataPhase,
+        SingleTapePassEvidence,
     },
 };
 
@@ -468,6 +471,423 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             .expect("expired confirmation should release scratch media");
     assert_eq!(reservation_after_expiry, None);
 
+    let rejected_profile = NewSingleTapeDataProfile {
+        name: "Unattested fixture".to_owned(),
+        source_subpath: "fixtures/unattested".to_owned(),
+        restore_subpath: "exercises/unattested".to_owned(),
+        source_mount_path: "/source/fixtures/unattested".to_owned(),
+        restore_root_path: "/restore/exercises/unattested".to_owned(),
+        immutable_snapshot_confirmed: false,
+    };
+    assert!(matches!(
+        store::create_single_tape_data_profile(&pool, &rejected_profile)
+            .await
+            .expect("an unattested profile should be a domain outcome"),
+        CreateSingleTapeDataProfileResult::Blocked(_)
+    ));
+    let data_profile = NewSingleTapeDataProfile {
+        name: "Integration physical recovery fixture".to_owned(),
+        source_subpath: "fixtures/immutable-001".to_owned(),
+        restore_subpath: "exercises/integration".to_owned(),
+        source_mount_path: "/source/fixtures/immutable-001".to_owned(),
+        restore_root_path: "/restore/exercises/integration".to_owned(),
+        immutable_snapshot_confirmed: true,
+    };
+    let created_profile = store::create_single_tape_data_profile(&pool, &data_profile)
+        .await
+        .expect("the self-contained mounted-source profile should persist");
+    let CreateSingleTapeDataProfileResult::Created(created_profile) = created_profile else {
+        panic!("an attested contained profile should be accepted");
+    };
+    assert_eq!(created_profile.source_subpath, "fixtures/immutable-001");
+    assert_eq!(created_profile.restore_subpath, "exercises/integration");
+    assert_eq!(created_profile.logical_root, "/fixtures/immutable-001");
+    assert!(created_profile.immutable_snapshot_confirmed);
+    assert!(!created_profile.production_eligible);
+    let source_binding = sqlx::query_as::<_, (String, String, String, Option<String>)>(
+        "SELECT source.dataset_name, source.logical_root, snapshot.logical_root,
+                snapshot.physical_path
+         FROM sources source
+         JOIN snapshots snapshot ON snapshot.source_id = source.id
+         WHERE source.id = $1 AND snapshot.id = $2",
+    )
+    .bind(created_profile.source_id)
+    .bind(created_profile.source_snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the profile should create its exact mounted snapshot binding");
+    assert_eq!(source_binding.0, "fixtures/immutable-001");
+    assert_eq!(source_binding.1, "/fixtures/immutable-001");
+    assert_eq!(source_binding.2, "/fixtures/immutable-001");
+    assert_eq!(
+        source_binding.3.as_deref(),
+        Some("/source/fixtures/immutable-001")
+    );
+
+    assert!(matches!(
+        store::queue_single_tape_data_run(
+            &pool,
+            created_profile.id,
+            drive_id,
+            "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+            scratch.id,
+            &scratch.internal_label,
+            true,
+            true,
+            false,
+        )
+        .await
+        .expect("the encryption deviation gate should be a domain outcome"),
+        QueueSingleTapeDataRunResult::Blocked(_)
+    ));
+    let queued_data_run = store::queue_single_tape_data_run(
+        &pool,
+        created_profile.id,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        scratch.id,
+        &scratch.internal_label,
+        true,
+        true,
+        true,
+    )
+    .await
+    .expect("the exact passed drive and cartridge should queue a physical data exercise");
+    let QueueSingleTapeDataRunResult::Queued(queued_data_run) = queued_data_run else {
+        panic!("qualified single-tape data exercise should queue");
+    };
+    assert_eq!(
+        queued_data_run.source_snapshot_id,
+        created_profile.source_snapshot_id
+    );
+    assert!(queued_data_run.encryption_deviation_confirmed);
+    assert!(matches!(
+        store::queue_single_tape_data_run(
+            &pool,
+            created_profile.id,
+            drive_id,
+            "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+            scratch.id,
+            &scratch.internal_label,
+            true,
+            true,
+            true,
+        )
+        .await
+        .expect("duplicate active work should be a domain outcome"),
+        QueueSingleTapeDataRunResult::Blocked(_)
+    ));
+    assert!(matches!(
+        store::queue_drive_operation(
+            &pool,
+            drive_id,
+            "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+            SasMotionOperation::Rewind,
+            true,
+        )
+        .await
+        .expect("the active data exercise should exclude standalone motion"),
+        QueueDriveOperationResult::Blocked(_)
+    ));
+    let data_claim = store::claim_next_single_tape_data_run(&pool, uuid::Uuid::now_v7())
+        .await
+        .expect("the worker should claim both exact resources");
+    let ClaimSingleTapeDataRunResult::Claimed(data_claim) = data_claim else {
+        panic!("the queued physical recovery exercise should be claimable");
+    };
+    assert!(store::renew_single_tape_data_run_leases(&pool, &data_claim)
+        .await
+        .expect("both data-run leases should renew"));
+    assert!(store::running_drive_operation_paths(&pool)
+        .await
+        .expect("active physical paths should query")
+        .contains(&"/dev/nst0".to_owned()));
+    assert!(store::append_single_tape_data_artifact(
+        &pool,
+        &data_claim,
+        "source_manifest",
+        "artifacts/source-manifest.json",
+        &"a".repeat(64),
+        1024,
+        json!({"manifest_digest":"fixture-manifest-v1","file_count":3}),
+    )
+    .await
+    .expect("source manifest evidence should append"));
+    assert!(store::transition_single_tape_data_phase(
+        &pool,
+        &data_claim,
+        SingleTapeDataPhase::Writing,
+        json!({"engine":"Bacula Community","operation":"full"}),
+    )
+    .await
+    .expect("the fenced run should enter writing"));
+    assert!(store::mark_single_tape_media_write_started(
+        &pool,
+        &data_claim,
+        "INTEGRATION-SCRATCH-L9-000001"
+    )
+    .await
+    .expect("the pre-label boundary should commit atomically"));
+    assert!(!store::mark_single_tape_media_write_started(
+        &pool,
+        &data_claim,
+        "INTEGRATION-SCRATCH-L9-000001"
+    )
+    .await
+    .expect("the media-write boundary cannot be committed twice"));
+    let (write_started, write_started_at, cartridge_health) =
+        sqlx::query_as::<_, (bool, bool, String)>(
+            "SELECT data_run.media_write_started,
+                    data_run.media_write_started_at IS NOT NULL,
+                    cartridge.health_status
+             FROM single_tape_data_runs data_run
+             JOIN cartridges cartridge ON cartridge.id = data_run.cartridge_id
+             WHERE data_run.id = $1",
+        )
+        .bind(data_claim.run.id)
+        .fetch_one(&pool)
+        .await
+        .expect("the durable media boundary should reload");
+    assert!(write_started);
+    assert!(write_started_at);
+    assert_eq!(cartridge_health, "write_in_progress");
+    assert!(store::append_single_tape_data_evidence_event(
+        &pool,
+        &data_claim,
+        "engine_dispatched",
+        json!({"operation":"backup","engine_job_id":1001}),
+    )
+    .await
+    .expect("correlated engine dispatch should append"));
+    assert!(store::transition_single_tape_data_phase(
+        &pool,
+        &data_claim,
+        SingleTapeDataPhase::Written,
+        json!({"engine_volume":"INTEGRATION-SCRATCH-L9-000001"}),
+    )
+    .await
+    .expect("the fenced run should record engine write completion"));
+    assert!(store::append_single_tape_data_artifact(
+        &pool,
+        &data_claim,
+        "engine_write",
+        "artifacts/engine-write.json",
+        &"b".repeat(64),
+        512,
+        json!({"finalized":true,"engine":"Bacula Community","version":"15.0.3"}),
+    )
+    .await
+    .expect("finalized engine-write evidence should append"));
+    assert!(store::transition_single_tape_data_phase(
+        &pool,
+        &data_claim,
+        SingleTapeDataPhase::Verifying,
+        json!({"path":"physical_tape_restore"}),
+    )
+    .await
+    .expect("the fenced run should enter physical verification"));
+    let pass_evidence = SingleTapePassEvidence {
+        engine_operation_id: "bacula-job-1001".to_owned(),
+        engine_volume_name: "INTEGRATION-SCRATCH-L9-000001".to_owned(),
+        engine_record_id: "bacula-media-record-1001".to_owned(),
+        first_record: "file=0:block=0".to_owned(),
+        last_record: Some("file=1:block=42".to_owned()),
+        logical_bytes: 4096,
+        encoded_bytes: 8192,
+        file_count: 3,
+        coverage: json!({"content_sha256":true,"mode":true,"numeric_owner":true}),
+        full_readback_evidence: json!({
+            "physical_media_readback":true,
+            "engine":"Bacula Community",
+            "volume":"INTEGRATION-SCRATCH-L9-000001"
+        }),
+        restore_test_evidence: json!({
+            "matched":true,
+            "isolated_destination":"/restore/exercises/integration/test-run"
+        }),
+        result: json!({"scope":"integration physical round trip"}),
+    };
+    assert!(matches!(
+        store::finalize_single_tape_data_pass(&pool, &data_claim, &pass_evidence)
+            .await
+            .expect("incomplete evidence should be a domain outcome"),
+        FinalizeSingleTapeDataResult::Rejected(_)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM recovery_points")
+            .fetch_one(&pool)
+            .await
+            .expect("recovery-point count should query"),
+        0
+    );
+    assert!(store::transition_single_tape_data_phase(
+        &pool,
+        &data_claim,
+        SingleTapeDataPhase::Restoring,
+        json!({"destination":"/restore/exercises/integration/test-run"}),
+    )
+    .await
+    .expect("the fenced run should enter isolated restore"));
+    assert!(
+        store::overview_counts(&pool)
+            .await
+            .expect("restoring overview should query")
+            .active_jobs
+            >= 1
+    );
+    assert!(store::append_single_tape_data_artifact(
+        &pool,
+        &data_claim,
+        "restored_manifest",
+        "artifacts/restored-manifest.json",
+        &"a".repeat(64),
+        1024,
+        json!({"manifest_digest":"fixture-manifest-v1","file_count":3}),
+    )
+    .await
+    .expect("restored manifest evidence should append"));
+    assert!(store::transition_single_tape_data_phase(
+        &pool,
+        &data_claim,
+        SingleTapeDataPhase::Comparing,
+        json!({"method":"normalized_manifest_sha256"}),
+    )
+    .await
+    .expect("the fenced run should enter manifest comparison"));
+    assert!(
+        store::overview_counts(&pool)
+            .await
+            .expect("comparing overview should query")
+            .active_jobs
+            >= 1
+    );
+    assert!(store::append_single_tape_data_artifact(
+        &pool,
+        &data_claim,
+        "comparison",
+        "artifacts/comparison.json",
+        &"c".repeat(64),
+        384,
+        json!({"matched":true,"differences":[]}),
+    )
+    .await
+    .expect("comparison evidence should append"));
+    let finalized = store::finalize_single_tape_data_pass(&pool, &data_claim, &pass_evidence)
+        .await
+        .expect("complete physical recovery evidence should finalize atomically");
+    let FinalizeSingleTapeDataResult::Passed {
+        recovery_point_id,
+        volume_record_id,
+    } = finalized
+    else {
+        panic!("complete matching evidence should create a verified recovery point");
+    };
+    assert!(matches!(
+        store::finalize_single_tape_data_pass(&pool, &data_claim, &pass_evidence)
+            .await
+            .expect("a stale terminal claim should be a domain outcome"),
+        FinalizeSingleTapeDataResult::FencedOut
+    ));
+    let durable_pass = sqlx::query_as::<_, (String, String, bool, String, i64)>(
+        "SELECT recovery.status, recovery.representation, volume.finalized,
+                verification.kind, count(*) OVER ()
+         FROM recovery_points recovery
+         JOIN volume_records volume ON volume.recovery_point_id = recovery.id
+         JOIN verification_records verification ON verification.recovery_point_id = recovery.id
+         WHERE recovery.id = $1 AND volume.id = $2
+         ORDER BY verification.kind",
+    )
+    .bind(recovery_point_id)
+    .bind(volume_record_id)
+    .fetch_all(&pool)
+    .await
+    .expect("the pass should expose durable recovery, volume, and verification evidence");
+    assert_eq!(durable_pass.len(), 2);
+    assert!(durable_pass
+        .iter()
+        .all(|row| row.0 == "verified" && row.1 == "file" && row.2 && row.4 == 2));
+    assert_eq!(
+        durable_pass
+            .iter()
+            .map(|row| row.3.as_str())
+            .collect::<Vec<_>>(),
+        vec!["full_readback", "restore_test"]
+    );
+    let (job_state, job_finished, engine_operation_id) =
+        sqlx::query_as::<_, (String, bool, Option<String>)>(
+            "SELECT state, finished_at IS NOT NULL, engine_operation_id
+             FROM job_runs WHERE id = $1",
+        )
+        .bind(data_claim.run.job_run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the finalized parent job should reload");
+    assert_eq!(job_state, "verified");
+    assert!(job_finished);
+    assert_eq!(engine_operation_id.as_deref(), Some("bacula-job-1001"));
+    let data_events = store::single_tape_data_events(&pool, queued_data_run.id)
+        .await
+        .expect("data-run events should reload");
+    assert_eq!(
+        data_events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "queued",
+            "started",
+            "writing",
+            "media_write_started",
+            "engine_dispatched",
+            "written",
+            "verifying",
+            "restoring",
+            "comparing",
+            "passed"
+        ]
+    );
+    let artifact_mutation = sqlx::query(
+        "UPDATE single_tape_data_artifacts SET metadata = '{}' WHERE single_tape_data_run_id = $1",
+    )
+    .bind(queued_data_run.id)
+    .execute(&pool)
+    .await
+    .expect_err("physical recovery artifacts must be append-only");
+    assert_eq!(
+        artifact_mutation
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("P0001")
+    );
+    let event_mutation =
+        sqlx::query("DELETE FROM single_tape_data_events WHERE single_tape_data_run_id = $1")
+            .bind(queued_data_run.id)
+            .execute(&pool)
+            .await
+            .expect_err("physical recovery phase evidence must be append-only");
+    assert_eq!(
+        event_mutation
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("P0001")
+    );
+    let reservation_after_data =
+        sqlx::query_scalar::<_, Option<String>>("SELECT reserved_by FROM cartridges WHERE id = $1")
+            .bind(scratch.id)
+            .fetch_one(&pool)
+            .await
+            .expect("passed data exercise should release its exact reservation");
+    assert_eq!(reservation_after_data, None);
+    let passed_cartridge_health =
+        sqlx::query_scalar::<_, String>("SELECT health_status FROM cartridges WHERE id = $1")
+            .bind(scratch.id)
+            .fetch_one(&pool)
+            .await
+            .expect("passed cartridge health should reload");
+    assert_eq!(passed_cartridge_health, "written_verified");
+
     let inventory = store::inventory_counts(&pool)
         .await
         .expect("inventory counts should succeed");
@@ -484,6 +904,247 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     .await
     .expect("drive audit query should succeed");
     assert_eq!(reconcile_audit, 1);
+
+    let quarantine_media = store::create_media(
+        &pool,
+        &NewMedia {
+            internal_label: "INTEGRATION-QUARANTINE-L9-000002".to_owned(),
+            barcode: Some("INT9000002".to_owned()),
+            media_generation: 9,
+            media_format: "LTO-9".to_owned(),
+            worm: false,
+        },
+    )
+    .await
+    .expect("quarantine fixture cartridge should persist");
+    let qualification = store::queue_qualification_run(
+        &pool,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        quarantine_media.id,
+        &quarantine_media.internal_label,
+        true,
+        true,
+    )
+    .await
+    .expect("quarantine fixture qualification should queue");
+    assert!(matches!(
+        qualification,
+        QueueQualificationRunResult::Queued(_)
+    ));
+    let quarantine_qualification = store::claim_next_qualification_run(&pool, uuid::Uuid::now_v7())
+        .await
+        .expect("quarantine fixture qualification should claim");
+    let ClaimQualificationRunResult::Claimed(quarantine_qualification) = quarantine_qualification
+    else {
+        panic!("quarantine fixture qualification should be claimed");
+    };
+    assert!(store::finish_qualification_run(
+        &pool,
+        &quarantine_qualification,
+        QualificationTerminalState::Passed,
+        json!({"detail":"qualified quarantine fixture","position_uncertain":false}),
+    )
+    .await
+    .expect("quarantine fixture qualification should finish"));
+
+    let fenced_run = store::queue_single_tape_data_run(
+        &pool,
+        created_profile.id,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        quarantine_media.id,
+        &quarantine_media.internal_label,
+        true,
+        true,
+        true,
+    )
+    .await
+    .expect("qualified quarantine fixture should queue");
+    assert!(matches!(
+        fenced_run,
+        QueueSingleTapeDataRunResult::Queued(_)
+    ));
+    let fenced_claim = store::claim_next_single_tape_data_run(&pool, uuid::Uuid::now_v7())
+        .await
+        .expect("quarantine fixture should claim");
+    let ClaimSingleTapeDataRunResult::Claimed(fenced_claim) = fenced_claim else {
+        panic!("quarantine fixture should be claimed");
+    };
+    assert!(store::transition_single_tape_data_phase(
+        &pool,
+        &fenced_claim,
+        SingleTapeDataPhase::Writing,
+        json!({"operation":"full"}),
+    )
+    .await
+    .expect("quarantine fixture should enter writing"));
+    assert!(store::mark_single_tape_media_write_started(
+        &pool,
+        &fenced_claim,
+        "INTEGRATION-QUARANTINE-L9-000002",
+    )
+    .await
+    .expect("quarantine fixture should commit the media boundary"));
+    sqlx::query(
+        "UPDATE resource_leases SET expires_at = now() - interval '1 second'
+         WHERE id = ANY($1::uuid[])",
+    )
+    .bind(vec![
+        fenced_claim.drive_lease_id,
+        fenced_claim.media_lease_id,
+    ])
+    .execute(&pool)
+    .await
+    .expect("both recovery-exercise leases should expire");
+    assert!(store::quarantine_fenced_single_tape_write(
+        &pool,
+        &fenced_claim,
+        "worker lost its fencing lease after label dispatch",
+    )
+    .await
+    .expect("the stale worker should quarantine without releasing a newer owner"));
+    assert_eq!(
+        store::recover_expired_single_tape_data_runs(&pool)
+            .await
+            .expect("expired media write should recover"),
+        1
+    );
+    let (quarantined_health, interrupted_state, interrupted_marker) =
+        sqlx::query_as::<_, (String, String, bool)>(
+            "SELECT cartridge.health_status, data_run.state,
+                    (data_run.result ->> 'media_write_started')::boolean
+             FROM single_tape_data_runs data_run
+             JOIN cartridges cartridge ON cartridge.id = data_run.cartridge_id
+             WHERE data_run.id = $1",
+        )
+        .bind(fenced_claim.run.id)
+        .fetch_one(&pool)
+        .await
+        .expect("quarantined run and cartridge should reload");
+    assert_eq!(quarantined_health, "write_unverified");
+    assert_eq!(interrupted_state, "interrupted");
+    assert!(interrupted_marker);
+    let fenced_events = store::single_tape_data_events(&pool, fenced_claim.run.id)
+        .await
+        .expect("fenced events should reload");
+    assert!(fenced_events
+        .iter()
+        .any(|event| event.event_type == "fenced_out"));
+
+    observation.observed_at = Utc::now();
+    store::record_drive_observation(&pool, &observation)
+        .await
+        .expect("fresh observation should clear the stale motion evidence");
+    assert!(matches!(
+        store::reconcile_drive(&pool, drive_id, "serial:IBM:ULTRIUM-HH9:DRIVE-001")
+            .await
+            .expect("drive should reconcile after a fresh safe observation"),
+        ReconcileDriveResult::Reconciled(_)
+    ));
+    assert!(matches!(
+        store::queue_single_tape_data_run(
+            &pool,
+            created_profile.id,
+            drive_id,
+            "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+            quarantine_media.id,
+            &quarantine_media.internal_label,
+            true,
+            true,
+            true,
+        )
+        .await
+        .expect("quarantined media should be a domain outcome"),
+        QueueSingleTapeDataRunResult::Blocked(_)
+    ));
+
+    let requalification = store::queue_qualification_run(
+        &pool,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        quarantine_media.id,
+        &quarantine_media.internal_label,
+        true,
+        true,
+    )
+    .await
+    .expect("write-unverified scratch media should permit destructive requalification");
+    assert!(matches!(
+        requalification,
+        QueueQualificationRunResult::Queued(_)
+    ));
+    let requalification = store::claim_next_qualification_run(&pool, uuid::Uuid::now_v7())
+        .await
+        .expect("requalification should claim");
+    let ClaimQualificationRunResult::Claimed(requalification) = requalification else {
+        panic!("requalification should be claimed");
+    };
+    assert!(store::finish_qualification_run(
+        &pool,
+        &requalification,
+        QualificationTerminalState::Passed,
+        json!({"detail":"fresh destructive qualification passed","position_uncertain":false}),
+    )
+    .await
+    .expect("fresh qualification should clear quarantine"));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT health_status FROM cartridges WHERE id = $1")
+            .bind(quarantine_media.id)
+            .fetch_one(&pool)
+            .await
+            .expect("requalified cartridge should reload"),
+        "qualified_scratch"
+    );
+
+    let failed_newer_qualification = store::queue_qualification_run(
+        &pool,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        quarantine_media.id,
+        &quarantine_media.internal_label,
+        true,
+        true,
+    )
+    .await
+    .expect("newer qualification attempt should queue");
+    assert!(matches!(
+        failed_newer_qualification,
+        QueueQualificationRunResult::Queued(_)
+    ));
+    let failed_newer_qualification =
+        store::claim_next_qualification_run(&pool, uuid::Uuid::now_v7())
+            .await
+            .expect("newer qualification attempt should claim");
+    let ClaimQualificationRunResult::Claimed(failed_newer_qualification) =
+        failed_newer_qualification
+    else {
+        panic!("newer qualification attempt should be claimed");
+    };
+    assert!(store::finish_qualification_run(
+        &pool,
+        &failed_newer_qualification,
+        QualificationTerminalState::Failed,
+        json!({"detail":"newer physical attempt failed","position_uncertain":false}),
+    )
+    .await
+    .expect("newer failed qualification should persist"));
+    assert!(matches!(
+        store::queue_single_tape_data_run(
+            &pool,
+            created_profile.id,
+            drive_id,
+            "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+            quarantine_media.id,
+            &quarantine_media.internal_label,
+            true,
+            true,
+            true,
+        )
+        .await
+        .expect("the latest exact failed qualification should govern"),
+        QueueSingleTapeDataRunResult::Blocked(_)
+    ));
 
     let queued_for_expiry = store::queue_drive_operation(
         &pool,

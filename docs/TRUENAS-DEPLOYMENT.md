@@ -1,16 +1,16 @@
 # TrueNAS deployment guide
 
 Supported qualification target: TrueNAS 25.10.8 on x86-64.
-Current status: Docker Compose engineering preview; no TrueNAS or hardware qualification has been completed.
+Current status: Docker Compose engineering preview with an attended G0.2 file-roundtrip path; no general TrueNAS or hardware qualification claim has been completed.
 
 TapeScale ships a four-service Compose topology:
 
 - `api`: `tapescale-api`, HTTP port 8080 inside the deployment;
 - `scheduler`: `tapescale-scheduler`, durable schedule evaluation and catch-up dispatch without host devices or data mounts;
-- `worker`: `tapescale-worker`, privileged orchestration, lab-only rewind/unload, the attended Bacula `btape` harness, and the simulator backup adapter;
+- `worker`: `tapescale-worker`, privileged orchestration, lab-only rewind/unload, the attended Bacula `btape` harness, and the fenced Bacula G0.2 write/readback/restore path;
 - `postgres`: PostgreSQL 16 durable product state.
 
-Production deployment remains blocked until a tape engine passes [ENGINE-EVALUATION.md](ENGINE-EVALUATION.md). Do not map production media to the simulator and infer that a write is protected.
+Production deployment remains blocked until the complete tape-engine matrix passes [ENGINE-EVALUATION.md](ENGINE-EVALUATION.md). A G0.2 pass proves one exact recovery exercise, not general engine, format, or media support.
 
 ## Prerequisites
 
@@ -37,13 +37,15 @@ Create explicit datasets rather than a broad host mount. A representative layout
 <restore-pool>/tapescale-staging
 ```
 
-Set quotas/reservations for spool, staging, and restore areas and preserve a configured pool free-space reserve. Source mounts are read-only. The API service receives none of these source/restore mounts; only the worker receives the exact paths it needs.
+Set quotas/reservations for spool, staging, and restore areas and preserve a configured pool free-space reserve. Source mounts are read-only. In the G0.2 test stack, the API receives read-only views of `/source` and `/restore` plus only `DAC_READ_SEARCH` to validate profile containment and source mount mode through restrictive dataset ACLs; the worker receives read-only `/source` and writable `/restore`. The scheduler receives neither. A production design should move filesystem validation to the fenced worker and narrow the source bind from the test stack's broad read-only `/mnt` view to approved snapshot roots.
 
 ## Secrets and first run
 
 Provide database credentials, session/secret-encryption material, TrueNAS API credentials, and TLS keys through mounted secret files or the TrueNAS secret facility. Never commit them to `.env`, Compose YAML, shell history, or diagnostic output.
 
 The self-contained `compose.truenas.yaml` is an explicitly disposable test configuration and intentionally embeds its PostgreSQL password. Do not reuse that password or treat this convenience file as the production credential model.
+
+The generic `compose.yaml` has no tape `devices:` mapping and leaves every physical gate disabled. If it is adapted for hardware testing, add an override for the one verified non-rewinding `/dev/nstN` node and keep the container path identical to the host/sysfs name. Do not grant `privileged`, map all `/dev`, or guess a generic SCSI node.
 
 No shared default password is valid. A production first-run bootstrap must create a unique administrator, enroll MFA, issue one-time recovery codes, and invalidate the bootstrap secret. Store recovery codes away from the NAS. The preview does not yet provide a production authentication/MFA bootstrap; demo access must not be exposed as a qualified installation.
 
@@ -79,15 +81,28 @@ The current standalone-drive milestone performs discovery, `mt status`, durable 
 ls -l /dev/nst* /dev/tape/by-id/*
 ```
 
-The test Compose maps host `/dev/nst0` to worker `/dev/nst0` with `rwm` device permission and sets both `TAPESCALE_LAB_TAPE_MOTION_ENABLED=true` and `TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED=true`. Write permission exists solely so the pinned Bacula 15.0.3 `btape` binary can run its destructive compatibility test. If the host node is `/dev/nst1`, set `TAPESCALE_TAPE_DEVICES` and both the source and target of the `devices` mapping to `/dev/nst1`. All three paths must match because TapeScale rejects symlinks and verifies the device node's major:minor number against `/sys/class/scsi_tape/nst1/dev` before status probes and again immediately before command dispatch. Never guess or map an unknown `/dev/sg*`, which may be a disk. After redeployment, open **Drives & libraries**, inspect the reported vendor/model/serial or WWN, firmware, path, and status, then use **Trust identity** only when they match the intended physical drive. A missing device, path change, firmware change, identity conflict, inaccessible node, immediate-mode setting, outstanding I/O, or uncertain operation result revokes reconciliation.
+The test Compose maps host `/dev/nst0` to worker `/dev/nst0` with `rwm` device permission and enables motion, G0.1 qualification, and G0.2 file-roundtrip flags. Write permission is used only inside the typed-confirmation scratch workflows. If the host node is `/dev/nst1`, set `TAPESCALE_TAPE_DEVICES` and both the source and target of the `devices` mapping to `/dev/nst1`. All three paths must match because TapeScale rejects symlinks and verifies the device node's major:minor number against `/sys/class/scsi_tape/nst1/dev` before status probes and again immediately before command dispatch. Never guess or map an unknown `/dev/sg*`, which may be a disk. After redeployment, open **Drives & libraries**, inspect the reported vendor/model/serial or WWN, firmware, path, and status, then use **Trust identity** only when they match the intended physical drive. A missing device, path change, firmware change, identity conflict, inaccessible node, immediate-mode setting, outstanding I/O, or uncertain operation result revokes reconciliation.
 
-Test image `0.1.0-test.6` corrects the private worker-state directories to UID 10001/GID 0 with mode `0770`. The TrueNAS worker remains UID/GID 0 so ordinary owner permissions on the exact `/dev/nstN` node and group permissions on these directories both work with every Linux capability still dropped. The Compose file uses new one-time worker-volume names so an older volume's incompatible `0755` ownership cannot survive the upgrade. PostgreSQL keeps its original volume, so cartridge inventory, drive trust, and qualification history remain intact; only disposable generated Bacula configuration, spool, and recovery-export workspace from the pre-`test.6` preview are left in the old unmounted volumes.
+Test image `0.1.0-test.8` adds the complete attended write/readback/restore/compare workflow and pins its Git context plus OCI revision to `v0.1.0-test.8`. The API remains read-only and receives only `DAC_READ_SEARCH`. The worker remains UID/GID 0 and receives only `CHOWN`, `DAC_OVERRIDE`, `DAC_READ_SEARCH`, `FOWNER`, and `FSETID`; these are needed to read protected snapshot content and restore recorded ownership/mode bits. It is not privileged. Bacula daemons bind only to worker loopback, configuration and PID files use bounded tmpfs mounts, daemon logs are continuously drained to bounded evidence files, Bacula working/bootstrap state uses `worker_bacula_runtime`, and PostgreSQL retains product state plus the engine catalog. The worker still has no Docker socket or writable host-root mount.
 
 Linux may finalize a prior write with a filemark before rewind/offline even though TapeScale issues no data-write command. The API therefore requires an explicit designated-scratch-media acknowledgement. Do not connect retained, production, unknown, or foreign media to this unqualified workflow.
 
-The preview API does not yet implement accounts or authentication. Anyone who can reach test port 18080 can request the allowlisted motions or attempt to queue the destructive test after supplying its visible confirmations. Use only an isolated, attended lab network and disable both lab flags before connecting non-scratch media.
+The preview API does not yet implement accounts or authentication. Anyone who can reach test port 18080 can request allowlisted motion or attempt to queue either destructive workflow after supplying its visible confirmations. Use only an isolated, attended lab network and disable all three lab flags before connecting non-scratch media.
 
 The motion gate exposes rewind and rewind-and-unload through fixed `mt-st` argument vectors. The qualification gate exposes one fixed Bacula invocation with the literal `test\n` input transcript; it does not expose `fill`, label, erase, a console, or arbitrary arguments. Before queueing, TapeScale requires an exact typed cartridge label, both destructive acknowledgements, an unprotected non-WORM inventory record, and a trusted ready drive. The worker holds one fenced drive lease, rechecks physical identity immediately before dispatch, and serializes discovery/motion with `btape`. A successful test is followed by a required rewind and ready-at-BOT observation. A process deadline cannot force tape I/O stuck in the kernel to finish; timeout, cancellation, lease loss, or an uncertain postcondition revokes reconciliation. A passing run is narrow G0.1 evidence and does not satisfy the complete engine/format gate.
+
+## G0.2 source and restore mounts
+
+Before installing `compose.truenas.yaml`, create `/mnt/tapescale-restores` as a dedicated empty test dataset/path using a Generic/POSIX-compatible ACL preset. Do not share it over SMB or NFS. The Compose bind uses `create_host_path: false`, so installation fails instead of silently creating a plain directory when this dataset is missing. The pasteable test file binds:
+
+- host `/mnt` to container `/source` as read-only in API and worker;
+- host `/mnt/tapescale-restores` to `/restore` as read-only in API and read/write in worker;
+- the exact non-rewinding tape device only to the worker;
+- Docker-managed evidence, Bacula working, and PostgreSQL volumes.
+
+The broad `/mnt` source bind is a test convenience, not the production layout. In **Recovery lab**, select only an immutable snapshot path such as `pool/dataset/.zfs/snapshot/tapescale-g02`. TapeScale rejects traversal, resolves the selection beneath `/source`, and verifies that the most-specific container mount is read-only. The operator's immutable-snapshot acknowledgement is additional evidence; it is not a substitute for that mount check.
+
+Create a restore profile subpath below `/mnt/tapescale-restores`. Each run receives a server-generated run directory created with descriptor-relative, no-symlink-following operations. The worker must never restore into `/source`, an existing live dataset, or an operator-supplied absolute path. A G0.2 run is destructive to tape and explicitly disables encryption as a recorded lab deviation. It supports exactly one full file capture, one standalone drive, one cartridge, at most 100,000 manifest entries, and at most 100 GiB logical data. A passed `btape` result for the exact drive/cartridge is a prerequisite.
 
 ## Compose deployment
 
@@ -122,20 +137,20 @@ Before enabling a policy, the web preflight must report each item independently:
 - spool, staging, restore capacity, quotas, and free-space reserve;
 - compatible writable media and overwrite-gate result.
 
-The fresh preview console starts without operational fixtures and reports only records stored in PostgreSQL. A correctly mapped SAS drive can make the device-access and stable-identity checks pass after explicit reconciliation. A completed `btape` run is displayed separately and never promotes the drive or product to physically qualified. The backup adapter remains a simulator and cannot make backup/restore, ZFS, ACL, full engine, or writable-media checks pass.
+The fresh preview console starts without operational fixtures and reports only records stored in PostgreSQL. A correctly mapped SAS drive can make the device-access and stable-identity checks pass after explicit reconciliation. A completed `btape` run is displayed separately and never promotes the drive or product to generally qualified. A G0.2 run can create one verified recovery point only after a Bacula full backup, physical Data verification, normal isolated restore, and independent manifest match. It cannot make native ZFS, NFSv4 ACL, spanning, encryption, changer, clean-catalog, or full engine checks pass.
 
 ## TrueNAS custom-app configuration
 
-For the current fixture-free test deployment, copy the complete repository-root `compose.truenas.yaml` into **Apps > Discover Apps > Install via YAML**. It builds public `main`, exposes the console on host port 18080, keeps the intentionally inline test database password, stores state in Docker-managed volumes, enables both attended scratch-media lab flags, and maps the single SAS node `/dev/nst0:rwm` to the worker. The initial operational UI is empty; discovered drives, motion history, manually registered cartridges, and qualification runs become the first real durable records.
+For the current fixture-free test deployment, first create `/mnt/tapescale-restores`, then copy the complete repository-root `compose.truenas.yaml` into **Apps > Discover Apps > Install via YAML**. It builds the public `v0.1.0-test.8` tag, exposes the console on host port 18080, keeps the intentionally inline test database password, stores state in Docker-managed volumes, enables all three attended scratch-media lab gates, mounts the source/restore roots described above, and maps `/dev/nst0:rwm` only to the worker. The initial operational UI is empty; discovered drives, motion history, manually registered cartridges, qualification runs, profiles, and recovery exercises become the first real durable records.
 
-To update this Git-context build, edit the installed custom app, replace its YAML with the latest raw `compose.truenas.yaml`, and save. Because the file uses `pull_policy: build`, the redeploy fetches and rebuilds the current `main` source. Verify the new commit and container logs before relying on any newly implemented workflow.
+To update this Git-context build, edit the installed custom app, replace its YAML with the latest raw `compose.truenas.yaml`, and save. Because the file uses `pull_policy: build`, the redeploy fetches and rebuilds the release tag named in that file. Retain the resulting image digest with physical-test evidence and verify the revision label plus container logs before relying on a newly implemented workflow.
 
 For a future qualified deployment, translate the same Compose boundaries into explicit TrueNAS datasets and production credential facilities:
 
 - four services: API, scheduler, worker, PostgreSQL 16;
 - private application network and TLS ingress to API port 8080;
 - persistent host-path datasets for the explicit state paths;
-- no devices or source/restore mounts on API or scheduler;
+- no devices on API or scheduler; if API-side path validation remains enabled, API receives read-only source/restore views only;
 - read-only selected source snapshot mounts to worker only;
 - read/write approved restore/staging mounts to worker only;
 - explicit qualified device mappings to worker only;
@@ -163,4 +178,4 @@ Stopping or removing containers must not delete persistent datasets, recovery bu
 
 ## Preview implementation boundary
 
-The Compose topology, PostgreSQL 16 persistence, health surface, static console, simulator, service separation, standalone SAS discovery, lab-only rewind/unload, and G0.1 `btape` harness are preview implementation. TLS ingress, production identity/MFA, TrueNAS WebSocket integration, ZFS/helper data paths, changer control, a selected production engine/format, backup/restore data flow, key packages, and full physical qualification remain incomplete or unqualified. Do not turn a target checklist item green solely because discovery, motion, or `btape test` succeeds.
+The Compose topology, PostgreSQL 16 persistence, health surface, static console, simulator, service separation, standalone SAS discovery, lab-only rewind/unload, G0.1 `btape`, and the attended G0.2 full-file roundtrip are preview implementation. TLS ingress, production identity/MFA, TrueNAS WebSocket snapshot control, native ZFS/helper data paths, changer control, spanning, incrementals, encryption/key packages, clean-catalog recovery, NFSv4 ACL fidelity, and broad physical qualification remain incomplete or unqualified. Do not turn a target checklist item green solely because discovery, motion, `btape`, or one recovery exercise succeeds.

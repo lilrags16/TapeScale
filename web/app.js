@@ -13,9 +13,22 @@
     recoveryPoints: "/recovery-points",
     preflight: "/preflight",
     qualification: "/qualification",
-    qualificationRuns: "/qualification/runs"
+    qualificationRuns: "/qualification/runs",
+    recoveryProfiles: "/recovery-exercises/profiles",
+    recoveryExercises: "/recovery-exercises"
   };
-  const routes = new Set(["overview", "jobs", "restore", "movements", "tapes", "drives", "verification", "settings"]);
+  const routes = new Set(["overview", "recovery-lab", "jobs", "restore", "movements", "tapes", "drives", "verification", "settings"]);
+  const RECOVERY_PHASES = [
+    { name: "Preflight", detail: "Bind source, drive, and tape", aliases: ["queued", "started", "preparing", "preflight"] },
+    { name: "Inventory", detail: "Hash the immutable fixture", aliases: ["inventorying", "manifesting", "manifest", "source_manifest"] },
+    { name: "Write tape", detail: "Full single-tape backup", aliases: ["writing", "backup", "engine_write"] },
+    { name: "Write complete", detail: "Close the Bacula backup job", aliases: ["written", "finalizing"] },
+    { name: "Read tape", detail: "Decode from physical media", aliases: ["verifying", "reading", "readback"] },
+    { name: "Restore", detail: "Extract to isolated destination", aliases: ["restoring", "restored", "restored_manifest"] },
+    { name: "Compare", detail: "Match source and restore", aliases: ["validating", "comparing", "comparison"] },
+    { name: "Proven", detail: "Retain recovery evidence", aliases: ["passed", "verified", "completed", "complete"] }
+  ];
+  const RECOVERY_TERMINAL_STATES = new Set(["passed", "verified", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
   const state = {
     route: "overview",
     loading: true,
@@ -34,11 +47,16 @@
       recoveryPoints: [],
       preflight: null,
       qualification: null,
-      qualificationRuns: []
+      qualificationRuns: [],
+      recoveryProfiles: [],
+      recoveryExercises: [],
+      recoveryExerciseDetails: {}
     },
     received: new Set(),
     errors: {},
-    qualificationPollTimer: null
+    qualificationPollTimer: null,
+    recoveryExercisePollTimer: null,
+    selectedRecoveryExerciseId: null
   };
 
   const main = document.querySelector("#main-content");
@@ -126,6 +144,11 @@
     if (key === "verification") return list(payload, "verification");
     if (key === "recoveryPoints") return list(payload, "recovery_points");
     if (key === "qualificationRuns") return list(payload, "runs");
+    if (key === "recoveryProfiles") return list(payload, "profiles");
+    if (key === "recoveryExercises") {
+      const exercises = list(payload, "exercises");
+      return exercises.length ? exercises : list(payload, "runs");
+    }
     if (key === "drives") {
       return { drives: list(payload, "drives"), slots: list(payload, "slots"), operations: list(payload, "operations") };
     }
@@ -185,11 +208,16 @@
     updateChrome();
     render();
     await Promise.all(Object.keys(endpoints).map(loadOne));
+    if (state.route === "recovery-lab") {
+      const exercise = selectedRecoveryExercise();
+      if (exercise && recordId(exercise)) await loadRecoveryExerciseDetail(recordId(exercise));
+    }
     state.loading = false;
     state.refreshing = false;
     updateChrome();
     render();
     scheduleQualificationPoll();
+    scheduleRecoveryExercisePoll();
   }
 
   function setBadge(id, value) {
@@ -225,6 +253,7 @@
     const summary = state.data.overview.summary || {};
     setBadge("#nav-job-count", state.data.jobs.length);
     setBadge("#nav-move-count", state.data.movements.length);
+    setBadge("#nav-recovery-count", state.data.recoveryExercises.filter(recoveryExerciseActive).length);
     const actionCount = Math.max(count(pick(summary, "required_actions")), state.data.overview.actions.length);
     setBadge("#notification-badge", actionCount);
     const notification = document.querySelector(".notification-button");
@@ -269,6 +298,7 @@
     const ready = state.received.has("overview");
     const metric = (name, value) => '<div class="metric"><span>' + esc(name) + '</span><strong>' + esc(ready ? value : "—") + "</strong></div>";
     let html = pageHead("Overview", "Current protection state reported by TapeScale.", refreshButton()) + noticeFor("overview");
+    html += renderRecoveryOverviewCallout();
     html += '<section class="panel metric-strip">' +
       metric("Protected sources", summary.protected_sources) +
       metric("Active jobs", summary.active_jobs) +
@@ -320,6 +350,333 @@
     if (!points.length) return html + empty("No recovery points", state.errors.recoveryPoints ? "Recovery points could not be loaded." : "A restore can be planned after a recovery point is available.");
     const rows = points.map((point) => '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="recoveryPoints" data-id="' + esc(recordId(point)) + '"><td class="primary-cell"><strong>' + esc(label(pick(point, "name", "id"))) + '</strong><small>' + esc(label(pick(point, "level", "kind", "representation"))) + "</small></td>" + cell(pick(point, "dataset_name", "source", "dataset")) + cell(date(pick(point, "recovery_time", "time", "created_at"))) + "<td>" + status(pick(point, "verification", "status", "state")) + "</td></tr>");
     return html + table(["Recovery point", "Source", "Created", "Verification"], rows);
+  }
+
+  function orderedRecoveryExercises() {
+    return state.data.recoveryExercises.slice().sort((left, right) => new Date(pick(right, "created_at", "started_at") || 0) - new Date(pick(left, "created_at", "started_at") || 0));
+  }
+
+  function recoveryExerciseState(exercise) {
+    return String(pick(exercise, "state", "status") || "queued").toLowerCase();
+  }
+
+  function recoveryExercisePhase(exercise) {
+    const result = exercise && exercise.result && typeof exercise.result === "object" ? exercise.result : {};
+    const evidence = result.evidence && typeof result.evidence === "object" ? result.evidence : {};
+    const detail = exercise && state.data.recoveryExerciseDetails[recordId(exercise)];
+    const events = detail ? list(detail, "events") : [];
+    const orderedEvents = events.slice().sort((left, right) => {
+      const timeDifference = new Date(pick(right, "occurred_at", "created_at") || 0) - new Date(pick(left, "occurred_at", "created_at") || 0);
+      return timeDifference || Number(pick(right, "id") || 0) - Number(pick(left, "id") || 0);
+    });
+    const latestEvent = orderedEvents[0];
+    const latestEvidence = latestEvent && latestEvent.evidence && typeof latestEvent.evidence === "object" ? latestEvent.evidence : {};
+    const phase = String(pick(exercise, "phase", "current_phase") || pick(result, "phase", "current_phase") || pick(evidence, "phase", "current_phase") || pick(latestEvidence, "phase", "current_phase") || pick(latestEvent, "phase", "to_state", "event_type") || recoveryExerciseState(exercise)).toLowerCase();
+    const recognized = RECOVERY_PHASES.some((item) => item.aliases.includes(phase));
+    if (!recoveryExerciseFailed(exercise) || recognized) return phase;
+    for (const event of orderedEvents) {
+      const eventEvidence = event && event.evidence && typeof event.evidence === "object" ? event.evidence : {};
+      const prior = String(pick(eventEvidence, "phase", "current_phase") || pick(event, "phase", "to_state", "event_type") || "").toLowerCase();
+      if (RECOVERY_PHASES.some((item) => item.aliases.includes(prior))) return prior;
+    }
+    return "preflight";
+  }
+
+  function recoveryExerciseActive(exercise) {
+    if (!exercise || pick(exercise, "finished_at")) return false;
+    const value = recoveryExerciseState(exercise);
+    if (RECOVERY_TERMINAL_STATES.has(value)) return false;
+    return true;
+  }
+
+  function recoveryExerciseFailed(exercise) {
+    return ["failed", "blocked", "interrupted", "cancelled", "canceled"].includes(recoveryExerciseState(exercise));
+  }
+
+  function recoveryExercisePassed(exercise) {
+    return ["passed", "verified", "completed", "complete"].includes(recoveryExerciseState(exercise));
+  }
+
+  function recoveryProfileName(profile) {
+    return String(pick(profile, "name") || "Unnamed recovery profile");
+  }
+
+  function recoveryExerciseProfileName(exercise) {
+    const direct = pick(exercise, "profile_name", "expected_profile_name", "name");
+    if (direct) return String(direct);
+    const profileId = String(pick(exercise, "profile_id") || "");
+    const profile = state.data.recoveryProfiles.find((item) => recordId(item) === profileId);
+    return profile ? recoveryProfileName(profile) : "Recovery exercise";
+  }
+
+  function recoveryExerciseDetail(exercise) {
+    const result = exercise && exercise.result && typeof exercise.result === "object" ? exercise.result : {};
+    const evidence = result.evidence && typeof result.evidence === "object" ? result.evidence : {};
+    const detail = pick(exercise, "failure_detail", "detail") || pick(result, "failure_detail", "detail", "message") || pick(evidence, "failure_detail", "detail", "message");
+    if (detail && typeof detail === "object") return JSON.stringify(detail);
+    return detail ? String(detail) : null;
+  }
+
+  function recoveryExerciseRecord(exercise) {
+    if (!exercise) return null;
+    const detail = state.data.recoveryExerciseDetails[recordId(exercise)];
+    const detailedExercise = detail && (detail.exercise || detail.run || (recordId(detail) === recordId(exercise) ? detail : null));
+    return detailedExercise && typeof detailedExercise === "object" ? detailedExercise : exercise;
+  }
+
+  function selectedRecoveryExercise() {
+    const exercises = orderedRecoveryExercises();
+    const selected = state.selectedRecoveryExerciseId && exercises.find((exercise) => recordId(exercise) === state.selectedRecoveryExerciseId);
+    return recoveryExerciseRecord(selected || exercises.find(recoveryExerciseActive) || exercises[0] || null);
+  }
+
+  function recoveryLabEnabled() {
+    return pick(state.data.system, "lab_file_roundtrip_enabled") === true;
+  }
+
+  function sameNullable(left, right) {
+    return (left === undefined || left === null ? null : left) === (right === undefined || right === null ? null : right);
+  }
+
+  function recoveryQualificationTupleMatches(run, drive, item) {
+    if (!run || !drive || !item) return false;
+    return String(pick(run, "drive_id") || "") === recordId(drive)
+      && String(pick(run, "cartridge_id") || "") === recordId(item)
+      && String(pick(run, "expected_stable_id") || "") === String(pick(drive, "stable_id") || "")
+      && String(pick(run, "expected_path") || "") === String(pick(drive, "observed_path") || "")
+      && sameNullable(run.expected_vendor, drive.vendor)
+      && sameNullable(run.expected_model, drive.model)
+      && sameNullable(run.expected_serial, drive.serial)
+      && sameNullable(run.expected_wwn, drive.wwn)
+      && sameNullable(run.expected_firmware, drive.firmware)
+      && String(pick(run, "expected_cartridge_label") || "") === String(mediaName(item) || "")
+      && sameNullable(run.expected_media_generation, item.media_generation)
+      && sameNullable(run.expected_media_format, item.media_format)
+      && pick(run, "engine_name") === "Bacula Community"
+      && pick(run, "engine_version") === "15.0.3"
+      && pick(run, "test_kind") === "btape_test";
+  }
+
+  function recoveryQualificationMatches(run, drive, item) {
+    if (!recoveryQualificationTupleMatches(run, drive, item)) return false;
+    const latest = state.data.qualificationRuns
+      .filter((candidate) => recoveryQualificationTupleMatches(candidate, drive, item))
+      .sort((left, right) => {
+        const timeDifference = new Date(pick(right, "created_at") || 0) - new Date(pick(left, "created_at") || 0);
+        return timeDifference || recordId(right).localeCompare(recordId(left));
+      })[0];
+    return latest && recordId(latest) === recordId(run) && recoveryExerciseState(run) === "passed" && Boolean(pick(run, "finished_at"));
+  }
+
+  function recoveryDriveSafetyBlocker(drive) {
+    const health = drive && drive.health && typeof drive.health === "object" ? drive.health : {};
+    const observedAt = new Date(pick(drive, "last_observed_at") || 0).getTime();
+    const current = Number.isFinite(observedAt) && Date.now() - observedAt <= 120000;
+    const activeExercise = state.data.recoveryExercises.some((exercise) => recoveryExerciseActive(exercise) && (String(pick(exercise, "drive_id")) === recordId(drive) || String(pick(exercise, "expected_stable_id")) === String(pick(drive, "stable_id"))));
+    if (activeExercise) return "A recovery exercise already owns this drive.";
+    if (!current) return "The drive observation is stale.";
+    if (health.present !== true || health.accessible !== true) return "The configured tape device is not accessible.";
+    if (health.identity_verified !== true || health.identity_conflict === true) return "The stable SCSI identity is not safe.";
+    if (drive.reconciled !== true) return "Trust the exact drive identity first.";
+    if (!pick(drive, "observed_path") || pick(drive, "observed_path") !== pick(drive, "expected_path")) return "The current tape path does not match the trusted path.";
+    if (health.motion_position_uncertain === true) return "The prior tape position is uncertain; reconcile the drive.";
+    if (health.immediate_mode !== false || health.in_flight !== 0) return "Kernel tape I/O state is not safe.";
+    if (health.medium_loaded !== true || health.ready !== true) return "Load the designated scratch cartridge and wait for ready.";
+    return null;
+  }
+
+  function recoveryMediaSafetyBlocker(item) {
+    const activeExercise = state.data.recoveryExercises.some((exercise) => recoveryExerciseActive(exercise) && String(pick(exercise, "cartridge_id")) === recordId(item));
+    if (activeExercise) return "A recovery exercise already reserves this cartridge.";
+    if (item.worm === true) return "WORM media cannot be used for this destructive lab exercise.";
+    if (count(pick(item, "active_holds")) > 0) return "The cartridge has an active hold.";
+    if (pick(item, "has_content") === true) return "The cartridge already contains a retained recovery point.";
+    if (pick(item, "reserved_by")) return "The cartridge is reserved by another workflow.";
+    if (["foreign", "mismatch"].includes(String(pick(item, "identity_status") || ""))) return "The cartridge identity is foreign or mismatched.";
+    if (String(pick(item, "health_status") || "") === "write_unverified") return "A prior write is unverified; run the destructive btape qualification again.";
+    return null;
+  }
+
+  function recoveryDriveBlocker(drive) {
+    const safetyBlocker = recoveryDriveSafetyBlocker(drive);
+    if (safetyBlocker) return safetyBlocker;
+    const hasQualifiedPair = state.data.media.some((item) => recoveryMediaSafetyBlocker(item) === null && state.data.qualificationRuns.some((run) => recoveryQualificationMatches(run, drive, item)));
+    return hasQualifiedPair ? null : "Pass Bacula btape qualification for this exact drive and an eligible scratch cartridge first.";
+  }
+
+  function eligibleRecoveryDrives() {
+    return state.data.drives.filter((drive) => recoveryDriveBlocker(drive) === null);
+  }
+
+  function recoveryMediaBlocker(item, drive) {
+    const safetyBlocker = recoveryMediaSafetyBlocker(item);
+    if (safetyBlocker) return safetyBlocker;
+    const drives = drive ? [drive] : state.data.drives.filter((candidate) => recoveryDriveSafetyBlocker(candidate) === null);
+    const passedQualification = drives.some((candidate) => state.data.qualificationRuns.some((run) => recoveryQualificationMatches(run, candidate, item)));
+    return passedQualification ? null : "Pass Bacula btape qualification with this exact drive and cartridge first.";
+  }
+
+  function eligibleRecoveryMedia(drive) {
+    return state.data.media.filter((item) => recoveryMediaBlocker(item, drive) === null);
+  }
+
+  function renderRecoveryOverviewCallout() {
+    if (!state.received.has("recoveryExercises") && state.errors.recoveryExercises) return "";
+    const latest = recoveryExerciseRecord(orderedRecoveryExercises()[0]);
+    if (!latest) {
+      return '<section class="recovery-callout section"><div><span class="lab-badge">G0.2 laboratory workflow</span><h2>Create your first recoverable tape</h2><p>Write a complete prepared fixture to one scratch cartridge, decode it from the physical tape, restore it into isolation, and compare the result.</p></div><a class="button button-primary" href="#recovery-lab">Start guided setup</a></section>';
+    }
+    const stateValue = recoveryExerciseState(latest);
+    const title = recoveryExercisePassed(latest) ? "A physical recovery exercise passed" : recoveryExerciseActive(latest) ? "Physical recovery exercise in progress" : "Review the latest recovery exercise";
+    const detail = recoveryExerciseDetail(latest) || (recoveryExercisePassed(latest) ? "TapeScale retained the write, readback, isolated restore, and comparison evidence." : "Open the laboratory workflow for the exact phase and retained evidence.");
+    return '<section class="recovery-callout section ' + (recoveryExercisePassed(latest) ? "passed" : recoveryExerciseFailed(latest) ? "failed" : "") + '"><div><span class="lab-badge">G0.2 laboratory workflow</span><h2>' + esc(title) + '</h2><p>' + esc(detail) + '</p></div><a class="button button-primary" href="#recovery-lab">Open ' + esc(human(stateValue)) + " run</a></section>";
+  }
+
+  function recoveryPhaseIndex(exercise) {
+    if (recoveryExercisePassed(exercise)) return RECOVERY_PHASES.length - 1;
+    const rawExplicit = recoveryEvidenceValue(exercise, "phase_index");
+    const explicit = rawExplicit == null ? NaN : Number(rawExplicit);
+    if (Number.isInteger(explicit) && explicit >= 0 && explicit < RECOVERY_PHASES.length) return explicit;
+    const phase = recoveryExercisePhase(exercise);
+    const index = RECOVERY_PHASES.findIndex((item) => item.aliases.includes(phase));
+    return index >= 0 ? index : 0;
+  }
+
+  function renderRecoveryPhaseTrack(exercise) {
+    const current = recoveryPhaseIndex(exercise);
+    const passed = recoveryExercisePassed(exercise);
+    const failed = recoveryExerciseFailed(exercise);
+    return '<div class="phase-track recovery-phase-track" aria-label="Recovery exercise phases">' + RECOVERY_PHASES.map((phase, index) => {
+      const phaseClass = passed || index < current ? " done" : index === current ? failed ? " failed" : " current" : "";
+      const marker = passed || index < current ? "✓" : index + 1;
+      return '<div class="phase' + phaseClass + '"' + (index === current && !passed ? ' aria-current="step"' : "") + '><span class="phase-marker">' + esc(marker) + '</span><strong>' + esc(phase.name) + '</strong><small>' + esc(phase.detail) + "</small></div>";
+    }).join("") + "</div>";
+  }
+
+  function recoveryEvidenceValue(exercise, ...keys) {
+    const result = exercise && exercise.result && typeof exercise.result === "object" ? exercise.result : {};
+    const evidence = result.evidence && typeof result.evidence === "object" ? result.evidence : {};
+    const direct = pick(exercise, ...keys);
+    if (direct !== null) return direct;
+    const resultValue = pick(result, ...keys);
+    if (resultValue !== null) return resultValue;
+    const resultEvidence = pick(evidence, ...keys);
+    if (resultEvidence !== null) return resultEvidence;
+    const detail = state.data.recoveryExerciseDetails[recordId(exercise)];
+    const events = detail ? list(detail, "events").slice().reverse() : [];
+    for (const event of events) {
+      const eventEvidence = event && event.evidence && typeof event.evidence === "object" ? event.evidence : {};
+      const value = pick(eventEvidence, ...keys);
+      if (value !== null) return value;
+    }
+    const artifacts = detail ? list(detail, "artifacts").slice().reverse() : [];
+    for (const artifact of artifacts) {
+      const metadata = artifact && artifact.metadata && typeof artifact.metadata === "object" ? artifact.metadata : {};
+      const value = pick(metadata, ...keys);
+      if (value !== null) return value;
+    }
+    return null;
+  }
+
+  function recoveryArtifactValue(exercise, kind, ...keys) {
+    const detail = state.data.recoveryExerciseDetails[recordId(exercise)];
+    const artifact = detail && list(detail, "artifacts").find((item) => pick(item, "artifact_kind", "kind") === kind);
+    if (!artifact) return null;
+    const metadata = artifact.metadata && typeof artifact.metadata === "object" ? artifact.metadata : {};
+    return pick(metadata, ...keys) || pick(artifact, "sha256", "digest_sha256", "digest");
+  }
+
+  function renderRecoveryEvidence(exercise) {
+    const sourceManifest = recoveryEvidenceValue(exercise, "source_manifest_sha256", "source_manifest_digest", "manifest_sha256") || recoveryArtifactValue(exercise, "source_manifest", "manifest_digest");
+    const restoredManifest = recoveryEvidenceValue(exercise, "restored_manifest_sha256", "restore_manifest_digest") || recoveryArtifactValue(exercise, "restored_manifest", "manifest_digest");
+    const evidence = [
+      ["Source entries", recoveryEvidenceValue(exercise, "source_entry_count", "entry_count", "file_count")],
+      ["Logical bytes", (() => { const value = recoveryEvidenceValue(exercise, "logical_bytes", "source_bytes"); return value == null ? null : bytes(value); })()],
+      ["Source manifest", sourceManifest],
+      ["Restored manifest", restoredManifest],
+      ["Restore destination", recoveryEvidenceValue(exercise, "restore_destination", "restore_path", "restored_path")],
+      ["Recovery point", recoveryEvidenceValue(exercise, "recovery_point_id")],
+      ["Engine job", recoveryEvidenceValue(exercise, "engine_job_id", "bacula_job_id", "engine_operation_id", "backup_job_id")],
+      ["Cartridge", pick(exercise, "expected_cartridge_label", "cartridge_label")]
+    ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "");
+    if (!evidence.length) return '<p class="recovery-evidence-pending">Durable evidence will appear as each physical phase completes.</p>';
+    return '<div class="recovery-evidence-grid">' + evidence.map(([name, value]) => '<div><span>' + esc(name) + '</span><strong' + (/manifest/i.test(name) ? ' class="digest-value"' : "") + '>' + esc(value) + "</strong></div>").join("") + "</div>";
+  }
+
+  function renderRecoveryEvents(exercise) {
+    const detail = state.data.recoveryExerciseDetails[recordId(exercise)];
+    const events = detail ? list(detail, "events") : [];
+    const artifacts = detail ? list(detail, "artifacts") : [];
+    let html = "";
+    if (events.length) html += '<section class="panel section"><div class="panel-head"><div><h2>Durable activity</h2><p>Append-only phase and evidence history.</p></div></div><div class="panel-body"><ol class="timeline">' + events.map((event) => {
+      const eventEvidence = event.evidence && typeof event.evidence === "object" ? event.evidence : {};
+      const detailText = pick(eventEvidence, "detail", "message", "path", "cartridge_label") || pick(event, "detail") || "Evidence recorded";
+      return '<li class="timeline-item"><time class="timeline-time">' + esc(date(pick(event, "occurred_at", "created_at"))) + '</time><span class="timeline-marker" aria-hidden="true"></span><div class="timeline-copy"><strong>' + esc(human(pick(event, "event_type", "to_state", "phase") || "event")) + '</strong><span>' + esc(detailText) + "</span></div></li>";
+    }).join("") + "</ol></div></section>";
+    if (artifacts.length) html += '<section class="panel section"><div class="panel-head"><div><h2>Retained artifacts</h2><p>Content-addressed evidence produced by this run.</p></div></div><div class="panel-body"><ul class="detail-list recovery-artifact-list">' + artifacts.map((artifact) => {
+      const name = human(pick(artifact, "artifact_kind", "kind") || "artifact");
+      const digest = pick(artifact, "sha256", "digest_sha256", "digest");
+      const location = pick(artifact, "storage_ref", "path", "location");
+      const size = pick(artifact, "size_bytes");
+      const description = [location, size == null ? null : bytes(size)].filter(Boolean).join(" · ");
+      return '<li><span><strong>' + esc(name) + '</strong>' + (description ? '<small>' + esc(description) + "</small>" : "") + '</span><strong class="digest-value">' + esc(label(digest)) + "</strong></li>";
+    }).join("") + "</ul></div></section>";
+    return html;
+  }
+
+  function renderRecoveryExercise(exercise) {
+    if (!exercise) return "";
+    const stateValue = recoveryExerciseState(exercise);
+    const detail = recoveryExerciseDetail(exercise);
+    const profileName = recoveryExerciseProfileName(exercise);
+    const terminal = recoveryExercisePassed(exercise) || recoveryExerciseFailed(exercise);
+    const detailError = state.errors["recoveryExercise:" + recordId(exercise)];
+    const progressRaw = recoveryEvidenceValue(exercise, "progress_percent", "percent_complete");
+    const progressValue = progressRaw == null ? NaN : Number(progressRaw);
+    let outcome = "";
+    if (recoveryExercisePassed(exercise)) {
+      outcome = '<div class="notice success"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Physical recovery exercise passed</strong><span>The full single-tape write was decoded from media, restored into isolation, and validated. This is retained G0.2 evidence, not production qualification.</span></div></div>';
+    } else if (recoveryExerciseFailed(exercise)) {
+      outcome = '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Recovery exercise ' + esc(stateValue) + '</strong><span>' + esc(detail || "Open the durable activity record for the exact terminal evidence.") + "</span></div></div>";
+    } else {
+      outcome = '<div class="notice info"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>' + esc(human(recoveryExercisePhase(exercise))) + '</strong><span>' + esc(detail || "Keep the worker, source mount, tape drive, and isolated restore destination online.") + "</span></div></div>";
+    }
+    const progress = Number.isFinite(progressValue) && progressValue >= 0 && progressValue <= 100 ? '<div class="progress recovery-progress"><div class="progress-track"><div class="progress-value" style="width:' + progressValue + '%"></div></div><div class="progress-meta"><span>Reported progress</span><span>' + progressValue + "%</span></div></div>" : "";
+    const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="refresh">Retry</button></div>' : "";
+    return '<section class="panel recovery-exercise-panel section"><div class="recovery-exercise-head"><div><span class="lab-badge">G0.2 · full · single tape · no encryption</span><h2>' + esc(profileName) + '</h2><p>Run ' + esc(recordId(exercise)) + " · " + esc(date(pick(exercise, "started_at", "created_at"))) + '</p></div>' + status(stateValue) + "</div>" + renderRecoveryPhaseTrack(exercise) + '<div class="panel-body recovery-exercise-body">' + detailFailure + outcome + progress + '<section class="recovery-evidence"><h3>' + (terminal ? "Retained result" : "Evidence so far") + "</h3>" + renderRecoveryEvidence(exercise) + "</section></div></section>" + renderRecoveryEvents(exercise);
+  }
+
+  function renderRecoveryLab() {
+    const profiles = state.data.recoveryProfiles;
+    const exercises = orderedRecoveryExercises();
+    const active = exercises.find(recoveryExerciseActive);
+    const drives = eligibleRecoveryDrives();
+    const media = eligibleRecoveryMedia(drives[0]);
+    const selected = selectedRecoveryExercise();
+    const enabled = recoveryLabEnabled();
+    const disabledReason = "The laboratory file roundtrip is disabled in this deployment.";
+    const createProfile = '<button class="button button-primary" type="button" data-action="open-recovery-profile"' + (!enabled ? ' disabled title="' + esc(disabledReason) + '"' : "") + '>Add source profile</button>';
+    const blocker = !enabled ? disabledReason : active ? "A recovery exercise is already active." : !profiles.length ? "Create a source and restore profile first." : !drives.length ? "No exact btape-qualified drive and scratch-cartridge pair is ready." : !media.length ? "No cartridge qualified with the selected ready drive is available." : null;
+    const start = '<button class="button button-primary" type="button" data-action="open-recovery-run"' + (blocker ? ' disabled title="' + esc(blocker) + '"' : "") + '>Create recoverable tape</button>';
+    let html = pageHead("Recovery laboratory", "One guided physical write, readback, isolated restore, and manifest comparison.", refreshButton() + createProfile + start);
+    html += noticeFor("recoveryProfiles") + noticeFor("recoveryExercises");
+    if (!enabled) html += '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Recovery laboratory disabled</strong><span>Enable TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED on both the API and worker before creating profiles or destructive recovery exercises.</span></div></div>';
+    html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>G0.2 laboratory path—not a production backup policy</strong><span>This workflow is full-only, one cartridge, prepared immutable fixture, and intentionally unencrypted. It destroys the selected scratch tape, then restores all captured content into the configured isolated destination. Incrementals, spanning, encryption, scheduling, and production qualification remain open.</span></div></div>';
+    html += '<section class="recovery-hero section"><div class="recovery-hero-copy"><span class="lab-badge">Recoverability before convenience</span><h2>' + (exercises.length ? "Run another complete recovery proof" : "Create your first recoverable tape") + '</h2><p>TapeScale will not call a write successful until it can decode the physical tape, restore the fixture, and compare retained manifests.</p><div class="recovery-hero-actions">' + (profiles.length ? start : createProfile) + '</div></div><div class="recovery-constraints"><div><strong>1</strong><span>Prepared immutable source</span></div><div><strong>2</strong><span>Full write to one tape</span></div><div><strong>3</strong><span>Full isolated restore</span></div><div><strong>4</strong><span>Manifest match</span></div></div></section>';
+    const profileSummary = profiles.length ? '<strong>' + esc(recoveryProfileName(profiles[0])) + '</strong><span>' + esc(label(pick(profiles[0], "source_subpath"))) + ' → ' + esc(label(pick(profiles[0], "restore_subpath"))) + "</span>" : '<strong>No profile</strong><span>Declare the prepared source and isolated restore subpaths.</span>';
+    const driveSummary = drives.length ? '<strong>' + esc(label(pick(drives[0], "model", "stable_id"))) + '</strong><span>' + esc(label(pick(drives[0], "stable_id"))) + "</span>" : '<strong>Drive not ready</strong><span>' + esc(state.data.drives.length ? recoveryDriveBlocker(state.data.drives[0]) : "No configured SAS drive was reported.") + "</span>";
+    const mediaSummary = media.length ? '<strong>' + esc(mediaName(media[0])) + '</strong><span>Available unprotected scratch cartridge</span>' : '<strong>No eligible tape</strong><span>Register or release an unprotected non-WORM cartridge.</span>';
+    html += '<div class="recovery-readiness-grid section"><section class="panel recovery-ready-card ' + (profiles.length ? "ready" : "blocked") + '"><span class="recovery-ready-number">1</span><div><small>Source and destination</small>' + profileSummary + '</div></section><section class="panel recovery-ready-card ' + (drives.length ? "ready" : "blocked") + '"><span class="recovery-ready-number">2</span><div><small>Qualified hardware</small>' + driveSummary + '</div></section><section class="panel recovery-ready-card ' + (media.length ? "ready" : "blocked") + '"><span class="recovery-ready-number">3</span><div><small>Destructive media</small>' + mediaSummary + "</div></section></div>";
+    if (selected) html += renderRecoveryExercise(selected);
+    if (exercises.length) {
+      const rows = exercises.map((exercise) => {
+        const profile = recoveryExerciseProfileName(exercise);
+        const detailText = recoveryExerciseDetail(exercise) || (recoveryExerciseActive(exercise) ? human(recoveryExercisePhase(exercise)) : "Retained evidence available");
+        return '<tr class="row-action" tabindex="0" data-action="select-recovery-exercise" data-id="' + esc(recordId(exercise)) + '"><td class="primary-cell"><strong>' + esc(profile) + '</strong><small>' + esc(recordId(exercise)) + "</small></td><td>" + status(recoveryExerciseState(exercise)) + "</td>" + cell(pick(exercise, "expected_cartridge_label", "cartridge_label")) + cell(date(pick(exercise, "finished_at", "started_at", "created_at"))) + cell(detailText) + "</tr>";
+      });
+      html += '<section class="section"><div class="section-head"><div><h2>Recovery exercise history</h2><p>Every attempt remains visible, including blocked and failed runs.</p></div></div>' + table(["Profile", "State", "Cartridge", "Activity", "Result"], rows) + "</section>";
+    }
+    return html;
   }
 
   function renderMovements() {
@@ -508,6 +865,7 @@
     }
     const renderers = {
       overview: renderOverview,
+      "recovery-lab": renderRecoveryLab,
       jobs: renderJobs,
       restore: renderRestore,
       movements: renderMovements,
@@ -568,6 +926,215 @@
   function closeModal() {
     modalLayer.hidden = true;
     modalLayer.innerHTML = "";
+  }
+
+  function rememberRecoveryProfile(profile) {
+    if (!profile || typeof profile !== "object" || !recordId(profile)) return;
+    state.data.recoveryProfiles = [profile].concat(state.data.recoveryProfiles.filter((item) => recordId(item) !== recordId(profile)));
+    state.received.add("recoveryProfiles");
+    delete state.errors.recoveryProfiles;
+  }
+
+  function rememberRecoveryExercise(exercise) {
+    if (!exercise || typeof exercise !== "object" || !recordId(exercise)) return;
+    state.data.recoveryExercises = [exercise].concat(state.data.recoveryExercises.filter((item) => recordId(item) !== recordId(exercise)));
+    state.received.add("recoveryExercises");
+    delete state.errors.recoveryExercises;
+  }
+
+  function openRecoveryProfile() {
+    if (!recoveryLabEnabled()) {
+      toast("Recovery laboratory is disabled", "Enable the laboratory file roundtrip on both the API and worker first.");
+      return;
+    }
+    const body = '<form id="recovery-profile-form"><div class="notice info"><span class="notice-icon" aria-hidden="true">1</span><div class="notice-copy"><strong>Declare the prepared recovery fixture</strong><span>Both paths are contained subpaths of the source and restore roots configured by the TrueNAS Compose file. TapeScale will not accept host-absolute paths here.</span></div></div><div class="form-grid"><div class="form-field full"><label for="recovery-profile-name">Profile name</label><input class="input" id="recovery-profile-name" name="name" maxlength="128" placeholder="Quarterly recovery fixture" required><small>This name appears in the destructive confirmation and retained evidence.</small></div><div class="form-field"><label for="recovery-source-subpath">Immutable source subpath</label><input class="input input-mono" id="recovery-source-subpath" name="source_subpath" maxlength="512" placeholder="fixture-2026-11" required><small>Relative to the configured read-only source root.</small></div><div class="form-field"><label for="recovery-restore-subpath">Isolated restore subpath</label><input class="input input-mono" id="recovery-restore-subpath" name="restore_subpath" maxlength="512" placeholder="exercises" required><small>Relative to the configured restore root; each run receives its own directory.</small></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="immutable_snapshot_confirmed" required> I confirm the source subpath is a prepared immutable snapshot or expendable fixture and will not change during this exercise.</label></div></div><p class="notice danger" id="recovery-profile-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Save and choose hardware</button></div></form>';
+    openModal("Set up a recovery exercise", body);
+    document.querySelector("#recovery-profile-name").focus();
+  }
+
+  async function submitRecoveryProfile(form) {
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#recovery-profile-error");
+    const values = new FormData(form);
+    submit.disabled = true;
+    submit.textContent = "Validating paths…";
+    errorBox.hidden = true;
+    try {
+      const response = await request(endpoints.recoveryProfiles, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: String(values.get("name") || "").trim(),
+          source_subpath: String(values.get("source_subpath") || "").trim(),
+          restore_subpath: String(values.get("restore_subpath") || "").trim(),
+          immutable_snapshot_confirmed: values.get("immutable_snapshot_confirmed") === "on"
+        })
+      });
+      const profile = response && (response.profile || response);
+      rememberRecoveryProfile(profile);
+      closeModal();
+      if (location.hash !== "#recovery-lab") location.hash = "#recovery-lab";
+      await loadOne("recoveryProfiles");
+      updateChrome();
+      render();
+      toast("Recovery profile ready", "Choose the exact loaded scratch tape to begin the destructive exercise.");
+      const readyDrive = eligibleRecoveryDrives()[0];
+      if (profile && readyDrive && eligibleRecoveryMedia(readyDrive).length) window.setTimeout(() => openRecoveryRun(recordId(profile)), 0);
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Save and choose hardware";
+    }
+  }
+
+  function openRecoveryRun(profileId) {
+    if (!recoveryLabEnabled()) {
+      toast("Recovery laboratory is disabled", "Enable the laboratory file roundtrip on both the API and worker first.");
+      return;
+    }
+    const profiles = state.data.recoveryProfiles;
+    const drives = eligibleRecoveryDrives();
+    const media = eligibleRecoveryMedia(drives[0]);
+    if (!profiles.length || !drives.length || !media.length || state.data.recoveryExercises.some(recoveryExerciseActive)) {
+      toast("Recovery exercise is not ready", "Review the source, drive, and cartridge readiness cards for the exact blocker.");
+      return;
+    }
+    const profileOptions = profiles.map((profile) => '<option value="' + esc(recordId(profile)) + '" data-name="' + esc(recoveryProfileName(profile)) + '"' + (profileId === recordId(profile) ? " selected" : "") + '>' + esc(recoveryProfileName(profile)) + " · " + esc(label(pick(profile, "source_subpath"))) + "</option>");
+    const driveOptions = drives.map((drive) => '<option value="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '">' + esc(label(pick(drive, "vendor"))) + " " + esc(label(pick(drive, "model"))) + " · " + esc(label(pick(drive, "stable_id"))) + "</option>");
+    const mediaOptions = media.map((item) => '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '">' + esc(mediaName(item)) + (pick(item, "barcode") ? " · barcode " + esc(pick(item, "barcode")) : "") + " · " + esc(label(pick(item, "media_format", "media_generation"))) + "</option>");
+    const body = '<form id="recovery-exercise-form"><div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>This erases the selected cartridge</strong><span>The lab path performs one full unencrypted write, reads it back from physical tape, restores all captured content into isolation, and compares manifests. It is not a production backup policy.</span></div></div><div class="form-grid"><div class="form-field full"><label for="recovery-run-profile">Prepared source profile</label><select class="select" id="recovery-run-profile" name="profile_id" required>' + profileOptions.join("") + '</select></div><div class="form-field full"><label for="recovery-run-drive">Exact loaded drive</label><select class="select" id="recovery-run-drive" name="drive_id" required>' + driveOptions.join("") + '</select><small>The worker will re-probe this stable identity immediately before writing.</small></div><div class="form-field full"><label for="recovery-run-cartridge">Loaded scratch cartridge</label><select class="select" id="recovery-run-cartridge" name="cartridge_id" required>' + mediaOptions.join("") + '</select><small>You are asserting that this registered cartridge is physically loaded in the selected standalone drive.</small></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="scratch_media_confirmed" required> I physically verified that the loaded cartridge is designated scratch media.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="destructive_overwrite_confirmed" required> I authorize complete destruction of every existing byte on this cartridge.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="encryption_deviation_confirmed" required> I understand this G0.2 exercise is intentionally unencrypted and must contain only expendable test data.</label></div><div class="form-field full"><label for="recovery-run-confirmation">Type the exact destructive confirmation</label><input class="input input-mono" id="recovery-run-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small id="recovery-run-confirmation-help"></small></div></div><p class="notice danger" id="recovery-run-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-danger" type="submit">Erase tape and prove recovery</button></div></form>';
+    openModal("Create a recoverable tape", body);
+    updateRecoveryRunConfirmation(document.querySelector("#recovery-exercise-form"));
+    document.querySelector("#recovery-run-confirmation").focus();
+  }
+
+  function updateRecoveryRunMediaOptions(form) {
+    if (!form) return;
+    const driveSelect = form.querySelector('[name="drive_id"]');
+    const cartridgeSelect = form.querySelector('[name="cartridge_id"]');
+    const submit = form.querySelector('[type="submit"]');
+    if (!driveSelect || !cartridgeSelect) return;
+    const drive = state.data.drives.find((item) => recordId(item) === driveSelect.value);
+    const priorCartridgeId = cartridgeSelect.value;
+    const media = eligibleRecoveryMedia(drive);
+    cartridgeSelect.innerHTML = media.map((item) => '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '"' + (recordId(item) === priorCartridgeId ? " selected" : "") + '>' + esc(mediaName(item)) + (pick(item, "barcode") ? " · barcode " + esc(pick(item, "barcode")) : "") + " · " + esc(label(pick(item, "media_format", "media_generation"))) + "</option>").join("");
+    cartridgeSelect.disabled = media.length === 0;
+    if (submit) submit.disabled = media.length === 0;
+    updateRecoveryRunConfirmation(form);
+  }
+
+  function updateRecoveryRunConfirmation(form) {
+    if (!form) return;
+    const profileSelect = form.querySelector('[name="profile_id"]');
+    const cartridgeSelect = form.querySelector('[name="cartridge_id"]');
+    const profileOption = profileSelect && profileSelect.options[profileSelect.selectedIndex];
+    const cartridgeOption = cartridgeSelect && cartridgeSelect.options[cartridgeSelect.selectedIndex];
+    const profileName = profileOption && profileOption.dataset.name;
+    const cartridgeLabel = cartridgeOption && cartridgeOption.dataset.label;
+    const phrase = profileName && cartridgeLabel ? "WRITE " + profileName + " TO " + cartridgeLabel + " AND RESTORE VERIFY" : "Select a profile and cartridge.";
+    const help = form.querySelector("#recovery-run-confirmation-help");
+    if (help) help.textContent = "Required: " + phrase;
+  }
+
+  async function submitRecoveryExercise(form) {
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#recovery-run-error");
+    const values = new FormData(form);
+    const profileSelect = form.querySelector('[name="profile_id"]');
+    const driveSelect = form.querySelector('[name="drive_id"]');
+    const cartridgeSelect = form.querySelector('[name="cartridge_id"]');
+    const profileOption = profileSelect.options[profileSelect.selectedIndex];
+    const driveOption = driveSelect.options[driveSelect.selectedIndex];
+    const cartridgeOption = cartridgeSelect.options[cartridgeSelect.selectedIndex];
+    const profileName = profileOption && profileOption.dataset.name;
+    const stableId = driveOption && driveOption.dataset.stableId;
+    const cartridgeLabel = cartridgeOption && cartridgeOption.dataset.label;
+    if (!profileName || !stableId || !cartridgeLabel) return;
+    submit.disabled = true;
+    submit.textContent = "Queueing recovery proof…";
+    errorBox.hidden = true;
+    try {
+      const response = await request(endpoints.recoveryExercises, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          profile_id: String(values.get("profile_id")),
+          drive_id: String(values.get("drive_id")),
+          stable_id: stableId,
+          cartridge_id: String(values.get("cartridge_id")),
+          cartridge_label: cartridgeLabel,
+          scratch_media_confirmed: values.get("scratch_media_confirmed") === "on",
+          destructive_overwrite_confirmed: values.get("destructive_overwrite_confirmed") === "on",
+          encryption_deviation_confirmed: values.get("encryption_deviation_confirmed") === "on",
+          confirmation: String(values.get("confirmation") || "")
+        })
+      });
+      const exercise = response && (response.exercise || response.run || response);
+      rememberRecoveryExercise(exercise);
+      state.selectedRecoveryExerciseId = recordId(exercise);
+      closeModal();
+      if (location.hash !== "#recovery-lab") location.hash = "#recovery-lab";
+      updateChrome();
+      render();
+      scheduleRecoveryExercisePoll();
+      live.textContent = "Physical recovery exercise queued for " + profileName + " on cartridge " + cartridgeLabel + ".";
+      toast("Recovery exercise queued", "Opening the durable phase timeline. Keep the source, drive, and restore destination online.");
+      await Promise.all([loadOne("recoveryExercises"), loadOne("drives"), loadOne("media")]);
+      await loadRecoveryExerciseDetail(state.selectedRecoveryExerciseId);
+      updateChrome();
+      render();
+      scheduleRecoveryExercisePoll();
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Erase tape and prove recovery";
+    }
+  }
+
+  async function loadRecoveryExerciseDetail(id) {
+    if (!id) return;
+    const errorKey = "recoveryExercise:" + id;
+    try {
+      const detail = await request(endpoints.recoveryExercises + "/" + encodeURIComponent(id));
+      state.data.recoveryExerciseDetails[id] = detail && typeof detail === "object" ? detail : {};
+      const detailedExercise = detail && (detail.exercise || detail.run || (recordId(detail) === id ? detail : null));
+      if (detailedExercise) rememberRecoveryExercise(detailedExercise);
+      delete state.errors[errorKey];
+    } catch (error) {
+      state.errors[errorKey] = error;
+    }
+  }
+
+  async function selectRecoveryExercise(id) {
+    if (!id) return;
+    state.selectedRecoveryExerciseId = id;
+    render();
+    await loadRecoveryExerciseDetail(id);
+    updateChrome();
+    render();
+    main.focus();
+  }
+
+  function scheduleRecoveryExercisePoll() {
+    if (state.recoveryExercisePollTimer) window.clearTimeout(state.recoveryExercisePollTimer);
+    const active = state.data.recoveryExercises.filter(recoveryExerciseActive);
+    if (!active.length) {
+      state.recoveryExercisePollTimer = null;
+      return;
+    }
+    state.recoveryExercisePollTimer = window.setTimeout(async () => {
+      const previouslyActive = new Set(active.map(recordId));
+      await Promise.all([loadOne("recoveryExercises"), loadOne("drives"), loadOne("media"), loadOne("recoveryPoints"), loadOne("verification")]);
+      const selected = state.selectedRecoveryExerciseId || (state.data.recoveryExercises.find(recoveryExerciseActive) && recordId(state.data.recoveryExercises.find(recoveryExerciseActive)));
+      if (selected) await loadRecoveryExerciseDetail(selected);
+      const completed = state.data.recoveryExercises.find((exercise) => previouslyActive.has(recordId(exercise)) && !recoveryExerciseActive(exercise));
+      if (completed) toast("Recovery exercise " + recoveryExerciseState(completed), recoveryExerciseDetail(completed) || "Durable result and evidence are ready.");
+      updateChrome();
+      render();
+      scheduleRecoveryExercisePoll();
+    }, 4000);
   }
 
   function openAddMedia() {
@@ -822,6 +1389,9 @@
     if (action === "close-nav") shell.classList.remove("nav-open");
     if (action === "refresh") loadAll(false);
     if (action === "add-media") openAddMedia();
+    if (action === "open-recovery-profile") openRecoveryProfile();
+    if (action === "open-recovery-run") openRecoveryRun(target.dataset.profileId || null);
+    if (action === "select-recovery-exercise") selectRecoveryExercise(target.dataset.id);
     if (action === "open-qualification") openQualification(target);
     if (action === "reconcile-drive") reconcileDrive(target);
     if (action === "drive-motion") queueDriveMotion(target);
@@ -840,6 +1410,14 @@
   });
 
   document.addEventListener("submit", (event) => {
+    if (event.target.id === "recovery-profile-form") {
+      event.preventDefault();
+      submitRecoveryProfile(event.target);
+    }
+    if (event.target.id === "recovery-exercise-form") {
+      event.preventDefault();
+      submitRecoveryExercise(event.target);
+    }
     if (event.target.id === "add-media-form") {
       event.preventDefault();
       submitMedia(event.target);
@@ -852,6 +1430,8 @@
 
   document.addEventListener("change", (event) => {
     if (event.target.id === "qualification-cartridge") updateQualificationConfirmation(event.target);
+    if (event.target.id === "recovery-run-drive") updateRecoveryRunMediaOptions(event.target.form);
+    if (["recovery-run-profile", "recovery-run-cartridge"].includes(event.target.id)) updateRecoveryRunConfirmation(event.target.form);
   });
 
   document.addEventListener("keydown", (event) => {
@@ -860,7 +1440,7 @@
       closeDrawer();
       shell.classList.remove("nav-open");
     }
-    if ((event.key === "Enter" || event.key === " ") && event.target.matches("tr[data-action='open-record']")) event.target.click();
+    if ((event.key === "Enter" || event.key === " ") && event.target.matches("tr[data-action='open-record'], tr[data-action='select-recovery-exercise']")) event.target.click();
   });
 
   modalLayer.addEventListener("click", (event) => {
@@ -873,6 +1453,18 @@
     shell.classList.remove("nav-open");
     render();
     main.focus();
+    if (state.route === "recovery-lab") {
+      const exercise = selectedRecoveryExercise();
+      const id = recordId(exercise);
+      if (id && !state.data.recoveryExerciseDetails[id]) {
+        loadRecoveryExerciseDetail(id).then(() => {
+          if (state.route === "recovery-lab") {
+            updateChrome();
+            render();
+          }
+        });
+      }
+    }
   });
 
   updateChrome();

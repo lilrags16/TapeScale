@@ -4,6 +4,8 @@
 //! output is retained within a fixed budget, and timeout/cancellation are explicit results.
 
 use std::{
+    collections::BTreeMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::ExitStatus,
     time::{Duration, Instant},
@@ -21,6 +23,7 @@ pub struct ToolCommand {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub working_dir: Option<PathBuf>,
+    pub environment: BTreeMap<OsString, OsString>,
     pub stdin: Option<Vec<u8>>,
     pub timeout: Duration,
     pub retained_output_bytes: usize,
@@ -33,6 +36,7 @@ impl ToolCommand {
             program: program.into(),
             args: Vec::new(),
             working_dir: None,
+            environment: BTreeMap::new(),
             stdin: None,
             timeout: Duration::from_secs(30),
             retained_output_bytes: 64 * 1024,
@@ -61,6 +65,14 @@ impl ToolCommand {
     #[must_use]
     pub const fn retained_output_bytes(mut self, bytes: usize) -> Self {
         self.retained_output_bytes = bytes;
+        self
+    }
+
+    /// Add an explicit environment value without involving a shell. Values are
+    /// intentionally omitted from durable tool output and error messages.
+    #[must_use]
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.environment.insert(key.into(), value.into());
         self
     }
 }
@@ -129,6 +141,7 @@ pub async fn run(
     let mut child = Command::new(&command.program);
     child
         .args(&command.args)
+        .envs(&command.environment)
         .kill_on_drop(true)
         .stdin(if command.stdin.is_some() {
             std::process::Stdio::piped()

@@ -2,19 +2,25 @@
 # The worker expects one standalone SAS tape drive at /dev/nst0. If TrueNAS
 # exposes /dev/nst1 instead, set TAPESCALE_TAPE_DEVICES and both sides of the
 # device mapping to /dev/nst1 so the container path matches Linux sysfs.
-# This lab stack exposes status, rewind, unload, and an attended Bacula btape
-# qualification run. Qualification deliberately overwrites the loaded tape.
-# Use only a registered cartridge that is physically designated as scratch.
+# This lab stack exposes status, rewind, unload, an attended Bacula btape
+# qualification run, and the G0.2 one-cartridge file recovery exercise.
+# Both tape workflows deliberately overwrite the loaded tape. Use only a
+# registered cartridge that is physically designated as scratch.
+# Before installing, create /mnt/tapescale-restores as an isolated test dataset
+# with a Generic/POSIX-compatible ACL preset and no SMB or NFS share.
+# /mnt is exposed read-only as /source so the UI can select an immutable
+# .zfs/snapshot subpath; it is never a writable source mount.
 # Paste this entire file into Apps > Discover Apps > Install via YAML.
 
 name: tapescale
 
 x-tapescale-common: &tapescale-common
   build:
-    context: https://github.com/lilrags16/TapeScale.git#main
+    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-test.8
     args:
-      TAPESCALE_VERSION: 0.1.0-test.6
-  image: tapescale:0.1.0-test.6
+      TAPESCALE_VERSION: 0.1.0-test.8
+      TAPESCALE_REVISION: v0.1.0-test.8
+  image: tapescale:0.1.0-test.8
   pull_policy: build
   restart: unless-stopped
   read_only: true
@@ -23,10 +29,15 @@ x-tapescale-common: &tapescale-common
     - no-new-privileges:true
   tmpfs:
     - /tmp:size=128m,mode=1777
+    - /etc/tapescale:size=1m,mode=0700
+    - /run/bacula:size=4m,mode=0750
   environment: &tapescale-environment
     TAPESCALE_DEMO_MODE: "false"
     TAPESCALE_LAB_TAPE_MOTION_ENABLED: "true"
     TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED: "true"
+    TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED: "true"
+    TAPESCALE_SOURCE_ROOT: /source
+    TAPESCALE_RESTORE_ROOT: /restore
     DATABASE_URL: postgresql://tapescale:tapescale_test_only_password@postgres:5432/tapescale
     RUST_LOG: tapescale=info,tower_http=info
   networks:
@@ -38,11 +49,21 @@ x-tapescale-common: &tapescale-common
 services:
   api:
     <<: *tapescale-common
+    user: "0:0"
+    cap_add: [DAC_READ_SEARCH]
     ports:
       - "18080:8080"
     networks:
       - control
       - edge
+    volumes:
+      - /mnt:/source:ro
+      - type: bind
+        source: /mnt/tapescale-restores
+        target: /restore
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://127.0.0.1:8080/health/ready]
       interval: 30s
@@ -59,8 +80,9 @@ services:
   worker:
     <<: *tapescale-common
     entrypoint: [/usr/local/bin/tapescale-worker]
-    stop_grace_period: 30s
+    stop_grace_period: 15m
     user: "0:0"
+    cap_add: [CHOWN, DAC_OVERRIDE, DAC_READ_SEARCH, FOWNER, FSETID]
     environment:
       <<: *tapescale-environment
       TAPESCALE_WORKER_POLL_SECS: "5"
@@ -68,8 +90,10 @@ services:
       TAPESCALE_SYSFS_ROOT: /sys
       TAPESCALE_MT_PATH: /usr/bin/mt-st
       TAPESCALE_BTAPE_PATH: /usr/sbin/btape
+      TAPESCALE_BCONSOLE_PATH: /usr/sbin/bconsole
       TAPESCALE_BACULA_STATE_DIR: /var/lib/tapescale/bacula
       TAPESCALE_QUALIFICATION_TIMEOUT_SECS: "1800"
+      TAPESCALE_DATA_RUN_TIMEOUT_SECS: "43200"
     healthcheck:
       disable: true
     devices:
@@ -78,6 +102,13 @@ services:
       - worker_recovery:/var/lib/tapescale/recovery
       - worker_spool:/var/lib/tapescale/spool
       - worker_engine_state:/var/lib/tapescale/bacula
+      - worker_bacula_runtime:/var/lib/bacula
+      - /mnt:/source:ro
+      - type: bind
+        source: /mnt/tapescale-restores
+        target: /restore
+        bind:
+          create_host_path: false
     deploy:
       resources:
         limits:
@@ -136,12 +167,11 @@ services:
 
 volumes:
   postgres_data:
-  # These one-time replacement names force Docker to copy the corrected
-  # UID 10001/GID 0 mode-0770 ownership from the test.6 image. PostgreSQL is
-  # unchanged, so inventory and qualification history remain intact.
+  # PostgreSQL retains inventory, qualification history, and recovery exercises.
   worker_recovery:
   worker_spool:
   worker_engine_state:
+  worker_bacula_runtime:
 
 networks:
   edge:

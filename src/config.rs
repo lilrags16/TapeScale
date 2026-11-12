@@ -12,9 +12,15 @@ pub struct Config {
     pub worker_poll_interval: Duration,
     pub lab_tape_motion_enabled: bool,
     pub lab_tape_qualification_enabled: bool,
+    pub lab_file_roundtrip_enabled: bool,
     pub btape_path: PathBuf,
+    pub bconsole_path: PathBuf,
     pub bacula_state_dir: PathBuf,
     pub qualification_timeout: Duration,
+    pub source_root: PathBuf,
+    pub restore_root: PathBuf,
+    pub evidence_root: PathBuf,
+    pub data_run_timeout: Duration,
 }
 
 impl Config {
@@ -30,13 +36,23 @@ impl Config {
         let lab_tape_motion_enabled = parse_bool("TAPESCALE_LAB_TAPE_MOTION_ENABLED", false)?;
         let lab_tape_qualification_enabled =
             parse_bool("TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED", false)?;
+        let lab_file_roundtrip_enabled = parse_bool("TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED", false)?;
         let btape_path = PathBuf::from(value("TAPESCALE_BTAPE_PATH", "/usr/sbin/btape"));
+        let bconsole_path = PathBuf::from(value("TAPESCALE_BCONSOLE_PATH", "/usr/sbin/bconsole"));
         let bacula_state_dir = PathBuf::from(value(
             "TAPESCALE_BACULA_STATE_DIR",
             "/var/lib/tapescale/bacula",
         ));
         let qualification_timeout =
             Duration::from_secs(parse("TAPESCALE_QUALIFICATION_TIMEOUT_SECS", 1_800)?);
+        let source_root = PathBuf::from(value("TAPESCALE_SOURCE_ROOT", "/source"));
+        let restore_root = PathBuf::from(value("TAPESCALE_RESTORE_ROOT", "/restore"));
+        let evidence_root = PathBuf::from(value(
+            "TAPESCALE_EVIDENCE_ROOT",
+            "/var/lib/tapescale/recovery",
+        ));
+        let data_run_timeout =
+            Duration::from_secs(parse("TAPESCALE_DATA_RUN_TIMEOUT_SECS", 43_200)?);
 
         anyhow::ensure!(
             qualification_timeout >= Duration::from_secs(60),
@@ -45,6 +61,38 @@ impl Config {
         anyhow::ensure!(
             qualification_timeout <= Duration::from_secs(5_400),
             "TAPESCALE_QUALIFICATION_TIMEOUT_SECS must not exceed 5400 for an attended lab run"
+        );
+        anyhow::ensure!(
+            source_root.is_absolute() && restore_root.is_absolute(),
+            "TAPESCALE_SOURCE_ROOT and TAPESCALE_RESTORE_ROOT must be absolute paths"
+        );
+        anyhow::ensure!(
+            source_root != restore_root,
+            "TAPESCALE_SOURCE_ROOT and TAPESCALE_RESTORE_ROOT must differ"
+        );
+        anyhow::ensure!(
+            evidence_root.is_absolute(),
+            "TAPESCALE_EVIDENCE_ROOT must be an absolute path"
+        );
+        anyhow::ensure!(
+            bacula_state_dir.is_absolute(),
+            "TAPESCALE_BACULA_STATE_DIR must be an absolute path"
+        );
+        if lab_file_roundtrip_enabled {
+            anyhow::ensure!(
+                source_root == PathBuf::from("/source")
+                    && restore_root == PathBuf::from("/restore"),
+                "the pinned G0.2 Bacula adapter requires TAPESCALE_SOURCE_ROOT=/source and TAPESCALE_RESTORE_ROOT=/restore"
+            );
+            anyhow::ensure!(
+                bconsole_path == PathBuf::from("/usr/sbin/bconsole"),
+                "the pinned G0.2 Bacula adapter requires TAPESCALE_BCONSOLE_PATH=/usr/sbin/bconsole"
+            );
+        }
+        anyhow::ensure!(
+            data_run_timeout >= Duration::from_secs(300)
+                && data_run_timeout <= Duration::from_secs(86_400),
+            "TAPESCALE_DATA_RUN_TIMEOUT_SECS must be between 300 and 86400"
         );
 
         Ok(Self {
@@ -56,9 +104,15 @@ impl Config {
             worker_poll_interval,
             lab_tape_motion_enabled,
             lab_tape_qualification_enabled,
+            lab_file_roundtrip_enabled,
             btape_path,
+            bconsole_path,
             bacula_state_dir,
             qualification_timeout,
+            source_root,
+            restore_root,
+            evidence_root,
+            data_run_timeout,
         })
     }
 }

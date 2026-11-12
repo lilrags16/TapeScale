@@ -9,10 +9,12 @@ RUN cargo build --locked --release --bins
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 ARG TAPESCALE_VERSION=0.1.0
+ARG TAPESCALE_REVISION=unknown
 ARG DEBIAN_SNAPSHOT=20250730T000000Z
 LABEL org.opencontainers.image.title="TapeScale" \
       org.opencontainers.image.description="Safety-first LTO backup control plane for TrueNAS" \
       org.opencontainers.image.version="${TAPESCALE_VERSION}" \
+      org.opencontainers.image.revision="${TAPESCALE_REVISION}" \
       org.opencontainers.image.source="https://github.com/lilrags16/TapeScale" \
       org.opencontainers.image.licenses="Apache-2.0 AND AGPL-3.0-only"
 
@@ -22,12 +24,17 @@ RUN echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/$
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
          ca-certificates \
          curl \
+         dbconfig-no-thanks \
          mt-st \
          tzdata \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
          -t bookworm-backports \
          bacula-bscan=15.0.3-3~bpo12+1 \
          bacula-common-pgsql=15.0.3-3~bpo12+1 \
+         bacula-console=15.0.3-3~bpo12+1 \
+         bacula-director=15.0.3-3~bpo12+1 \
+         bacula-director-pgsql=15.0.3-3~bpo12+1 \
+         bacula-fd=15.0.3-3~bpo12+1 \
          bacula-sd=15.0.3-3~bpo12+1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 tapescale \

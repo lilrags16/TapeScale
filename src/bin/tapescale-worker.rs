@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tapescale::{
     config::Config,
+    data_run,
     device::{
         discover_sas_drives, execute_sas_motion, SasDiscoveryConfig, SasMotionError,
         SasMotionOperation, SasProbeResult,
@@ -62,6 +63,14 @@ async fn main() -> Result<()> {
             "destructive Bacula btape qualification is enabled for attended scratch-media tests"
         );
     }
+    if config.lab_file_roundtrip_enabled {
+        warn!(
+            source_root = %config.source_root.display(),
+            restore_root = %config.restore_root.display(),
+            timeout_seconds = config.data_run_timeout.as_secs(),
+            "G0.2 laboratory single-tape full-file write, physical readback, and restore comparison is enabled; it is not production-qualified"
+        );
+    }
     let btape_config = BtapeQualificationConfig {
         enabled: config.lab_tape_qualification_enabled,
         program: config.btape_path.clone(),
@@ -91,7 +100,7 @@ async fn main() -> Result<()> {
         reconcile_once(
             pool.as_ref(),
             &sas_config,
-            config.lab_tape_motion_enabled,
+            &config,
             &btape_config,
             worker_id,
             &shutdown,
@@ -117,7 +126,7 @@ async fn main() -> Result<()> {
 async fn reconcile_once(
     pool: Option<&sqlx::PgPool>,
     sas_config: &SasDiscoveryConfig,
-    lab_tape_motion_enabled: bool,
+    config: &Config,
     btape_config: &BtapeQualificationConfig,
     worker_id: Uuid,
     cancellation: &CancellationToken,
@@ -125,11 +134,13 @@ async fn reconcile_once(
     reconcile_sas_devices(pool, sas_config).await?;
 
     if let Some(pool) = pool {
+        data_run::process_single_tape_data_runs(pool, sas_config, config, worker_id, cancellation)
+            .await?;
         process_qualification_runs(pool, sas_config, btape_config, worker_id, cancellation).await?;
         process_drive_operations(
             pool,
             sas_config,
-            lab_tape_motion_enabled,
+            config.lab_tape_motion_enabled,
             worker_id,
             cancellation,
         )

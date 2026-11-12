@@ -5,7 +5,7 @@ Specification baseline: TrueNAS LTO Backup System requirements v1.1, 11 November
 
 TapeScale is a control plane for protecting TrueNAS data on LTO media. It deliberately does not invent a tape-record format. Product policy and operator workflows belong to TapeScale; physical records, volume spanning, tape positioning, and the engine catalog belong to a qualified tape engine.
 
-No physical tape, changer, ACL, or disaster-recovery qualification is implied by this repository. See [QUALIFICATION.md](QUALIFICATION.md).
+No general physical tape, changer, ACL, or disaster-recovery qualification is implied by this repository. A passed G0.2 run is evidence only for its exact recorded tuple. See [QUALIFICATION.md](QUALIFICATION.md).
 
 ## Runtime boundaries
 
@@ -24,12 +24,12 @@ flowchart LR
 
 The architecture separates three custom Rust runtime responsibilities. The engineering-preview Compose deployment has `api`, `scheduler`, `worker`, and `postgres` services. PostgreSQL is the handoff boundary; no service relies on an in-memory queue for durable work:
 
-- The web/API service authenticates users, enforces request-level authorization, creates audited intents, and serves the compiled browser application. It has no tape devices, host root, or Docker socket.
+- The web/API service authenticates users, enforces request-level authorization, creates audited intents, and serves the compiled browser application. It has no tape devices, writable host path, or Docker socket. The G0.2 test stack gives it read-only source/restore views and only `DAC_READ_SEARCH` for path containment and mount-mode preflight; a future qualified design moves filesystem proof to the fenced worker.
 - The scheduler evaluates timezone-aware schedules, downtime/catch-up policy, retention graphs, recovery dependencies, resource availability, and movement plans. It creates durable work in PostgreSQL and has no tape devices or source/restore mounts.
 - The worker performs privileged orchestration and is the only component allowed to touch approved source mounts, restore destinations, tape/changer devices, ZFS integration, or the engine control interface. Worker authorization is checked again at execution time.
 - The recovery CLI is a separate Rust binary intended to inspect recovery bundles, identify media, rebuild/import catalog information through supported interfaces, and initiate recovery without the original TapeScale database.
 
-The current binaries are `tapescale-api` on port 8080, `tapescale-scheduler`, `tapescale-worker`, and `tapescale-recovery`. PostgreSQL 16 is the durable product store and coordination boundary. Backup jobs still have only the simulator adapter, so production tape operations remain gated. Explicit lab flags can enable durable rewind/unload and an attended Bacula Community 15.0.3 `btape test`; the latter creates narrow drive/media compatibility evidence but never a recovery point or automatic product/drive qualification.
+The current binaries are `tapescale-api` on port 8080, `tapescale-scheduler`, `tapescale-worker`, and `tapescale-recovery`. PostgreSQL 16 is the durable product store and coordination boundary. General backup jobs still use the simulator, so production tape operations remain gated. Explicit lab flags enable durable rewind/unload, the Bacula Community 15.0.3 `btape test`, and a separate G0.2 single-volume full-file recovery exercise. Only the G0.2 path can create a recovery point, and only after physical Data verification plus an independently compared restore.
 
 Browser JavaScript or TypeScript and build tooling are permitted. Runtime API, scheduling, policy, workers, adapters, helpers, and recovery logic must remain Rust. PostgreSQL, OpenZFS, the selected tape engine, and qualified tape utilities are existing Linux components rather than custom TapeScale backend code.
 
@@ -91,6 +91,12 @@ Lab drive motion follows the same separation: the API records an exact stable-id
 
 The G0.1 qualification path is a separate destructive intent. The operator selects a registered unprotected non-WORM cartridge, types its exact label into a closed confirmation phrase, and acknowledges both scratch designation and complete overwrite. PostgreSQL reserves that cartridge and fences the exact reconciled drive. The singleton worker re-probes the bound path and identity, writes a generated per-run Bacula Storage Daemon configuration, and starts only `/usr/sbin/btape -c <config> /dev/nstN` with the fixed `test\n` standard-input transcript. It does not start `bacula-sd` or accept a user-supplied command. On `btape` success the worker performs the separately allowlisted rewind and accepts the run only after the same identity is observed ready at BOT. Failure, timeout, cancellation, lease loss, or an unverifiable postcondition leaves the run failed/interrupted and revokes drive reconciliation. Events and bounded tool evidence are append-only. Even a pass leaves G0 open and creates no recovery point, verified backup, engine selection, or on-tape-format claim.
 
+The G0.2 data path is another explicit, destructive, laboratory-only intent. A profile binds a normalized relative selection beneath the read-only `/source` mount to an isolated relative destination beneath `/restore`. Queueing requires the exact passed G0.1 drive/cartridge combination, all destructive/scratch acknowledgements, an explicit encryption-disabled deviation, and `WRITE <profile name> TO <cartridge label> AND RESTORE VERIFY`. PostgreSQL atomically binds the source snapshot, drive identity, cartridge, pinned engine/adapter/format versions, reservations, and fenced leases.
+
+The worker independently inventories and hashes the source, persists append-only evidence, renders fixed Bacula 15.0.3 resources, and starts process-isolated Director, Storage Daemon, and File Daemon instances under the singleton controller. A restricted fixed-input `bconsole` adapter labels only the selected scratch volume, submits one full file job, correlates the exact engine JobId, requires strict terminal success, submits `Level=Data` verification against that job, then performs a normal Bacula restore into the server-generated isolated run directory. TapeScale inventories the restored tree independently and compares paths, SHA-256 content, and declared metadata coverage. Only an exact match plus valid engine/tape evidence is atomically promoted to a verified recovery point and volume record. Warnings, verify differences, missing evidence, source changes, lease loss, cancellation, or cleanup uncertainty cannot pass.
+
+This is not the general engine contract: it intentionally excludes encryption, spanning, incrementals, changers, native ZFS, arbitrary scheduling, catalog-loss reconstruction, and broad metadata qualification. Bacula remains authoritative for its physical job/volume/catalog records; TapeScale retains the cross-catalog binding, manifests, comparison, and operator evidence.
+
 ## Backup representations
 
 File mode captures a defined immutable snapshot tree, exact selection rules, namespace state, metadata, and SHA-256 content digests while reading the selected snapshot. Exact incrementals must account for additions, changes, moves, deletions, and metadata-only changes.
@@ -119,7 +125,7 @@ The adapter is versioned separately from the product API and exposes structured 
 
 Arguments are passed directly to processes without a shell. Input is validated, output is bounded, timeouts and cancellation are explicit, and both producer and consumer exit status are required for success. The adapter must never infer structured state from decorative console output when a supported structured interface exists.
 
-The development simulator exists for deterministic policy and failure testing only. It is not tape-engine qualification and must be visibly identified in system status and diagnostic exports.
+The development simulator remains the backend for general policy and failure testing. It is not tape-engine qualification and must be visibly distinguished from the fenced G0.2 Bacula adapter in system status and diagnostic exports.
 
 ## Retention and overwrite gate
 
@@ -141,14 +147,14 @@ Failure or uncertainty at any step denies the write.
 
 The JSON API is versioned below `/api/v1`. Principal groups are authentication, setup/preflight, TrueNAS and sources, policies and schedules, jobs and runs, devices and media, recovery points and verification, restore planning/execution, locations and rotations, keys and recovery bundles, notifications, audit, and diagnostics.
 
-The production contract makes destructive operations three-step workflows: generate a preview, reauthenticate, then execute using a short-lived token bound to the preview hash and exact object versions. The explicitly unauthenticated G0.1 `btape` harness is a temporary, isolated-lab exception with separate scratch-media acknowledgements and an exact typed phrase; its constraints are documented in [Security](SECURITY.md). It must not be exposed as a production workflow.
+The production contract makes destructive operations three-step workflows: generate a preview, reauthenticate, then execute using a short-lived token bound to the preview hash and exact object versions. The explicitly unauthenticated G0.1 and G0.2 harnesses are temporary, isolated-lab exceptions with separate scratch-media acknowledgements and exact typed phrases; their constraints are documented in [Security](SECURITY.md). They must not be exposed as production workflows.
 
 ## Deployment rules
 
 - Pin release images and the Rust toolchain; commit the lockfile.
 - Persist PostgreSQL, engine catalog/configuration, TapeScale state, manifests, recovery exports, and required spool/staging data outside containers.
 - Keep database and engine control ports on private networks.
-- Mount sources read-only and restore targets only into the restore worker.
+- Mount sources read-only and restore targets writable only into the worker. If the API performs G0.2 path preflight, give it read-only views only.
 - Map only named tape/changer devices. Never mount host root or the Docker socket.
 - Use mounted secret files or the platform secret facility; do not place long-lived credentials in checked-in environment files.
 - Expose dependency-specific readiness for database, engine, TrueNAS API/certificate, snapshot access, native-ZFS path, devices, keys, scratch capacity, and compatible media.
@@ -163,4 +169,4 @@ Generation compatibility rules are data, separate from physical qualification ev
 
 ## Preview implementation versus target contract
 
-Normative language in this document describes the release contract, not a claim that every path is complete. The preview implements Rust API/scheduler/worker/recovery process boundaries, PostgreSQL schema and coordination primitives, SAS identity/status discovery, explicitly enabled lab-only rewind/unload, a fenced Bacula `btape test` qualification harness, simulator-backed backup workflows, LTO capability rules, retention/overwrite policy, core state machines, safe argument-based process execution, and a browser prototype. Production authentication/MFA, TrueNAS control and streaming, a qualified backup engine/format, general tape data operations, encryption/key lifecycle, actual backup/restore, notification delivery, and clean-host media reconstruction remain incomplete or unqualified. The acceptance ledger is authoritative for evidence status.
+Normative language in this document describes the release contract, not a claim that every path is complete. The preview implements Rust API/scheduler/worker/recovery process boundaries, PostgreSQL schema and coordination primitives, SAS identity/status discovery, lab-only rewind/unload, the fenced Bacula `btape` harness, the G0.2 single-volume file write/readback/restore path, simulator-backed general workflows, LTO capability rules, retention/overwrite policy, core state machines, safe process execution, and the guided browser workflow. Production authentication/MFA, TrueNAS snapshot automation and native streaming, a generally qualified engine/format, spanning/incrementals, encryption/key lifecycle, changer control, notifications, and clean-host media reconstruction remain incomplete or unqualified. The acceptance ledger is authoritative for evidence status.

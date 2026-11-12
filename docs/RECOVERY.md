@@ -2,7 +2,7 @@
 
 Status: recovery contract for the engineering preview. A clean-host physical recovery has not been run. Do not treat this document as G2 evidence.
 
-The preview CLI validates the documented recovery-bundle envelope and points operators to this runbook. Media identification, engine catalog reconstruction, key-package decryption, and data restore are target behavior pending engine selection and qualification; the imperative steps below must not be read as claims that those paths are already implemented.
+The preview CLI validates the documented recovery-bundle envelope and points operators to this runbook. The attended G0.2 lab path can restore its own exact Bacula full-file job while the original PostgreSQL/engine catalog is available. Media identification after catalog loss, catalog reconstruction, key-package decryption, and general recovery remain target behavior; the imperative steps below must not be read as claims that those paths are complete.
 
 TapeScale recovery must remain possible after loss of the original TrueNAS host, TapeScale PostgreSQL database, and application catalog. Successful disaster recovery depends on three separately protected sets:
 
@@ -11,6 +11,14 @@ TapeScale recovery must remain possible after loss of the original TrueNAS host,
 3. the independently protected key package and any original ZFS dataset keys required for raw encrypted streams.
 
 Keeping all three on the source NAS defeats this design.
+
+## G0.2 recovery evidence
+
+The first-recoverable-tape exercise is an online recovery test, not this independent disaster-recovery procedure. It writes one immutable mounted snapshot to one cartridge, performs Bacula Data verification from the physical volume, restores through the normal Bacula restore path into `/restore/<profile subpath>/<run id>`, and compares a separately generated restored manifest with the retained source manifest. Only a complete match creates a verified recovery point.
+
+Retain the source manifest, restored manifest, comparison, engine JobIds/status, volume binding, drive/firmware identity, cartridge identity, pinned software/configuration digests, and append-only event trail. Keep the restored directory isolated until reviewed, then remove it only through the documented test-data lifecycle.
+
+A G0.2 pass does not prove that the tape can be found or restored after loss of PostgreSQL, the Bacula catalog, the original host, or keys. Encryption is explicitly disabled for this laboratory deviation. No recovery bundle, clean-host import, multi-volume scan, NFSv4 ACL proof, native ZFS recovery, or independent key recovery is created by this gate.
 
 ## Recovery bundle contract
 
@@ -138,4 +146,4 @@ Follow the selected engine's documented catalog reconstruction path and scan med
 
 ## Current limitations
 
-The repository currently exposes a simulator adapter and has not selected or pinned Bacula 15 or another production engine. No clean-host tape restoration, physical multi-volume recovery, ACL round trip, or independent-key recovery has been evidenced. These are explicit G0/G1/G2 blockers.
+The repository pins Bacula Community 15.0.3 for G0.1/G0.2 laboratory execution, while general workflows still use the simulator. Bacula is not yet selected or qualified as the production engine/format. No clean-host tape restoration, catalog reconstruction, physical multi-volume recovery, NFSv4 ACL roundtrip, native ZFS restore, or independent-key recovery has been evidenced. These remain explicit G0/G1/G2 blockers regardless of a successful online G0.2 run.

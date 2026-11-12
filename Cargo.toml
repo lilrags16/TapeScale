@@ -38,10 +38,11 @@ chrono-tz = "0.10.3"
 clap = { version = "4.5.32", features = ["derive", "env"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+rustix = { version = "1.1.6", features = ["fs", "process"] }
 sha2 = "0.10.8"
 sqlx = { version = "0.8.3", default-features = false, features = ["chrono", "macros", "migrate", "postgres", "runtime-tokio-rustls", "uuid"] }
 thiserror = "2.0.12"
-tokio = { version = "1.44.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.44.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7.14"
 tower-http = { version = "0.6.2", features = ["compression-gzip", "cors", "fs", "request-id", "trace"] }
 tracing = "0.1.41"

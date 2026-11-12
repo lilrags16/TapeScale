@@ -5,6 +5,7 @@ x-tapescale-common: &tapescale-common
     context: .
     args:
       TAPESCALE_VERSION: ${TAPESCALE_VERSION:-0.1.0}
+      TAPESCALE_REVISION: ${TAPESCALE_REVISION:-development}
   image: tapescale:${TAPESCALE_VERSION:-0.1.0}
   restart: unless-stopped
   read_only: true
@@ -13,12 +14,17 @@ x-tapescale-common: &tapescale-common
     - no-new-privileges:true
   tmpfs:
     - /tmp:size=128m,mode=1777
+    - /etc/tapescale:size=1m,mode=0700
+    - /run/bacula:size=4m,mode=0750
   secrets:
     - postgres_password
   environment: &tapescale-environment
     TAPESCALE_DEMO_MODE: ${TAPESCALE_DEMO_MODE:-false}
     TAPESCALE_LAB_TAPE_MOTION_ENABLED: ${TAPESCALE_LAB_TAPE_MOTION_ENABLED:-false}
     TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED: ${TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED:-false}
+    TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED: ${TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED:-false}
+    TAPESCALE_SOURCE_ROOT: /source
+    TAPESCALE_RESTORE_ROOT: /restore
     TAPESCALE_DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
     TAPESCALE_DATABASE_HOST: postgres
     TAPESCALE_DATABASE_PORT: 5432
@@ -34,11 +40,21 @@ x-tapescale-common: &tapescale-common
 services:
   api:
     <<: *tapescale-common
+    user: "0:0"
+    cap_add: [DAC_READ_SEARCH]
     ports:
       - "${TAPESCALE_HTTP_PORT:-8080}:8080"
     networks:
       - control
       - edge
+    volumes:
+      - ${TAPESCALE_SOURCE_HOST_PATH:-./fixtures}:/source:ro
+      - type: bind
+        source: ${TAPESCALE_RESTORE_HOST_PATH:-./restore}
+        target: /restore
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test: [CMD, curl, --fail, --silent, http://127.0.0.1:8080/health/ready]
       interval: 30s
@@ -55,7 +71,9 @@ services:
   worker:
     <<: *tapescale-common
     entrypoint: [/usr/local/bin/tapescale-worker]
-    stop_grace_period: 30s
+    stop_grace_period: 15m
+    user: "0:0"
+    cap_add: [CHOWN, DAC_OVERRIDE, DAC_READ_SEARCH, FOWNER, FSETID]
     environment:
       <<: *tapescale-environment
       TAPESCALE_WORKER_POLL_SECS: ${TAPESCALE_WORKER_POLL_SECS:-5}
@@ -63,14 +81,23 @@ services:
       TAPESCALE_SYSFS_ROOT: ${TAPESCALE_SYSFS_ROOT:-/sys}
       TAPESCALE_MT_PATH: ${TAPESCALE_MT_PATH:-/usr/bin/mt-st}
       TAPESCALE_BTAPE_PATH: ${TAPESCALE_BTAPE_PATH:-/usr/sbin/btape}
+      TAPESCALE_BCONSOLE_PATH: ${TAPESCALE_BCONSOLE_PATH:-/usr/sbin/bconsole}
       TAPESCALE_BACULA_STATE_DIR: /var/lib/tapescale/bacula
       TAPESCALE_QUALIFICATION_TIMEOUT_SECS: ${TAPESCALE_QUALIFICATION_TIMEOUT_SECS:-1800}
+      TAPESCALE_DATA_RUN_TIMEOUT_SECS: ${TAPESCALE_DATA_RUN_TIMEOUT_SECS:-43200}
     healthcheck:
       disable: true
     volumes:
       - recovery_exports:/var/lib/tapescale/recovery
       - spool:/var/lib/tapescale/spool
       - engine_state:/var/lib/tapescale/bacula
+      - bacula_runtime:/var/lib/bacula
+      - ${TAPESCALE_SOURCE_HOST_PATH:-./fixtures}:/source:ro
+      - type: bind
+        source: ${TAPESCALE_RESTORE_HOST_PATH:-./restore}
+        target: /restore
+        bind:
+          create_host_path: false
     deploy:
       resources:
         limits:
@@ -138,6 +165,7 @@ volumes:
   recovery_exports:
   spool:
   engine_state:
+  bacula_runtime:
 
 networks:
   edge:

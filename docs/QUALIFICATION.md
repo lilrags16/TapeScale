@@ -24,16 +24,16 @@ This is an initial engineering ledger. Automated test references should be added
 | AT-04 | Automated inventory and movement | Simulated | Not run | Requires a named changer and import/export-slot evidence. |
 | AT-05 | Concurrent compatible drives | Implemented/Simulated | Not run | Durable per-drive motion/qualification leases, media reservations, and fencing are tested in PostgreSQL; two-drive hardware and engine routing remain unproven. |
 | AT-06 | Snapshot protection and cleanup | Simulated | Not run | Requires real TrueNAS snapshots, holds, hooks, and pressure cases. |
-| AT-07 | File content and metadata round trip | Not run | Not run | Requires real POSIX and TrueNAS NFSv4 ACL fixtures. |
+| AT-07 | File content and metadata round trip | Implemented (G0.2 subset) | Not run | G0.2 compares paths, SHA-256 content, and declared manifest metadata after a Bacula restore; representative POSIX and TrueNAS NFSv4 ACL fixtures remain required. |
 | AT-08 | Native dataset reconstruction | Not run | Not run | Requires actual `zfs send`/`receive` path and alternate pool. |
 | AT-09 | Explicit zvol coverage | Not run | Not run | UI/model treatment alone is insufficient. |
-| AT-10 | Exact selected recovery point | Simulated | Not run | Namespace model may be tested; engine and snapshot-path proof remains. |
+| AT-10 | Exact selected recovery point | Implemented/Simulated | Not run | G0.2 binds a normalized read-only snapshot selection, Bacula JobId, cartridge, and restore comparison; broader namespace/snapshot automation remains. |
 | AT-11 | Object larger than one cartridge | Simulated | Not run | Requires file and native-stream physical spanning. |
 | AT-12 | Cancellation and host/process failure | Implemented/Simulated | Not run | Expired motion and destructive-test leases terminate without retry and revoke reconciliation; controlled physical interruption evidence remains. |
 | AT-13 | Unknown media/device loss/position | Implemented/Simulated | Not run | Missing/path-changed SAS devices, stale identity, protected/foreign/WORM inventory, and unverifiable postconditions are blocked. Rewind/offline recovery and the post-`btape` cleanup require affirmative physical postconditions. Physical reset/disconnect evidence remains. |
 | AT-14 | Compression modes restore | Not run | Not run | Each supported resolved pipeline requires byte-exact restore evidence. |
 | AT-15 | Corrupt/reordered/truncated content | Simulated | Not run | Record/authentication fault injection must be tied to selected engine. |
-| AT-16 | Media read-back and restore tests | Not run | Not run | Cached or source rereads do not count. |
+| AT-16 | Media read-back and restore tests | Implemented (G0.2 path) | Not run | The path requires Bacula `Level=Data` verification from the volume plus a normal restore and independent comparison; named physical evidence is still required. |
 | AT-17 | Loss of original host and catalog | Not run | Not run | Requires clean replacement installation and independently recovered keys. |
 | AT-18 | Independent keys and rotation | Simulated | Not run | Real encrypted historical backups and portable-key recovery remain. |
 | AT-19 | Dependencies/shared tapes/archives | Implemented/Simulated | Not run | Dependency and overwrite-gate tests are control-plane evidence. |
@@ -44,11 +44,11 @@ This is an initial engineering ledger. Automated test references should be added
 | AT-24 | Container replacement/migration | Not run | Not run | Requires previous-version database and active-job drain exercise. |
 | AT-25 | Backpressure/exhausted capacity | Simulated | Not run | Real spool, destination, snapshot, and staging pressure remain. |
 | AT-26 | Representative workloads | Not run | Not run | Targets must be measured, not invented. |
-| AT-27 | Source errors/existing destinations | Simulated | Not run | Requires actual engine/source error and metadata coverage. |
-| AT-28 | Durable events/actionable status | Implemented/Simulated | Not run | Motion and qualification intents, append-only events, claims, reservations, results, and audit evidence are durable; broader end-to-end restart and delivery-channel evidence is pending. |
+| AT-27 | Source errors/existing destinations | Implemented/Simulated | Not run | G0.2 rejects writable/changed sources and uses a server-generated isolated destination; physical engine/source error fixtures and broader metadata coverage remain. |
+| AT-28 | Durable events/actionable status | Implemented/Simulated | Not run | Motion, qualification, and G0.2 intents, append-only events/artifacts, claims, reservations, phases, results, and audit evidence are durable; broader end-to-end restart and delivery-channel evidence is pending. |
 | AT-29 | Rust boundary/Linux dependency audit | Implemented (source boundary) | Not run | Rust owns the custom workflow; Debian Bacula 15.0.3 packages are pinned and process-isolated. Final image/SBOM/license audit remains. |
-| AT-30 | Safe external-tool execution | Implemented/Simulated | Not run | `mt-st` uses a closed argv mapping; `btape` is bound to a pinned path/digest, fixed transcript, required success markers, bounded retained output, cancellation, and a deadline. Physical interruption evidence remains, and kernel tape I/O may outlive a userspace deadline. |
-| AT-31 | Product-specific visual/workflow review | Implemented | Not run | The destructive workflow displays exact blockers, two acknowledgements, typed confirmation, durable progress, and G0 limitations; product-owner desktop/phone review must still be recorded. |
+| AT-30 | Safe external-tool execution | Implemented/Simulated | Not run | `mt-st` and Bacula daemon startup use closed argv; `btape` has a fixed transcript and required markers; G0.2 uses generated configs and a restricted fixed-input `bconsole` adapter with structured JobId/status correlation. Physical interruption evidence remains, and kernel tape I/O may outlive a userspace deadline. |
+| AT-31 | Product-specific visual/workflow review | Implemented | Not run | G0.1 and G0.2 display exact blockers, acknowledgements, typed confirmation, durable phases, evidence, and limitations; product-owner desktop/phone review must still be recorded. |
 
 `Implemented/Simulated` means an implementation exists but its present evidence uses simulated dependencies. A qualified backend may still be absent. `Implemented (source boundary)` is narrower than a completed runtime audit. Neither status may be shortened to Qualified.
 
@@ -67,15 +67,20 @@ Required exit evidence:
 - documented restart boundaries;
 - reproducible measured workload plan.
 
-Current status: **Blocked by engine selection and physical laboratory evidence**.
+Current status: **Blocked by completion/review of the engine matrix and physical laboratory evidence**.
 
-Implemented entry stage: **G0.1 Bacula `btape test` harness; physical run not yet recorded.** A pass from this stage remains a prerequisite artifact, not the G0 decision.
+Implemented entry stages:
+
+- **G0.1 Bacula `btape test` harness.** A local operator pass remains a prerequisite artifact for the exact drive/cartridge, not the G0 decision. No reviewed repository qualification report is implied.
+- **G0.2 first-recoverable-tape harness.** One immutable source selection is written as a full Bacula file job to one qualified scratch cartridge, reread using Bacula Data verification, restored normally to an isolated destination, and compared using independent manifests. Encryption is explicitly disabled for this lab deviation. No physical G0.2 report has been reviewed in this ledger.
+
+Neither stage qualifies spanning, incrementals, changers, NFSv4 ACLs, native ZFS, encryption, interruption recovery, or clean-catalog reconstruction.
 
 ### G1 — Recovery safety
 
 Required exit evidence: file/native/incremental round trips, physical EOM, wrong/unknown media protection, dependency retention, and controlled interruption results.
 
-Current status: **Not run**.
+Current status: **G0.2 path implemented; full G1 evidence not run**.
 
 ### G2 — Independent recovery
 
