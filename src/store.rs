@@ -4544,6 +4544,11 @@ pub async fn get_recovery_point_aggregate(
                  JOIN cartridges qualified_cartridge
                    ON qualified_cartridge.id = candidate.cartridge_id
                  WHERE candidate.drive_id = d.id
+                   -- A queued request that was rejected before btape ran does
+                   -- not invalidate the last physical result.  Only terminal
+                   -- attempts that could have changed our knowledge of the
+                   -- drive/media pair participate in latest-result selection.
+                   AND candidate.state IN ('passed', 'failed', 'interrupted')
                    AND candidate.expected_cartridge_label = qualified_cartridge.internal_label
                    AND candidate.expected_media_generation
                        IS NOT DISTINCT FROM qualified_cartridge.media_generation

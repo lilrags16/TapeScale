@@ -1033,7 +1033,10 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         .filter_map(|blocker| blocker["code"].as_str())
         .collect::<Vec<_>>();
     assert!(blocker_codes.contains(&"tape_location_unknown"));
-    assert!(blocker_codes.contains(&"no_qualified_compatible_drive"));
+    assert!(!blocker_codes.contains(&"no_qualified_compatible_drive"));
+    assert!(plan["volumes"][0]["compatible_qualified_drives"]
+        .as_array()
+        .is_some_and(|drives| !drives.is_empty()));
     assert!(plan["preview_hash"]
         .as_str()
         .is_some_and(|digest| digest.len() == 64));
