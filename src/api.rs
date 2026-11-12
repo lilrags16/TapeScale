@@ -15,6 +15,7 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
+use uuid::Uuid;
 
 use crate::{
     domain::path::validate_archive_path,
@@ -52,6 +53,7 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .route("/api/v1/jobs/{id}", get(job))
         .route("/api/v1/media", get(media).post(create_media))
         .route("/api/v1/drives", get(drives))
+        .route("/api/v1/drives/{id}/reconcile", post(reconcile_drive))
         .route("/api/v1/movements", get(movements))
         .route("/api/v1/movements/{id}/confirm", post(confirm_movement))
         .route("/api/v1/verification", get(verification))
@@ -280,6 +282,43 @@ async fn drives(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
     Ok(Json(json!({"drives":drives,"slots":slots})))
 }
 
+#[derive(Debug, Deserialize)]
+struct ReconcileDriveRequest {
+    stable_id: String,
+}
+
+async fn reconcile_drive(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ReconcileDriveRequest>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let id = Uuid::parse_str(&id)
+        .map_err(|_| AppError::Invalid("drive id must be a UUID".to_owned()))?;
+    let stable_id = request.stable_id.trim();
+    if stable_id.is_empty()
+        || stable_id.chars().count() > 512
+        || stable_id.chars().any(char::is_control)
+    {
+        return Err(AppError::Invalid(
+            "stable_id must contain 1 to 512 characters".to_owned(),
+        ));
+    }
+
+    match store::reconcile_drive(pool, id, stable_id).await? {
+        store::ReconcileDriveResult::Reconciled(drive) => Ok(Json(json!({
+            "drive":drive,
+            "audit":"appended",
+            "physical_qualification":"not_established"
+        }))),
+        store::ReconcileDriveResult::NotFound => Err(AppError::NotFound),
+        store::ReconcileDriveResult::Blocked => Err(AppError::Blocked(
+            "drive reconciliation requires the exact observed stable identity, current device access, no identity conflict, and a known tape position"
+                .to_owned(),
+        )),
+    }
+}
+
 async fn movements(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let movements = match state.pool.as_ref() {
         Some(pool) => store::list_movements(pool).await?,
@@ -386,7 +425,17 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     } else {
         "blocked"
     };
-    let drive_status = if inventory.qualified_drives > 0 {
+    let access_status = if inventory.accessible_drives > 0 {
+        "passed"
+    } else {
+        "blocked"
+    };
+    let identity_status = if inventory.reconciled_drives > 0 {
+        "passed"
+    } else {
+        "blocked"
+    };
+    let qualification_status = if inventory.qualified_drives > 0 {
         "passed"
     } else {
         "blocked"
@@ -403,7 +452,11 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
             preflight_check("database", "Database", "passed", "PostgreSQL responded"),
             preflight_check("truenas_registration", "TrueNAS registration", truenas_status,
                 if inventory.truenas_instances > 0 {"A registration exists; live connectivity is not checked yet"} else {"No TrueNAS system is registered"}),
-            preflight_check("physical_drive", "Qualified tape drive", drive_status,
+            preflight_check("sas_device_access", "SAS tape device access", access_status,
+                if inventory.accessible_drives > 0 {"The worker can read status from a configured non-rewinding tape device"} else {"No configured SAS tape device is currently accessible"}),
+            preflight_check("stable_drive_identity", "Stable drive identity", identity_status,
+                if inventory.reconciled_drives > 0 {"An accessible drive is bound to its observed stable identity"} else {"No accessible drive identity has been reconciled"}),
+            preflight_check("physical_drive", "Qualified tape drive", qualification_status,
                 if inventory.qualified_drives > 0 {"A physically qualified drive is recorded"} else {"No physically qualified drive is recorded"}),
             preflight_check("media_inventory", "Media inventory", media_status,
                 if inventory.cartridges > 0 {"Cartridges are registered; on-tape identity still governs safe use"} else {"No cartridges are registered"}),
@@ -464,6 +517,8 @@ fn empty_inventory() -> Value {
         "installations":0,
         "truenas_instances":0,
         "drives":0,
+        "accessible_drives":0,
+        "reconciled_drives":0,
         "qualified_drives":0,
         "cartridges":0
     })

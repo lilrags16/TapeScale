@@ -1,4 +1,6 @@
 # Test-only TrueNAS deployment. Credentials are intentionally embedded.
+# The worker expects one standalone SAS tape drive at /dev/nst0. Change both
+# /dev/nst0 values below if TrueNAS exposes the non-rewinding node elsewhere.
 # Paste this entire file into Apps > Discover Apps > Install via YAML.
 
 name: tapescale
@@ -51,11 +53,17 @@ services:
   worker:
     <<: *tapescale-common
     entrypoint: [/usr/local/bin/tapescale-worker]
+    user: "0:0"
     environment:
       <<: *tapescale-environment
-      TAPESCALE_WORKER_POLL_SECS: "5"
+      TAPESCALE_WORKER_POLL_SECS: "30"
+      TAPESCALE_TAPE_DEVICES: /dev/nst0
+      TAPESCALE_SYSFS_ROOT: /sys
+      TAPESCALE_MT_PATH: /usr/bin/mt-st
     healthcheck:
       disable: true
+    devices:
+      - /dev/nst0:/dev/nst0:r
     volumes:
       - recovery_exports:/var/lib/tapescale/recovery
       - spool:/var/lib/tapescale/spool

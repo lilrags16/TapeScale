@@ -56,6 +56,9 @@ services:
     environment:
       <<: *tapescale-environment
       TAPESCALE_WORKER_POLL_SECS: ${TAPESCALE_WORKER_POLL_SECS:-5}
+      TAPESCALE_TAPE_DEVICES: ${TAPESCALE_TAPE_DEVICES:-}
+      TAPESCALE_SYSFS_ROOT: ${TAPESCALE_SYSFS_ROOT:-/sys}
+      TAPESCALE_MT_PATH: ${TAPESCALE_MT_PATH:-/usr/bin/mt-st}
     healthcheck:
       disable: true
     volumes:

@@ -7,6 +7,8 @@ use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, FromRow, PgPool};
 use uuid::Uuid;
 
+use crate::device::{MissingSasDrive, SasDriveObservation};
+
 #[derive(Clone, Debug, FromRow, Serialize)]
 pub struct OverviewCounts {
     pub protected_sources: i64,
@@ -93,7 +95,7 @@ pub struct DriveRecord {
     pub serial: Option<String>,
     pub wwn: Option<String>,
     pub firmware: Option<String>,
-    pub generation: i16,
+    pub generation: Option<i16>,
     pub observed_path: Option<String>,
     pub expected_path: Option<String>,
     pub reconciled: bool,
@@ -164,8 +166,17 @@ pub struct InventoryCounts {
     pub installations: i64,
     pub truenas_instances: i64,
     pub drives: i64,
+    pub accessible_drives: i64,
+    pub reconciled_drives: i64,
     pub qualified_drives: i64,
     pub cartridges: i64,
+}
+
+#[derive(Clone, Debug)]
+pub enum ReconcileDriveResult {
+    Reconciled(Box<DriveRecord>),
+    NotFound,
+    Blocked,
 }
 
 pub async fn connect(database_url: &str, timeout: Duration) -> Result<PgPool> {
@@ -341,18 +352,192 @@ pub async fn create_media(pool: &PgPool, media: &NewMedia) -> Result<MediaRecord
     Ok(record)
 }
 
-pub async fn list_drives(pool: &PgPool) -> Result<Vec<DriveRecord>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT d.id, d.stable_id, d.vendor, d.model, d.serial, d.wwn,
+const DRIVE_SELECT: &str = "SELECT d.id, d.stable_id, d.vendor, d.model, d.serial, d.wwn,
                 d.firmware, d.generation, d.observed_path, d.expected_path,
                 d.reconciled, d.qualification_status, d.health,
                 d.last_observed_at, c.stable_id AS changer_stable_id
          FROM drives d
-         LEFT JOIN changers c ON c.id = d.changer_id
-         ORDER BY d.stable_id",
+         LEFT JOIN changers c ON c.id = d.changer_id";
+
+pub async fn list_drives(pool: &PgPool) -> Result<Vec<DriveRecord>, sqlx::Error> {
+    sqlx::query_as(&format!("{DRIVE_SELECT} ORDER BY d.stable_id"))
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn record_drive_observation(
+    pool: &PgPool,
+    observation: &SasDriveObservation,
+) -> Result<DriveRecord, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+
+    sqlx::query(
+        "UPDATE drives
+         SET reconciled = false,
+             qualification_status = 'detected_unqualified',
+             health = health || jsonb_build_object(
+                 'present', false,
+                 'accessible', false,
+                 'status', 'identity_replaced',
+                 'detail', 'A different stable identity was observed at this device path',
+                 'observed_at', $1::timestamptz),
+             last_observed_at = $1
+         WHERE observed_path = $2 AND stable_id <> $3",
     )
-    .fetch_all(pool)
-    .await
+    .bind(observation.observed_at)
+    .bind(&observation.observed_path)
+    .bind(&observation.stable_id)
+    .execute(&mut *transaction)
+    .await?;
+
+    let health = observation.health();
+    let id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO drives
+            (stable_id, vendor, model, serial, wwn, firmware, generation,
+             observed_path, reconciled, qualification_status, health, last_observed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7,
+                 $8, false, 'detected_unqualified', $9, $10)
+         ON CONFLICT (stable_id) DO UPDATE SET
+             vendor = EXCLUDED.vendor,
+             model = EXCLUDED.model,
+             serial = EXCLUDED.serial,
+             wwn = EXCLUDED.wwn,
+             firmware = EXCLUDED.firmware,
+             generation = COALESCE(EXCLUDED.generation, drives.generation),
+             observed_path = EXCLUDED.observed_path,
+             reconciled = drives.reconciled
+                 AND drives.expected_path = EXCLUDED.observed_path
+                 AND drives.vendor IS NOT DISTINCT FROM EXCLUDED.vendor
+                 AND drives.model IS NOT DISTINCT FROM EXCLUDED.model
+                 AND drives.firmware IS NOT DISTINCT FROM EXCLUDED.firmware
+                 AND $11
+                 AND NOT $12
+                 AND $13
+                 AND $14,
+             qualification_status = CASE
+                 WHEN drives.vendor IS DISTINCT FROM EXCLUDED.vendor
+                   OR drives.model IS DISTINCT FROM EXCLUDED.model
+                   OR drives.firmware IS DISTINCT FROM EXCLUDED.firmware
+                   OR NOT $11
+                   OR $12
+                 THEN 'detected_unqualified'
+                 ELSE drives.qualification_status
+             END,
+             health = EXCLUDED.health,
+             last_observed_at = EXCLUDED.last_observed_at
+         RETURNING id",
+    )
+    .bind(&observation.stable_id)
+    .bind(&observation.vendor)
+    .bind(&observation.model)
+    .bind(&observation.serial)
+    .bind(&observation.wwn)
+    .bind(&observation.firmware)
+    .bind(observation.generation)
+    .bind(&observation.observed_path)
+    .bind(health)
+    .bind(observation.observed_at)
+    .bind(observation.identity_verified)
+    .bind(observation.identity_conflict)
+    .bind(observation.accessible)
+    .bind(observation.position_lost != Some(true))
+    .fetch_one(&mut *transaction)
+    .await?;
+
+    let record = sqlx::query_as(&format!("{DRIVE_SELECT} WHERE d.id = $1"))
+        .bind(id)
+        .fetch_one(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(record)
+}
+
+pub async fn mark_drive_missing(
+    pool: &PgPool,
+    missing: &MissingSasDrive,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE drives
+         SET reconciled = false,
+             health = health || jsonb_build_object(
+                 'present', false,
+                 'accessible', false,
+                 'ready', NULL,
+                 'medium_loaded', NULL,
+                 'status', 'missing',
+                 'detail', $1::text,
+                 'observed_at', $2::timestamptz),
+             last_observed_at = $2
+         WHERE observed_path = $3",
+    )
+    .bind(&missing.reason)
+    .bind(missing.observed_at)
+    .bind(&missing.observed_path)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn reconcile_drive(
+    pool: &PgPool,
+    id: Uuid,
+    stable_id: &str,
+) -> Result<ReconcileDriveResult, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let updated_id = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE drives
+         SET reconciled = true, expected_path = observed_path
+         WHERE id = $1 AND stable_id = $2
+           AND observed_path IS NOT NULL
+           AND health->>'present' = 'true'
+           AND health->>'accessible' = 'true'
+           AND health->>'identity_verified' = 'true'
+           AND COALESCE(health->>'identity_conflict', 'false') <> 'true'
+           AND COALESCE(health->>'position_lost', 'false') <> 'true'
+           AND last_observed_at >= now() - interval '2 minutes'
+         RETURNING id",
+    )
+    .bind(id)
+    .bind(stable_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+
+    let Some(updated_id) = updated_id else {
+        let exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM drives WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        transaction.rollback().await?;
+        return Ok(if exists {
+            ReconcileDriveResult::Blocked
+        } else {
+            ReconcileDriveResult::NotFound
+        });
+    };
+
+    sqlx::query(
+        "INSERT INTO audit_events
+            (id, actor_label, action, object_type, object_id,
+             requested, result, correlation_id)
+         SELECT $1, 'local-api', 'drive.reconcile', 'drive', d.id::text,
+                jsonb_build_object('stable_id', d.stable_id,
+                                   'observed_path', d.observed_path),
+                'reconciled', $2
+         FROM drives d WHERE d.id = $3",
+    )
+    .bind(Uuid::now_v7())
+    .bind(Uuid::now_v7())
+    .bind(updated_id)
+    .execute(&mut *transaction)
+    .await?;
+
+    let record = sqlx::query_as(&format!("{DRIVE_SELECT} WHERE d.id = $1"))
+        .bind(updated_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(ReconcileDriveResult::Reconciled(Box::new(record)))
 }
 
 pub async fn list_slots(pool: &PgPool) -> Result<Vec<SlotRecord>, sqlx::Error> {
@@ -424,6 +609,19 @@ pub async fn inventory_counts(pool: &PgPool) -> Result<InventoryCounts, sqlx::Er
             (SELECT count(*) FROM installations) AS installations,
             (SELECT count(*) FROM truenas_instances) AS truenas_instances,
             (SELECT count(*) FROM drives) AS drives,
+            (SELECT count(*) FROM drives
+             WHERE health->>'present' = 'true'
+               AND health->>'accessible' = 'true'
+               AND COALESCE(health->>'position_lost', 'false') <> 'true'
+               AND last_observed_at >= now() - interval '2 minutes') AS accessible_drives,
+            (SELECT count(*) FROM drives
+             WHERE reconciled
+               AND health->>'present' = 'true'
+               AND health->>'accessible' = 'true'
+               AND health->>'identity_verified' = 'true'
+               AND COALESCE(health->>'identity_conflict', 'false') <> 'true'
+               AND COALESCE(health->>'position_lost', 'false') <> 'true'
+               AND last_observed_at >= now() - interval '2 minutes') AS reconciled_drives,
             (SELECT count(*) FROM drives
              WHERE qualification_status = 'physically_qualified') AS qualified_drives,
             (SELECT count(*) FROM cartridges) AS cartridges",

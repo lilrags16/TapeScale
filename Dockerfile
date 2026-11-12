@@ -16,7 +16,7 @@ LABEL org.opencontainers.image.title="TapeScale" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates curl tzdata \
+    && apt-get install --yes --no-install-recommends ca-certificates curl mt-st tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 tapescale \
     && useradd --system --uid 10001 --gid tapescale --home-dir /var/lib/tapescale tapescale \

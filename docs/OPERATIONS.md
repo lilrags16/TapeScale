@@ -1,6 +1,6 @@
 # Operator guide
 
-This guide describes the intended TapeScale operating model. The current release is an engineering preview with a simulator-only engine adapter. It must not be represented as protecting real tape until G0/G1 qualification is complete.
+This guide describes the intended TapeScale operating model. The current release is an engineering preview with read-only SAS discovery and a simulator-only engine adapter. It must not be represented as protecting real tape until G0/G1 qualification is complete.
 
 Procedures below are the operator acceptance target. The preview can exercise console, policy, scheduler, custody, restore-planning, and failure states with simulated data, but it cannot perform or verify a physical backup, restore, movement, encryption recovery, or catalog-loss recovery. Controls that lack a qualified backend are demonstrations, not operational authorization.
 
@@ -43,6 +43,8 @@ Each run begins from immutable selected snapshots and records exact coverage. A 
 Never satisfy a media request with a tape chosen only by matching its paper label. Confirm the application identity and wait for TapeScale to reconcile the on-tape identity.
 
 ## Manual tape handling
+
+Before handling media, verify the intended drive under **Drives & libraries**. A newly discovered drive is untrusted. Compare its physical model, serial/WWN, firmware, and non-rewinding device path, then select **Trust identity**. TapeScale revokes that reconciliation when the path, identity, firmware, or access state changes. This setup action authorizes observation only—not tape motion or data writes.
 
 For a standalone drive:
 

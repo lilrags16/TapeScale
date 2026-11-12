@@ -327,8 +327,16 @@
     let html = pageHead("Drives & libraries", "Hardware inventory returned by TapeScale.", refreshButton()) + noticeFor("drives");
     if (!state.data.drives.length && !state.data.slots.length) return html + empty("No hardware inventory", state.errors.drives ? "Drive and slot inventory could not be loaded." : "No drives or library slots have been reported.");
     if (state.data.drives.length) {
-      const rows = state.data.drives.map((drive) => '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="drives" data-id="' + esc(recordId(drive)) + '"><td class="primary-cell"><strong>' + esc(label(pick(drive, "stable_id", "name", "id", "device"))) + '</strong><small>' + esc(label(pick(drive, "model", "serial", "observed_path"))) + "</small></td>" + cell(pick(drive, "generation", "model")) + "<td>" + status(pick(drive, "qualification_status", "state", "status", "health")) + "</td>" + cell(mediaName(pick(drive, "media") || {}) || pick(drive, "loaded_media", "cartridge")) + "</tr>");
-      html += table(["Drive", "Generation / model", "Status", "Loaded media"], rows);
+      const rows = state.data.drives.map((drive) => {
+        const health = drive.health && typeof drive.health === "object" ? drive.health : {};
+        const observedAt = new Date(pick(drive, "last_observed_at") || 0).getTime();
+        const current = Number.isFinite(observedAt) && Date.now() - observedAt <= 120000;
+        const canReconcile = current && !drive.reconciled && health.present === true && health.accessible === true && health.position_lost !== true && health.identity_verified === true && health.identity_conflict !== true;
+        const action = canReconcile ? '<button class="button button-small" type="button" data-action="reconcile-drive" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '">Trust identity</button>' : status(drive.reconciled ? "reconciled" : "unreconciled");
+        const access = current ? pick(health, "status") || pick(drive, "qualification_status") : "stale";
+        return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="drives" data-id="' + esc(recordId(drive)) + '"><td class="primary-cell"><strong>' + esc(label(pick(drive, "stable_id", "name", "id", "device"))) + '</strong><small>' + esc(label(pick(drive, "model", "serial", "observed_path"))) + "</small></td>" + cell(pick(drive, "generation", "model")) + "<td>" + status(access) + "</td><td>" + status(pick(drive, "qualification_status")) + "</td><td>" + action + "</td></tr>";
+      });
+      html += table(["Drive", "Generation / model", "Access", "Qualification", "Identity"], rows);
     }
     if (state.data.slots.length) {
       const rows = state.data.slots.map((slot) => "<tr>" + cell(pick(slot, "element_address", "name", "id", "slot")) + cell(pick(slot, "type", "kind")) + cell(pick(slot, "state", "status")) + cell(pick(slot, "observed_barcode", "media_label", "barcode", "cartridge")) + "</tr>");
@@ -435,8 +443,7 @@
     if (!record) return;
     const title = pick(record, "name", "internal_label", "external_id", "stable_id", "label", "id", "job_id") || human(kind);
     const rows = Object.entries(record)
-      .filter(([, value]) => value == null || ["string", "number", "boolean"].includes(typeof value))
-      .map(([key, value]) => "<li><span>" + esc(human(key)) + "</span><strong>" + esc(label(value)) + "</strong></li>")
+      .map(([key, value]) => "<li><span>" + esc(human(key)) + "</span><strong>" + esc(value && typeof value === "object" ? JSON.stringify(value) : label(value)) + "</strong></li>")
       .join("");
     drawerLayer.innerHTML = '<aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title"><div class="drawer-head"><h2 id="drawer-title">' + esc(title) + '</h2><button class="icon-button" type="button" data-action="close-drawer" aria-label="Close">&times;</button></div><div class="drawer-body"><ul class="detail-list">' + rows + "</ul></div></aside>";
     drawerLayer.hidden = false;
@@ -500,6 +507,29 @@
     }
   }
 
+  async function reconcileDrive(button) {
+    const id = button.dataset.id;
+    const stableId = button.dataset.stableId;
+    if (!id || !stableId || !window.confirm("Trust this exact SAS drive identity? A path, firmware, or identity change will require reconciliation again.")) return;
+    button.disabled = true;
+    button.textContent = "Checking…";
+    try {
+      await request("/drives/" + encodeURIComponent(id) + "/reconcile", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ stable_id: stableId })
+      });
+      await Promise.all([loadOne("drives"), loadOne("preflight")]);
+      updateChrome();
+      render();
+      toast("Drive identity trusted", "TapeScale will block the drive again if its path, firmware, or stable identity changes.");
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Trust identity";
+      toast("Drive reconciliation failed", errorMessage(error));
+    }
+  }
+
   function toast(title, message) {
     const region = document.querySelector("#toast-region");
     const element = document.createElement("div");
@@ -527,6 +557,7 @@
     if (action === "close-nav") shell.classList.remove("nav-open");
     if (action === "refresh") loadAll(false);
     if (action === "add-media") openAddMedia();
+    if (action === "reconcile-drive") reconcileDrive(target);
     if (action === "close-modal") closeModal();
     if (action === "close-drawer") closeDrawer();
     if (action === "open-record") openRecord(target.dataset.kind, target.dataset.id);

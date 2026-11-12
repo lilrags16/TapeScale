@@ -18,7 +18,7 @@ This is an initial engineering ledger. Automated test references should be added
 
 | ID | Acceptance case | Software status | Physical/operational evidence | Release note |
 |---|---|---|---|---|
-| AT-01 | Clean installation and preflight | Simulated | Not run | Compose/health scaffolding exists; complete dependency preflight and TrueNAS/device proof are pending. |
+| AT-01 | Clean installation and preflight | Implemented/Simulated | Not run | Read-only SAS discovery and identity reconciliation exist; named TrueNAS/device proof and remaining dependencies are pending. |
 | AT-02 | LTO-1 through LTO-10 compatibility | Simulated | Not run | Rules can be unit-tested; no generation is physically qualified. |
 | AT-03 | Manual multi-volume job | Simulated | Not run | Requires physical EOM and wrong continuation media. |
 | AT-04 | Automated inventory and movement | Simulated | Not run | Requires a named changer and import/export-slot evidence. |
@@ -30,7 +30,7 @@ This is an initial engineering ledger. Automated test references should be added
 | AT-10 | Exact selected recovery point | Simulated | Not run | Namespace model may be tested; engine and snapshot-path proof remains. |
 | AT-11 | Object larger than one cartridge | Simulated | Not run | Requires file and native-stream physical spanning. |
 | AT-12 | Cancellation and host/process failure | Simulated | Not run | Controlled engine/tape interruptions remain. |
-| AT-13 | Unknown media/device loss/position | Simulated | Not run | Policy behavior is modeled; physical reset/disconnect remains. |
+| AT-13 | Unknown media/device loss/position | Implemented/Simulated | Not run | Missing/path-changed SAS devices are blocked in software; physical reset/disconnect and tape-position evidence remain. |
 | AT-14 | Compression modes restore | Not run | Not run | Each supported resolved pipeline requires byte-exact restore evidence. |
 | AT-15 | Corrupt/reordered/truncated content | Simulated | Not run | Record/authentication fault injection must be tied to selected engine. |
 | AT-16 | Media read-back and restore tests | Not run | Not run | Cached or source rereads do not count. |

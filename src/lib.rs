@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod config;
+pub mod device;
 pub mod domain;
 pub mod engine;
 pub mod error;

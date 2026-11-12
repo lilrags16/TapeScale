@@ -73,6 +73,16 @@ Map exact stable tape and changer device nodes required by the qualified utiliti
 
 After a reboot or path change, TapeScale reconciles stable identity and blocks automatic selection if it cannot prove the same device.
 
+The current standalone-drive milestone performs read-only discovery and `mt status` only. On the TrueNAS host, identify the non-rewinding node before deployment:
+
+```sh
+ls -l /dev/nst* /dev/tape/by-id/*
+```
+
+The test Compose file currently maps host `/dev/nst0` to worker `/dev/nst0` with read permission only. If the host node differs, change both the worker `devices` source and `TAPESCALE_TAPE_DEVICES`; never guess or map an unknown `/dev/sg*`, which may be a disk. After redeployment, open **Drives & libraries**, inspect the reported vendor/model/serial or WWN, firmware, path, and status, then use **Trust identity** only when they match the intended physical drive. A missing device, path change, firmware change, identity conflict, or inaccessible node revokes reconciliation.
+
+Discovery does not load, unload, rewind, erase, format, label, read, or write tape. Those operations remain behind the G0 engine/format and exclusive-ownership gates.
+
 ## Compose deployment
 
 From the repository root, review the rendered configuration before starting:
@@ -106,11 +116,11 @@ Before enabling a policy, the web preflight must report each item independently:
 - spool, staging, restore capacity, quotas, and free-space reserve;
 - compatible writable media and overwrite-gate result.
 
-The fresh preview console starts without operational fixtures and reports only records stored in PostgreSQL. The engine adapter remains a simulator and cannot make device, ZFS, ACL, engine, or media checks pass.
+The fresh preview console starts without operational fixtures and reports only records stored in PostgreSQL. A correctly mapped SAS drive can make the device-access and stable-identity checks pass after explicit reconciliation. The engine adapter remains a simulator and cannot make physical qualification, ZFS, ACL, engine, or writable-media checks pass.
 
 ## TrueNAS custom-app configuration
 
-For the current fixture-free test deployment, copy the complete repository-root `compose.truenas.yaml` into **Apps > Discover Apps > Install via YAML**. It builds public `main`, exposes the console on host port 18080, keeps the intentionally inline test database password, and stores state in Docker-managed volumes. The initial UI is empty; manually registered cartridges are the first real durable records.
+For the current fixture-free test deployment, copy the complete repository-root `compose.truenas.yaml` into **Apps > Discover Apps > Install via YAML**. It builds public `main`, exposes the console on host port 18080, keeps the intentionally inline test database password, stores state in Docker-managed volumes, and maps the single read-only SAS node `/dev/nst0` to the worker. The initial operational UI is empty; discovered drives and manually registered cartridges become the first real durable records.
 
 To update this Git-context build, edit the installed custom app, replace its YAML with the latest raw `compose.truenas.yaml`, and save. Because the file uses `pull_policy: build`, the redeploy fetches and rebuilds the current `main` source. Verify the new commit and container logs before relying on any newly implemented workflow.
 
@@ -147,4 +157,4 @@ Stopping or removing containers must not delete persistent datasets, recovery bu
 
 ## Preview implementation boundary
 
-The Compose topology, PostgreSQL 16 persistence, health surface, static console, simulator, and service separation are preview implementation. TLS ingress, production identity/MFA, TrueNAS WebSocket integration, ZFS/helper data paths, hardware device mappings, selected tape engine, backup/restore data flow, key packages, and physical preflight evidence are target requirements and remain incomplete or unqualified. Do not turn a target checklist item green solely because its configuration field exists.
+The Compose topology, PostgreSQL 16 persistence, health surface, static console, simulator, service separation, and read-only standalone SAS discovery are preview implementation. TLS ingress, production identity/MFA, TrueNAS WebSocket integration, ZFS/helper data paths, changer control, selected tape engine, backup/restore data flow, key packages, and physical qualification evidence are target requirements and remain incomplete or unqualified. Do not turn a target checklist item green solely because discovery succeeds.

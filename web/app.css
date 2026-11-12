@@ -1607,6 +1607,10 @@ svg {
   color: var(--ink-soft);
 }
 
+.detail-list strong {
+  overflow-wrap: anywhere;
+}
+
 .modal {
   position: absolute;
   top: 50%;
