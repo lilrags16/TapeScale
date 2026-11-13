@@ -2,7 +2,7 @@
 
 This guide describes the intended TapeScale operating model. The current release is an engineering preview with SAS discovery, lab-only rewind/unload, a destructive Bacula `btape test` harness, and an attended G0.2 Bacula file roundtrip. It must not be represented as generally protecting production tape until G0/G1 qualification is complete.
 
-Procedures below are the operator acceptance target. The G0.2 path can write and restore one full file capture on one cartridge under explicit lab gates. The preview also exposes that retained point through the Recovery Vault, persists restore-readiness plans, and records confirmed manual custody movements. General scheduled backup, reusable restore execution, encryption recovery, catalog-loss recovery, spanning, incrementals, native ZFS, and production authorization remain simulated, incomplete, or unqualified.
+Procedures below are the operator acceptance target. The G0.2 path can write and restore one full file capture on one cartridge under explicit lab gates. The preview also exposes that retained point through the Recovery Vault, persists restore-readiness plans, can perform a later attended read-only recovery rehearsal for that narrow point, and records confirmed manual custody movements. General scheduled backup, general-purpose restore execution, encryption recovery, catalog-loss recovery, spanning, incrementals, native ZFS, and production authorization remain simulated, incomplete, or unqualified.
 
 ## Daily overview
 
@@ -114,9 +114,17 @@ Interrupted verification cannot pass. New data defaults to full read-back before
 
 ## Plan and execute a restore
 
-The current console implements the planning half of this workflow. Open **Restore → Recovery vault**, search by source, tape, representation, status, or date, and select a point. The dossier joins the durable recovery contract to ordered volume records, confirmed locations, physical readback, isolated restore-test evidence, origin events, and retained artifact digests. The evidence download is bounded and omits internal artifact storage paths.
+Open **Restore → Recovery vault**, search by source, tape, representation, status, or date, and select a point. The dossier joins the durable recovery contract to ordered volume records, confirmed locations, physical readback, isolated restore-test evidence, origin events, retained artifact digests, and later rehearsal runs. Evidence downloads are bounded and omit internal artifact storage paths.
 
-Select **Plan restore**, choose a contained relative destination and conflict policy, and declare the destination/key/capacity facts that are actually known. TapeScale persists the preview for 30 minutes and reports required tapes, dependency order, exact compatible qualified drives, locations, keys, warnings, and blockers. An unverified point, unknown tape location, missing exact hardware qualification, unsafe destination, insufficient declared capacity, or unavailable key prevents a ready result. Planning does not move media, invoke Bacula, create the directory, or restore data in this release.
+Select **Plan restore**, choose a contained relative destination and conflict policy, and declare the destination/key/capacity facts that are actually known. TapeScale persists the preview for 30 minutes and reports required tapes, dependency order, exact compatible qualified drives, locations, keys, warnings, and blockers. An unverified point, unknown tape location, missing exact hardware qualification, unsafe destination, insufficient declared capacity, or unavailable key prevents a ready result. Planning alone never moves media, invokes Bacula, or creates a destination.
+
+A ready plan exposes **Run attended recovery rehearsal** only when it resolves to a passed G0.2 `file/full` point with exactly one finalized unencrypted volume, no recovery dependencies or key lineage, the pinned Bacula 15.0.3 adapter/format, a retained source manifest, an intact original backup JobId/catalog, and a current exact qualified drive/cartridge tuple. Every broader plan remains planning-only.
+
+Before queueing the rehearsal, physically retrieve the displayed tape, load it in the selected exact drive, confirm its printed/internal identity against the plan, and keep the worker and database available. Queueing submits the plan UUID, unchanged preview hash, selected drive UUID, and attended confirmation. The worker rechecks every durable prerequisite, fences the drive and cartridge, re-probes the SAS identity, and asks Bacula to read only the retained backup JobId. It never labels, clears, erases, backs up, or otherwise writes the cartridge.
+
+The destination is always a newly created `/restore/<planned relative path>/<rehearsal UUID>` directory. Replace, rename, merge, live cutover, and automatic share publication are unavailable. TapeScale verifies the retained source-manifest artifact before dispatch, performs the normal physical-media restore, scans the recovered tree independently, and requires an exact comparison of every promised path, SHA-256 content value, and covered metadata field. A pass appends another `restore_test` verification record; it does not create a recovery point or expand hardware qualification.
+
+Queued and running rehearsals are durable. The Recovery Vault reports exact media/drive/destination, phase events, engine correlation, comparison, result, cancellation, and bounded evidence. A running cancellation asks Bacula to cancel and waits for a terminal observation. Lease loss, worker restart during physical work, timeout, identity change, catalog disagreement, wrong/missing media, manifest mismatch, or uncertain cleanup cannot pass and may require drive reconciliation.
 
 Use the restore planner before loading media. It must show:
 

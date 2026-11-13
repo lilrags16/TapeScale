@@ -86,6 +86,8 @@ Creation uses descriptor-relative operations or an equivalent race-resistant mec
 
 Existing destinations default to skip conflicts. Rename and replace are explicit. Dataset replacement and deletion reconciliation are destructive administrator operations with preview and reauthentication.
 
+The preview's attended verified-point rehearsal is a narrow laboratory exception, not the production authorization model. It requires an unexpired blocker-free plan and unchanged preview hash, explicit exact-drive selection, three attended confirmations, and a typed phrase bound to the plan. The API cannot read worker evidence files or the restore destination. The worker independently revalidates the plan provenance, current drive/media reservation and fencing, original Bacula catalog/volume, and retained manifest artifact before dispatch. It creates a brand-new UUID destination and has no rehearsal code path for label, erase, BOT invalidation, backup, media reuse, existing-destination replacement, or publication. Internal artifact storage paths never enter public detail or evidence responses. The preview still has no authentication, so deploy this physical-read surface only on the isolated attended lab network described for G0.1/G0.2.
+
 ## Encryption and keys
 
 Encryption is enabled by default for new policies and covers content plus sensitive filenames, paths, metadata, and exported catalogs. Use an established authenticated-encryption format or a qualified encryption-plus-authentication construction. Compression occurs before application encryption. Hardware encryption is optional; a qualified software path is required for older drives.
