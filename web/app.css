@@ -1978,6 +1978,61 @@ svg {
   align-items: flex-start;
 }
 
+.input-suffix {
+  display: flex;
+  align-items: stretch;
+}
+
+.input-suffix .input {
+  min-width: 0;
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+}
+
+.input-suffix > span {
+  display: grid;
+  padding: 0 13px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-left: 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  color: var(--ink-soft);
+  background: var(--surface-soft);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.backup-plan-summary {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 12px 13px;
+  border: 1px solid #a9d0c5;
+  border-radius: var(--radius-sm);
+  background: var(--teal-soft);
+}
+
+.backup-plan-summary > span {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 50%;
+  color: white;
+  background: var(--teal);
+  font-weight: 800;
+}
+
+.backup-plan-summary strong,
+.backup-plan-summary small {
+  display: block;
+}
+
+.backup-plan-summary small {
+  margin-top: 3px;
+  color: var(--ink-soft);
+}
+
 .backup-timeline {
   margin: 0;
   padding: 0;
@@ -2114,7 +2169,7 @@ svg {
 }
 
 .source-browser-context > div > span {
-  color: var(--ink-faint);
+  color: var(--ink-soft);
   font-size: 10px;
   font-weight: 800;
   letter-spacing: 0.08em;
@@ -2156,7 +2211,7 @@ svg {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 14px;
   padding: 7px 14px 7px 53px;
-  color: var(--ink-faint);
+  color: var(--ink-soft);
   background: var(--surface-soft);
   font-size: 10px;
   font-weight: 800;
@@ -2165,7 +2220,7 @@ svg {
 }
 
 .source-browser-column-head span:last-child {
-  min-width: 74px;
+  min-width: 28px;
   text-align: right;
 }
 
@@ -2243,18 +2298,24 @@ button.source-browser-name:hover strong {
 
 .source-browser-name small {
   margin-top: 2px;
-  color: var(--ink-faint);
+  color: var(--ink-soft);
   font-size: 11px;
 }
 
 .source-browser-entry-action {
-  min-width: 74px;
+  min-width: 28px;
   text-align: right;
 }
 
 .source-browser-entry-note {
-  color: var(--ink-faint);
+  color: var(--ink-soft);
   font-size: 11px;
+}
+
+.source-browser-open {
+  color: var(--teal-strong);
+  font-size: 24px;
+  line-height: 1;
 }
 
 .source-browser-footer {
@@ -2278,7 +2339,7 @@ button.source-browser-name:hover strong {
 }
 
 .source-browser-selection span {
-  color: var(--ink-faint);
+  color: var(--ink-soft);
   font-size: 10px;
   font-weight: 800;
   letter-spacing: 0.07em;
@@ -3068,7 +3129,7 @@ button.source-browser-name:hover strong {
 .field-help {
   display: block;
   margin-top: 4px;
-  color: var(--ink-faint);
+  color: var(--ink-soft);
   font-size: 10px;
 }
 

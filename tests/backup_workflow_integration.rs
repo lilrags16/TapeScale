@@ -188,6 +188,63 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(first.requested_level, "full");
     assert!(first.assigned_data_run_id.is_none());
 
+    let retained = backup_ops::get_backup_request_by_idempotency_key(
+        &pool,
+        manual_profile.id,
+        "integration-manual-001",
+    )
+    .await
+    .expect("the retained request should be addressable by its idempotency key")
+    .expect("the retained request should exist");
+    assert_eq!(retained.id, first.id);
+    assert_eq!(retained.job_run_id, first.job_run_id);
+    let serialized_retained = backup_ops::get_backup_request_by_idempotency_key_serialized(
+        &pool,
+        manual_profile.id,
+        "integration-manual-001",
+    )
+    .await
+    .expect("serialized replay lookup should succeed")
+    .expect("serialized replay lookup should retain the request");
+    assert_eq!(serialized_retained.id, first.id);
+    assert!(backup_ops::get_backup_request_by_idempotency_key(
+        &pool,
+        manual_profile.id,
+        "integration-manual-missing",
+    )
+    .await
+    .expect("a missing idempotency key lookup should succeed")
+    .is_none());
+
+    let replay_source_root = tempfile::tempdir().expect("replay source root should exist");
+    let replay_web_root = tempfile::tempdir().expect("replay web root should exist");
+    let replay_application = api::router(
+        AppState::new(
+            Some(pool.clone()),
+            false,
+            true,
+            true,
+            true,
+            replay_source_root.path().to_path_buf(),
+            PathBuf::from("/restore"),
+        ),
+        replay_web_root.path().to_path_buf(),
+    );
+    let replay = api_request(
+        &replay_application,
+        Method::POST,
+        format!("/api/v1/backup-profiles/{}/runs", manual_profile.id),
+        json!({
+            "idempotency_key": "integration-manual-001",
+            "requested_by_label": "Backup integration operator"
+        }),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay = response_json(replay).await;
+    assert_eq!(replay["run"]["id"], json!(first.id));
+    assert_eq!(replay["run"]["job_run_id"], json!(first.job_run_id));
+
     let duplicate = backup_ops::create_manual_backup_request(
         &pool,
         manual_profile.id,

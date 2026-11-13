@@ -25,8 +25,9 @@ use crate::{
     config::Config,
     data_path::{
         build_manifest_with_cancel, compare_manifests, create_isolated_restore_destination,
-        persist_json_artifact, persist_manifest, source_manifests_stable, verify_read_only_mount,
-        FileManifest, JsonArtifactSummary, ManifestArtifactSummary, ManifestComparison,
+        persist_json_artifact, persist_manifest, resolve_existing_zfs_snapshot_selection,
+        source_manifests_stable, verify_read_only_mount, FileManifest, JsonArtifactSummary,
+        ManifestArtifactSummary, ManifestComparison,
     },
     device::{
         clear_sas_scratch_label, discover_sas_drives, execute_sas_motion, SasDiscoveryConfig,
@@ -235,6 +236,32 @@ fn validate_paths(
         return Err(ExerciseFailure::blocked(
             "persisted source and restore paths are not contained child paths",
         ));
+    }
+    if claim.run.workflow_kind == "backup" {
+        let source_relative = source.strip_prefix(&config.source_root).map_err(|_| {
+            ExerciseFailure::blocked("the backup source path escaped the configured source root")
+        })?;
+        let source_relative = source_relative.to_str().ok_or_else(|| {
+            ExerciseFailure::blocked("the backup source path must be valid UTF-8")
+        })?;
+        let resolved_source =
+            resolve_existing_zfs_snapshot_selection(&config.source_root, source_relative).map_err(
+                |error| {
+                    ExerciseFailure::blocked(format!(
+                        "the backup source is not a contained named ZFS snapshot: {error}"
+                    ))
+                },
+            )?;
+        let persisted_source = source.canonicalize().map_err(|error| {
+            ExerciseFailure::blocked(format!(
+                "the persisted backup source cannot be resolved: {error}"
+            ))
+        })?;
+        if resolved_source != persisted_source {
+            return Err(ExerciseFailure::blocked(
+                "the persisted backup source no longer matches its named ZFS snapshot path",
+            ));
+        }
     }
     Ok(())
 }
@@ -1036,7 +1063,7 @@ async fn complete_backup(
         "scope": "attended single-volume full-file backup with complete physical-media readback",
         "qualification": "test_slice",
         "production_eligible": false,
-        "limitations": ["single_volume", "full_only", "unencrypted", "operator_attested_snapshot"],
+        "limitations": ["single_volume", "full_only", "unencrypted", "server_verified_read_only_source"],
         "engine": {"name":"Bacula Community","version":"15.0.3"},
         "backup_job": &completed.backup,
         "backup_catalog": &completed.backup_catalog,

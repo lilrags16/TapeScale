@@ -2941,7 +2941,7 @@ pub async fn create_single_tape_data_profile(
     }
     if !profile.immutable_snapshot_confirmed {
         return Ok(CreateSingleTapeDataProfileResult::Blocked(
-            "the operator must attest that the selected source is an immutable mounted snapshot or expendable read-only fixture"
+            "the selected source must be verified as an immutable mounted snapshot or expendable read-only fixture"
                 .to_owned(),
         ));
     }
@@ -3029,10 +3029,10 @@ pub async fn create_single_tape_data_profile(
                 "INSERT INTO truenas_instances
                     (name, websocket_url, certificate_fingerprint,
                      api_version, software_version, credential_secret_ref)
-                 VALUES ('G0.2 operator-attested local mount (not API connected)',
+                 VALUES ('G0.2 local read-only mount (not API connected)',
                          'wss://local-mounted-source.invalid',
                          'not-applicable-local-mounted-source',
-                         'not-connected', 'operator-attested-mounted-fixture',
+                         'not-connected', 'verified-read-only-mounted-fixture',
                          'g0.2-local-mounted-source:no-api')
                  RETURNING id",
             )
@@ -3073,7 +3073,7 @@ pub async fn create_single_tape_data_profile(
             .bind(&source_subpath)
             .bind(&logical_root)
             .bind(json!({
-                "binding": "operator_attested_read_only_mounted_snapshot",
+                "binding": "verified_read_only_mounted_source",
                 "source_subpath": source_subpath,
                 "physical_path": profile.source_mount_path,
                 "immutable_snapshot_confirmed": true,
@@ -3118,7 +3118,7 @@ pub async fn create_single_tape_data_profile(
         )
         .bind(source_id)
         .bind(snapshot_guid)
-        .bind(format!("operator-attested-mounted:{source_subpath}"))
+        .bind(format!("verified-read-only-mounted:{source_subpath}"))
         .bind(&profile.source_mount_path)
         .bind(&logical_root)
         .fetch_one(&mut *transaction)
@@ -3593,7 +3593,10 @@ async fn queue_single_tape_data_run_inner(
     } else if profile.production_eligible {
         Some("this test-qualified single-volume workflow cannot be production eligible".to_owned())
     } else if !profile.immutable_snapshot_confirmed {
-        Some("the profile lacks its persisted immutable-snapshot operator attestation".to_owned())
+        Some(
+            "the profile lacks persisted immutable-snapshot or read-only-source verification"
+                .to_owned(),
+        )
     } else if snapshot.source_id != profile.source_id
         || snapshot.released_at.is_some()
         || snapshot.logical_root != profile.logical_root
@@ -5017,7 +5020,7 @@ pub async fn finalize_single_tape_backup_pass(
         "scope": "attended full-file backup with complete physical-media readback",
         "qualification": "test_slice",
         "production_eligible": false,
-        "limitations": ["single_volume", "full_only", "unencrypted", "operator_attested_snapshot"],
+        "limitations": ["single_volume", "full_only", "unencrypted", "server_verified_read_only_source"],
         "logical_root": claim.run.logical_root,
         "source_snapshot_id": claim.run.source_snapshot_id,
         "file_count": evidence.file_count,

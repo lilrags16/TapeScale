@@ -771,6 +771,51 @@ pub async fn get_backup_request(
     .await?)
 }
 
+pub async fn get_backup_request_by_idempotency_key(
+    pool: &PgPool,
+    profile_id: Uuid,
+    idempotency_key: &str,
+) -> Result<Option<BackupRequestRecord>, BackupOpsError> {
+    validate_label(idempotency_key, "idempotency_key")?;
+    Ok(sqlx::query_as::<_, BackupRequestRecord>(&format!(
+        "{BACKUP_REQUEST_SELECT}
+         AND request.profile_id = $1
+         AND request.idempotency_key = $2"
+    ))
+    .bind(profile_id)
+    .bind(idempotency_key)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Reload an idempotent request after waiting for any in-flight creator for
+/// the same profile. This is used only on a failed filesystem preflight, where
+/// returning a transient source error would otherwise hide a request that is
+/// concurrently being committed after a response-loss retry.
+pub async fn get_backup_request_by_idempotency_key_serialized(
+    pool: &PgPool,
+    profile_id: Uuid,
+    idempotency_key: &str,
+) -> Result<Option<BackupRequestRecord>, BackupOpsError> {
+    validate_label(idempotency_key, "idempotency_key")?;
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("tapescale:backup-request:{profile_id}"))
+        .execute(&mut *transaction)
+        .await?;
+    let record = sqlx::query_as::<_, BackupRequestRecord>(&format!(
+        "{BACKUP_REQUEST_SELECT}
+         AND request.profile_id = $1
+         AND request.idempotency_key = $2"
+    ))
+    .bind(profile_id)
+    .bind(idempotency_key)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(record)
+}
+
 async fn fetch_backup_request(
     transaction: &mut Transaction<'_, Postgres>,
     id: Uuid,

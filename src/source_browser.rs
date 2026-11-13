@@ -8,7 +8,7 @@
 use std::{
     cmp::Ordering,
     fs,
-    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -22,7 +22,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    data_path::{load_manifest_bytes, verify_read_only_mount, EntryKind, FileManifest},
+    data_path::{descriptor_is_on_read_only_mount, load_manifest_bytes, EntryKind, FileManifest},
     domain::path::validate_archive_path,
 };
 
@@ -143,7 +143,11 @@ fn browse_source_with_limit(
     Ok(BrowserListing {
         parent_path: relative.parent().map(portable_path).transpose()?,
         breadcrumbs: breadcrumbs(&relative)?,
-        selectable: !relative.as_os_str().is_empty() && read_only,
+        // Browsing is selection assistance, not the write-safety authority.
+        // Let the operator choose any contained non-root directory; plan
+        // creation independently opens the path and proves its mount is
+        // read-only before persisting it.
+        selectable: !relative.as_os_str().is_empty(),
         current_path,
         read_only,
         snapshot,
@@ -214,8 +218,7 @@ fn open_source_directory_fallback(
 }
 
 fn read_only_directory(directory: &OwnedFd) -> bool {
-    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-    verify_read_only_mount(&descriptor_path).is_ok()
+    descriptor_is_on_read_only_mount(directory).unwrap_or(false)
 }
 
 fn live_entries_from_directory(
@@ -313,7 +316,7 @@ fn live_entry_from_stat(
         symlink: kind == BrowserEntryKind::Symlink,
         snapshot: is_snapshot_path(child_safe.as_path()),
         navigable: directory,
-        selectable: directory && read_only,
+        selectable: directory,
     })
 }
 
@@ -576,7 +579,7 @@ fn is_snapshot_path(path: &Path) -> bool {
         .collect::<Vec<_>>();
     components
         .windows(3)
-        .any(|window| window[0] == ".zfs" && window[1] == "snapshot")
+        .any(|window| window[0] == ".zfs" && window[1] == "snapshot" && !window[2].is_empty())
 }
 
 fn compare_entries(left: &BrowserEntry, right: &BrowserEntry) -> Ordering {
@@ -654,10 +657,13 @@ mod tests {
         let listing = browse_source(root.path(), "pool/snapshot").expect("listing");
         assert_eq!(listing.current_path, "pool/snapshot");
         assert_eq!(listing.parent_path.as_deref(), Some("pool"));
+        assert!(!listing.read_only);
+        assert!(listing.selectable);
         assert_eq!(listing.entries.len(), 2);
         assert_eq!(listing.entries[0].name, "photos");
         assert_eq!(listing.entries[0].kind, BrowserEntryKind::Directory);
         assert!(listing.entries[0].navigable);
+        assert!(listing.entries[0].selectable);
         assert_eq!(listing.entries[1].name, "image.raw");
         assert_eq!(listing.entries[1].size_bytes, Some(8));
         assert!(!listing.entries[1].selectable);
@@ -684,6 +690,9 @@ mod tests {
             .expect("snapshot tree");
         let dataset = browse_source(root.path(), "dataset").expect("dataset listing");
         assert!(dataset.entries.iter().any(|entry| entry.name == ".zfs"));
+        let snapshot_container = browse_source(root.path(), "dataset/.zfs/snapshot")
+            .expect("snapshot container listing");
+        assert!(!snapshot_container.snapshot);
         let snapshot =
             browse_source(root.path(), "dataset/.zfs/snapshot/nightly").expect("snapshot listing");
         assert!(snapshot.snapshot);

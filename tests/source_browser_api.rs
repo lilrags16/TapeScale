@@ -66,8 +66,11 @@ async fn source_browser_route_is_bounded_contained_and_not_cached() {
         Some(&header::HeaderValue::from_static("no-store"))
     );
     assert_eq!(body["current_path"], "dataset");
+    assert_eq!(body["read_only"], false);
+    assert_eq!(body["selectable"], true);
     assert_eq!(body["entries"][0]["name"], "photos");
     assert_eq!(body["entries"][0]["kind"], "directory");
+    assert_eq!(body["entries"][0]["selectable"], true);
     assert_eq!(body["entries"][1]["name"], "photo.raw");
     assert_eq!(body["entries"][1]["size_bytes"], 3);
     assert_eq!(body["entries"][2]["name"], "escape");

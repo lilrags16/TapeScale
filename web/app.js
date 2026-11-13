@@ -651,12 +651,12 @@
       const id = recordId(profile);
       const latest = orderedBackupRuns().find((run) => String(pick(run, "profile_id", "backup_profile_id") || "") === id);
       const source = pick(profile, "source_subpath", "source_path", "logical_root") || "Source not reported";
-      const schedule = pick(profile, "schedule_enabled") === true ? "Saturday 02:00 · " + label(pick(profile, "schedule_timezone")) : "Manual only";
+      const schedule = pick(profile, "schedule_enabled") === true ? "Fixed source · Saturday 02:00 · " + label(pick(profile, "schedule_timezone")) : "Run manually";
       const retention = count(pick(profile, "retention_days")) || 28;
       const pool = pick(profile, "media_pool_name") || "any eligible scratch pool";
       return '<article class="backup-profile-card"><div class="backup-profile-mark" aria-hidden="true">B</div><div class="backup-profile-copy"><span><strong>' + esc(backupProfileName(profile)) + '</strong>' + status(human(pick(profile, "enabled") === false ? "disabled" : "ready")) + '</span><code>' + esc(source) + '</code><small>Full · full readback · ' + retention + " days · " + esc(pool) + " · " + esc(schedule) + '</small></div><div class="backup-profile-actions"><span>' + (latest ? esc(human(backupRunState(latest))) + " · " + esc(date(pick(latest, "created_at", "started_at"))) : "Never run") + '</span><button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(id) + '"' + (pick(profile, "enabled") === false ? " disabled" : "") + '>Run now</button></div></article>';
     }).join("");
-    return '<section class="panel backup-profiles"><div class="panel-head"><div><h2>Backup plans</h2><p>Approved source scope and repeatable full-backup intent.</p></div><button class="button button-small" type="button" data-action="create-backup-profile">Create plan</button></div><div class="backup-profile-list">' + (cards || '<div class="media-inline-empty">No backup plans yet. Create one for an explicit path inside the mounted source root.</div>') + "</div></section>";
+    return '<section class="panel backup-profiles"><div class="panel-head"><div><h2>Backup plans</h2><p>Approved source scope and repeatable full-backup intent.</p></div><button class="button button-small" type="button" data-action="create-backup-profile">Create plan</button></div><div class="backup-profile-list">' + (cards || '<div class="media-inline-empty">No backup plans yet. Create one for a named ZFS snapshot folder.</div>') + "</div></section>";
   }
 
   function renderBackupRunTable(runs) {
@@ -754,9 +754,9 @@
     const failed = runs.filter((run) => ["failed", "blocked", "interrupted"].includes(backupRunState(run))).length;
     const latestVerified = runs.find((run) => ["verified", "passed", "completed", "complete"].includes(backupRunState(run)));
     const create = '<button class="button button-primary" type="button" data-action="create-backup-profile">Create backup plan</button>';
-    let html = pageHead("Backup Center", "Configure and operate durable, full single-tape backups from mounted read-only source snapshots.", refreshButton() + create);
+    let html = pageHead("Backup Center", "Choose a source folder, then run a durable full backup when the tape is ready.", refreshButton() + create);
     html += noticeFor("backupProfiles") + noticeFor("backupRuns");
-    html += '<div class="notice warning backup-scope-notice"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Current operational boundary</strong><span>This build supports manual and weekly scheduled full, file-mode, single-volume, unencrypted backups from an operator-attested read-only source. Incrementals, spanning, native ZFS, and encryption remain blocked rather than simulated.</span></div></div>';
+    html += '<div class="notice info backup-scope-notice"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>What this build does</strong><span>Each new console plan protects one ZFS snapshot folder with a manually started Full backup, one tape, and a complete physical readback. TapeScale verifies the source when the plan is saved and again before a manual run is queued.</span></div></div>';
     html += '<section class="panel metric-strip backup-metrics"><div class="metric"><span>Backup plans</span><strong>' + profiles.length + '</strong></div><div class="metric"><span>Active runs</span><strong>' + active + '</strong></div><div class="metric"><span>Waiting for media</span><strong>' + waiting + '</strong></div><div class="metric"><span>Latest verified</span><strong class="backup-metric-date">' + esc(latestVerified ? date(pick(latestVerified, "finished_at", "created_at")) : "None") + "</strong></div></section>";
     html += renderBackupProfiles();
     if (!runs.length) return html + empty("No backup runs", state.errors.backupRuns ? "Backup runs could not be loaded." : "Create a plan, then choose Run now to queue a durable backup request.", create);
@@ -1477,7 +1477,7 @@
     const action = kind === "directory"
       ? '<button class="button button-quiet button-small" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(path) + '">Open</button>'
       : '<span class="source-browser-entry-note">Browse only</span>';
-    return '<div class="source-browser-entry ' + esc(kind) + '" role="row"><span class="source-browser-icon" aria-hidden="true">' + icon + '</span>' + nameControl + '<div class="source-browser-entry-action">' + action + "</div></div>";
+    return '<div class="source-browser-entry ' + esc(kind) + '" role="listitem"><span class="source-browser-icon" aria-hidden="true">' + icon + '</span>' + nameControl + '<div class="source-browser-entry-action">' + action + "</div></div>";
   }
 
   async function loadRecoveryPointFiles(pointId, path, focusEntries) {
@@ -1561,7 +1561,7 @@
       return String(pick(left, "name", "display_name") || "").localeCompare(String(pick(right, "name", "display_name") || ""), undefined, { numeric: true, sensitivity: "base" });
     });
     const empty = '<div class="source-browser-empty"><span aria-hidden="true">□</span><strong>No retained entries in this directory</strong><small>The manifest reports an empty folder.</small></div>';
-    return '<section class="vault-dossier-section recovery-file-browser-shell" data-recovery-files="' + esc(pointId) + '"><div class="vault-section-head"><div><h3>Files & directories</h3><p>Catalog view from the content-addressed manifest.</p></div><button class="icon-button" type="button" data-action="close-recovery-files" data-id="' + esc(pointId) + '" aria-label="Close retained contents browser">&times;</button></div><div class="notice info recovery-files-boundary"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Browse-only recovery inventory</strong><span>This view does not read tape and does not change restore scope. The currently proven recovery action still restores the complete recovery point.</span></div></div><div class="backup-source-browser retained-browser"><div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(parentPath || "") + '" aria-label="Open parent retained directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Retained backup path">' + recoveryFileBreadcrumbs(pointId, currentPath) + '</nav></div><div class="source-browser-context"><div><span>Retained path</span><code>/' + esc(currentPath) + '</code></div><span class="source-browser-scope readonly"><span aria-hidden="true">◇</span> Manifest evidence</span></div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Action</span></div><div class="source-browser-entries" role="table" aria-label="Retained files and directories in ' + esc(currentPath || "backup root") + '">' + (entries.length ? entries.map((entry) => recoveryFileEntry(entry, currentPath, pointId)).join("") : empty) + '</div><p class="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + " retained entries loaded") + "</p></div></section>";
+    return '<section class="vault-dossier-section recovery-file-browser-shell" data-recovery-files="' + esc(pointId) + '"><div class="vault-section-head"><div><h3>Files & directories</h3><p>Catalog view from the content-addressed manifest.</p></div><button class="icon-button" type="button" data-action="close-recovery-files" data-id="' + esc(pointId) + '" aria-label="Close retained contents browser">&times;</button></div><div class="notice info recovery-files-boundary"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Browse-only recovery inventory</strong><span>This view does not read tape and does not change restore scope. The currently proven recovery action still restores the complete recovery point.</span></div></div><div class="backup-source-browser retained-browser"><div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(parentPath || "") + '" aria-label="Open parent retained directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Retained backup path">' + recoveryFileBreadcrumbs(pointId, currentPath) + '</nav></div><div class="source-browser-context"><div><span>Retained path</span><code>/' + esc(currentPath) + '</code></div><span class="source-browser-scope readonly"><span aria-hidden="true">◇</span> Manifest evidence</span></div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Action</span></div><div class="source-browser-entries" role="list" aria-label="Retained files and directories in ' + esc(currentPath || "backup root") + '">' + (entries.length ? entries.map((entry) => recoveryFileEntry(entry, currentPath, pointId)).join("") : empty) + '</div><p class="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + " retained entries loaded") + "</p></div></section>";
   }
 
   const RESTORE_REHEARSAL_PHASES = [
@@ -3499,7 +3499,7 @@
 
   function sourceBrowserSnapshotPath(path) {
     const segments = String(path || "").split("/").filter(Boolean);
-    return segments.some((segment, index) => segment === ".zfs" && segments[index + 1] === "snapshot");
+    return segments.some((segment, index) => segment === ".zfs" && segments[index + 1] === "snapshot" && Boolean(segments[index + 2]));
   }
 
   function sourceBrowserBreadcrumbs(path) {
@@ -3530,9 +3530,9 @@
       ? '<button class="source-browser-name" type="button" data-action="source-browser-navigate" data-path="' + esc(path) + '" aria-label="Open folder ' + esc(name) + '"><strong>' + esc(name) + "</strong><small>" + esc(facts.join(" · ")) + "</small></button>"
       : '<div class="source-browser-name"><strong>' + esc(name) + "</strong><small>" + esc(facts.join(" · ")) + "</small></div>";
     const action = kind === "directory"
-      ? '<button class="button button-quiet button-small" type="button" data-action="source-browser-navigate" data-path="' + esc(path) + '">Open</button>'
+      ? '<span class="source-browser-open" aria-hidden="true">›</span>'
       : kind === "symlink" ? '<span class="source-browser-entry-note">Not followed</span>' : kind === "file" ? '<span class="source-browser-entry-note">Included with folder</span>' : '<span class="source-browser-entry-note">Backup will reject</span>';
-    return '<div class="source-browser-entry ' + esc(kind) + '" role="row"><span class="source-browser-icon" aria-hidden="true">' + icon + '</span>' + nameControl + '<div class="source-browser-entry-action">' + action + "</div></div>";
+    return '<div class="source-browser-entry ' + esc(kind) + '" role="listitem"><span class="source-browser-icon" aria-hidden="true">' + icon + '</span>' + nameControl + '<div class="source-browser-entry-action">' + action + "</div></div>";
   }
 
   function renderSourceBrowser(payload, requestedPath) {
@@ -3550,17 +3550,27 @@
     const payloadReadOnly = payload && (payload.read_only ?? payload.current_read_only ?? payload.readonly);
     sourceBrowserPath = currentPath;
     sourceBrowserReadOnly = typeof payloadReadOnly === "boolean" ? payloadReadOnly : null;
-    sourceBrowserSelectable = Boolean(currentPath) && (!payload || payload.selectable !== false);
-    const parentPath = payload && Object.prototype.hasOwnProperty.call(payload, "parent_path") ? payload.parent_path : (currentPath ? sourceBrowserParent(currentPath) : null);
     const snapshot = payload && (payload.is_snapshot === true || payload.snapshot === true) || sourceBrowserSnapshotPath(currentPath);
+    const backupPlanSelection = sourceBrowserTarget.inputId === "backup-source-subpath";
+    // Browsing is selection assistance, not the authority for plan creation.
+    // Operational plans require a named ZFS snapshot, while the create-plan
+    // endpoint remains authoritative for containment and read-only mount state.
+    sourceBrowserSelectable = Boolean(currentPath) && (!backupPlanSelection || snapshot);
+    const parentPath = payload && Object.prototype.hasOwnProperty.call(payload, "parent_path") ? payload.parent_path : (currentPath ? sourceBrowserParent(currentPath) : null);
     const scopeBadge = snapshot
-      ? '<span class="source-browser-scope snapshot"><span aria-hidden="true">◆</span> Snapshot path</span>'
-      : sourceBrowserReadOnly === true
-        ? '<span class="source-browser-scope readonly"><span aria-hidden="true">✓</span> Read-only mount</span>'
-        : '<span class="source-browser-scope caution"><span aria-hidden="true">!</span> Verify immutable snapshot</span>';
+      ? '<span class="source-browser-scope snapshot"><span aria-hidden="true">◆</span> ZFS snapshot</span>'
+      : backupPlanSelection
+        ? '<span class="source-browser-scope caution"><span aria-hidden="true">i</span> Open a ZFS snapshot</span>'
+        : sourceBrowserReadOnly === true
+        ? '<span class="source-browser-scope readonly"><span aria-hidden="true">✓</span> Read-only source</span>'
+        : '<span class="source-browser-scope caution"><span aria-hidden="true">i</span> Checked when saved</span>';
     const empty = '<div class="source-browser-empty"><span aria-hidden="true">□</span><strong>This directory is empty</strong><small>Choose a different folder or use this empty scope intentionally.</small></div>';
-    const selectionBlocker = pick(payload, "selection_blocker", "blocked_reason", "reason") || (!currentPath ? "Open a directory below the source root first." : "This directory cannot be selected by the server.");
-    panel.innerHTML = '<div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="source-browser-navigate" data-path="' + esc(parentPath || "") + '" aria-label="Open parent directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Source path">' + sourceBrowserBreadcrumbs(currentPath) + '</nav><button class="icon-button" type="button" data-action="close-source-browser" aria-label="Close source browser">&times;</button></div><div class="source-browser-context"><div><span>Browsing</span><code>/source' + (currentPath ? "/" + esc(currentPath) : "") + '</code></div>' + scopeBadge + '</div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Action</span></div><div class="source-browser-entries" role="table" aria-label="Files and directories in ' + esc(currentPath || "source root") + '">' + (entries.length ? entries.map((entry) => sourceBrowserEntry(entry, currentPath)).join("") : empty) + '</div><div class="source-browser-footer"><div class="source-browser-selection"><span>Backup scope</span><strong>' + esc(currentPath || "Open a folder to select it") + '</strong><small>' + esc(sourceBrowserSelectable ? "Every visible file and nested folder beneath the selected directory is included in one Full backup." : selectionBlocker) + '</small></div><button class="button button-primary" type="button" data-action="select-source-directory"' + (sourceBrowserSelectable ? "" : ' disabled title="' + esc(selectionBlocker) + '"') + '>Use this directory</button></div><p class="source-browser-live" id="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + " entries loaded") + "</p>";
+    const selectionBlocker = !currentPath
+      ? "Open a folder below the source root first."
+      : backupPlanSelection && !snapshot
+        ? "Open a folder inside .zfs/snapshot/<snapshot-name> before selecting it."
+        : "";
+    panel.innerHTML = '<div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="source-browser-navigate" data-path="' + esc(parentPath || "") + '" aria-label="Open parent directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Source path">' + sourceBrowserBreadcrumbs(currentPath) + '</nav><button class="icon-button" type="button" data-action="close-source-browser" aria-label="Close source browser">&times;</button></div><div class="source-browser-context"><div><span>Browsing</span><code>/source' + (currentPath ? "/" + esc(currentPath) : "") + '</code></div>' + scopeBadge + '</div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Open</span></div><div class="source-browser-entries" role="list" aria-label="Files and directories in ' + esc(currentPath || "source root") + '">' + (entries.length ? entries.map((entry) => sourceBrowserEntry(entry, currentPath)).join("") : empty) + '</div><div class="source-browser-footer"><div class="source-browser-selection"><span>Selected folder</span><strong>' + esc(currentPath || "Open a folder to select it") + '</strong><small>' + esc(sourceBrowserSelectable ? "Everything inside this folder will be included in the Full backup." : selectionBlocker) + '</small></div><button class="button button-primary" type="button" data-action="select-source-directory"' + (sourceBrowserSelectable ? "" : ' disabled title="' + esc(selectionBlocker) + '"') + '>Select this folder</button></div><p class="source-browser-live" id="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + " entries loaded") + "</p>";
   }
 
   async function loadSourceBrowser(path, focusEntries) {
@@ -3617,7 +3627,7 @@
     input.dispatchEvent(new Event("input", { bubbles: true }));
     if (summary) {
       summary.hidden = false;
-      summary.innerHTML = '<span aria-hidden="true">✓</span><div><strong>Directory selected</strong><code>/source/' + esc(sourceBrowserPath) + '</code><small>' + (sourceBrowserSnapshotPath(sourceBrowserPath) ? "This path is inside a visible ZFS snapshot namespace." : sourceBrowserReadOnly === true ? "The API reports this path on a read-only mount; immutable-snapshot attestation is still required." : "Confirm this directory is an immutable read-only snapshot before creating the plan.") + "</small></div>";
+      summary.innerHTML = '<span aria-hidden="true">✓</span><div><strong>Folder selected</strong><code>/source/' + esc(sourceBrowserPath) + '</code><small>' + (sourceBrowserSnapshotPath(sourceBrowserPath) ? "ZFS snapshot selected. TapeScale will verify read-only access when you save." : "TapeScale will verify containment and read-only access when you save.") + "</small></div>";
     }
     closeSourceBrowser();
     const name = document.getElementById(sourceBrowserTarget.nameId);
@@ -3634,23 +3644,18 @@
     })();
     const poolOptions = ['<option value="">No fixed pool</option>'].concat(state.data.mediaPools.filter((pool) => pick(pool, "purpose") !== "cleaning").map((pool) => '<option value="' + esc(recordId(pool)) + '">' + esc(label(pick(pool, "name"))) + " · " + esc(human(pick(pool, "purpose") || "routine")) + "</option>"));
     const body = [
-      '<form id="backup-profile-form">',
-      '<div class="backup-boundary"><span aria-hidden="true">B</span><div><strong>Full single-tape protection plan</strong><p>Choose one directory beneath the configured source mount. Every file and nested folder in that scope is written together as one Full backup.</p></div></div>',
+      '<form id="backup-profile-form" data-timezone="' + esc(timezone) + '">',
+      '<div class="backup-boundary"><span aria-hidden="true">1</span><div><strong>Choose one folder</strong><p>Everything inside it is written together as one Full backup. No tape is touched while saving this plan.</p></div></div>',
       '<div class="form-grid">',
       '<div class="form-field full"><label for="backup-profile-name">Plan name</label><input class="input" id="backup-profile-name" name="name" maxlength="128" required placeholder="Sports archive full backup"></div>',
-      '<div class="form-field full backup-source-field"><label for="backup-source-subpath">Source directory</label><div class="source-browser-input"><input class="input input-mono" id="backup-source-subpath" name="source_subpath" maxlength="512" required autocomplete="off" placeholder="tank/media/.zfs/snapshot/nightly"><button class="button button-quiet" type="button" data-action="open-source-browser" data-browser-target="backup" aria-controls="backup-source-browser" aria-expanded="false"><span aria-hidden="true">▰</span> Browse</button></div><small>Browse graphically or enter a contained relative path manually. Files are shown for context; the backup root must be a directory. A path inside <code>.zfs/snapshot</code> is preferred.</small><div class="source-browser-selected" id="backup-source-selection" hidden></div></div>',
+      '<div class="form-field full backup-source-field"><label for="backup-source-subpath">Snapshot folder to back up</label><div class="source-browser-input"><input class="input input-mono" id="backup-source-subpath" name="source_subpath" maxlength="512" required autocomplete="off" placeholder="Choose a ZFS snapshot folder"><button class="button button-primary" type="button" data-action="open-source-browser" data-browser-target="backup" aria-controls="backup-source-browser" aria-expanded="false"><span aria-hidden="true">▰</span> Choose folder</button></div><small>Choose a folder inside <code>.zfs/snapshot/&lt;snapshot-name&gt;</code>. TapeScale verifies containment and read-only mount state when you save.</small><div class="source-browser-selected" id="backup-source-selection" hidden></div></div>',
       '<section class="backup-source-browser" id="backup-source-browser" aria-label="Source file browser" hidden></section>',
-      '<div class="form-field"><label for="backup-media-pool">Preferred media pool</label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div>',
-      '<div class="form-field"><label for="backup-retention-days">Retention days</label><input class="input" id="backup-retention-days" name="retention_days" type="number" min="1" max="36500" value="28" required></div>',
-      '<div class="form-field"><label for="backup-timezone">Site timezone</label><input class="input" id="backup-timezone" name="schedule_timezone" maxlength="128" value="' + esc(timezone) + '" required></div>',
-      '<div class="form-field"><label>Run level</label><input class="input" value="Full only" disabled></div>',
-      '<div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="schedule_enabled"> Queue a full backup every Saturday at 02:00 in this timezone.</label><small>Scheduled runs wait durably for attended media assignment. They never select or overwrite tape automatically.</small></div>',
-      '<div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="source_snapshot_attested_read_only" required> I attest this directory resolves to an immutable, read-only snapshot for every run.</label></div>',
-      '<div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="limitations_acknowledged" required> I understand this current gate is single-volume, unencrypted, and full-readback verified.</label></div>',
-      '<div class="form-field full"><label for="backup-profile-operator">Operator</label><input class="input" id="backup-profile-operator" name="requested_by_label" maxlength="128" value="Web operator" required></div>',
+      '<div class="form-field"><label for="backup-retention-days">Keep completed backups for</label><div class="input-suffix"><input class="input" id="backup-retention-days" name="retention_days" type="number" min="1" max="36500" value="28" required><span>days</span></div></div>',
+      '<div class="form-field"><label for="backup-media-pool">Tape pool <small>(optional)</small></label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div>',
+      '<div class="form-field full"><div class="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Manual Full backup · one tape · complete readback</strong><small>Use Run now when you are ready. Automatic rolling snapshots and recurring schedules are not enabled yet.</small></div></div></div>',
       '</div>',
-      '<p class="notice danger" id="backup-profile-error" hidden></p>',
-      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Create backup plan</button></div>',
+      '<p class="notice danger" id="backup-profile-error" role="alert" aria-live="assertive" hidden></p>',
+      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Save plan</button></div>',
       '</form>'
     ].join("");
     sourceBrowserRequest += 1;
@@ -3666,8 +3671,16 @@
     const values = new FormData(form);
     const submit = form.querySelector('[type="submit"]');
     const errorBox = form.querySelector("#backup-profile-error");
+    const source = String(values.get("source_subpath") || "").trim();
+    if (!sourceBrowserSnapshotPath(source)) {
+      errorBox.textContent = "Choose a folder inside .zfs/snapshot/<snapshot-name>.";
+      errorBox.hidden = false;
+      const chooser = form.querySelector('[data-action="open-source-browser"]');
+      if (chooser) chooser.focus();
+      return;
+    }
     submit.disabled = true;
-    submit.textContent = "Creating plan…";
+    submit.textContent = "Saving…";
     errorBox.hidden = true;
     try {
       const response = await request(endpoints.backupProfiles, {
@@ -3675,22 +3688,12 @@
         headers: { Accept: "application/json", "Content-Type": "application/json" },
         body: JSON.stringify({
           name: String(values.get("name") || "").trim(),
-          source_subpath: String(values.get("source_subpath") || "").trim(),
+          source_subpath: source,
           media_pool_id: String(values.get("media_pool_id") || "") || null,
-          schedule_timezone: String(values.get("schedule_timezone") || "UTC").trim(),
-          full_schedule: "0 2 * * 6",
-          schedule_enabled: values.get("schedule_enabled") === "on",
+          schedule_timezone: form.dataset.timezone || "UTC",
+          schedule_enabled: false,
           retention_days: Number(values.get("retention_days")),
-          representation: "file",
-          requested_level: "full",
-          verification_mode: "full_readback",
-          encryption_enabled: false,
-          spanning_enabled: false,
-          source_snapshot_attested_read_only: values.get("source_snapshot_attested_read_only") === "on",
-          immutable_snapshot_confirmed: values.get("source_snapshot_attested_read_only") === "on",
-          limitations_acknowledged: values.get("limitations_acknowledged") === "on",
-          requested_by_label: String(values.get("requested_by_label") || "").trim(),
-          actor_label: String(values.get("requested_by_label") || "").trim()
+          requested_by_label: "Web operator"
         })
       });
       const profile = response && (response.profile || response);
@@ -3699,12 +3702,12 @@
       await loadOne("backupProfiles");
       updateChrome();
       render();
-      toast("Backup plan created", "The plan is ready for an attended full run. No tape has been written.");
+      toast("Backup plan saved", "Use Run now when you are ready. No tape has been written.");
     } catch (error) {
       errorBox.textContent = errorMessage(error);
       errorBox.hidden = false;
       submit.disabled = false;
-      submit.textContent = "Create backup plan";
+      submit.textContent = "Save plan";
     }
   }
 
@@ -3713,13 +3716,12 @@
     if (!profile) return;
     const source = pick(profile, "source_subpath", "source_path", "logical_root");
     const idempotencyKey = operationKey("manual-backup");
-    const body = '<form id="start-backup-form" data-profile-id="' + esc(profileId) + '" data-idempotency-key="' + esc(idempotencyKey) + '"><div class="backup-boundary warning"><span aria-hidden="true">▶</span><div><strong>Queue a durable full backup</strong><p>' + esc(backupProfileName(profile)) + " will inventory " + esc(label(source)) + '. The run waits for explicit drive and scratch-media assignment before any tape write.</p></div></div><div class="backup-start-facts"><div><span>Representation</span><strong>File</strong></div><div><span>Level</span><strong>Full</strong></div><div><span>Volumes</span><strong>Exactly one</strong></div><div><span>Verification</span><strong>Full readback</strong></div></div><div class="form-grid"><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="source_snapshot_attested_read_only" required> The configured source currently resolves to the approved immutable read-only snapshot.</label></div><div class="form-field full"><label for="backup-start-operator">Operator</label><input class="input" id="backup-start-operator" name="requested_by_label" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="start-backup-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Queue full backup</button></div></form>';
+    const body = '<form id="start-backup-form" data-profile-id="' + esc(profileId) + '" data-idempotency-key="' + esc(idempotencyKey) + '"><div class="backup-boundary"><span aria-hidden="true">▶</span><div><strong>Start this Full backup?</strong><p>TapeScale will verify <code>' + esc(label(source)) + '</code>, then create a durable request waiting for your drive and scratch tape. Nothing is overwritten yet.</p></div></div><div class="backup-start-facts"><div><span>Source</span><strong>' + esc(label(source)) + '</strong></div><div><span>Backup</span><strong>Full</strong></div><div><span>Tapes</span><strong>One</strong></div><div><span>After write</span><strong>Complete readback</strong></div></div><p class="notice danger" id="start-backup-error" role="alert" aria-live="assertive" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Start backup</button></div></form>';
     openModal("Run " + backupProfileName(profile), body);
   }
 
   async function submitStartBackup(form) {
     const profileId = form.dataset.profileId;
-    const values = new FormData(form);
     const submit = form.querySelector('[type="submit"]');
     const errorBox = form.querySelector("#start-backup-error");
     submit.disabled = true;
@@ -3731,9 +3733,7 @@
         headers: { Accept: "application/json", "Content-Type": "application/json" },
         body: JSON.stringify({
           idempotency_key: form.dataset.idempotencyKey || operationKey("manual-backup"),
-          requested_by_label: String(values.get("requested_by_label") || "").trim(),
-          actor_label: String(values.get("requested_by_label") || "").trim(),
-          source_snapshot_attested_read_only: values.get("source_snapshot_attested_read_only") === "on"
+          requested_by_label: "Web operator"
         })
       });
       const run = response && (response.run || response.backup_run || response.request || response);
@@ -3751,7 +3751,7 @@
       errorBox.textContent = errorMessage(error);
       errorBox.hidden = false;
       submit.disabled = false;
-      submit.textContent = "Queue full backup";
+      submit.textContent = "Start backup";
     }
   }
 

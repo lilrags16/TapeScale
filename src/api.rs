@@ -24,7 +24,10 @@ use uuid::Uuid;
 use crate::{
     backup_ops,
     custody_ops::{self, CustodyActor, CustodyOpsError},
-    data_path::{isolated_restore_destination, resolve_existing_selection, verify_read_only_mount},
+    data_path::{
+        isolated_restore_destination, resolve_existing_selection,
+        resolve_existing_zfs_snapshot_selection, verify_read_only_mount,
+    },
     device::SasMotionOperation,
     domain::{
         path::validate_archive_path,
@@ -370,8 +373,14 @@ struct CreateBackupProfileRequest {
     retention_days: i32,
     #[serde(default)]
     media_pool_id: Option<Uuid>,
-    source_snapshot_attested_read_only: bool,
-    limitations_acknowledged: bool,
+    // Kept as optional, ignored compatibility fields for clients released
+    // before the server made its read-only mount check authoritative. Plan
+    // creation must not require an operator to restate a property the API can
+    // and does verify itself.
+    #[serde(default, rename = "source_snapshot_attested_read_only")]
+    _legacy_source_snapshot_attested_read_only: Option<bool>,
+    #[serde(default, rename = "limitations_acknowledged")]
+    _legacy_limitations_acknowledged: Option<bool>,
     #[serde(default)]
     requested_by_label: Option<String>,
 }
@@ -400,12 +409,6 @@ async fn create_backup_profile(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     require_file_roundtrip(&state)?;
     let pool = require_pool(&state)?;
-    if !request.source_snapshot_attested_read_only || !request.limitations_acknowledged {
-        return Err(AppError::Invalid(
-            "source_snapshot_attested_read_only and limitations_acknowledged must both be true"
-                .to_owned(),
-        ));
-    }
     let name = request.name.trim();
     if name.is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) {
         return Err(AppError::Invalid(
@@ -435,9 +438,29 @@ async fn create_backup_profile(
             ));
         }
     }
-    let source_subpath = normalized_relative_path(&request.source_subpath, "source_subpath")?;
-    let source_mount = resolve_existing_selection(&state.source_root, &source_subpath)
-        .map_err(|error| AppError::Blocked(error.to_string()))?;
+    let requested_source_subpath =
+        normalized_relative_path(&request.source_subpath, "source_subpath")?;
+    let source_mount =
+        resolve_existing_zfs_snapshot_selection(&state.source_root, &requested_source_subpath)
+            .map_err(|error| AppError::Blocked(error.to_string()))?;
+    let canonical_source_root = state.source_root.canonicalize().map_err(|error| {
+        AppError::Blocked(format!(
+            "configured source root {} is unavailable: {error}",
+            state.source_root.display()
+        ))
+    })?;
+    let source_subpath = source_mount
+        .strip_prefix(&canonical_source_root)
+        .map_err(|_| {
+            AppError::Blocked(
+                "resolved backup source escaped the configured source root".to_owned(),
+            )
+        })?
+        .to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            AppError::Blocked("resolved backup source must be valid UTF-8".to_owned())
+        })?;
     verify_read_only_mount(&source_mount).map_err(|error| AppError::Blocked(error.to_string()))?;
     let restore_subpath = "backup-rehearsals".to_owned();
     let restore_probe =
@@ -495,7 +518,10 @@ async fn create_backup_profile(
 
 #[derive(Debug, Deserialize)]
 struct CreateBackupRunRequest {
-    source_snapshot_attested_read_only: bool,
+    // Accepted only for compatibility with older clients. The API verifies the
+    // configured source again instead of asking an operator to certify it.
+    #[serde(default, rename = "source_snapshot_attested_read_only")]
+    _legacy_source_snapshot_attested_read_only: Option<bool>,
     #[serde(default)]
     requested_by_label: Option<String>,
     #[serde(default)]
@@ -510,21 +536,78 @@ async fn create_backup_run(
     require_file_roundtrip(&state)?;
     let pool = require_pool(&state)?;
     let profile_id = parse_uuid_path(&id, "backup profile")?;
-    if !request.source_snapshot_attested_read_only {
-        return Err(AppError::Invalid(
-            "source_snapshot_attested_read_only must be true".to_owned(),
-        ));
-    }
     let actor = backup_actor_label(request.requested_by_label.as_deref())?;
     let idempotency_key = request
         .idempotency_key
         .unwrap_or_else(|| format!("manual:{}", Uuid::now_v7()));
+    if let Some(existing) =
+        backup_ops::get_backup_request_by_idempotency_key(pool, profile_id, &idempotency_key)
+            .await
+            .map_err(map_backup_ops_error)?
+    {
+        return backup_run_response(
+            pool,
+            backup_ops::CreateBackupRequestResult::Existing(existing),
+        )
+        .await;
+    }
+    let profile = backup_ops::get_backup_profile(pool, profile_id)
+        .await
+        .map_err(map_backup_ops_error)?
+        .ok_or(AppError::NotFound)?;
+    let source_preflight =
+        resolve_existing_zfs_snapshot_selection(&state.source_root, &profile.source_subpath)
+            .map_err(|error| AppError::Blocked(error.to_string()))
+            .and_then(|source_mount| {
+                let persisted_source_mount = std::fs::canonicalize(&profile.source_mount_path)
+                    .map_err(|error| {
+                        AppError::Blocked(format!(
+                            "configured backup source mount {} is unavailable: {error}",
+                            profile.source_mount_path
+                        ))
+                    })?;
+                if source_mount != persisted_source_mount {
+                    return Err(AppError::Blocked(
+                        "configured backup source no longer resolves to its retained snapshot mount"
+                            .to_owned(),
+                    ));
+                }
+                verify_read_only_mount(&source_mount)
+                    .map_err(|error| AppError::Blocked(error.to_string()))
+            });
+    if let Err(error) = source_preflight {
+        // A concurrent request may have committed after the first lookup but
+        // before this source check. Preserve exact idempotent replay semantics
+        // even if the configured snapshot disappeared during that interval.
+        if let Some(existing) = backup_ops::get_backup_request_by_idempotency_key_serialized(
+            pool,
+            profile_id,
+            &idempotency_key,
+        )
+        .await
+        .map_err(map_backup_ops_error)?
+        {
+            return backup_run_response(
+                pool,
+                backup_ops::CreateBackupRequestResult::Existing(existing),
+            )
+            .await;
+        }
+        return Err(error);
+    }
     let disposition =
         backup_ops::create_manual_backup_request(pool, profile_id, &idempotency_key, &actor)
             .await
             .map_err(map_backup_ops_error)?;
+    backup_run_response(pool, disposition).await
+}
+
+async fn backup_run_response(
+    pool: &PgPool,
+    disposition: backup_ops::CreateBackupRequestResult,
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let created = matches!(
-        disposition,
+        &disposition,
         backup_ops::CreateBackupRequestResult::Created(_)
     );
     let response_state = disposition.record().state.clone();
@@ -3590,6 +3673,53 @@ mod tests {
         let mut request = valid_request();
         request.barcode = Some("   ".to_owned());
         assert_eq!(request.validate().expect("request is valid").barcode, None);
+    }
+
+    #[test]
+    fn backup_plan_legacy_acknowledgements_are_optional_and_backward_compatible() {
+        let without_legacy_fields: CreateBackupProfileRequest = serde_json::from_value(json!({
+            "name": "Radio archive",
+            "source_subpath": "pool/archive/.zfs/snapshot/nightly"
+        }))
+        .expect("the simplified request should deserialize");
+        assert_eq!(
+            without_legacy_fields._legacy_source_snapshot_attested_read_only,
+            None
+        );
+        assert_eq!(without_legacy_fields._legacy_limitations_acknowledged, None);
+
+        let old_client_payload: CreateBackupProfileRequest = serde_json::from_value(json!({
+            "name": "Radio archive",
+            "source_subpath": "pool/archive/.zfs/snapshot/nightly",
+            "source_snapshot_attested_read_only": false,
+            "limitations_acknowledged": true
+        }))
+        .expect("legacy acknowledgement fields should remain accepted");
+        assert_eq!(
+            old_client_payload._legacy_source_snapshot_attested_read_only,
+            Some(false)
+        );
+        assert_eq!(
+            old_client_payload._legacy_limitations_acknowledged,
+            Some(true)
+        );
+
+        let run_without_attestation: CreateBackupRunRequest =
+            serde_json::from_value(json!({"idempotency_key": "manual-radio-001"}))
+                .expect("the simplified run request should deserialize");
+        assert_eq!(
+            run_without_attestation._legacy_source_snapshot_attested_read_only,
+            None
+        );
+
+        let legacy_run: CreateBackupRunRequest = serde_json::from_value(json!({
+            "source_snapshot_attested_read_only": false
+        }))
+        .expect("the legacy run field should remain accepted");
+        assert_eq!(
+            legacy_run._legacy_source_snapshot_attested_read_only,
+            Some(false)
+        );
     }
 
     #[test]

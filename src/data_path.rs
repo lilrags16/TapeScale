@@ -9,13 +9,14 @@ use std::{
     ffi::OsStr,
     fs::{self, File, Metadata},
     io::{self, Read, Write},
+    os::fd::AsFd,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use rustix::{
-    fs::{mkdirat, open, openat, Mode, OFlags},
+    fs::{fstatvfs, mkdirat, open, openat, Mode, OFlags, StatVfsMountFlags},
     io::Errno,
 };
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,8 @@ pub enum ManifestError {
     InvalidRoot(PathBuf),
     #[error("source selection is not on a read-only mount: {0}")]
     WritableSource(PathBuf),
+    #[error("source selection must be inside a named ZFS snapshot: {0}")]
+    NotNamedZfsSnapshot(PathBuf),
     #[error("path escaped the configured root: {0}")]
     EscapedRoot(PathBuf),
     #[error("unsupported source object at {path}: {kind}")]
@@ -207,6 +210,51 @@ pub fn resolve_existing_selection(
     Ok(candidate)
 }
 
+/// Resolve one operational backup source and prove that both the requested
+/// path and its canonical target remain beneath `.zfs/snapshot/<name>`.
+///
+/// Checking both forms prevents a manually entered symlink inside a snapshot
+/// from resolving back into a mutable live dataset while still looking safe in
+/// the persisted request string.
+pub fn resolve_existing_zfs_snapshot_selection(
+    configured_root: &Path,
+    relative: &str,
+) -> Result<PathBuf, ManifestError> {
+    let requested = Path::new(relative);
+    if !is_named_zfs_snapshot_path(requested) {
+        return Err(ManifestError::NotNamedZfsSnapshot(requested.to_owned()));
+    }
+
+    let root = configured_root
+        .canonicalize()
+        .map_err(|source| ManifestError::Io {
+            path: configured_root.to_owned(),
+            source,
+        })?;
+    let resolved = resolve_existing_selection(&root, relative)?;
+    let canonical_relative = resolved
+        .strip_prefix(&root)
+        .map_err(|_| ManifestError::EscapedRoot(resolved.clone()))?;
+    if !is_named_zfs_snapshot_path(canonical_relative) {
+        return Err(ManifestError::NotNamedZfsSnapshot(resolved));
+    }
+    Ok(resolved)
+}
+
+#[must_use]
+pub fn is_named_zfs_snapshot_path(path: &Path) -> bool {
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    components
+        .windows(3)
+        .any(|window| window[0] == ".zfs" && window[1] == "snapshot")
+}
+
 /// Prove the source is covered by the most-specific read-only Linux mount.
 /// Container deployments bind the TrueNAS snapshot tree at `/source:ro`; this
 /// check makes the immutability assertion independently visible to the worker.
@@ -215,16 +263,33 @@ pub fn verify_read_only_mount(path: &Path) -> Result<(), ManifestError> {
         path: path.to_owned(),
         source,
     })?;
-    let mountinfo =
-        fs::read_to_string("/proc/self/mountinfo").map_err(|source| ManifestError::Io {
-            path: PathBuf::from("/proc/self/mountinfo"),
-            source,
-        })?;
-    if read_only_mount_for(&canonical, &mountinfo) == Some(true) {
+    let directory = open(
+        &canonical,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| ManifestError::Io {
+        path: canonical.clone(),
+        source: source.into(),
+    })?;
+    if descriptor_is_on_read_only_mount(&directory).map_err(|source| ManifestError::Io {
+        path: canonical.clone(),
+        source,
+    })? {
         Ok(())
     } else {
         Err(ManifestError::WritableSource(canonical))
     }
+}
+
+/// Ask the kernel for the mount flags attached to an already-open path.
+///
+/// An open descriptor retains the exact bind mount used to reach the source,
+/// so this avoids translating `/proc/self/fd/*` back into a pathname and then
+/// trying to rediscover the matching mount from `/proc/self/mountinfo`.
+pub fn descriptor_is_on_read_only_mount<Fd: AsFd>(descriptor: Fd) -> io::Result<bool> {
+    let status = fstatvfs(descriptor).map_err(io::Error::from)?;
+    Ok(mount_flags_are_read_only(status.f_flag))
 }
 
 /// Construct a destination path without creating it. Every component remains
@@ -702,42 +767,8 @@ fn validate_relative(value: &str) -> Result<(), ManifestError> {
     Ok(())
 }
 
-fn read_only_mount_for(path: &Path, mountinfo: &str) -> Option<bool> {
-    mountinfo
-        .lines()
-        .filter_map(|line| {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() < 6 {
-                return None;
-            }
-            let mount_point = PathBuf::from(unescape_mountinfo(fields[4])?);
-            path.starts_with(&mount_point).then(|| {
-                let read_only = fields[5].split(',').any(|option| option == "ro");
-                (mount_point.components().count(), read_only)
-            })
-        })
-        .max_by_key(|(specificity, _)| *specificity)
-        .map(|(_, read_only)| read_only)
-}
-
-fn unescape_mountinfo(value: &str) -> Option<String> {
-    let mut decoded = String::with_capacity(value.len());
-    let mut characters = value.chars();
-    while let Some(character) = characters.next() {
-        if character != '\\' {
-            decoded.push(character);
-            continue;
-        }
-        let escape = [characters.next()?, characters.next()?, characters.next()?];
-        decoded.push(match escape {
-            ['0', '4', '0'] => ' ',
-            ['0', '1', '1'] => '\t',
-            ['0', '1', '2'] => '\n',
-            ['1', '3', '4'] => '\\',
-            _ => return None,
-        });
-    }
-    Some(decoded)
+fn mount_flags_are_read_only(flags: StatVfsMountFlags) -> bool {
+    flags.contains(StatVfsMountFlags::RDONLY)
 }
 
 fn entry_kind(metadata: &Metadata, relative: &Path) -> Result<EntryKind, ManifestError> {
@@ -1065,6 +1096,40 @@ mod tests {
     }
 
     #[test]
+    fn operational_source_requires_a_named_snapshot_after_symlink_resolution() {
+        let root = tempdir().expect("root");
+        let live = root.path().join("pool/dataset/live");
+        let snapshot = root.path().join("pool/dataset/.zfs/snapshot/nightly/files");
+        fs::create_dir_all(&live).expect("live dataset");
+        fs::create_dir_all(&snapshot).expect("snapshot directory");
+
+        assert_eq!(
+            resolve_existing_zfs_snapshot_selection(
+                root.path(),
+                "pool/dataset/.zfs/snapshot/nightly/files"
+            )
+            .expect("named snapshot"),
+            snapshot.canonicalize().expect("canonical snapshot")
+        );
+        assert!(matches!(
+            resolve_existing_zfs_snapshot_selection(root.path(), "pool/dataset/live"),
+            Err(ManifestError::NotNamedZfsSnapshot(_))
+        ));
+
+        let link = root
+            .path()
+            .join("pool/dataset/.zfs/snapshot/nightly/live-link");
+        symlink(&live, &link).expect("snapshot-to-live symlink");
+        assert!(matches!(
+            resolve_existing_zfs_snapshot_selection(
+                root.path(),
+                "pool/dataset/.zfs/snapshot/nightly/live-link"
+            ),
+            Err(ManifestError::NotNamedZfsSnapshot(_))
+        ));
+    }
+
+    #[test]
     fn restore_creation_rejects_a_symlink_replaced_after_planning() {
         let root = tempdir().expect("root");
         let outside = tempdir().expect("outside");
@@ -1167,22 +1232,18 @@ mod tests {
     }
 
     #[test]
-    fn most_specific_mount_controls_read_only_proof() {
-        let mountinfo = "1 0 0:1 / / rw - rootfs rootfs rw\n\
-                         2 1 0:2 / /source ro,nosuid - zfs pool/data ro\n\
-                         3 2 0:3 / /source/writable rw - zfs pool/writable rw\n\
-                         4 2 0:4 / /source/a\\040space ro - zfs pool/space ro\n";
-        assert_eq!(
-            read_only_mount_for(Path::new("/source/snapshot/files"), mountinfo),
-            Some(true)
-        );
-        assert_eq!(
-            read_only_mount_for(Path::new("/source/writable/file"), mountinfo),
-            Some(false)
-        );
-        assert_eq!(
-            read_only_mount_for(Path::new("/source/a space/file"), mountinfo),
-            Some(true)
-        );
+    fn kernel_mount_flags_control_read_only_proof() {
+        assert!(mount_flags_are_read_only(StatVfsMountFlags::RDONLY));
+        assert!(!mount_flags_are_read_only(StatVfsMountFlags::empty()));
+
+        let writable = tempdir().expect("writable directory");
+        let descriptor = open(
+            writable.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("directory descriptor");
+        assert!(!descriptor_is_on_read_only_mount(&descriptor)
+            .expect("kernel should report mount flags"));
     }
 }

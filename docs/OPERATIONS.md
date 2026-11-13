@@ -2,7 +2,7 @@
 
 This guide describes the intended TapeScale operating model. The current release is an engineering preview with SAS discovery, guided tape initialization, bounded graphical source/retained-manifest browsing, lab-only rewind/unload, a destructive Bacula `btape test` harness, an attended operational full-backup path, and a G0.2 Bacula restore-comparison exercise. It must not be represented as generally protecting production tape until G0/G1 qualification is complete.
 
-Procedures below distinguish the implemented preview from the broader operator acceptance target. Backup Center can queue manual or weekly Saturday 02:00 full-file requests, wait durably for an operator to assign one exact qualified drive and scratch cartridge, write through Bacula, and physically read the entire backup before retaining a recovery point. Tape selection and destructive authorization remain attended. The G0.2 path additionally restores one capture and compares independent manifests. General-purpose restore execution, encryption recovery, catalog-loss recovery, spanning, incrementals, native ZFS, and production authorization remain incomplete or unqualified.
+Procedures below distinguish the implemented preview from the broader operator acceptance target. Backup Center creates simple manual Full plans, waits durably for an operator to assign one exact qualified drive and scratch cartridge, writes through Bacula, and physically reads the entire backup before retaining a recovery point. A fixed-source Saturday scheduler exists behind the API, but the console does not offer it because it does not yet create or select a newer TrueNAS snapshot. Tape selection and destructive authorization remain attended. The G0.2 path additionally restores one capture and compares independent manifests. General-purpose restore execution, encryption recovery, catalog-loss recovery, spanning, incrementals, native ZFS, and production authorization remain incomplete or unqualified.
 
 ## Daily overview
 
@@ -19,9 +19,9 @@ The latest successful backup, latest verified recovery point, and latest complet
 
 ## Configure a backup plan
 
-In **Backup Center**, create an explicit file-mode plan for a relative path beneath the configured read-only `/source` mount. Use **Browse** to inspect one bounded directory level at a time. It displays folders plus recorded file size/mtime, never file contents; symlinks and special objects are non-navigable, and only a non-root directory can become the recursive backup scope. Prefer an immutable `.zfs/snapshot/<name>` directory. Manual relative-path entry remains available.
+In **Backup Center**, create an explicit file-mode plan for a relative path beneath the configured read-only `/source` mount. Use **Choose folder** to inspect one bounded directory level at a time. It displays folders plus recorded file size/mtime, never file contents; symlinks and special objects are non-navigable. Operational plans require a named `.zfs/snapshot/<name>` directory or one of its descendants as the recursive backup scope. Manual relative-path entry remains available but is validated by the same rule.
 
-The browser is selection assistance, not safety authority. Plan submission independently resolves and contains the path, rejects traversal and symlink escape, verifies that the container mount is read-only, and records the operator's separate immutable-snapshot attestation. That attestation does not create or hold a TrueNAS snapshot; prepare and retain the snapshot outside TapeScale before each run.
+The browser is selection assistance, not safety authority. Plan submission independently resolves and contains the path, rejects traversal and symlink escape, and verifies the exact open directory's kernel mount flags. TapeScale repeats that verification when a manual run is queued. Prepare and retain the snapshot outside TapeScale; the preview does not create or hold it.
 
 The executable preview contract is deliberately fixed:
 
@@ -31,16 +31,16 @@ The executable preview contract is deliberately fixed:
 - encryption: disabled;
 - verification: full physical readback;
 - retention: 1 to 36,500 days, default 28;
-- schedule: manual only, or Saturday at 02:00 in the selected IANA timezone;
+- schedule: manual in the console;
 - media: optional preferred scratch pool, with exact attended assignment for every request.
 
-Native ZFS, dual representation, incrementals, alternate cron expressions, multi-volume spanning, and encryption fail validation. The weekly scheduler persists an idempotent occurrence and coalesces missed weeks to the latest due full; it does not choose hardware, load media, or grant overwrite authority.
+Native ZFS, dual representation, incrementals, multi-volume spanning, and encryption fail validation. The existing API-level Saturday scheduler binds the exact same source path on every occurrence; it remains a preview mechanism rather than a rolling-backup control until TrueNAS snapshot creation/selection is implemented.
 
 ## Run and monitor a backup
 
-Choosing **Run now** or reaching a due weekly occurrence creates a durable job and backup request in `waiting_for_media`. No source read or tape write occurs until an operator assigns exact media. A run then progresses through queued/preparing, source inventory, writing, written, verifying, and verified, or to blocked/interrupted/failed/cancelled with retained evidence.
+Choosing **Run now** revalidates the source and creates a durable job and backup request in `waiting_for_media`. No source read or tape write occurs until an operator assigns exact media. A run then progresses through queued/preparing, source inventory, writing, written, verifying, and verified, or to blocked/interrupted/failed/cancelled with retained evidence.
 
-- `waiting for media` survives restart and requires operator action; TapeScale does not create a TrueNAS hold, so the operator must keep the attested snapshot immutable and available.
+- `waiting for media` survives restart and requires operator action; TapeScale does not create a TrueNAS hold, so the selected snapshot must remain available.
 - `written` is not export-ready when full read-back is required.
 - `verified` records the exact full-media read-back, manifest, catalog binding, volume record, and recovery point; it is not a restore test.
 - Unexpected unreadable paths, enumeration failure, missing keys, unsupported mandatory metadata, producer failure, or integrity error prevents a clean result.
@@ -82,8 +82,8 @@ The API reserves the selected cartridge and creates append-only events before th
 
 Use **Backup Center** only after the exact loaded drive/cartridge combination has a passed G0.1 `btape` result. Every assignment is destructive to the selected scratch cartridge.
 
-1. Create a backup plan for an existing immutable snapshot below the read-only source mount. Choose retention, an optional scratch pool, and either manual operation or the supported Saturday 02:00 schedule.
-2. Choose **Run now** or allow the scheduler to create the occurrence. Confirm the request is **Waiting for media**; this is durable demand, not evidence that the source was captured.
+1. Create a backup plan for an existing immutable snapshot below the read-only source mount. Choose retention and an optional scratch pool. TapeScale verifies the source instead of asking for a redundant read-only attestation.
+2. Choose **Run now**. Confirm the request is **Waiting for media**; this is durable demand, not evidence that the source was captured.
 3. Physically load one eligible scratch cartridge into the exact trusted and qualified drive. Check its printed identity against the inventory record and ensure no other controller uses the drive.
 4. Choose **Assign media**. Type the cartridge label, confirm that it is physically loaded, authorize complete scratch overwrite, accept the unencrypted test-gate deviation, and type `OVERWRITE <cartridge label> FOR BACKUP <request UUID>` exactly.
 5. Monitor the durable phases and append-only events. The worker re-probes identity and eligibility, reserves and fences the drive/cartridge, inventories and hashes the source, commits the destructive boundary, prepares BOT, labels the assigned volume, submits one Bacula Full job, and correlates its catalog result.
