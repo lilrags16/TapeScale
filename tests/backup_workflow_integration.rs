@@ -1633,15 +1633,26 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     .execute(&pool)
     .await
     .expect("second finalized recovery volume should persist");
+    // Verification history is append-only. Retain the original one-volume
+    // proof and append the later ordered two-volume proof used by this restore
+    // fixture instead of rewriting historical evidence.
     sqlx::query(
-        "UPDATE verification_records
-         SET media_ids = ARRAY[$1, $2]::uuid[],
-             scope = scope || jsonb_build_object('volume_count', 2)
-         WHERE recovery_point_id = $3 AND kind = 'full_readback'
-           AND outcome = 'passed'",
+        "INSERT INTO verification_records
+            (id, recovery_point_id, kind, scope, outcome, drive_id, media_ids,
+             evidence, correlation_id, started_at, finished_at)
+         SELECT $1, recovery_point_id, kind,
+                scope || jsonb_build_object('volume_count', 2), outcome,
+                drive_id, ARRAY[$2, $3]::uuid[], evidence, $4, now(), now()
+         FROM verification_records
+         WHERE recovery_point_id = $5 AND kind = 'full_readback'
+           AND outcome = 'passed'
+         ORDER BY started_at DESC, id DESC
+         LIMIT 1",
     )
+    .bind(Uuid::now_v7())
     .bind(scratch.id)
     .bind(continuation_second.id)
+    .bind(Uuid::now_v7())
     .bind(recovery_point_id)
     .execute(&pool)
     .await
