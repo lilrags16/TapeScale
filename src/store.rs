@@ -480,6 +480,7 @@ pub struct RestoreRehearsalRunRecord {
     pub adapter_version: String,
     pub format_version: String,
     pub preview_hash: String,
+    pub restore_scope: Value,
     pub production_eligible: bool,
     pub workflow_kind: String,
     pub volume_count: i32,
@@ -8750,7 +8751,7 @@ const RESTORE_REHEARSAL_RUN_SELECT: &str = "SELECT id, restore_plan_id, job_id, 
             source_mount_path, logical_root, destination_subpath,
             estimated_required_bytes, available_bytes, required_free_reserve_bytes,
             engine_name, engine_version, adapter_version, format_version,
-            preview_hash, production_eligible, workflow_kind, volume_count,
+            preview_hash, restore_scope, production_eligible, workflow_kind, volume_count,
             state, phase, requested_by_label,
             correlation_id, cancel_requested_at, cancel_requested_by_label,
             drive_lease_id, drive_fencing_token, media_lease_id, media_fencing_token,
@@ -9053,6 +9054,82 @@ fn restore_plan_recovery_point_id(plan: &RestorePlanRecord) -> Option<Uuid> {
         .and_then(|value| Uuid::parse_str(value).ok())
 }
 
+fn restore_plan_scope(plan: &RestorePlanRecord) -> Result<Value, String> {
+    let scope = plan
+        .selection
+        .get("request")
+        .and_then(|request| request.get("restore_scope"))
+        .ok_or_else(|| "the restore plan has no immutable restore scope".to_owned())?;
+    validate_restore_scope(scope)?;
+    Ok(scope.clone())
+}
+
+fn restore_scope_is_selected(scope: &Value) -> bool {
+    scope.get("kind").and_then(Value::as_str) == Some("selected_paths")
+}
+
+fn validate_restore_scope(scope: &Value) -> Result<(), String> {
+    let object = scope
+        .as_object()
+        .ok_or_else(|| "the restore plan scope is not an object".to_owned())?;
+    match object.get("kind").and_then(Value::as_str) {
+        Some("complete_point") => {
+            if object
+                .get("normalized_paths")
+                .and_then(Value::as_array)
+                .is_some_and(|paths| !paths.is_empty())
+            {
+                return Err("a complete-point restore scope cannot contain paths".to_owned());
+            }
+        }
+        Some("selected_paths") => {
+            let requested_paths = object
+                .get("requested_paths")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "the selected restore scope has no requested paths".to_owned())?;
+            if requested_paths.is_empty()
+                || requested_paths.len() > crate::data_path::MAX_RESTORE_SELECTION_PATHS
+                || requested_paths.iter().any(|path| !path.is_string())
+            {
+                return Err(format!(
+                    "the selected restore scope must contain 1 through {} requested paths",
+                    crate::data_path::MAX_RESTORE_SELECTION_PATHS
+                ));
+            }
+            let normalized_paths = object
+                .get("normalized_paths")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "the selected restore scope has no normalized paths".to_owned())?;
+            if normalized_paths.is_empty() || normalized_paths.iter().any(|path| !path.is_string())
+            {
+                return Err("the selected restore scope has invalid normalized paths".to_owned());
+            }
+            // Hard-link closure can legitimately add more normalized roots
+            // than the client request limit. The authenticated resolver and
+            // one-megabyte scope bound remain authoritative for that expanded
+            // set; the 256-path limit applies only to operator input.
+            for field in [
+                "manifest_digest",
+                "selected_manifest_digest",
+                "selection_hash",
+            ] {
+                if !object
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(valid_sha256)
+                {
+                    return Err(format!("the selected restore scope has an invalid {field}"));
+                }
+            }
+        }
+        _ => return Err("the restore plan scope kind is unsupported".to_owned()),
+    }
+    if serde_json::to_vec(scope).map_or(true, |bytes| bytes.len() > 1_048_576) {
+        return Err("the immutable restore scope exceeds its storage bound".to_owned());
+    }
+    Ok(())
+}
+
 fn restore_rehearsal_destination(plan: &RestorePlanRecord) -> Result<String, String> {
     let path = plan
         .destination
@@ -9131,6 +9208,21 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn restore_scope_expected_manifest_digest<'a>(
+    scope: &'a Value,
+    complete_manifest_digest: &'a str,
+) -> Option<(&'static str, &'a str)> {
+    match scope.get("kind").and_then(Value::as_str)? {
+        "complete_point" => Some(("restore_test", complete_manifest_digest)),
+        "selected_paths" => scope
+            .get("selected_manifest_digest")
+            .and_then(Value::as_str)
+            .filter(|digest| valid_sha256(digest))
+            .map(|digest| ("selective_restore_test", digest)),
+        _ => None,
+    }
+}
+
 fn parse_bacula_job_id(value: Option<&str>) -> Option<i64> {
     value?
         .strip_prefix("bacula-job:")?
@@ -9191,6 +9283,13 @@ pub async fn queue_restore_rehearsal(
     let Some(plan) = plan else {
         transaction.rollback().await?;
         return Ok(QueueRestoreRehearsalResult::NotFound);
+    };
+    let restore_scope = match restore_plan_scope(&plan) {
+        Ok(scope) => scope,
+        Err(reason) => {
+            transaction.rollback().await?;
+            return Ok(QueueRestoreRehearsalResult::Blocked(reason));
+        }
     };
     let existing = sqlx::query_as::<_, RestoreRehearsalRunRecord>(&format!(
         "{RESTORE_REHEARSAL_RUN_SELECT}
@@ -9353,7 +9452,12 @@ pub async fn queue_restore_rehearsal(
             && candidate.reserved_by.is_none()
     });
 
-    let eligibility_blocker = if origin.recovery_point_id != recovery_point_id
+    let eligibility_blocker = if restore_scope_is_selected(&restore_scope) && volume_count != 1 {
+        Some(
+            "selected-path restore execution currently requires a single-volume recovery point"
+                .to_owned(),
+        )
+    } else if origin.recovery_point_id != recovery_point_id
         || origin.representation != "file"
         || origin.level != "full"
         || origin.recovery_status != "verified"
@@ -9537,13 +9641,14 @@ pub async fn queue_restore_rehearsal(
              source_manifest_size_bytes, source_mount_path, logical_root,
              destination_subpath, estimated_required_bytes, available_bytes,
              required_free_reserve_bytes, engine_name, engine_version,
-             adapter_version, format_version, preview_hash, workflow_kind, volume_count,
+             adapter_version, format_version, preview_hash, restore_scope,
+             workflow_kind, volume_count,
              requested_by_label, correlation_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                  $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
                  $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
                  $31, $32, $33, $34, $35, $36, $37, $38, $39, $40,
-                 $41, $42)",
+                 $41, $42, $43)",
     )
     .bind(id)
     .bind(restore_plan_id)
@@ -9583,6 +9688,7 @@ pub async fn queue_restore_rehearsal(
     .bind(&origin.adapter_version)
     .bind(&origin.format_version)
     .bind(preview_hash)
+    .bind(&restore_scope)
     .bind(&origin.workflow_kind)
     .bind(volume_count)
     .bind(requested_by_label)
@@ -9672,6 +9778,7 @@ pub async fn queue_restore_rehearsal(
             "estimated_required_bytes": estimated_required_bytes,
             "available_bytes": available_bytes,
             "required_free_reserve_bytes": required_free_reserve_bytes,
+            "restore_scope": restore_scope,
             "operator_attestations": {
                 "confirmation": attestations.confirmation,
                 "tape_loaded_confirmed": attestations.tape_loaded_confirmed,
@@ -9681,7 +9788,7 @@ pub async fn queue_restore_rehearsal(
                 "safety_authority": false
             },
             "origin_workflow_kind": origin.workflow_kind,
-            "scope": "attended ordered-volume full-file recovery replay",
+            "scope": "attended ordered-volume manifest-bound recovery replay",
             "production_eligible": false
         }),
         requested_by_label,
@@ -10037,6 +10144,7 @@ pub async fn claim_next_restore_rehearsal_run(
             && candidate.confirmed_location_id.is_some()
             && candidate.reserved_by.as_deref() == Some(expected_reservation.as_str())
     });
+    let current_restore_scope = restore_plan_scope(&plan);
     let ledger_matches_source = restore_volumes.len() == volumes.len()
         && volumes
             .iter()
@@ -10064,7 +10172,12 @@ pub async fn claim_next_restore_rehearsal_run(
                     && snapshot.media_lease_id.is_none()
                     && snapshot.media_fencing_token.is_none()
             });
-    let blocker = if run.cancel_requested_at.is_some() {
+    let blocker = if restore_scope_is_selected(&run.restore_scope) && volume_count != 1 {
+        Some(
+            "selected-path restore execution currently requires a single-volume recovery point"
+                .to_owned(),
+        )
+    } else if run.cancel_requested_at.is_some() {
         Some("the recovery rehearsal was cancelled before worker dispatch".to_owned())
     } else if plan.preview_hash != run.preview_hash
         || plan.expires_at <= Utc::now()
@@ -10075,6 +10188,7 @@ pub async fn claim_next_restore_rehearsal_run(
             .and_then(Value::as_bool)
             != Some(true)
         || !plan.blockers.as_array().is_some_and(Vec::is_empty)
+        || current_restore_scope.as_ref() != Ok(&run.restore_scope)
     {
         Some("the restore plan expired, changed, or is no longer ready".to_owned())
     } else if plan.dependency_chain != vec![run.recovery_point_id]
@@ -11691,8 +11805,16 @@ pub async fn finalize_restore_rehearsal_pass(
         .get("source_manifest_digest")
         .and_then(Value::as_str)
         .filter(|value| valid_sha256(value));
+    let retained_manifest_digest = result
+        .get("retained_manifest_digest")
+        .and_then(Value::as_str)
+        .filter(|value| valid_sha256(value));
     let restored_manifest_digest = result
         .get("restored_manifest_digest")
+        .and_then(Value::as_str)
+        .filter(|value| valid_sha256(value));
+    let raw_restored_manifest_digest = result
+        .get("raw_restored_manifest_digest")
         .and_then(Value::as_str)
         .filter(|value| valid_sha256(value));
     let report_comparison = result.get("comparison");
@@ -11705,6 +11827,8 @@ pub async fn finalize_restore_rehearsal_pass(
         Some(restored_manifest_sha256),
         Some(source_manifest_digest),
         Some(restored_manifest_digest),
+        Some(raw_restored_manifest_digest),
+        Some(retained_manifest_digest),
         Some(report_comparison),
     ) = (
         source_backup_job_id,
@@ -11715,6 +11839,8 @@ pub async fn finalize_restore_rehearsal_pass(
         restored_manifest_sha256,
         source_manifest_digest,
         restored_manifest_digest,
+        raw_restored_manifest_digest,
+        retained_manifest_digest,
         report_comparison,
     )
     else {
@@ -11723,6 +11849,17 @@ pub async fn finalize_restore_rehearsal_pass(
                 .to_owned(),
         ));
     };
+    let Some((verification_kind, expected_comparison_digest)) =
+        restore_scope_expected_manifest_digest(
+            &claim.run.restore_scope,
+            &claim.run.source_manifest_digest,
+        )
+    else {
+        return Ok(FinalizeRestoreRehearsalResult::Rejected(
+            "the queued restore scope has no valid expected manifest digest".to_owned(),
+        ));
+    };
+    let selective = verification_kind == "selective_restore_test";
     let Ok(restore_job_id_i64) = i64::try_from(restore_job_id) else {
         return Ok(FinalizeRestoreRehearsalResult::Rejected(
             "restore JobId exceeds the supported catalog range".to_owned(),
@@ -11753,17 +11890,18 @@ pub async fn finalize_restore_rehearsal_pass(
             .get("restore_destination")
             .and_then(Value::as_str)
             .is_none_or(|destination| Path::new(destination) != expected_destination)
-        || source_manifest_digest != claim.run.source_manifest_digest
-        || restored_manifest_digest != claim.run.source_manifest_digest
+        || retained_manifest_digest != claim.run.source_manifest_digest
+        || source_manifest_digest != expected_comparison_digest
+        || restored_manifest_digest != expected_comparison_digest
         || report_comparison.get("matched").and_then(Value::as_bool) != Some(true)
         || report_comparison
             .get("expected_digest")
             .and_then(Value::as_str)
-            != Some(claim.run.source_manifest_digest.as_str())
+            != Some(expected_comparison_digest)
         || report_comparison
             .get("actual_digest")
             .and_then(Value::as_str)
-            != Some(claim.run.source_manifest_digest.as_str())
+            != Some(expected_comparison_digest)
     {
         return Ok(FinalizeRestoreRehearsalResult::Rejected(
             "pass report does not match the retained backup job and source manifest".to_owned(),
@@ -11910,6 +12048,7 @@ pub async fn finalize_restore_rehearsal_pass(
         && engine.metadata.get("volume_count").and_then(Value::as_u64)
             == u64::try_from(volumes.len()).ok()
         && engine.metadata.get("volumes") == Some(&ordered_volume_evidence)
+        && engine.metadata.get("restore_scope") == Some(&claim.run.restore_scope)
         && engine
             .metadata
             .get("destination")
@@ -11919,22 +12058,24 @@ pub async fn finalize_restore_rehearsal_pass(
         .metadata
         .get("manifest_digest")
         .and_then(Value::as_str)
-        == Some(claim.run.source_manifest_digest.as_str())
+        == Some(raw_restored_manifest_digest)
         && restored.sha256 == restored_manifest_sha256;
     let comparison_valid = comparison.metadata.get("matched").and_then(Value::as_bool)
         == Some(true)
+        && comparison.metadata.get("restore_scope") == Some(&claim.run.restore_scope)
         && comparison
             .metadata
             .get("expected_digest")
             .and_then(Value::as_str)
-            == Some(claim.run.source_manifest_digest.as_str())
+            == Some(expected_comparison_digest)
         && comparison
             .metadata
             .get("actual_digest")
             .and_then(Value::as_str)
-            == Some(claim.run.source_manifest_digest.as_str());
+            == Some(expected_comparison_digest);
     let report_valid = report.metadata.get("complete").and_then(Value::as_bool) == Some(true)
         && report.metadata.get("matched").and_then(Value::as_bool) == Some(true)
+        && report.metadata.get("restore_scope") == Some(&claim.run.restore_scope)
         && report
             .metadata
             .get("read_only_media_operation")
@@ -11944,12 +12085,17 @@ pub async fn finalize_restore_rehearsal_pass(
             .metadata
             .get("source_manifest_digest")
             .and_then(Value::as_str)
-            == Some(claim.run.source_manifest_digest.as_str())
+            == Some(expected_comparison_digest)
         && report
             .metadata
             .get("restored_manifest_digest")
             .and_then(Value::as_str)
-            == Some(claim.run.source_manifest_digest.as_str())
+            == Some(expected_comparison_digest)
+        && report
+            .metadata
+            .get("raw_restored_manifest_digest")
+            .and_then(Value::as_str)
+            == Some(raw_restored_manifest_digest)
         && report.metadata.get("volume_count").and_then(Value::as_u64)
             == u64::try_from(volumes.len()).ok()
         && report.metadata.get("volumes") == Some(&ordered_volume_evidence);
@@ -11972,7 +12118,9 @@ pub async fn finalize_restore_rehearsal_pass(
         "preview_hash": claim.run.preview_hash,
         "source_manifest_artifact_id": claim.run.source_manifest_artifact_id,
         "source_manifest_sha256": claim.run.source_manifest_sha256,
-        "source_manifest_digest": claim.run.source_manifest_digest,
+        "retained_manifest_digest": claim.run.source_manifest_digest,
+        "source_manifest_digest": expected_comparison_digest,
+        "restore_scope": claim.run.restore_scope,
         "restored_manifest_artifact_id": restored.id,
         "restored_manifest_sha256": restored.sha256,
         "comparison_artifact_id": comparison.id,
@@ -11993,16 +12141,19 @@ pub async fn finalize_restore_rehearsal_pass(
         "INSERT INTO verification_records
             (id, recovery_point_id, kind, scope, outcome, drive_id, media_ids,
              evidence, correlation_id, started_at, finished_at)
-         VALUES ($1, $2, 'restore_test', $3, 'passed', $4, $5::uuid[],
-                 $6, $7, $8, now())",
+         VALUES ($1, $2, $3, $4, 'passed', $5, $6::uuid[],
+                 $7, $8, $9, now())",
     )
     .bind(verification_record_id)
     .bind(claim.run.recovery_point_id)
+    .bind(verification_kind)
     .bind(json!({
-        "scope": "complete attended ordered-volume file recovery replay",
+        "kind": claim.run.restore_scope.get("kind"),
+        "restore_scope": claim.run.restore_scope,
         "volume_count": claim.run.volume_count,
         "ordered_media_ids": ordered_media_ids,
-        "source_manifest_digest": claim.run.source_manifest_digest,
+        "retained_manifest_digest": claim.run.source_manifest_digest,
+        "source_manifest_digest": expected_comparison_digest,
         "destination_subpath": claim.run.destination_subpath
     }))
     .bind(claim.run.drive_id)
@@ -12013,14 +12164,25 @@ pub async fn finalize_restore_rehearsal_pass(
     .execute(&mut *transaction)
     .await?;
     let pass_result = json!({
-        "detail": "physical tape was restored again into isolation and matched the retained source manifest",
+        "detail": if selective {
+            "selected paths were restored from physical tape into isolation and matched their authenticated manifest scope"
+        } else {
+            "physical tape was restored again into isolation and matched the retained source manifest"
+        },
         "verification_record_id": verification_record_id,
-        "restore_test_passed": true,
+        "restore_test_passed": !selective,
+        "selective_restore_test_passed": selective,
+        "restore_scope": claim.run.restore_scope,
         "engine_operation_id": expected_engine_operation_id,
         "restore_job_id": restore_job_id_i64,
-        "source_manifest_digest": claim.run.source_manifest_digest,
+        "retained_manifest_digest": claim.run.source_manifest_digest,
+        "source_manifest_digest": expected_comparison_digest,
         "production_eligible": false,
-        "execution_scope": "attended_ordered_volume_file_restore",
+        "execution_scope": if selective {
+            "attended_ordered_volume_selected_path_restore"
+        } else {
+            "attended_ordered_volume_file_restore"
+        },
         "volume_count": claim.run.volume_count,
         "ordered_media_ids": ordered_media_ids,
         "evidence": result
@@ -12616,6 +12778,88 @@ mod recovery_vault_tests {
             i64::try_from(RESTORE_MANIFEST_ARTIFACT_MAX_BYTES + 1)
                 .expect("fixed limit plus one fits i64")
         ));
+    }
+
+    #[test]
+    fn selective_restore_proof_cannot_satisfy_complete_restore_evidence() {
+        let complete_digest = "a".repeat(64);
+        let selected_digest = "b".repeat(64);
+        let complete_scope = json!({
+            "kind": "complete_point",
+            "selected_manifest_digest": selected_digest
+        });
+        let selected_scope = json!({
+            "kind": "selected_paths",
+            "selected_manifest_digest": selected_digest
+        });
+
+        assert_eq!(
+            restore_scope_expected_manifest_digest(&complete_scope, &complete_digest),
+            Some(("restore_test", complete_digest.as_str()))
+        );
+        assert_eq!(
+            restore_scope_expected_manifest_digest(&selected_scope, &complete_digest),
+            Some(("selective_restore_test", selected_digest.as_str()))
+        );
+        assert_eq!(
+            restore_scope_expected_manifest_digest(
+                &json!({
+                    "kind": "selected_paths",
+                    "selected_manifest_digest": "not-a-digest"
+                }),
+                &complete_digest
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn restore_scope_limits_operator_requests_but_allows_hard_link_expansion() {
+        let expanded_paths = (0..300)
+            .map(|index| format!("hard-links/peer-{index:03}"))
+            .collect::<Vec<_>>();
+        let scope = json!({
+            "kind": "selected_paths",
+            "requested_paths": ["hard-links/original"],
+            "normalized_paths": expanded_paths,
+            "manifest_digest": "a".repeat(64),
+            "selected_manifest_digest": "b".repeat(64),
+            "selection_hash": "c".repeat(64)
+        });
+        validate_restore_scope(&scope)
+            .expect("server-added hard-link peers are not client path requests");
+
+        let too_many_requests = json!({
+            "kind": "selected_paths",
+            "requested_paths": (0..=crate::data_path::MAX_RESTORE_SELECTION_PATHS)
+                .map(|index| format!("requested-{index}"))
+                .collect::<Vec<_>>(),
+            "normalized_paths": ["requested-0"],
+            "manifest_digest": "a".repeat(64),
+            "selected_manifest_digest": "b".repeat(64),
+            "selection_hash": "c".repeat(64)
+        });
+        assert!(validate_restore_scope(&too_many_requests).is_err());
+
+        let missing_selected_digest = json!({
+            "kind": "selected_paths",
+            "requested_paths": ["one"],
+            "normalized_paths": ["one"],
+            "manifest_digest": "a".repeat(64),
+            "selection_hash": "c".repeat(64)
+        });
+        assert!(validate_restore_scope(&missing_selected_digest).is_err());
+    }
+
+    #[test]
+    fn selected_restore_scope_is_detected_for_single_volume_execution_gate() {
+        assert!(restore_scope_is_selected(
+            &json!({"kind": "selected_paths"})
+        ));
+        assert!(!restore_scope_is_selected(
+            &json!({"kind": "complete_point"})
+        ));
+        assert!(!restore_scope_is_selected(&json!({})));
     }
 
     #[test]

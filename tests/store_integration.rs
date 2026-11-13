@@ -1908,6 +1908,8 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         panic!("the attended restore rehearsal should be claimable");
     };
     assert_eq!(rehearsal_claim.run.id, rehearsal_id);
+    let complete_restore_scope = rehearsal_claim.run.restore_scope.clone();
+    assert_eq!(complete_restore_scope["kind"], "complete_point");
     assert!(
         store::renew_restore_rehearsal_run_leases(&pool, &rehearsal_claim)
             .await
@@ -1975,6 +1977,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             "volume": "INTEGRATION-SCRATCH-L9-000001",
             "volume_count": 1,
             "volumes": ordered_restore_volumes.clone(),
+            "restore_scope": complete_restore_scope.clone(),
             "destination": rehearsal_destination.clone()
         }),
     )
@@ -2026,6 +2029,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         384,
         json!({
             "matched": true,
+            "restore_scope": complete_restore_scope.clone(),
             "expected_digest": source_manifest_digest.clone(),
             "actual_digest": source_manifest_digest.clone(),
             "differences": 0
@@ -2043,11 +2047,13 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         json!({
             "complete": true,
             "matched": true,
+            "restore_scope": complete_restore_scope.clone(),
             "read_only_media_operation": true,
             "volume_count": 1,
             "volumes": ordered_restore_volumes.clone(),
             "source_manifest_digest": source_manifest_digest.clone(),
-            "restored_manifest_digest": source_manifest_digest.clone()
+            "restored_manifest_digest": source_manifest_digest.clone(),
+            "raw_restored_manifest_digest": source_manifest_digest.clone()
         }),
     )
     .await
@@ -2080,8 +2086,11 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         },
         "volume_count": 1,
         "volumes": ordered_restore_volumes,
+        "restore_scope": complete_restore_scope,
+        "retained_manifest_digest": source_manifest_digest.clone(),
         "source_manifest_digest": source_manifest_digest.clone(),
         "restored_manifest_digest": source_manifest_digest.clone(),
+        "raw_restored_manifest_digest": source_manifest_digest.clone(),
         "restored_manifest_sha256": "f".repeat(64),
         "comparison": {
             "matched": true,

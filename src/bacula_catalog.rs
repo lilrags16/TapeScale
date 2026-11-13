@@ -1,13 +1,17 @@
 //! Fail-closed evidence read directly from the pinned Bacula PostgreSQL catalog.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use serde::Serialize;
 use sqlx::{FromRow, PgPool};
 
 use crate::engine::bacula::{
-    BaculaJobId, BaculaPoolName, VolumeLabel, BACKUP_JOB_NAME, DIRECTOR_NAME, MEDIA_TYPE,
-    RESTORE_JOB_NAME, STORAGE_NAME, VERIFY_JOB_NAME,
+    BaculaBvfsRestoreTable, BaculaFileIndex, BaculaJobId, BaculaPathId, BaculaPoolName,
+    BaculaRestoreFileIndex, BaculaRestoreSelection, VolumeLabel, BACKUP_JOB_NAME, DIRECTOR_NAME,
+    MEDIA_TYPE, RESTORE_JOB_NAME, STORAGE_NAME, VERIFY_JOB_NAME,
 };
 
 // Bacula 15.0.3 persists these one-byte JCR codes in the catalog Job table.
@@ -55,6 +59,44 @@ pub enum BaculaCatalogEvidenceError {
         restore_job_id: BaculaJobId,
         backup_job_id: BaculaJobId,
     },
+    #[error("at least one absolute retained path is required for selected restore")]
+    EmptyRestoreSelection,
+    #[error("invalid absolute retained restore path: {0}")]
+    InvalidRestoreSelectionPath(String),
+    #[error("retained restore path {path} was assigned conflicting object kinds")]
+    ConflictingRestoreSelectionKind { path: String },
+    #[error("retained restore directory {ancestor} contains another selected path {descendant}")]
+    OverlappingRestoreSelection {
+        ancestor: String,
+        descendant: String,
+    },
+    #[error("resolved restore selection identities were invalid: {0}")]
+    InvalidRestoreSelectionIdentity(String),
+    #[error("Bacula BVFS restore table {table} contained no selected file rows")]
+    EmptyBvfsRestoreTable { table: String },
+    #[error(
+        "Bacula BVFS restore table {table} was not pinned exclusively to backup JobId {job_id}"
+    )]
+    BvfsRestoreJobMismatch { table: String, job_id: BaculaJobId },
+}
+
+/// Object type asserted by the already authenticated retained manifest.
+/// Files and symlinks share Bacula's exact Path+Filename catalog lookup; a
+/// directory resolves to one PathId for recursive BVFS expansion.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaculaCatalogPathKind {
+    FileOrSymlink,
+    Directory,
+}
+
+/// One immutable, absolute catalog path supplied by TapeScale's retained
+/// manifest selection layer. The resolver still validates normalization and
+/// the antichain invariant before querying Bacula.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BaculaCatalogPathSelection {
+    pub absolute_path: String,
+    pub kind: BaculaCatalogPathKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -174,6 +216,150 @@ struct CatalogJobMediaRow {
     start_block: i64,
     end_file: i32,
     end_block: i64,
+}
+
+#[derive(FromRow)]
+struct CatalogRestoreFileRow {
+    file_index: i32,
+}
+
+#[derive(FromRow)]
+struct CatalogRestoreDirectoryRow {
+    path_id: i32,
+    file_index: i32,
+}
+
+const RESTORE_FILE_SELECTION_QUERY: &str = "SELECT f.fileindex AS file_index
+       FROM file f JOIN path p USING (pathid)
+      WHERE f.jobid = $1 AND p.path = $2 AND f.filename = $3
+        AND f.fileindex > 0";
+
+const RESTORE_DIRECTORY_SELECTION_QUERY: &str =
+    "SELECT p.pathid AS path_id, f.fileindex AS file_index
+       FROM path p JOIN file f USING (pathid)
+      WHERE f.jobid = $1 AND p.path = $2 AND f.filename = ''
+        AND f.fileindex > 0";
+
+/// Resolve authenticated absolute paths to the numeric identities accepted by
+/// Bacula's BVFS restore-list command.
+///
+/// Every query is parameterized and pinned to one backup JobId. User or
+/// manifest path text is never rendered into bconsole input. Exact duplicate
+/// selections are collapsed; conflicting kinds and directory/descendant
+/// overlaps fail closed.
+pub async fn resolve_restore_selection(
+    database: &PgPool,
+    backup_job_id: BaculaJobId,
+    selections: &[BaculaCatalogPathSelection],
+) -> Result<BaculaRestoreSelection, BaculaCatalogEvidenceError> {
+    let selections = normalize_restore_selections(selections)?;
+    let catalog_job_id = job_id_i32(backup_job_id)?;
+    let mut file_indexes = Vec::new();
+    let mut directory_path_ids = Vec::new();
+
+    for selection in selections {
+        match selection.kind {
+            BaculaCatalogPathKind::FileOrSymlink => {
+                let (catalog_path, filename) = catalog_file_parts(&selection.absolute_path)?;
+                let rows = sqlx::query_as::<_, CatalogRestoreFileRow>(RESTORE_FILE_SELECTION_QUERY)
+                    .bind(catalog_job_id)
+                    .bind(&catalog_path)
+                    .bind(&filename)
+                    .fetch_all(database)
+                    .await?;
+                require_unique_restore_match("restore file", &selection.absolute_path, rows.len())?;
+                let file_index = positive_i32("restore.file_index", rows[0].file_index)?;
+                file_indexes.push(BaculaRestoreFileIndex {
+                    job_id: backup_job_id,
+                    file_index: BaculaFileIndex::new(file_index).map_err(|error| {
+                        BaculaCatalogEvidenceError::InvalidRestoreSelectionIdentity(
+                            error.to_string(),
+                        )
+                    })?,
+                });
+            }
+            BaculaCatalogPathKind::Directory => {
+                let catalog_path = catalog_directory_path(&selection.absolute_path)?;
+                let rows = sqlx::query_as::<_, CatalogRestoreDirectoryRow>(
+                    RESTORE_DIRECTORY_SELECTION_QUERY,
+                )
+                .bind(catalog_job_id)
+                .bind(&catalog_path)
+                .fetch_all(database)
+                .await?;
+                require_unique_restore_match(
+                    "restore directory",
+                    &selection.absolute_path,
+                    rows.len(),
+                )?;
+                // Requiring the positive directory FileIndex in the query and
+                // conversion proves this PathId is represented by a directory
+                // record in the pinned backup, not merely a global Path row.
+                let _directory_file_index =
+                    positive_i32("restore.directory_file_index", rows[0].file_index)?;
+                let path_id = positive_i32("restore.path_id", rows[0].path_id)?;
+                directory_path_ids.push(BaculaPathId::new(path_id).map_err(|error| {
+                    BaculaCatalogEvidenceError::InvalidRestoreSelectionIdentity(error.to_string())
+                })?);
+            }
+        }
+    }
+
+    BaculaRestoreSelection::new(backup_job_id, file_indexes, directory_path_ids).map_err(|error| {
+        BaculaCatalogEvidenceError::InvalidRestoreSelectionIdentity(error.to_string())
+    })
+}
+
+/// Prove that Bacula materialized a non-empty BVFS selection before a tape
+/// restore is dispatched. The identifier is a server-generated typed value;
+/// retained path text is never interpolated into this catalog query.
+pub async fn validate_bvfs_restore_table(
+    database: &PgPool,
+    table: &BaculaBvfsRestoreTable,
+    backup_job_id: BaculaJobId,
+) -> Result<u64, BaculaCatalogEvidenceError> {
+    if !bvfs_restore_table_exists(database, table).await? {
+        return Err(BaculaCatalogEvidenceError::Missing {
+            kind: "BVFS restore table",
+            identifier: table.as_str().to_owned(),
+        });
+    }
+    let catalog_job_id = job_id_i32(backup_job_id)?;
+    let count_query = format!(
+        "SELECT COUNT(*)::bigint, BOOL_AND(jobid = $1) FROM {}",
+        table.as_str()
+    );
+    let (count, all_from_job) = sqlx::query_as::<_, (i64, Option<bool>)>(&count_query)
+        .bind(catalog_job_id)
+        .fetch_one(database)
+        .await?;
+    let count = nonnegative_i64("bvfs_restore_table.count", count)?;
+    if count == 0 {
+        Err(BaculaCatalogEvidenceError::EmptyBvfsRestoreTable {
+            table: table.as_str().to_owned(),
+        })
+    } else if all_from_job != Some(true) {
+        Err(BaculaCatalogEvidenceError::BvfsRestoreJobMismatch {
+            table: table.as_str().to_owned(),
+            job_id: backup_job_id,
+        })
+    } else {
+        Ok(count)
+    }
+}
+
+/// Check whether a typed server-generated BVFS table still exists. This lets
+/// the worker prove cleanup instead of treating bconsole's process exit status
+/// as evidence that the Director accepted the command.
+pub async fn bvfs_restore_table_exists(
+    database: &PgPool,
+    table: &BaculaBvfsRestoreTable,
+) -> Result<bool, BaculaCatalogEvidenceError> {
+    let relation = sqlx::query_scalar::<_, Option<String>>("SELECT to_regclass($1)::text")
+        .bind(table.as_str())
+        .fetch_one(database)
+        .await?;
+    Ok(relation.is_some())
 }
 
 /// Prove the label exists in one otherwise-empty, non-recycling per-run pool.
@@ -638,6 +824,116 @@ fn require_exactly_one(kind: &'static str, count: usize) -> Result<(), BaculaCat
     }
 }
 
+fn normalize_restore_selections(
+    selections: &[BaculaCatalogPathSelection],
+) -> Result<Vec<BaculaCatalogPathSelection>, BaculaCatalogEvidenceError> {
+    if selections.is_empty() {
+        return Err(BaculaCatalogEvidenceError::EmptyRestoreSelection);
+    }
+    let mut normalized = selections.to_vec();
+    for selection in &normalized {
+        validate_absolute_restore_path(&selection.absolute_path)?;
+    }
+    normalized.sort_by(|left, right| {
+        left.absolute_path
+            .cmp(&right.absolute_path)
+            .then(left.kind.cmp(&right.kind))
+    });
+
+    let mut deduplicated: Vec<BaculaCatalogPathSelection> = Vec::with_capacity(normalized.len());
+    for selection in normalized {
+        if let Some(previous) = deduplicated.last() {
+            if previous.absolute_path == selection.absolute_path {
+                if previous.kind != selection.kind {
+                    return Err(
+                        BaculaCatalogEvidenceError::ConflictingRestoreSelectionKind {
+                            path: selection.absolute_path,
+                        },
+                    );
+                }
+                continue;
+            }
+        }
+        deduplicated.push(selection);
+    }
+
+    for (ancestor_index, ancestor) in deduplicated.iter().enumerate() {
+        if ancestor.kind != BaculaCatalogPathKind::Directory {
+            continue;
+        }
+        for (descendant_index, descendant) in deduplicated.iter().enumerate() {
+            if ancestor_index != descendant_index
+                && Path::new(&descendant.absolute_path)
+                    .starts_with(Path::new(&ancestor.absolute_path))
+            {
+                return Err(BaculaCatalogEvidenceError::OverlappingRestoreSelection {
+                    ancestor: ancestor.absolute_path.clone(),
+                    descendant: descendant.absolute_path.clone(),
+                });
+            }
+        }
+    }
+    Ok(deduplicated)
+}
+
+fn validate_absolute_restore_path(path: &str) -> Result<(), BaculaCatalogEvidenceError> {
+    let invalid = path.is_empty()
+        || path == "/"
+        || !path.starts_with('/')
+        || path.starts_with("//")
+        || path.ends_with('/')
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path[1..]
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."));
+    if invalid {
+        Err(BaculaCatalogEvidenceError::InvalidRestoreSelectionPath(
+            path.to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn catalog_file_parts(absolute_path: &str) -> Result<(String, String), BaculaCatalogEvidenceError> {
+    validate_absolute_restore_path(absolute_path)?;
+    let (parent, filename) = absolute_path.rsplit_once('/').ok_or_else(|| {
+        BaculaCatalogEvidenceError::InvalidRestoreSelectionPath(absolute_path.to_owned())
+    })?;
+    if filename.is_empty() {
+        return Err(BaculaCatalogEvidenceError::InvalidRestoreSelectionPath(
+            absolute_path.to_owned(),
+        ));
+    }
+    let catalog_path = if parent.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("{parent}/")
+    };
+    Ok((catalog_path, filename.to_owned()))
+}
+
+fn catalog_directory_path(absolute_path: &str) -> Result<String, BaculaCatalogEvidenceError> {
+    validate_absolute_restore_path(absolute_path)?;
+    Ok(format!("{absolute_path}/"))
+}
+
+fn require_unique_restore_match(
+    kind: &'static str,
+    path: &str,
+    count: usize,
+) -> Result<(), BaculaCatalogEvidenceError> {
+    match count {
+        1 => Ok(()),
+        0 => Err(BaculaCatalogEvidenceError::Missing {
+            kind,
+            identifier: path.to_owned(),
+        }),
+        actual => Err(BaculaCatalogEvidenceError::Ambiguous { kind, actual }),
+    }
+}
+
 fn expect(
     field: &'static str,
     expected: &str,
@@ -676,6 +972,15 @@ fn nonnegative_i32(field: &'static str, value: i32) -> Result<u64, BaculaCatalog
 
 fn nonnegative_i64(field: &'static str, value: i64) -> Result<u64, BaculaCatalogEvidenceError> {
     u64::try_from(value).map_err(|_| BaculaCatalogEvidenceError::InvalidNumber { field })
+}
+
+fn positive_i32(field: &'static str, value: i32) -> Result<u64, BaculaCatalogEvidenceError> {
+    let value = nonnegative_i32(field, value)?;
+    if value == 0 {
+        Err(BaculaCatalogEvidenceError::InvalidNumber { field })
+    } else {
+        Ok(value)
+    }
 }
 
 fn job_id_i32(job_id: BaculaJobId) -> Result<i32, BaculaCatalogEvidenceError> {
@@ -954,5 +1259,118 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn restore_path_selection_is_normalized_as_an_antichain() {
+        let selections = vec![
+            BaculaCatalogPathSelection {
+                absolute_path: "/source/archive/z-last".to_owned(),
+                kind: BaculaCatalogPathKind::FileOrSymlink,
+            },
+            BaculaCatalogPathSelection {
+                absolute_path: "/source/archive/a-first".to_owned(),
+                kind: BaculaCatalogPathKind::Directory,
+            },
+            BaculaCatalogPathSelection {
+                absolute_path: "/source/archive/z-last".to_owned(),
+                kind: BaculaCatalogPathKind::FileOrSymlink,
+            },
+        ];
+        let normalized = normalize_restore_selections(&selections).expect("antichain");
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].absolute_path, "/source/archive/a-first");
+        assert_eq!(normalized[1].absolute_path, "/source/archive/z-last");
+
+        let overlapping = vec![
+            BaculaCatalogPathSelection {
+                absolute_path: "/source/archive/photos".to_owned(),
+                kind: BaculaCatalogPathKind::Directory,
+            },
+            BaculaCatalogPathSelection {
+                absolute_path: "/source/archive/photos/2026/image.raw".to_owned(),
+                kind: BaculaCatalogPathKind::FileOrSymlink,
+            },
+        ];
+        assert!(matches!(
+            normalize_restore_selections(&overlapping),
+            Err(BaculaCatalogEvidenceError::OverlappingRestoreSelection {
+                ancestor,
+                descendant,
+            }) if ancestor == "/source/archive/photos"
+                && descendant == "/source/archive/photos/2026/image.raw"
+        ));
+        assert!(matches!(
+            normalize_restore_selections(&[]),
+            Err(BaculaCatalogEvidenceError::EmptyRestoreSelection)
+        ));
+    }
+
+    #[test]
+    fn restore_path_selection_rejects_ambiguous_or_conflicting_paths() {
+        for path in [
+            "source/archive/file",
+            "/",
+            "/source/archive/",
+            "/source//archive/file",
+            "/source/archive/../file",
+            "/source/archive/./file",
+            "/source/archive\\file",
+            "/source/archive/file\n.bvfs_cleanup path=b20",
+        ] {
+            assert!(matches!(
+                normalize_restore_selections(&[BaculaCatalogPathSelection {
+                    absolute_path: path.to_owned(),
+                    kind: BaculaCatalogPathKind::FileOrSymlink,
+                }]),
+                Err(BaculaCatalogEvidenceError::InvalidRestoreSelectionPath(_))
+            ));
+        }
+
+        let conflicting = [
+            BaculaCatalogPathSelection {
+                absolute_path: "/source/archive/item".to_owned(),
+                kind: BaculaCatalogPathKind::FileOrSymlink,
+            },
+            BaculaCatalogPathSelection {
+                absolute_path: "/source/archive/item".to_owned(),
+                kind: BaculaCatalogPathKind::Directory,
+            },
+        ];
+        assert!(matches!(
+            normalize_restore_selections(&conflicting),
+            Err(BaculaCatalogEvidenceError::ConflictingRestoreSelectionKind { path })
+                if path == "/source/archive/item"
+        ));
+    }
+
+    #[test]
+    fn catalog_path_mapping_preserves_literal_sql_metacharacters_for_bound_parameters() {
+        let absolute = "/source/archive/quo'te; DROP TABLE File--";
+        let (path, filename) = catalog_file_parts(absolute).expect("literal path");
+        assert_eq!(path, "/source/archive/");
+        assert_eq!(filename, "quo'te; DROP TABLE File--");
+        assert_eq!(
+            catalog_directory_path("/source/archive/100%_literal").expect("directory"),
+            "/source/archive/100%_literal/"
+        );
+        assert!(RESTORE_FILE_SELECTION_QUERY.contains("f.jobid = $1"));
+        assert!(RESTORE_FILE_SELECTION_QUERY.contains("p.path = $2"));
+        assert!(RESTORE_FILE_SELECTION_QUERY.contains("f.filename = $3"));
+        assert!(RESTORE_DIRECTORY_SELECTION_QUERY.contains("f.jobid = $1"));
+        assert!(RESTORE_DIRECTORY_SELECTION_QUERY.contains("p.path = $2"));
+        assert!(!RESTORE_FILE_SELECTION_QUERY.contains(absolute));
+    }
+
+    #[test]
+    fn restore_catalog_ids_must_be_positive() {
+        assert_eq!(positive_i32("restore.file_index", 7).expect("positive"), 7);
+        assert!(matches!(
+            positive_i32("restore.file_index", 0),
+            Err(BaculaCatalogEvidenceError::InvalidNumber {
+                field: "restore.file_index"
+            })
+        ));
+        assert!(positive_i32("restore.file_index", -1).is_err());
     }
 }

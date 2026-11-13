@@ -4,10 +4,14 @@ set -euo pipefail
 # Exercise the exact Bacula 15.0.3 catalog contract without tape hardware. The
 # Storage Daemon still uses TapeScale's LTO media type and resource names, but
 # its Device Type is File so CI can prove backup, Data verify, initial restore,
-# then a second restore after daemon restart with the source unavailable. The
-# spanning mode adds GZIP6 and forces that same readback path across exactly two
-# 1 MB file-backed volumes. LZO mode proves the other public compression choice
-# with an actual write, Data verify, and two source-independent restores.
+# then complete and BVFS-selected restores after daemon restart with the source
+# unavailable. The spanning mode adds GZIP6 and forces that engine path across
+# exactly two 1 MB file-backed volumes. Its BVFS extraction is a Bacula
+# mechanism test, not evidence that TapeScale currently permits a multi-volume
+# selected run; the product gate requires exactly one retained volume until it
+# can record authenticated path-to-volume and truthful per-volume read evidence.
+# LZO mode proves the other public compression choice with an actual write,
+# Data verify, and source-independent complete plus selective restores.
 
 : "${DATABASE_URL:?DATABASE_URL is required}"
 : "${BACULA_CATALOG_HOST:?BACULA_CATALOG_HOST is required}"
@@ -76,6 +80,10 @@ readonly source_root="/source"
 readonly restore_root="/restore"
 readonly restore_destination="${restore_root}/${run_token}"
 readonly rehearsal_destination="${restore_root}/${run_token}-rehearsal"
+readonly selected_restore_destination="${restore_root}/${run_token}-selected"
+readonly selected_file_fixture="selected-exact.txt"
+readonly selected_directory_fixture="selected-directory"
+readonly excluded_file_fixture="excluded-from-selection.txt"
 readonly log_root="$(mktemp -d /tmp/tapescale-bacula-roundtrip.XXXXXX)"
 
 sd_pid=""
@@ -136,6 +144,23 @@ elif [[ "$ci_mode" == "lzo" ]]; then
 else
   printf '%s\n' 'TapeScale exact Bacula catalog roundtrip fixture.' >"$source_root/$fixture_name"
 fi
+
+# Every mode carries the same mixed selective-restore fixture. The exact file
+# and recursive directory are selected through numeric catalog identities;
+# the two decoys make an accidental complete-job restore fail the assertion.
+install -d -m 0750 \
+  "$source_root/$selected_directory_fixture/nested" \
+  "$source_root/unselected-directory"
+printf '%s\n' 'TapeScale selected exact-file fixture.' \
+  >"$source_root/$selected_file_fixture"
+printf '%s\n' 'TapeScale selected directory child.' \
+  >"$source_root/$selected_directory_fixture/child.txt"
+printf '%s\n' 'TapeScale selected nested directory child.' \
+  >"$source_root/$selected_directory_fixture/nested/grandchild.txt"
+printf '%s\n' 'TapeScale excluded root fixture.' \
+  >"$source_root/$excluded_file_fixture"
+printf '%s\n' 'TapeScale excluded directory fixture.' \
+  >"$source_root/unselected-directory/decoy.txt"
 
 cat >"$config_root/bacula-dir.conf" <<EOF
 Director {
@@ -254,7 +279,7 @@ Job {
 Console {
   Name = tapescale-adapter
   Password = "ci-console-password"
-  Command ACL = run, cancel, status, .status, .api, .jlist, restore, label, mount, unmount, release
+  Command ACL = run, cancel, status, .status, .api, .jlist, .bvfs_restore, .bvfs_cleanup, restore, label, mount, unmount, release
   Job ACL = *all*
   Client ACL = *all*
   Backup Client ACL = tapescale-fd
@@ -631,4 +656,95 @@ cmp "${source_root}.unavailable/$fixture_name" "$rehearsal_destination/source/$f
 
 validate_roundtrip_catalog "$backup_job_id" "$verify_job_id" "$rehearsal_job_id"
 
-echo "Bacula ${ci_mode} file-backed recovery path passed: backup=${backup_job_id} verify=${verify_job_id} initial_restore=${restore_job_id} restarted_restore=${rehearsal_job_id}"
+# Resolve the same parameterized, JobId-pinned identities used by TapeScale's
+# backend. These values—not retained path text—are the only selection data sent
+# to bconsole. A malformed or ambiguous lookup leaves a non-numeric value and
+# fails before any restore command is dispatched.
+selected_file_index="$(psql_catalog --command "
+  SELECT f.fileindex
+    FROM file f
+    JOIN path p USING (pathid)
+   WHERE f.jobid = ${backup_job_id}
+     AND p.path = '/source/'
+     AND f.filename = '${selected_file_fixture}'
+     AND f.fileindex > 0")"
+if [[ ! "$selected_file_index" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Bacula catalog did not resolve exactly one selected file identity: ${selected_file_index:-missing}" >&2
+  exit 1
+fi
+
+selected_directory_path_id="$(psql_catalog --command "
+  SELECT p.pathid
+    FROM path p
+    JOIN file f USING (pathid)
+   WHERE f.jobid = ${backup_job_id}
+     AND p.path = '/source/${selected_directory_fixture}/'
+     AND f.filename = ''
+     AND f.fileindex > 0")"
+if [[ ! "$selected_directory_path_id" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Bacula catalog did not resolve exactly one selected directory identity: ${selected_directory_path_id:-missing}" >&2
+  exit 1
+fi
+
+# Bacula accepts only b2 followed by decimal digits for the temporary BVFS
+# table. JobId is catalog-authored, and the mode suffix prevents collisions if
+# this script is extended with more than one selected restore per backup.
+readonly bvfs_restore_table="b2${backup_job_id}42"
+prepare_selected_output="$(run_console ".bvfs_restore path=${bvfs_restore_table} jobid=${backup_job_id} fileindex=${backup_job_id},${selected_file_index} dirid=${selected_directory_path_id}")"
+bvfs_restore_shape="$(psql_catalog --command "
+  SELECT count(*) || '|' || bool_and(jobid = ${backup_job_id})::text
+    FROM ${bvfs_restore_table}")"
+if [[ ! "$bvfs_restore_shape" =~ ^[1-9][0-9]*\|true$ ]]; then
+  echo "Bacula did not materialize a pinned non-empty BVFS selection table: ${bvfs_restore_shape:-missing}" >&2
+  echo "$prepare_selected_output" >&2
+  exit 1
+fi
+
+selected_restore_output="$(run_console "restore jobid=${backup_job_id} restorejob=TS-Restore restoreclient=tapescale-fd where=\"${selected_restore_destination}\" file=\"?${bvfs_restore_table}\" done yes")"
+selected_restore_job_id="$(extract_job_id "$selected_restore_output")"
+
+# The Director consumes the restore table synchronously while dispatching the
+# job. Mirror the production adapter by dropping it immediately after dispatch,
+# then prove the queued job remains independently executable.
+cleanup_selected_output="$(run_console ".bvfs_cleanup path=${bvfs_restore_table}")"
+bvfs_table_after_cleanup="$(psql_catalog --command "
+  SELECT (to_regclass('public.${bvfs_restore_table}') IS NULL)::text")"
+if [[ "$bvfs_table_after_cleanup" != "true" ]]; then
+  echo "Bacula did not clean the temporary BVFS restore table" >&2
+  echo "$cleanup_selected_output" >&2
+  exit 1
+fi
+
+wait_for_job "$selected_restore_job_id" "BVFS selected restore"
+validate_roundtrip_catalog "$backup_job_id" "$verify_job_id" "$selected_restore_job_id"
+
+cmp \
+  "${source_root}.unavailable/$selected_file_fixture" \
+  "$selected_restore_destination/source/$selected_file_fixture"
+cmp \
+  "${source_root}.unavailable/$selected_directory_fixture/child.txt" \
+  "$selected_restore_destination/source/$selected_directory_fixture/child.txt"
+cmp \
+  "${source_root}.unavailable/$selected_directory_fixture/nested/grandchild.txt" \
+  "$selected_restore_destination/source/$selected_directory_fixture/nested/grandchild.txt"
+
+selected_files="$(
+  find "$selected_restore_destination" -type f -printf '%P\n' \
+    | LC_ALL=C sort
+)"
+expected_selected_files="$(printf '%s\n' \
+  "source/${selected_directory_fixture}/child.txt" \
+  "source/${selected_directory_fixture}/nested/grandchild.txt" \
+  "source/${selected_file_fixture}" \
+  | LC_ALL=C sort
+)"
+if [[ "$selected_files" != "$expected_selected_files" ]]; then
+  echo "BVFS selected restore included missing or unrequested files" >&2
+  printf 'expected:\n%s\nactual:\n%s\n' "$expected_selected_files" "$selected_files" >&2
+  exit 1
+fi
+test ! -e "$selected_restore_destination/source/$fixture_name"
+test ! -e "$selected_restore_destination/source/$excluded_file_fixture"
+test ! -e "$selected_restore_destination/source/unselected-directory"
+
+echo "Bacula ${ci_mode} file-backed recovery path passed: backup=${backup_job_id} verify=${verify_job_id} initial_restore=${restore_job_id} restarted_restore=${rehearsal_job_id} selected_restore=${selected_restore_job_id}"

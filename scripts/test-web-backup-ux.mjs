@@ -132,12 +132,78 @@ test("bounded source and retained browsers disclose partial directory views", ()
   assert.match(source, /type a known snapshot path/);
   assert.match(source, /no TapeScale total file-count limit/);
   assert.match(retained, /payload\.truncated === true/);
-  assert.match(retained, /Only this browse-only directory view is bounded/);
+  assert.match(retained, /Only this directory view is bounded/);
   assert.match(retained, /retained manifest and tape archive are complete/);
   assert.match(retained, /backup itself was not limited/);
+  assert.match(retained, /selected folder still includes descendants that are not displayed here/);
 });
 
-test("the Recovery Vault offers attended one- and multi-tape Restore runs only under the server contract", () => {
+test("retained manifests provide an accessible, capability-gated selective restore planner", () => {
+  const helpers = section("  function retainedRestorePath(", "  function recoveryFileBreadcrumbs(");
+  const entry = section("  function recoveryFileEntry(", "  async function loadRecoveryPointFiles(");
+  const browser = section("  function renderRecoveryPointFiles(", "  const RESTORE_REHEARSAL_PHASES");
+  const openPlan = section("  function openRestorePlan(", "  function optionalFormNumber(");
+  const planContract = section("  function restorePlanExecution(", "  function restorePlanTapes(");
+  const submitPlan = section("  async function submitRestorePlan(", "  function openRestoreRehearsal(");
+  const queue = section("  async function submitRestoreRehearsal(", "  function restoreMediaReadinessValue(");
+
+  assert.match(helpers, /path_selective_restore_supported/);
+  assert.match(helpers, /selection_capabilities/);
+  assert.match(helpers, /"maximum_paths"/);
+  assert.match(helpers, /maximum : 256/);
+  assert.match(helpers, /"recursive_directories"/);
+  assert.match(entry, /entry\.selectable === true/);
+  assert.match(entry, /data-action="toggle-recovery-restore-path"/);
+  assert.match(entry, /already included by a selected parent folder/);
+  assert.match(browser, /Choose files and folders to restore/);
+  assert.match(browser, /does not advertise path-selective restore/);
+  assert.match(browser, /renderRecoveryRestoreSelectionTray/);
+  assert.match(helpers, /data-action="plan-selected-restore"/);
+  assert.match(helpers, /role="status"|aria-live="polite"/);
+  assert.match(helpers, /including entries not shown in this partial directory view/);
+
+  const state = {
+    recoveryRestoreSelections: { point: ["folder/child.txt", "other.txt"] },
+    recoveryFileBrowserCapabilities: {
+      point: { path_selective_restore_supported: true, selection_capabilities: { maximum_paths: 256, recursive_directories: true } }
+    }
+  };
+  const testPick = (object, ...keys) => {
+    if (!object || typeof object !== "object") return null;
+    for (const key of keys) if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+    return null;
+  };
+  const api = Function(
+    "state", "pick", "toast", "render", "live", "window", "CSS", "esc",
+    '"use strict";\n' + helpers + "\nreturn { toggleRecoveryRestorePath, recoveryRestorePathRelation, recoveryRestoreSelectionContract };"
+  )(state, testPick, () => {}, () => {}, { textContent: "" }, { requestAnimationFrame: () => {} }, { escape: String }, String);
+  api.toggleRecoveryRestorePath("point", "folder");
+  assert.deepEqual(state.recoveryRestoreSelections.point, ["folder", "other.txt"], "a selected parent must replace redundant descendants");
+  assert.equal(api.recoveryRestorePathRelation("point", "folder/deeper/file.txt"), "included");
+  assert.deepEqual(api.recoveryRestoreSelectionContract("point"), { kind: "selected_paths", paths: ["folder", "other.txt"] });
+  state.recoveryRestoreSelections.point = [];
+  assert.deepEqual(api.recoveryRestoreSelectionContract("point"), { kind: "complete_point", paths: [] });
+
+  assert.match(openPlan, /selection \|\| \{ kind: "complete_point", paths: \[\] \}/);
+  assert.match(openPlan, /Plan selected restore/);
+  assert.match(openPlan, /Folders recursively include everything beneath them/);
+  assert.match(submitPlan, /selection,/);
+  assert.match(submitPlan, /kind: "selected_paths"/);
+  assert.match(submitPlan, /kind: "complete_point", paths: \[\]/);
+  assert.match(planContract, /"normalized_paths", "paths", "requested_paths"/);
+  assert.match(planContract, /"selection_hash"/);
+  assert.match(planContract, /"selected_manifest_digest"/);
+  assert.match(queue, /plan_id: planId/);
+  assert.match(queue, /preview_hash:/);
+  assert.doesNotMatch(queue, /selection:/, "execution must stay bound to the immutable server plan instead of resending mutable paths");
+
+  assert.match(css, /\.recovery-selection-tray/);
+  assert.match(css, /\.recovery-entry-selection/);
+  assert.match(css, /\.restore-plan-scope/);
+  assert.match(css, /@media \(max-width: 680px\)[\s\S]*\.recovery-selection-actions/);
+});
+
+test("the Recovery Vault keeps multi-tape full restore and single-tape selected restore inside the server contract", () => {
   const phases = section("  const RESTORE_REHEARSAL_PHASES = [", "  function restoreRehearsalDetailRecord(");
   const detailContract = section("  function restoreRehearsalVolumes(", "  function restoreRehearsalPhase(");
   const history = section("  function renderRestoreRehearsal(", "  function renderRecoveryPointDossier(");
@@ -148,7 +214,7 @@ test("the Recovery Vault offers attended one- and multi-tape Restore runs only u
   const start = section("  function openRestoreRehearsal(", "  async function submitRestoreRehearsal(");
   const handoff = section("  function restoreMediaReadinessValue(", "  function openCancelRestoreRehearsal(");
 
-  assert.match(phases, /name: "Restore files", detail: "Read the complete backup across its ordered tapes"/);
+  assert.match(phases, /name: "Restore files", detail: "Read the planned scope across its ordered tapes"/);
   assert.match(phases, /"waiting_for_media", "media_required"/);
   assert.match(phases, /name: "Verify files", detail: "Hash and compare restored content"/);
   assert.match(phases, /name: "Complete", detail: "Retain restore evidence"/);
@@ -174,29 +240,36 @@ test("the Recovery Vault offers attended one- and multi-tape Restore runs only u
   assert.match(history, /Download restore evidence/);
   assert.doesNotMatch(history, /Ready G0\.2 restore plans|Recovery rehearsals/);
 
-  assert.match(dossier, /recovers the complete point across its exact ordered tape set into a new isolated destination/);
-  assert.match(dossier, /File or directory selection, encrypted recovery points, and clean-catalog recovery are not available yet/);
+  assert.match(app, /Server-normalized file or directory selection is executable only for a single-tape recovery point/);
+  assert.match(app, /multi-tape selected execution stays blocked until per-path media evidence is retained/);
+  assert.match(app, /Plan complete restore/);
   assert.match(planDialog, /server-returned ordered tape set/);
 
   assert.match(mediaContract, /planArray\(restorePlanExecution\(plan\), "required_tape_ids", "required_tapes", "tapes"\)/);
   assert.match(mediaContract, /pick\(execution, "multi_volume"\) === true/);
   assert.match(mediaContract, /declaredCount === tapes\.length/);
   assert.match(mediaContract, /tapes\.length === 1 \|\| restorePlanMultiVolumeSupported\(plan\)/);
-  assert.match(result, /executionSupported = ready && executionOffered && volumeContractReady/);
+  assert.match(result, /selectedMultiVolume = selectedScope && multiVolume/);
+  assert.match(result, /executionSupported = ready && executionOffered && volumeContractReady && !selectedMultiVolume/);
+  assert.match(result, /Selected-path execution requires a single-volume recovery point/);
   assert.match(result, /matching attended execution contract for this ordered media set/);
   assert.match(result, /Restore this complete recovery point/);
+  assert.match(result, /Restore the selected content/);
+  assert.match(result, /server-normalized selected scope/);
   assert.match(result, /Start Restore run/);
   assert.match(result, /pause durably at each media boundary and name the exact next cartridge/);
-  assert.match(result, /Full-point-only and does not support file selection, encrypted recovery points, or clean-catalog recovery/);
+  assert.match(result, /Encrypted recovery points and clean-catalog recovery remain unavailable/);
   assert.match(result, /Every later tape requires its own exact attended handoff/);
 
   assert.match(start, /if \(!restorePlanVolumeContractReady\(plan\)\)/);
   assert.doesNotMatch(start, /if \(tapes\.length !== 1\)/);
+  assert.match(start, /if \(selectedScope && tapes\.length > 1\)/);
+  assert.match(start, /Generate a complete-point plan for this multi-tape backup/);
   assert.match(start, /pick\(restorePlanExecution\(plan\), "destination_subpath", "destination"\)/);
-  assert.match(start, /restores the complete recovery point across .* exact ordered cartridges/);
+  assert.match(start, /planned selected scope.*complete recovery point/);
   assert.match(start, /Load only tape 1 now/);
   assert.match(start, /Later tapes use separate exact handoffs/);
-  assert.match(start, /File or directory selection, encrypted recovery points, and clean-catalog recovery are not supported/);
+  assert.match(start, /immutably bound to the normalized paths and selection hash/);
   assert.match(start, /local console has no application sign-in/);
   assert.match(start, /new isolated recovery destination, not live data/);
   assert.match(start, /openModal\("Start Restore run"/);

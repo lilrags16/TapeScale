@@ -785,7 +785,7 @@ Job {{
 Console {{
   Name = {CONSOLE_NAME}
   Password = "{console_password}"
-  Command ACL = run, cancel, status, .status, .api, .jlist, restore, label, mount, unmount, release
+  Command ACL = run, cancel, status, .status, .api, .jlist, .bvfs_restore, .bvfs_cleanup, restore, label, mount, unmount, release
   # Bacula refuses Storage-Daemon running-status records when either of these
   # two visibility ACLs is narrower. The generated configuration still defines
   # only TapeScale's three fixed Jobs and one fixed Client; backup/restore
@@ -974,6 +974,143 @@ impl fmt::Display for BaculaJobId {
     }
 }
 
+/// One positive FileIndex from Bacula's catalog.
+///
+/// Selected restore commands never contain a user-provided pathname. The
+/// catalog resolver turns an authenticated path into this numeric identity
+/// before anything is rendered for bconsole.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct BaculaFileIndex(NonZeroU64);
+
+impl BaculaFileIndex {
+    pub fn new(value: u64) -> Result<Self, BaculaValidationError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(BaculaValidationError::OutOfRange {
+                field: "file_index",
+            })
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for BaculaFileIndex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// One positive PathId from Bacula's catalog.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct BaculaPathId(NonZeroU64);
+
+impl BaculaPathId {
+    pub fn new(value: u64) -> Result<Self, BaculaValidationError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(BaculaValidationError::OutOfRange { field: "path_id" })
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for BaculaPathId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// A file selection remains paired with the exact backup JobId that owns its
+/// FileIndex. Bacula's BVFS syntax accepts an alternating job,index list.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct BaculaRestoreFileIndex {
+    pub job_id: BaculaJobId,
+    pub file_index: BaculaFileIndex,
+}
+
+/// Catalog identities for one immutable path-selection contract.
+///
+/// The constructor sorts and deduplicates identities, rejects an empty
+/// selection, and requires every file pair to belong to the pinned backup job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BaculaRestoreSelection {
+    backup_job_id: BaculaJobId,
+    file_indexes: Vec<BaculaRestoreFileIndex>,
+    directory_path_ids: Vec<BaculaPathId>,
+}
+
+impl BaculaRestoreSelection {
+    pub fn new(
+        backup_job_id: BaculaJobId,
+        mut file_indexes: Vec<BaculaRestoreFileIndex>,
+        mut directory_path_ids: Vec<BaculaPathId>,
+    ) -> Result<Self, BaculaValidationError> {
+        if file_indexes
+            .iter()
+            .any(|selection| selection.job_id != backup_job_id)
+        {
+            return Err(BaculaValidationError::InvalidValue {
+                field: "restore_file_job_id",
+            });
+        }
+        file_indexes.sort_unstable();
+        file_indexes.dedup();
+        directory_path_ids.sort_unstable();
+        directory_path_ids.dedup();
+        if file_indexes.is_empty() && directory_path_ids.is_empty() {
+            return Err(BaculaValidationError::Empty {
+                field: "restore_selection",
+            });
+        }
+        Ok(Self {
+            backup_job_id,
+            file_indexes,
+            directory_path_ids,
+        })
+    }
+
+    #[must_use]
+    pub const fn backup_job_id(&self) -> BaculaJobId {
+        self.backup_job_id
+    }
+
+    #[must_use]
+    pub fn file_indexes(&self) -> &[BaculaRestoreFileIndex] {
+        &self.file_indexes
+    }
+
+    #[must_use]
+    pub fn directory_path_ids(&self) -> &[BaculaPathId] {
+        &self.directory_path_ids
+    }
+}
+
+/// A BVFS restore-list table name that cannot contain user input.
+///
+/// Bacula 15.0.3 accepts only `b2` followed by decimal digits for these
+/// tables. Encoding the server-generated run UUID as one u128 decimal integer
+/// also keeps the identifier below PostgreSQL's 63-byte limit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BaculaBvfsRestoreTable(String);
+
+impl BaculaBvfsRestoreTable {
+    #[must_use]
+    pub fn for_run(run_id: Uuid) -> Self {
+        Self(format!("b2{}", run_id.as_u128()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VolumeLabel(String);
 
@@ -1029,6 +1166,9 @@ pub enum BaculaOperationKind {
     FullBackup,
     DataVerify,
     FullRestore,
+    PrepareSelectedRestore,
+    SelectedRestore,
+    CleanupSelectedRestore,
     Cancel,
     QueryJob,
     QueryLatestBackup,
@@ -1070,6 +1210,7 @@ impl BaculaJobResource {
             (Self::Backup, BaculaOperationKind::FullBackup)
                 | (Self::Verify, BaculaOperationKind::DataVerify)
                 | (Self::Restore, BaculaOperationKind::FullRestore)
+                | (Self::Restore, BaculaOperationKind::SelectedRestore)
         )
     }
 }
@@ -1180,6 +1321,73 @@ impl BaculaCommands {
                 "restore jobid={backup_job_id} restorejob={RESTORE_JOB_NAME} restoreclient={FILE_DAEMON_NAME} where=\"{}\" all done yes",
                 destination.path().display()
             ),
+            false,
+        )
+    }
+
+    /// Ask Bacula's BVFS to materialize the exact numeric restore list.
+    ///
+    /// All rendered values are positive integer wrappers or the
+    /// server-generated `b2<decimal UUID>` token. No pathname reaches Console
+    /// stdin through this command.
+    #[must_use]
+    pub fn prepare_selected_restore(
+        selection: &BaculaRestoreSelection,
+        table: &BaculaBvfsRestoreTable,
+    ) -> BconsoleScript {
+        let mut command = format!(
+            ".bvfs_restore path={} jobid={}",
+            table.as_str(),
+            selection.backup_job_id()
+        );
+        if !selection.file_indexes().is_empty() {
+            command.push_str(" fileindex=");
+            for (position, selected) in selection.file_indexes().iter().enumerate() {
+                if position > 0 {
+                    command.push(',');
+                }
+                use std::fmt::Write as _;
+                write!(command, "{},{}", selected.job_id, selected.file_index)
+                    .expect("writing to a String is infallible");
+            }
+        }
+        if !selection.directory_path_ids().is_empty() {
+            command.push_str(" dirid=");
+            for (position, path_id) in selection.directory_path_ids().iter().enumerate() {
+                if position > 0 {
+                    command.push(',');
+                }
+                use std::fmt::Write as _;
+                write!(command, "{path_id}").expect("writing to a String is infallible");
+            }
+        }
+        BconsoleScript::console_command(BaculaOperationKind::PrepareSelectedRestore, command, false)
+    }
+
+    /// Dispatch a restore from the already materialized BVFS table.
+    #[must_use]
+    pub fn selected_restore(
+        backup_job_id: BaculaJobId,
+        destination: &BaculaRestoreDestination,
+        table: &BaculaBvfsRestoreTable,
+    ) -> BconsoleScript {
+        BconsoleScript::console_command(
+            BaculaOperationKind::SelectedRestore,
+            format_args!(
+                "restore jobid={backup_job_id} restorejob={RESTORE_JOB_NAME} restoreclient={FILE_DAEMON_NAME} where=\"{}\" file=\"?{}\" done yes",
+                destination.path().display(),
+                table.as_str()
+            ),
+            false,
+        )
+    }
+
+    /// Drop a server-generated BVFS restore-list table after dispatch.
+    #[must_use]
+    pub fn cleanup_selected_restore(table: &BaculaBvfsRestoreTable) -> BconsoleScript {
+        BconsoleScript::console_command(
+            BaculaOperationKind::CleanupSelectedRestore,
+            format_args!(".bvfs_cleanup path={}", table.as_str()),
             false,
         )
     }
@@ -1963,6 +2171,9 @@ mod tests {
         assert!(rendered.director.contains("Client ACL = *all*"));
         assert!(rendered
             .director
+            .contains(".bvfs_restore, .bvfs_cleanup, restore"));
+        assert!(rendered
+            .director
             .contains("Backup Client ACL = tapescale-fd"));
         assert!(rendered
             .director
@@ -2300,6 +2511,109 @@ mod tests {
         ));
         assert!(destination.path().starts_with(RESTORE_ROOT));
         assert!(!input.contains("../"));
+    }
+
+    #[test]
+    fn selected_restore_commands_use_only_typed_catalog_identities() {
+        let backup_job_id = BaculaJobId::new(42).expect("job id");
+        let run_id = Uuid::parse_str("018f7cac-2e2a-7dc5-b70c-78a46a6f6f01").expect("uuid");
+        let table = BaculaBvfsRestoreTable::for_run(run_id);
+        assert_eq!(table.as_str(), format!("b2{}", run_id.as_u128()));
+        assert!(table.as_str().strip_prefix("b2").is_some_and(
+            |value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        ));
+
+        let selection = BaculaRestoreSelection::new(
+            backup_job_id,
+            vec![
+                BaculaRestoreFileIndex {
+                    job_id: backup_job_id,
+                    file_index: BaculaFileIndex::new(17).expect("file index"),
+                },
+                BaculaRestoreFileIndex {
+                    job_id: backup_job_id,
+                    file_index: BaculaFileIndex::new(3).expect("file index"),
+                },
+                BaculaRestoreFileIndex {
+                    job_id: backup_job_id,
+                    file_index: BaculaFileIndex::new(17).expect("duplicate file index"),
+                },
+            ],
+            vec![
+                BaculaPathId::new(11).expect("path id"),
+                BaculaPathId::new(5).expect("path id"),
+                BaculaPathId::new(11).expect("duplicate path id"),
+            ],
+        )
+        .expect("selection");
+        let prepared =
+            String::from_utf8(BaculaCommands::prepare_selected_restore(&selection, &table).stdin)
+                .expect("utf8");
+        assert_eq!(
+            prepared,
+            format!(
+                ".api 2 api_opts=j\n.bvfs_restore path={} jobid=42 fileindex=42,3,42,17 dirid=5,11\n.quit\n",
+                table.as_str()
+            )
+        );
+        assert!(!prepared.contains("/source"));
+        assert!(!prepared.contains('"'));
+
+        let restore_subpath = BaculaRestoreSubpath::parse("selected restores").expect("path");
+        let destination = restore_subpath.destination(run_id);
+        let restored = String::from_utf8(
+            BaculaCommands::selected_restore(backup_job_id, &destination, &table).stdin,
+        )
+        .expect("utf8");
+        assert_eq!(
+            restored,
+            format!(
+                ".api 2 api_opts=j\nrestore jobid=42 restorejob=TS-Restore restoreclient=tapescale-fd where=\"{}\" file=\"?{}\" done yes\n.quit\n",
+                destination.path().display(),
+                table.as_str()
+            )
+        );
+        assert!(!restored.contains("/source"));
+        assert_eq!(restored.lines().count(), 3);
+
+        let cleanup = String::from_utf8(BaculaCommands::cleanup_selected_restore(&table).stdin)
+            .expect("utf8");
+        assert_eq!(
+            cleanup,
+            format!(
+                ".api 2 api_opts=j\n.bvfs_cleanup path={}\n.quit\n",
+                table.as_str()
+            )
+        );
+        assert!(BaculaJobResource::Restore.accepts_operation(BaculaOperationKind::SelectedRestore));
+        assert!(!BaculaJobResource::Restore
+            .accepts_operation(BaculaOperationKind::PrepareSelectedRestore));
+    }
+
+    #[test]
+    fn selected_restore_identity_contract_rejects_empty_or_cross_job_values() {
+        let backup_job_id = BaculaJobId::new(42).expect("job id");
+        assert!(matches!(
+            BaculaRestoreSelection::new(backup_job_id, Vec::new(), Vec::new()),
+            Err(BaculaValidationError::Empty {
+                field: "restore_selection"
+            })
+        ));
+        assert!(matches!(
+            BaculaRestoreSelection::new(
+                backup_job_id,
+                vec![BaculaRestoreFileIndex {
+                    job_id: BaculaJobId::new(99).expect("other job id"),
+                    file_index: BaculaFileIndex::new(1).expect("file index"),
+                }],
+                Vec::new()
+            ),
+            Err(BaculaValidationError::InvalidValue {
+                field: "restore_file_job_id"
+            })
+        ));
+        assert!(BaculaFileIndex::new(0).is_err());
+        assert!(BaculaPathId::new(0).is_err());
     }
 
     #[test]

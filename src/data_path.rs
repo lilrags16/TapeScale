@@ -29,6 +29,7 @@ const MANIFEST_FORMAT: &str = "tapescale-file-manifest-v2";
 const MAX_DIFFERENCES: usize = 1_000;
 pub const MAX_G02_MANIFEST_ENTRIES: u64 = 100_000;
 pub const MAX_G02_LOGICAL_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+pub const MAX_RESTORE_SELECTION_PATHS: usize = 256;
 const STREAMING_MANIFEST_SORT_CHUNK_ENTRIES: usize = 1_024;
 
 #[derive(Debug, Error)]
@@ -69,6 +70,16 @@ pub enum ManifestError {
     Integrity(&'static str),
     #[error("a manifest artifact already exists and will not be overwritten: {0}")]
     ArtifactExists(PathBuf),
+    #[error("a selected-path restore requires at least one retained path")]
+    EmptyRestoreSelection,
+    #[error("a selected-path restore accepts at most {limit} requested paths (received {actual})")]
+    RestoreSelectionTooLarge { limit: usize, actual: usize },
+    #[error("restore selection path is not a safe retained relative path: {0}")]
+    InvalidRestoreSelectionPath(String),
+    #[error("restore selection path does not exist in the retained manifest: {0}")]
+    RestoreSelectionPathNotFound(String),
+    #[error("the resolved restore selection no longer matches its retained manifest")]
+    RestoreSelectionMismatch,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -153,6 +164,66 @@ pub enum EntryKind {
     Directory,
     File,
     Symlink,
+}
+
+/// Client intent for one immutable restore plan.  The API accepts this shape,
+/// resolves it against an authenticated retained manifest, and persists only
+/// the corresponding [`ResolvedManifestSelection`] as execution authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ManifestSelectionRequest {
+    CompletePoint {
+        #[serde(default)]
+        paths: Vec<String>,
+    },
+    SelectedPaths {
+        paths: Vec<String>,
+    },
+}
+
+impl Default for ManifestSelectionRequest {
+    fn default() -> Self {
+        Self::CompletePoint { paths: Vec::new() }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestSelectionKind {
+    CompletePoint,
+    SelectedPaths,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManifestSelectionRoot {
+    pub path: String,
+    pub kind: EntryKind,
+    pub implicit_hard_link: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManifestSelectionSummary {
+    pub path_count: usize,
+    pub entry_count: u64,
+    pub file_count: u64,
+    pub logical_bytes: u64,
+}
+
+/// Server-resolved, content-addressed restore scope.  `normalized_paths`
+/// includes every effective root, including hard-link peers that must travel
+/// together to preserve the retained link relationship.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ResolvedManifestSelection {
+    pub kind: ManifestSelectionKind,
+    pub requested_paths: Vec<String>,
+    pub normalized_paths: Vec<String>,
+    pub implicit_hard_link_paths: Vec<String>,
+    pub roots: Vec<ManifestSelectionRoot>,
+    pub recursive_directories: bool,
+    pub manifest_digest: String,
+    pub selected_manifest_digest: String,
+    pub selection_hash: String,
+    pub summary: ManifestSelectionSummary,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -706,7 +777,12 @@ pub fn load_manifest(path: &Path) -> Result<FileManifest, ManifestError> {
 /// so the bytes they validate are exactly the bytes that are decoded. Reopening
 /// a pathname after hashing would leave a time-of-check/time-of-use gap.
 pub fn load_manifest_bytes(bytes: &[u8]) -> Result<FileManifest, ManifestError> {
-    load_manifest_bytes_with_limit(bytes, MAX_G02_MANIFEST_ENTRIES)
+    // The G0.2 fixture builder remains deliberately bounded, but retained
+    // operational manifests must not inherit that laboratory entry ceiling.
+    // Callers already impose an authenticated artifact-byte bound before this
+    // decoder is reached, so use the serialized artifact as the resource
+    // authority rather than rejecting a valid inventory at 100,000 entries.
+    load_manifest_bytes_with_limit(bytes, u64::MAX)
 }
 
 fn load_manifest_bytes_with_limit(
@@ -800,6 +876,454 @@ pub fn compare_manifests(expected: &FileManifest, actual: &FileManifest) -> Mani
         differences,
         differences_truncated,
     }
+}
+
+/// Resolve client restore intent against one authenticated retained manifest.
+///
+/// Paths are normalized and deduplicated by the server. Selecting a directory
+/// includes its complete retained subtree. Selecting any member of a hard-link
+/// group also includes every retained peer so a selective restore cannot turn
+/// a proven link relationship into unrelated file data.
+pub fn resolve_manifest_selection(
+    manifest: &FileManifest,
+    request: &ManifestSelectionRequest,
+) -> Result<ResolvedManifestSelection, ManifestError> {
+    validate_selection_manifest(manifest)?;
+    match request {
+        ManifestSelectionRequest::CompletePoint { paths } => {
+            if !paths.is_empty() {
+                return Err(ManifestError::InvalidRestoreSelectionPath(
+                    "complete_point does not accept paths".to_owned(),
+                ));
+            }
+            resolved_selection(
+                ManifestSelectionKind::CompletePoint,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                manifest,
+            )
+        }
+        ManifestSelectionRequest::SelectedPaths { paths } => {
+            resolve_selected_manifest_paths(manifest, paths)
+        }
+    }
+}
+
+fn resolve_selected_manifest_paths(
+    manifest: &FileManifest,
+    paths: &[String],
+) -> Result<ResolvedManifestSelection, ManifestError> {
+    if paths.is_empty() {
+        return Err(ManifestError::EmptyRestoreSelection);
+    }
+    if paths.len() > MAX_RESTORE_SELECTION_PATHS {
+        return Err(ManifestError::RestoreSelectionTooLarge {
+            limit: MAX_RESTORE_SELECTION_PATHS,
+            actual: paths.len(),
+        });
+    }
+
+    let by_path = manifest
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut requested = BTreeSet::new();
+    for path in paths {
+        let normalized = normalize_restore_selection_path(path)?;
+        if !by_path.contains_key(normalized.as_str()) {
+            return Err(ManifestError::RestoreSelectionPathNotFound(normalized));
+        }
+        requested.insert(normalized);
+    }
+    let requested_paths = requested.into_iter().collect::<Vec<_>>();
+
+    // Consider shallow candidates first so a selected directory can subsume
+    // every redundant descendant even when the request arrived out of order.
+    let mut candidates = requested_paths.clone();
+    candidates.sort_by(|left, right| {
+        Path::new(left)
+            .components()
+            .count()
+            .cmp(&Path::new(right).components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut roots = Vec::<ManifestSelectionRoot>::new();
+    for path in candidates {
+        if roots.iter().any(|root| {
+            root.kind == EntryKind::Directory && manifest_path_within(&path, &root.path)
+        }) {
+            continue;
+        }
+        let entry = by_path
+            .get(path.as_str())
+            .expect("requested paths were checked above");
+        roots.push(ManifestSelectionRoot {
+            path,
+            kind: entry.kind,
+            implicit_hard_link: false,
+        });
+    }
+
+    let selected_groups = manifest
+        .entries
+        .iter()
+        .filter(|entry| selection_roots_contain(&roots, &entry.path))
+        .filter_map(|entry| entry.hard_link_group.as_deref())
+        .collect::<BTreeSet<_>>();
+    let mut implicit_hard_link_paths = Vec::new();
+    for entry in &manifest.entries {
+        if entry.kind != EntryKind::File
+            || entry
+                .hard_link_group
+                .as_deref()
+                .is_none_or(|group| !selected_groups.contains(group))
+            || selection_roots_contain(&roots, &entry.path)
+        {
+            continue;
+        }
+        implicit_hard_link_paths.push(entry.path.clone());
+        roots.push(ManifestSelectionRoot {
+            path: entry.path.clone(),
+            kind: EntryKind::File,
+            implicit_hard_link: true,
+        });
+    }
+    roots.sort_by(|left, right| left.path.cmp(&right.path));
+    implicit_hard_link_paths.sort();
+
+    resolved_selection(
+        ManifestSelectionKind::SelectedPaths,
+        requested_paths,
+        roots,
+        implicit_hard_link_paths,
+        manifest,
+    )
+}
+
+fn resolved_selection(
+    kind: ManifestSelectionKind,
+    requested_paths: Vec<String>,
+    roots: Vec<ManifestSelectionRoot>,
+    implicit_hard_link_paths: Vec<String>,
+    manifest: &FileManifest,
+) -> Result<ResolvedManifestSelection, ManifestError> {
+    let normalized_paths = roots
+        .iter()
+        .map(|root| root.path.clone())
+        .collect::<Vec<_>>();
+    let (entry_count, file_count, logical_bytes, selected_manifest_digest) = match kind {
+        ManifestSelectionKind::CompletePoint => (
+            manifest.entry_count,
+            manifest.file_count,
+            manifest.logical_bytes,
+            manifest.digest_sha256.clone(),
+        ),
+        ManifestSelectionKind::SelectedPaths => {
+            // The projected manifest retains `.` as a neutral comparison root.
+            // Including it here keeps the summary identical to the exact
+            // manifest artifact used for verification.
+            let mut entry_count = 1_u64;
+            let mut file_count = 0_u64;
+            let mut logical_bytes = 0_u64;
+            for entry in manifest
+                .entries
+                .iter()
+                .filter(|entry| entry.path != "." && selection_roots_contain(&roots, &entry.path))
+            {
+                entry_count = entry_count
+                    .checked_add(1)
+                    .ok_or(ManifestError::Integrity("selection entry count overflow"))?;
+                if entry.kind == EntryKind::File {
+                    file_count = file_count
+                        .checked_add(1)
+                        .ok_or(ManifestError::Integrity("selection file count overflow"))?;
+                }
+                logical_bytes = logical_bytes.checked_add(entry.size.unwrap_or(0)).ok_or(
+                    ManifestError::Integrity("selection logical byte count overflow"),
+                )?;
+            }
+            let selected_entries = manifest
+                .entries
+                .iter()
+                .filter(|entry| entry.path == "." || selection_roots_contain(&roots, &entry.path))
+                .cloned()
+                .collect::<Vec<_>>();
+            let selected_manifest_digest =
+                manifest_from_scoped_entries(selected_entries)?.digest_sha256;
+            (
+                entry_count,
+                file_count,
+                logical_bytes,
+                selected_manifest_digest,
+            )
+        }
+    };
+    let summary = ManifestSelectionSummary {
+        path_count: normalized_paths.len(),
+        entry_count,
+        file_count,
+        logical_bytes,
+    };
+    let mut resolved = ResolvedManifestSelection {
+        kind,
+        requested_paths,
+        normalized_paths,
+        implicit_hard_link_paths,
+        roots,
+        recursive_directories: true,
+        manifest_digest: manifest.digest_sha256.clone(),
+        selected_manifest_digest,
+        selection_hash: String::new(),
+        summary,
+    };
+    resolved.selection_hash = resolved_selection_hash(&resolved)?;
+    Ok(resolved)
+}
+
+#[derive(Serialize)]
+struct SelectionHashMaterial<'a> {
+    format: &'static str,
+    kind: ManifestSelectionKind,
+    requested_paths: &'a [String],
+    normalized_paths: &'a [String],
+    implicit_hard_link_paths: &'a [String],
+    roots: &'a [ManifestSelectionRoot],
+    recursive_directories: bool,
+    manifest_digest: &'a str,
+    selected_manifest_digest: &'a str,
+    summary: &'a ManifestSelectionSummary,
+}
+
+fn resolved_selection_hash(selection: &ResolvedManifestSelection) -> Result<String, ManifestError> {
+    let material = SelectionHashMaterial {
+        format: "tapescale-restore-selection-v1",
+        kind: selection.kind,
+        requested_paths: &selection.requested_paths,
+        normalized_paths: &selection.normalized_paths,
+        implicit_hard_link_paths: &selection.implicit_hard_link_paths,
+        roots: &selection.roots,
+        recursive_directories: selection.recursive_directories,
+        manifest_digest: &selection.manifest_digest,
+        selected_manifest_digest: &selection.selected_manifest_digest,
+        summary: &selection.summary,
+    };
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&material)?)
+    ))
+}
+
+/// Produce the exact expected manifest for an immutable restore scope.
+/// Selected manifests retain the original relative paths and a neutral root;
+/// callers can therefore verify several disjoint selections in one scan.
+pub fn project_manifest_selection(
+    manifest: &FileManifest,
+    selection: &ResolvedManifestSelection,
+) -> Result<FileManifest, ManifestError> {
+    ensure_resolved_selection(manifest, selection)?;
+    if selection.kind == ManifestSelectionKind::CompletePoint {
+        return Ok(manifest.clone());
+    }
+    let entries = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.path == "." || selection_roots_contain(&selection.roots, &entry.path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let projected = manifest_from_scoped_entries(entries)?;
+    if projected.entry_count != selection.summary.entry_count
+        || projected.file_count != selection.summary.file_count
+        || projected.logical_bytes != selection.summary.logical_bytes
+        || projected.digest_sha256 != selection.selected_manifest_digest
+    {
+        return Err(ManifestError::RestoreSelectionMismatch);
+    }
+    Ok(projected)
+}
+
+/// Compare a restored tree with exactly the approved scope.
+///
+/// Bacula may materialize parent directories needed to reach individually
+/// selected objects. Those directory scaffolds are ignored, but any other
+/// out-of-scope object is retained in the observed projection and therefore
+/// reported as unexpected by the ordinary manifest comparator.
+pub fn compare_manifest_selection(
+    expected: &FileManifest,
+    actual: &FileManifest,
+    selection: &ResolvedManifestSelection,
+) -> Result<ManifestComparison, ManifestError> {
+    ensure_resolved_selection(expected, selection)?;
+    validate_selection_manifest(actual)?;
+    if selection.kind == ManifestSelectionKind::CompletePoint {
+        return Ok(compare_manifests(expected, actual));
+    }
+    let projected_expected = project_manifest_selection(expected, selection)?;
+    let expected_root = projected_expected
+        .entries
+        .iter()
+        .find(|entry| entry.path == ".")
+        .cloned()
+        .ok_or(ManifestError::Integrity("manifest root entry is missing"))?;
+    let mut observed_entries = vec![expected_root];
+    for entry in actual.entries.iter().filter(|entry| entry.path != ".") {
+        let selected = selection_roots_contain(&selection.roots, &entry.path);
+        let scaffold = entry.kind == EntryKind::Directory
+            && selection.roots.iter().any(|root| {
+                root.path != entry.path && manifest_path_within(&root.path, &entry.path)
+            });
+        if selected || !scaffold {
+            observed_entries.push(entry.clone());
+        }
+    }
+    let projected_actual = manifest_from_scoped_entries(observed_entries)?;
+    Ok(compare_manifests(&projected_expected, &projected_actual))
+}
+
+fn ensure_resolved_selection(
+    manifest: &FileManifest,
+    selection: &ResolvedManifestSelection,
+) -> Result<(), ManifestError> {
+    let request = match selection.kind {
+        ManifestSelectionKind::CompletePoint => {
+            ManifestSelectionRequest::CompletePoint { paths: Vec::new() }
+        }
+        ManifestSelectionKind::SelectedPaths => ManifestSelectionRequest::SelectedPaths {
+            paths: selection.requested_paths.clone(),
+        },
+    };
+    let resolved = resolve_manifest_selection(manifest, &request)?;
+    if &resolved == selection {
+        Ok(())
+    } else {
+        Err(ManifestError::RestoreSelectionMismatch)
+    }
+}
+
+fn validate_selection_manifest(manifest: &FileManifest) -> Result<(), ManifestError> {
+    if manifest.format != MANIFEST_FORMAT
+        || manifest.entry_count != manifest.entries.len() as u64
+        || manifest.file_count
+            != manifest
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::File)
+                .count() as u64
+        || manifest.logical_bytes
+            != manifest
+                .entries
+                .iter()
+                .filter_map(|entry| entry.size)
+                .sum::<u64>()
+        || manifest.coverage != ManifestCoverage::default()
+        || manifest.digest_sha256 != manifest_digest(&manifest.entries)?
+    {
+        return Err(ManifestError::Integrity(
+            "manifest counters, coverage, or digest are invalid",
+        ));
+    }
+    let mut previous: Option<&str> = None;
+    let mut root_seen = false;
+    for entry in &manifest.entries {
+        if previous.is_some_and(|value| value >= entry.path.as_str()) {
+            return Err(ManifestError::Integrity(
+                "manifest paths are duplicated or not strictly sorted",
+            ));
+        }
+        previous = Some(&entry.path);
+        if entry.path == "." {
+            if root_seen || entry.kind != EntryKind::Directory {
+                return Err(ManifestError::Integrity("manifest root entry is invalid"));
+            }
+            root_seen = true;
+            continue;
+        }
+        if entry.path.chars().any(char::is_control) {
+            return Err(ManifestError::UnsafeArchivePath(entry.path.clone()));
+        }
+        let safe = validate_archive_path(Path::new(&entry.path))
+            .map_err(|_| ManifestError::UnsafeArchivePath(entry.path.clone()))?;
+        if safe.as_path().to_str() != Some(entry.path.as_str()) {
+            return Err(ManifestError::UnsafeArchivePath(entry.path.clone()));
+        }
+        if let Some(target) = &entry.symlink_target {
+            resolve_link_target(&safe, Path::new(target))
+                .map_err(|_| ManifestError::UnsafeArchivePath(entry.path.clone()))?;
+        }
+    }
+    if !root_seen {
+        return Err(ManifestError::Integrity("manifest root entry is missing"));
+    }
+    Ok(())
+}
+
+fn normalize_restore_selection_path(value: &str) -> Result<String, ManifestError> {
+    if value.is_empty() || value == "." || value.chars().any(char::is_control) {
+        return Err(ManifestError::InvalidRestoreSelectionPath(value.to_owned()));
+    }
+    let safe = validate_archive_path(Path::new(value))
+        .map_err(|_| ManifestError::InvalidRestoreSelectionPath(value.to_owned()))?;
+    let normalized = safe
+        .as_path()
+        .to_str()
+        .ok_or_else(|| ManifestError::InvalidRestoreSelectionPath(value.to_owned()))?
+        .to_owned();
+    if normalized == "." {
+        Err(ManifestError::InvalidRestoreSelectionPath(value.to_owned()))
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn manifest_path_within(path: &str, directory: &str) -> bool {
+    Path::new(path).starts_with(Path::new(directory))
+}
+
+fn selection_roots_contain(roots: &[ManifestSelectionRoot], path: &str) -> bool {
+    roots.iter().any(|root| {
+        root.path == path
+            || (root.kind == EntryKind::Directory && manifest_path_within(path, &root.path))
+    })
+}
+
+fn manifest_from_scoped_entries(
+    mut entries: Vec<ManifestEntry>,
+) -> Result<FileManifest, ManifestError> {
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut canonical_groups = BTreeMap::<String, String>::new();
+    let mut next_group = 1_u64;
+    for entry in &mut entries {
+        if let Some(group) = entry.hard_link_group.clone() {
+            entry.hard_link_group = Some(
+                canonical_groups
+                    .entry(group)
+                    .or_insert_with(|| {
+                        let value = format!("link-{next_group}");
+                        next_group += 1;
+                        value
+                    })
+                    .clone(),
+            );
+        }
+    }
+    let entry_count = entries.len() as u64;
+    let file_count = entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::File)
+        .count() as u64;
+    let logical_bytes = entries.iter().filter_map(|entry| entry.size).sum();
+    let digest_sha256 = manifest_digest(&entries)?;
+    Ok(FileManifest {
+        format: MANIFEST_FORMAT.to_owned(),
+        entries,
+        entry_count,
+        file_count,
+        logical_bytes,
+        digest_sha256,
+        coverage: ManifestCoverage::default(),
+        source_stability_digest_sha256: String::new(),
+    })
 }
 
 fn validate_relative(value: &str) -> Result<(), ManifestError> {
@@ -1581,6 +2105,240 @@ mod tests {
 
     use super::*;
 
+    fn selection_entry(
+        path: &str,
+        kind: EntryKind,
+        size: Option<u64>,
+        hard_link_group: Option<&str>,
+    ) -> ManifestEntry {
+        ManifestEntry {
+            path: path.to_owned(),
+            kind,
+            mode: if kind == EntryKind::Directory {
+                0o755
+            } else {
+                0o640
+            },
+            uid: 1_000,
+            gid: 1_000,
+            mtime_seconds: 1_700_000_000,
+            size,
+            content_sha256: size.map(|value| format!("{value:064x}")),
+            symlink_target: None,
+            hard_link_group: hard_link_group.map(str::to_owned),
+        }
+    }
+
+    fn selection_fixture_manifest() -> FileManifest {
+        manifest_from_scoped_entries(vec![
+            selection_entry(".", EntryKind::Directory, None, None),
+            selection_entry("alpha", EntryKind::Directory, None, None),
+            selection_entry("alpha/a.bin", EntryKind::File, Some(4), Some("source-pair")),
+            selection_entry("alpha/solo.txt", EntryKind::File, Some(2), None),
+            selection_entry("beta", EntryKind::Directory, None, None),
+            selection_entry(
+                "beta/a-link.bin",
+                EntryKind::File,
+                Some(4),
+                Some("source-pair"),
+            ),
+            selection_entry("gamma.txt", EntryKind::File, Some(8), None),
+        ])
+        .expect("selection fixture")
+    }
+
+    #[test]
+    fn selected_manifest_scope_is_recursive_deduplicated_and_hard_link_closed() {
+        let manifest = selection_fixture_manifest();
+        let request = ManifestSelectionRequest::SelectedPaths {
+            paths: vec!["alpha/a.bin".to_owned(), "alpha".to_owned()],
+        };
+        let selection = resolve_manifest_selection(&manifest, &request).expect("selection");
+
+        assert_eq!(selection.kind, ManifestSelectionKind::SelectedPaths);
+        assert_eq!(selection.requested_paths, vec!["alpha", "alpha/a.bin"]);
+        assert_eq!(selection.normalized_paths, vec!["alpha", "beta/a-link.bin"]);
+        assert_eq!(selection.implicit_hard_link_paths, vec!["beta/a-link.bin"]);
+        assert_eq!(selection.summary.path_count, 2);
+        assert_eq!(selection.summary.entry_count, 5);
+        assert_eq!(selection.summary.file_count, 3);
+        assert_eq!(selection.summary.logical_bytes, 10);
+        assert_eq!(selection.selection_hash.len(), 64);
+        assert_eq!(selection.selected_manifest_digest.len(), 64);
+        assert_ne!(
+            selection.selected_manifest_digest,
+            selection.manifest_digest
+        );
+
+        let projected = project_manifest_selection(&manifest, &selection).expect("projection");
+        assert_eq!(projected.digest_sha256, selection.selected_manifest_digest);
+        assert_eq!(projected.entry_count, selection.summary.entry_count);
+        assert!(projected.entries.iter().all(|entry| entry.path == "."
+            || entry.path == "alpha"
+            || entry.path.starts_with("alpha/")
+            || entry.path == "beta/a-link.bin"));
+
+        let reordered = resolve_manifest_selection(
+            &manifest,
+            &ManifestSelectionRequest::SelectedPaths {
+                paths: vec!["alpha".to_owned(), "alpha/a.bin".to_owned()],
+            },
+        )
+        .expect("reordered selection");
+        assert_eq!(selection, reordered);
+    }
+
+    #[test]
+    fn selected_manifest_scope_rejects_empty_unsafe_missing_and_oversized_requests() {
+        let manifest = selection_fixture_manifest();
+        assert!(matches!(
+            resolve_manifest_selection(
+                &manifest,
+                &ManifestSelectionRequest::SelectedPaths { paths: Vec::new() }
+            ),
+            Err(ManifestError::EmptyRestoreSelection)
+        ));
+        for path in [".", "../alpha", "/alpha", "alpha\nfile"] {
+            assert!(matches!(
+                resolve_manifest_selection(
+                    &manifest,
+                    &ManifestSelectionRequest::SelectedPaths {
+                        paths: vec![path.to_owned()]
+                    }
+                ),
+                Err(ManifestError::InvalidRestoreSelectionPath(_))
+            ));
+        }
+        assert!(matches!(
+            resolve_manifest_selection(
+                &manifest,
+                &ManifestSelectionRequest::SelectedPaths {
+                    paths: vec!["missing".to_owned()]
+                }
+            ),
+            Err(ManifestError::RestoreSelectionPathNotFound(path)) if path == "missing"
+        ));
+        assert!(matches!(
+            resolve_manifest_selection(
+                &manifest,
+                &ManifestSelectionRequest::SelectedPaths {
+                    paths: vec!["alpha".to_owned(); MAX_RESTORE_SELECTION_PATHS + 1]
+                }
+            ),
+            Err(ManifestError::RestoreSelectionTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn selective_comparison_ignores_only_required_directory_scaffolds() {
+        let manifest = selection_fixture_manifest();
+        let selection = resolve_manifest_selection(
+            &manifest,
+            &ManifestSelectionRequest::SelectedPaths {
+                paths: vec!["alpha/solo.txt".to_owned()],
+            },
+        )
+        .expect("selection");
+        let mut root = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == ".")
+            .expect("root")
+            .clone();
+        root.mode = 0o700;
+        let mut scaffold = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "alpha")
+            .expect("alpha")
+            .clone();
+        scaffold.mode = 0o711;
+        let selected = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "alpha/solo.txt")
+            .expect("selected")
+            .clone();
+        let actual = manifest_from_scoped_entries(vec![root, scaffold, selected.clone()])
+            .expect("actual manifest");
+        assert!(
+            compare_manifest_selection(&manifest, &actual, &selection)
+                .expect("comparison")
+                .matched
+        );
+
+        let rogue = selection_entry("alpha/rogue.txt", EntryKind::File, Some(1), None);
+        let actual_with_rogue = manifest_from_scoped_entries(vec![
+            selection_entry(".", EntryKind::Directory, None, None),
+            selection_entry("alpha", EntryKind::Directory, None, None),
+            selected,
+            rogue,
+        ])
+        .expect("rogue manifest");
+        let comparison =
+            compare_manifest_selection(&manifest, &actual_with_rogue, &selection).expect("compare");
+        assert!(!comparison.matched);
+        assert!(comparison
+            .differences
+            .iter()
+            .any(|difference| difference.contains("unexpected restored path: alpha/rogue.txt")));
+    }
+
+    #[test]
+    fn selective_comparison_canonicalizes_closed_hard_link_groups() {
+        let manifest = selection_fixture_manifest();
+        let selection = resolve_manifest_selection(
+            &manifest,
+            &ManifestSelectionRequest::SelectedPaths {
+                paths: vec!["alpha/a.bin".to_owned()],
+            },
+        )
+        .expect("selection");
+        let mut first = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "alpha/a.bin")
+            .expect("first link")
+            .clone();
+        let mut second = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "beta/a-link.bin")
+            .expect("second link")
+            .clone();
+        first.hard_link_group = Some("restored-inode".to_owned());
+        second.hard_link_group = Some("restored-inode".to_owned());
+        let actual = manifest_from_scoped_entries(vec![
+            selection_entry(".", EntryKind::Directory, None, None),
+            selection_entry("alpha", EntryKind::Directory, None, None),
+            first,
+            selection_entry("beta", EntryKind::Directory, None, None),
+            second,
+        ])
+        .expect("restored links");
+        assert!(
+            compare_manifest_selection(&manifest, &actual, &selection)
+                .expect("comparison")
+                .matched
+        );
+    }
+
+    #[test]
+    fn complete_point_selection_preserves_the_existing_comparison_contract() {
+        let manifest = selection_fixture_manifest();
+        let selection = resolve_manifest_selection(
+            &manifest,
+            &ManifestSelectionRequest::CompletePoint { paths: Vec::new() },
+        )
+        .expect("complete selection");
+        assert_eq!(selection.manifest_digest, manifest.digest_sha256);
+        assert_eq!(selection.selected_manifest_digest, manifest.digest_sha256);
+        assert_eq!(
+            compare_manifest_selection(&manifest, &manifest, &selection).expect("comparison"),
+            compare_manifests(&manifest, &manifest)
+        );
+    }
+
     #[test]
     fn manifest_detects_content_and_link_relationships() {
         let source = tempdir().expect("source");
@@ -1953,6 +2711,10 @@ mod tests {
         assert!(summary.storage_path.is_file());
         assert_eq!(summary.artifact_sha256.len(), 64);
         assert_eq!(summary.manifest_digest.len(), 64);
+        let loaded = load_manifest(&summary.storage_path)
+            .expect("operational decoder must not inherit the G0.2 entry ceiling");
+        assert_eq!(loaded.entry_count, count);
+        assert_eq!(loaded.logical_bytes, MAX_G02_LOGICAL_BYTES + 1);
     }
 
     #[test]

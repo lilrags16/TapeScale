@@ -30,15 +30,17 @@ use uuid::Uuid;
 
 use crate::{
     bacula_catalog::{
-        validate_backup_job_on_volumes, validate_restore_job, BaculaBackupCatalogEvidence,
-        BaculaRestoreCatalogEvidence,
+        bvfs_restore_table_exists, resolve_restore_selection, validate_backup_job_on_volumes,
+        validate_bvfs_restore_table, validate_restore_job, BaculaBackupCatalogEvidence,
+        BaculaCatalogPathKind, BaculaCatalogPathSelection, BaculaRestoreCatalogEvidence,
     },
     bacula_runtime::{BaculaRuntime, BaculaRuntimeEvidence},
     config::Config,
     data_path::{
-        build_and_persist_manifest_with_cancel, compare_manifests,
-        create_isolated_restore_destination, persist_json_artifact, FileManifest,
-        JsonArtifactSummary, ManifestArtifactSummary, ManifestComparison,
+        build_and_persist_manifest_with_cancel, compare_manifest_selection,
+        create_isolated_restore_destination, persist_json_artifact, project_manifest_selection,
+        EntryKind, FileManifest, JsonArtifactSummary, ManifestArtifactSummary, ManifestComparison,
+        ManifestSelectionKind, ResolvedManifestSelection,
     },
     device::{
         discover_sas_drives, execute_sas_motion, SasDiscoveryConfig, SasMotionOperation,
@@ -46,9 +48,10 @@ use crate::{
     },
     domain::path::{resolve_link_target, validate_archive_path},
     engine::bacula::{
-        BaculaAdapter, BaculaCommands, BaculaCompression, BaculaDataOptions, BaculaJobEvidence,
-        BaculaJobId, BaculaJobResource, BaculaJobState, BaculaPaths, BaculaPoolName,
-        BaculaRestoreSubpath, CorrelatedJobDispatch, DirectBconsoleExecutor, VolumeLabel,
+        BaculaAdapter, BaculaBvfsRestoreTable, BaculaCommands, BaculaCompression,
+        BaculaDataOptions, BaculaJobEvidence, BaculaJobId, BaculaJobResource, BaculaJobState,
+        BaculaPaths, BaculaPoolName, BaculaRestoreSubpath, CorrelatedJobDispatch,
+        DirectBconsoleExecutor, VolumeLabel,
     },
     store,
 };
@@ -102,6 +105,8 @@ impl RehearsalFailure {
 #[derive(Debug)]
 struct CompletedRehearsal {
     source_manifest: FileManifest,
+    retained_manifest_digest: String,
+    restore_scope: ResolvedManifestSelection,
     restored_manifest: FileManifest,
     restored_manifest_artifact_sha256: String,
     comparison: ManifestComparison,
@@ -263,7 +268,8 @@ async fn perform_rehearsal(
     let deadline = Instant::now() + config.data_run_timeout;
     let mut runtime: Option<BaculaRuntime> = None;
     let mut tape_touched = false;
-    let operation = async {
+    let mut selected_table_cleanup_required = false;
+    let mut operation = async {
         validate_contract(config, &claim.run)?;
         prepare_evidence_directory(&config.evidence_root, evidence_directory)?;
 
@@ -282,6 +288,18 @@ async fn perform_rehearsal(
         .map_err(|error| {
             RehearsalFailure::blocked(format!("retained-manifest worker failed: {error}"))
         })??;
+        let restore_scope: ResolvedManifestSelection =
+            serde_json::from_value(claim.run.restore_scope.clone()).map_err(|error| {
+                RehearsalFailure::blocked(format!(
+                    "the immutable restore scope could not be decoded: {error}"
+                ))
+            })?;
+        let scoped_source_manifest =
+            project_manifest_selection(&source_manifest, &restore_scope).map_err(|error| {
+                RehearsalFailure::blocked(format!(
+                    "the immutable restore scope no longer matches the authenticated manifest: {error}"
+                ))
+            })?;
         let estimated_required_bytes = u64::try_from(claim.run.estimated_required_bytes)
             .map_err(|_| RehearsalFailure::blocked("restore-plan byte estimate is invalid"))?;
         let reserve_bytes = u64::try_from(claim.run.required_free_reserve_bytes)
@@ -291,11 +309,11 @@ async fn perform_rehearsal(
         })?;
         let capacity = destination_capacity_evidence(
             &config.restore_root,
-            source_manifest
+            scoped_source_manifest
                 .logical_bytes
                 .max(estimated_required_bytes),
             reserve_bytes,
-            source_manifest.logical_bytes,
+            scoped_source_manifest.logical_bytes,
             estimated_required_bytes,
             asserted_available_bytes,
         )?;
@@ -340,6 +358,23 @@ async fn perform_rehearsal(
             })?;
         let ordered_volume_evidence =
             validate_restore_catalog_volumes(&restore_volumes, &backup_catalog, backup_job_id)?;
+        let selected_catalog_paths = bacula_catalog_path_selections(
+            Path::new(&claim.run.source_mount_path),
+            &restore_scope,
+        )?;
+        let selected_catalog = if restore_scope.kind == ManifestSelectionKind::SelectedPaths {
+            Some(
+                resolve_restore_selection(pool, backup_job_id, &selected_catalog_paths)
+                    .await
+                    .map_err(|error| {
+                        RehearsalFailure::blocked(format!(
+                            "the selected retained paths no longer map exactly to the pinned Bacula catalog: {error}"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
 
         let source_relative = Path::new(&claim.run.source_mount_path)
             .strip_prefix(&config.source_root)
@@ -419,7 +454,11 @@ async fn perform_rehearsal(
             claim,
             store::RestoreRehearsalPhase::Restoring,
             json!({
-                "detail": "retained source manifest and Bacula catalog binding passed; starting read-only full restore",
+                "detail": if restore_scope.kind == ManifestSelectionKind::SelectedPaths {
+                    "retained manifest selection and Bacula catalog identities passed; starting read-only selected-path restore"
+                } else {
+                    "retained source manifest and Bacula catalog binding passed; starting read-only complete restore"
+                },
                 "backup_job_id": backup_job_id,
                 "engine_media_id": backup_catalog.volume.media_id,
                 "volume": volume.as_str(),
@@ -427,6 +466,8 @@ async fn perform_rehearsal(
                 "volumes": ordered_volume_evidence,
                 "source_manifest_artifact_sha256": claim.run.source_manifest_sha256,
                 "source_manifest_digest": source_manifest.digest_sha256,
+                "selected_manifest_digest": scoped_source_manifest.digest_sha256,
+                "restore_scope": restore_scope,
                 "restore_destination": destination.path(),
                 "destination_capacity": capacity,
                 "media_mutation_allowed": false
@@ -434,18 +475,100 @@ async fn perform_rehearsal(
         )
         .await?;
 
-        // From this point the command may have reached the Storage Daemon even if correlation or
-        // evidence persistence fails. Cleanup and reconciliation are therefore mandatory.
-        tape_touched = true;
-        let restore_dispatch = adapter
-            .dispatch_and_correlate(
-                BaculaJobResource::Restore,
-                &BaculaCommands::full_restore(backup_job_id, &destination),
-            )
-            .await
-            .map_err(|error| {
-                RehearsalFailure::failed(format!("Bacula restore dispatch failed: {error}"))
-            })?;
+        let selected_table = selected_catalog
+            .as_ref()
+            .map(|_| BaculaBvfsRestoreTable::for_run(claim.run.id));
+        let mut selected_restore_rows = None;
+        let restore_dispatch_result = async {
+            if let (Some(selection), Some(table)) = (&selected_catalog, &selected_table) {
+                selected_table_cleanup_required = true;
+                // Remove a stale table from a process crash before recreating this
+                // run's server-generated restore list. No media command is issued.
+                let _ = adapter
+                    .dispatch(&BaculaCommands::cleanup_selected_restore(table))
+                    .await;
+                if bvfs_restore_table_exists(pool, table)
+                    .await
+                    .map_err(|error| {
+                        RehearsalFailure::failed(format!(
+                            "could not verify stale BVFS restore-table cleanup: {error}"
+                        ))
+                    })?
+                {
+                    return Err(RehearsalFailure::failed(
+                        "the stale BVFS restore table could not be removed before dispatch",
+                    ));
+                }
+                // From this point even a failed console command may have
+                // created the server-named table, so common teardown owns it.
+                adapter
+                    .dispatch(&BaculaCommands::prepare_selected_restore(selection, table))
+                    .await
+                    .map_err(|error| {
+                        RehearsalFailure::failed(format!(
+                            "Bacula could not materialize the selected restore list: {error}"
+                        ))
+                    })?;
+                selected_restore_rows = Some(
+                    validate_bvfs_restore_table(pool, table, backup_job_id)
+                        .await
+                        .map_err(|error| {
+                            RehearsalFailure::failed(format!(
+                                "Bacula did not materialize the approved selected restore list: {error}"
+                            ))
+                        })?,
+                );
+            }
+            let restore_script = match &selected_table {
+                Some(table) => BaculaCommands::selected_restore(backup_job_id, &destination, table),
+                None => BaculaCommands::full_restore(backup_job_id, &destination),
+            };
+            if cancellation.is_cancelled() {
+                return Err(RehearsalFailure::interrupted(
+                    "worker shutdown was requested immediately before restore dispatch",
+                ));
+            }
+            if cancellation_requested(pool, claim).await? {
+                return Err(RehearsalFailure::cancelled(
+                    "restore rehearsal was cancelled immediately before restore dispatch",
+                ));
+            }
+            // Selected BVFS materialization can be catalog-heavy. Reassert the
+            // durable lease and fencing tokens after that work, at the final
+            // boundary before Bacula can issue a physical media read.
+            renew_claim(pool, claim, "at the final restore-dispatch boundary").await?;
+            // From this boundary the command may have reached the Storage Daemon
+            // even if correlation or evidence persistence fails. Drive cleanup and
+            // reconciliation are therefore mandatory.
+            tape_touched = true;
+            adapter
+                .dispatch_and_correlate(BaculaJobResource::Restore, &restore_script)
+                .await
+                .map_err(|error| {
+                    RehearsalFailure::failed(format!("Bacula restore dispatch failed: {error}"))
+                })
+        }
+        .await;
+        let mut selected_table_cleaned = selected_table.is_none();
+        if let Some(table) = &selected_table {
+            let cleanup_dispatched = adapter
+                .dispatch(&BaculaCommands::cleanup_selected_restore(table))
+                .await
+                .is_ok();
+            selected_table_cleaned = cleanup_dispatched
+                && matches!(bvfs_restore_table_exists(pool, table).await, Ok(false));
+            if selected_table_cleaned {
+                selected_table_cleanup_required = false;
+            }
+            if !selected_table_cleaned {
+                warn!(
+                    restore_rehearsal_id = %claim.run.id,
+                    table = table.as_str(),
+                    "BVFS restore table cleanup will be retried after the active restore"
+                );
+            }
+        }
+        let restore_dispatch = restore_dispatch_result?;
         record_engine_dispatch(pool, claim, &restore_dispatch, &adapter).await?;
         let restore = wait_for_job(
             pool,
@@ -461,6 +584,33 @@ async fn perform_rehearsal(
             cancellation,
         )
         .await?;
+        if !selected_table_cleaned {
+            let table = selected_table
+                .as_ref()
+                .expect("cleanup is pending only for a selected restore");
+            adapter
+                .dispatch(&BaculaCommands::cleanup_selected_restore(table))
+                .await
+                .map_err(|error| {
+                    RehearsalFailure::failed(format!(
+                        "selected restore completed but its BVFS table could not be cleaned up: {error}"
+                    ))
+                })?;
+            if bvfs_restore_table_exists(pool, table)
+                .await
+                .map_err(|error| {
+                    RehearsalFailure::failed(format!(
+                        "selected restore completed but BVFS cleanup could not be verified: {error}"
+                    ))
+                })?
+            {
+                return Err(RehearsalFailure::failed(
+                    "selected restore completed but its BVFS table still exists",
+                ));
+            }
+            selected_table_cleaned = true;
+            selected_table_cleanup_required = false;
+        }
         let final_backup_catalog = validate_backup_job_on_volumes(
             pool,
             backup_job_id,
@@ -499,7 +649,11 @@ async fn perform_rehearsal(
             "volume": volume.as_str(),
             "volume_count": ordered_volume_evidence.len(),
             "volumes": ordered_volume_evidence,
-            "restore_destination": destination.path()
+            "restore_destination": destination.path(),
+            "restore_scope": restore_scope,
+            "selected_restore": selected_catalog.is_some(),
+            "bvfs_selected_rows": selected_restore_rows,
+            "bvfs_restore_table_cleaned": selected_table_cleaned
         });
         let engine_artifact = persist_json_artifact(
             evidence_directory,
@@ -525,6 +679,10 @@ async fn perform_rehearsal(
                 "volume_count": ordered_volume_evidence.len(),
                 "volumes": ordered_volume_evidence,
                 "destination": destination.path()
+                ,"restore_scope": restore_scope
+                ,"selected_restore": selected_catalog.is_some()
+                ,"bvfs_selected_rows": selected_restore_rows
+                ,"bvfs_restore_table_cleaned": selected_table_cleaned
             }),
         )
         .await?;
@@ -534,9 +692,14 @@ async fn perform_rehearsal(
             claim,
             store::RestoreRehearsalPhase::Comparing,
             json!({
-                "detail": "Bacula restore completed; independently hashing restored content and covered metadata",
+                "detail": if restore_scope.kind == ManifestSelectionKind::SelectedPaths {
+                    "Bacula selected restore completed; independently hashing and comparing the exact approved manifest scope"
+                } else {
+                    "Bacula restore completed; independently hashing restored content and covered metadata"
+                },
                 "restore_job": restore,
-                "restore_destination": destination.path()
+                "restore_destination": destination.path(),
+                "restore_scope": restore_scope
             }),
         )
         .await?;
@@ -571,7 +734,16 @@ async fn perform_rehearsal(
         )
         .await?;
 
-        let comparison = compare_manifests(&source_manifest, &restored_manifest);
+        let comparison = compare_manifest_selection(
+            &source_manifest,
+            &restored_manifest,
+            &restore_scope,
+        )
+        .map_err(|error| {
+            RehearsalFailure::failed(format!(
+                "could not compare the immutable restore scope: {error}"
+            ))
+        })?;
         let comparison_artifact =
             persist_json_artifact(evidence_directory, "comparison", &comparison)
                 .map_err(|error| RehearsalFailure::failed(error.to_string()))?;
@@ -585,7 +757,9 @@ async fn perform_rehearsal(
                 "expected_digest": comparison.expected_digest,
                 "actual_digest": comparison.actual_digest,
                 "differences": comparison.differences.len(),
-                "differences_truncated": comparison.differences_truncated
+                "differences_truncated": comparison.differences_truncated,
+                "restore_scope": restore_scope,
+                "retained_manifest_digest": source_manifest.digest_sha256
             }),
         )
         .await?;
@@ -608,7 +782,9 @@ async fn perform_rehearsal(
         renew_claim(pool, claim, "before restore-rehearsal finalization").await?;
 
         Ok(CompletedRehearsal {
-            source_manifest,
+            retained_manifest_digest: source_manifest.digest_sha256.clone(),
+            source_manifest: scoped_source_manifest,
+            restore_scope,
             restored_manifest,
             restored_manifest_artifact_sha256: restored_artifact.artifact_sha256,
             comparison,
@@ -619,6 +795,35 @@ async fn perform_rehearsal(
         })
     }
     .await;
+
+    if selected_table_cleanup_required {
+        let table = BaculaBvfsRestoreTable::for_run(claim.run.id);
+        let cleanup_adapter = BaculaAdapter::new(DirectBconsoleExecutor::default());
+        let cleanup_dispatched = cleanup_adapter
+            .dispatch(&BaculaCommands::cleanup_selected_restore(&table))
+            .await
+            .is_ok();
+        let cleanup_verified = cleanup_dispatched
+            && matches!(bvfs_restore_table_exists(pool, &table).await, Ok(false));
+        if cleanup_verified {
+            selected_table_cleanup_required = false;
+        } else {
+            let cleanup_detail =
+                "the temporary Bacula BVFS restore table could not be removed during teardown";
+            if let Err(error) = &mut operation {
+                error.detail.push_str("; ");
+                error.detail.push_str(cleanup_detail);
+            } else {
+                operation = Err(RehearsalFailure::failed(cleanup_detail));
+            }
+            warn!(
+                restore_rehearsal_id = %claim.run.id,
+                table = table.as_str(),
+                "BVFS restore table remains after final teardown cleanup"
+            );
+        }
+    }
+    debug_assert!(!selected_table_cleanup_required || operation.is_err());
 
     let runtime_evidence = if let Some(active_runtime) = runtime.take() {
         Some(active_runtime.stop().await)
@@ -673,11 +878,14 @@ async fn complete_rehearsal(
                 return Ok(());
             }
             let report = json!({
-                "scope": if completed.volumes.len() > 1 {
-                    "attended verified-point multi-volume full-file restore rehearsal"
+                "scope": if completed.restore_scope.kind == ManifestSelectionKind::SelectedPaths {
+                    "attended verified-point ordered-volume selected-path restore"
+                } else if completed.volumes.len() > 1 {
+                    "attended verified-point multi-volume complete-file restore rehearsal"
                 } else {
-                    "attended verified-point single-volume full-file restore rehearsal"
+                    "attended verified-point single-volume complete-file restore rehearsal"
                 },
+                "restore_scope": completed.restore_scope,
                 "production_eligible": false,
                 "media_operation": "read_only",
                 "recovery_point_id": claim.run.recovery_point_id,
@@ -689,8 +897,10 @@ async fn complete_rehearsal(
                 "restore_catalog": completed.restore_catalog,
                 "volume_count": completed.volumes.len(),
                 "volumes": completed.volumes,
+                "retained_manifest_digest": completed.retained_manifest_digest,
                 "source_manifest_digest": completed.source_manifest.digest_sha256,
-                "restored_manifest_digest": completed.restored_manifest.digest_sha256,
+                "restored_manifest_digest": completed.comparison.actual_digest,
+                "raw_restored_manifest_digest": completed.restored_manifest.digest_sha256,
                 "restored_manifest_sha256": completed.restored_manifest_artifact_sha256,
                 "comparison": completed.comparison,
                 "restore_destination": completed.restore_destination,
@@ -715,8 +925,11 @@ async fn complete_rehearsal(
                         "read_only_media_operation": true,
                         "volume_count": completed.volumes.len(),
                         "volumes": completed.volumes,
+                        "restore_scope": completed.restore_scope,
+                        "retained_manifest_digest": completed.retained_manifest_digest,
                         "source_manifest_digest": completed.source_manifest.digest_sha256,
-                        "restored_manifest_digest": completed.restored_manifest.digest_sha256
+                        "restored_manifest_digest": completed.comparison.actual_digest,
+                        "raw_restored_manifest_digest": completed.restored_manifest.digest_sha256
                     }),
                 )
                 .await
@@ -955,6 +1168,17 @@ fn validate_contract(
     {
         return Err(RehearsalFailure::blocked(
             "the recovery point is not bound to the supported pinned Bacula adapter and format",
+        ));
+    }
+    let restore_scope: ResolvedManifestSelection =
+        serde_json::from_value(run.restore_scope.clone()).map_err(|error| {
+            RehearsalFailure::blocked(format!(
+                "the immutable restore scope could not be decoded: {error}"
+            ))
+        })?;
+    if restore_scope.kind == ManifestSelectionKind::SelectedPaths && run.volume_count != 1 {
+        return Err(RehearsalFailure::blocked(
+            "selected-path restore execution currently requires a single-volume recovery point",
         ));
     }
     let source = Path::new(&run.source_mount_path);
@@ -1348,6 +1572,55 @@ fn positive_bacula_job_id(value: i64) -> Result<BaculaJobId, RehearsalFailure> {
         .map_err(|_| RehearsalFailure::blocked("retained Bacula JobId is invalid"))?;
     BaculaJobId::new(value)
         .map_err(|error| RehearsalFailure::blocked(format!("invalid Bacula JobId: {error}")))
+}
+
+fn bacula_catalog_path_selections(
+    source_mount_path: &Path,
+    scope: &ResolvedManifestSelection,
+) -> Result<Vec<BaculaCatalogPathSelection>, RehearsalFailure> {
+    if scope.kind != ManifestSelectionKind::SelectedPaths {
+        return Ok(Vec::new());
+    }
+    if !source_mount_path.is_absolute() || source_mount_path == Path::new("/") {
+        return Err(RehearsalFailure::blocked(
+            "the retained source root is not an absolute child path",
+        ));
+    }
+    scope
+        .roots
+        .iter()
+        .map(|root| {
+            let relative = validate_archive_path(Path::new(&root.path)).map_err(|_| {
+                RehearsalFailure::blocked(format!(
+                    "restore scope contains unsafe retained path {}",
+                    root.path
+                ))
+            })?;
+            let absolute = source_mount_path.join(relative.as_path());
+            if !absolute.starts_with(source_mount_path) {
+                return Err(RehearsalFailure::blocked(
+                    "restore scope escaped the retained source root",
+                ));
+            }
+            let absolute_path = absolute
+                .to_str()
+                .filter(|path| !path.chars().any(char::is_control))
+                .ok_or_else(|| {
+                    RehearsalFailure::blocked(
+                        "restore scope produced an invalid Bacula catalog path",
+                    )
+                })?
+                .to_owned();
+            let kind = match root.kind {
+                EntryKind::Directory => BaculaCatalogPathKind::Directory,
+                EntryKind::File | EntryKind::Symlink => BaculaCatalogPathKind::FileOrSymlink,
+            };
+            Ok(BaculaCatalogPathSelection {
+                absolute_path,
+                kind,
+            })
+        })
+        .collect()
 }
 
 fn restored_source_path(
@@ -2485,7 +2758,78 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::data_path::{build_manifest, persist_manifest, MAX_G02_LOGICAL_BYTES};
+    use crate::data_path::{
+        build_manifest, persist_manifest, resolve_manifest_selection, ManifestSelectionRequest,
+        MAX_G02_LOGICAL_BYTES,
+    };
+
+    #[test]
+    fn selected_manifest_roots_become_only_typed_absolute_catalog_paths() {
+        let source = tempdir().expect("source");
+        fs::create_dir(source.path().join("photos")).expect("photos directory");
+        fs::write(source.path().join("photos/image.raw"), b"image").expect("image");
+        fs::create_dir(source.path().join("links")).expect("links directory");
+        fs::write(source.path().join("links/original.bin"), b"linked").expect("original");
+        fs::hard_link(
+            source.path().join("links/original.bin"),
+            source.path().join("links/peer.bin"),
+        )
+        .expect("hard-link peer");
+        let manifest = build_manifest(source.path()).expect("manifest");
+
+        let directory_scope = resolve_manifest_selection(
+            &manifest,
+            &ManifestSelectionRequest::SelectedPaths {
+                paths: vec!["photos".to_owned()],
+            },
+        )
+        .expect("directory selection");
+        assert_eq!(
+            bacula_catalog_path_selections(Path::new("/source/archive"), &directory_scope)
+                .expect("catalog directory selection"),
+            vec![BaculaCatalogPathSelection {
+                absolute_path: "/source/archive/photos".to_owned(),
+                kind: BaculaCatalogPathKind::Directory,
+            }]
+        );
+
+        let hard_link_scope = resolve_manifest_selection(
+            &manifest,
+            &ManifestSelectionRequest::SelectedPaths {
+                paths: vec!["links/original.bin".to_owned()],
+            },
+        )
+        .expect("hard-link selection");
+        assert_eq!(
+            bacula_catalog_path_selections(Path::new("/source/archive"), &hard_link_scope)
+                .expect("catalog hard-link selection"),
+            vec![
+                BaculaCatalogPathSelection {
+                    absolute_path: "/source/archive/links/original.bin".to_owned(),
+                    kind: BaculaCatalogPathKind::FileOrSymlink,
+                },
+                BaculaCatalogPathSelection {
+                    absolute_path: "/source/archive/links/peer.bin".to_owned(),
+                    kind: BaculaCatalogPathKind::FileOrSymlink,
+                },
+            ]
+        );
+        assert_eq!(
+            hard_link_scope.implicit_hard_link_paths,
+            vec!["links/peer.bin"]
+        );
+
+        let complete_scope = resolve_manifest_selection(
+            &manifest,
+            &ManifestSelectionRequest::CompletePoint { paths: Vec::new() },
+        )
+        .expect("complete scope");
+        assert!(
+            bacula_catalog_path_selections(Path::new("/source/archive"), &complete_scope)
+                .expect("complete scope does not use BVFS identities")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn retained_manifest_requires_exact_path_size_and_artifact_digest() {

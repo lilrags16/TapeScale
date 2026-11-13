@@ -2877,6 +2877,187 @@ button.source-browser-name:hover strong {
   max-height: 430px;
 }
 
+.retained-browser .source-browser-entry-action {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.recovery-entry-selection {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink-soft);
+  background: var(--surface);
+  font-size: 11px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.recovery-entry-selection:hover {
+  border-color: var(--teal);
+  color: var(--teal-strong);
+  background: var(--teal-soft);
+}
+
+.recovery-entry-selection:has(input:checked) {
+  border-color: #84bcb1;
+  color: var(--teal-strong);
+  background: var(--teal-soft);
+}
+
+.recovery-entry-selection.inherited {
+  border-style: dashed;
+  cursor: default;
+  opacity: 0.8;
+}
+
+.recovery-entry-selection input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--teal);
+}
+
+.recovery-selection-tray {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.75fr) minmax(220px, 1.25fr) auto;
+  gap: 12px 18px;
+  align-items: center;
+  padding: 14px;
+  border-top: 1px solid #acd3cb;
+  background: linear-gradient(135deg, var(--teal-soft), #f8fbf9);
+}
+
+.recovery-selection-summary span,
+.recovery-selection-summary strong,
+.recovery-selection-summary small {
+  display: block;
+}
+
+.recovery-selection-summary span {
+  color: var(--teal-strong);
+  font-size: 9px;
+  font-weight: 850;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.recovery-selection-summary strong {
+  margin-top: 2px;
+  font-size: 13px;
+}
+
+.recovery-selection-summary small,
+.recovery-selection-empty,
+.recovery-selection-partial {
+  margin: 2px 0 0;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.recovery-selection-paths {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.recovery-selection-paths li {
+  min-width: 0;
+  max-width: 100%;
+  padding: 3px 6px;
+  border: 1px solid #cce1dc;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 75%);
+}
+
+.recovery-selection-paths code {
+  display: block;
+  overflow: hidden;
+  max-width: 240px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 9px var(--font-mono);
+}
+
+.recovery-selection-paths .more {
+  color: var(--ink-soft);
+  font-size: 9px;
+}
+
+.recovery-selection-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.recovery-selection-partial {
+  grid-column: 1 / -1;
+  margin: -2px 0 0;
+  color: #7f4911;
+}
+
+.restore-plan-scope {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.65fr) minmax(0, 1.35fr);
+  gap: 12px;
+  padding: 12px 18px;
+  border-bottom: 1px solid #cce1dc;
+  background: #f7fbf9;
+}
+
+.restore-plan-scope span,
+.restore-plan-scope strong,
+.restore-plan-scope small {
+  display: block;
+}
+
+.restore-plan-scope span {
+  color: var(--teal-strong);
+  font-size: 9px;
+  font-weight: 850;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.restore-plan-scope strong {
+  margin-top: 2px;
+}
+
+.restore-plan-scope small {
+  margin-top: 2px;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.restore-plan-scope ul {
+  max-height: 105px;
+  overflow: auto;
+  margin: 0;
+  padding: 6px 8px 6px 24px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.restore-plan-scope li + li {
+  margin-top: 4px;
+}
+
+.restore-plan-scope code {
+  overflow-wrap: anywhere;
+  font: 9px var(--font-mono);
+}
+
 .tape-init-modal {
   width: min(760px, calc(100vw - 30px));
 }
@@ -8288,6 +8469,16 @@ button.source-browser-name:hover strong {
     text-align: left;
   }
 
+  .retained-browser .source-browser-entry-action {
+    align-items: stretch;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .recovery-entry-selection {
+    justify-content: center;
+  }
+
   .source-browser-entry-action .button {
     min-height: 30px;
   }
@@ -8301,6 +8492,29 @@ button.source-browser-name:hover strong {
   .source-browser-entries,
   .retained-browser .source-browser-entries {
     max-height: 315px;
+  }
+
+  .recovery-selection-tray,
+  .restore-plan-scope {
+    grid-template-columns: 1fr;
+  }
+
+  .recovery-selection-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 0.7fr) minmax(0, 1.3fr);
+  }
+
+  .recovery-selection-actions .button {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .recovery-selection-paths code {
+    max-width: calc(100vw - 76px);
+  }
+
+  .restore-plan-scope ul {
+    max-height: 130px;
   }
 }
 

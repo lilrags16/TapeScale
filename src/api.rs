@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -29,7 +29,9 @@ use crate::{
     custody_ops::{self, CustodyActor, CustodyOpsError},
     data_path::{
         isolated_restore_destination, resolve_existing_selection,
-        resolve_existing_zfs_snapshot_selection, verify_read_only_mount,
+        resolve_existing_zfs_snapshot_selection, resolve_manifest_selection,
+        verify_read_only_mount, ManifestError, ManifestSelectionKind, ManifestSelectionRequest,
+        ManifestSelectionRoot, ManifestSelectionSummary, ResolvedManifestSelection,
     },
     device::SasMotionOperation,
     domain::{
@@ -2338,10 +2340,20 @@ async fn recovery_point_files(
         .as_object_mut()
         .expect("serialized browser listing is an object");
     object.insert("recovery_point_id".to_owned(), json!(recovery_point_id));
-    object.insert("browse_only".to_owned(), Value::Bool(true));
+    object.insert("browse_only".to_owned(), Value::Bool(false));
     object.insert(
         "path_selective_restore_supported".to_owned(),
-        Value::Bool(false),
+        Value::Bool(true),
+    );
+    object.insert(
+        "selection_capabilities".to_owned(),
+        json!({
+            "recursive_directories": true,
+            "maximum_paths": crate::data_path::MAX_RESTORE_SELECTION_PATHS,
+            "hard_link_closure": true,
+            "required_media_policy": "single_volume_selected_execution",
+            "multi_volume_selected_execution": false
+        }),
     );
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response())
 }
@@ -2631,6 +2643,8 @@ struct RestorePlanRequest {
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
+    selection: ManifestSelectionRequest,
+    #[serde(default)]
     destination: Option<String>,
     #[serde(default)]
     conflict_policy: Option<String>,
@@ -2660,6 +2674,105 @@ struct RestorePlanRequest {
     destructive_preview_accepted: bool,
     #[serde(default)]
     automatic_publication_requested: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PlanningOnlyRestoreScope {
+    kind: ManifestSelectionKind,
+    requested_paths: Vec<String>,
+    normalized_paths: Vec<String>,
+    implicit_hard_link_paths: Vec<String>,
+    roots: Vec<ManifestSelectionRoot>,
+    recursive_directories: bool,
+    selection_hash: String,
+    summary: ManifestSelectionSummary,
+    planning_only: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+enum RestorePlanningScope {
+    AuthenticatedManifest(ResolvedManifestSelection),
+    PlanningOnly(PlanningOnlyRestoreScope),
+}
+
+impl RestorePlanningScope {
+    const fn kind(&self) -> ManifestSelectionKind {
+        match self {
+            Self::AuthenticatedManifest(scope) => scope.kind,
+            Self::PlanningOnly(scope) => scope.kind,
+        }
+    }
+
+    fn selection_hash(&self) -> &str {
+        match self {
+            Self::AuthenticatedManifest(scope) => &scope.selection_hash,
+            Self::PlanningOnly(scope) => &scope.selection_hash,
+        }
+    }
+
+    const fn summary(&self) -> &ManifestSelectionSummary {
+        match self {
+            Self::AuthenticatedManifest(scope) => &scope.summary,
+            Self::PlanningOnly(scope) => &scope.summary,
+        }
+    }
+
+    fn implicit_hard_link_paths(&self) -> &[String] {
+        match self {
+            Self::AuthenticatedManifest(scope) => &scope.implicit_hard_link_paths,
+            Self::PlanningOnly(scope) => &scope.implicit_hard_link_paths,
+        }
+    }
+}
+
+fn planning_only_restore_scope(
+    selection: &ManifestSelectionRequest,
+    recovery_point_id: Uuid,
+    mode: RestoreMode,
+    representation: &str,
+    estimated_required_bytes: Option<u64>,
+) -> Result<RestorePlanningScope, AppError> {
+    match selection {
+        ManifestSelectionRequest::CompletePoint { paths } if paths.is_empty() => {}
+        ManifestSelectionRequest::CompletePoint { .. } => {
+            return Err(AppError::Invalid(
+                "complete_point does not accept paths".to_owned(),
+            ));
+        }
+        ManifestSelectionRequest::SelectedPaths { .. } => {
+            return Err(AppError::Invalid(
+                "selected_paths requires an authenticated retained file manifest and is unavailable for native-stream planning"
+                    .to_owned(),
+            ));
+        }
+    }
+    let hash_material = json!({
+        "format": "tapescale-planning-only-restore-scope-v1",
+        "kind": "complete_point",
+        "recovery_point_id": recovery_point_id,
+        "mode": restore_mode_name(mode),
+        "representation": representation
+    });
+    let selection_hash = format!("{:x}", Sha256::digest(canonical_json(&hash_material)?));
+    Ok(RestorePlanningScope::PlanningOnly(
+        PlanningOnlyRestoreScope {
+            kind: ManifestSelectionKind::CompletePoint,
+            requested_paths: Vec::new(),
+            normalized_paths: Vec::new(),
+            implicit_hard_link_paths: Vec::new(),
+            roots: Vec::new(),
+            recursive_directories: false,
+            selection_hash,
+            summary: ManifestSelectionSummary {
+                path_count: 0,
+                entry_count: 0,
+                file_count: 0,
+                logical_bytes: estimated_required_bytes.unwrap_or(0),
+            },
+            planning_only: true,
+        },
+    ))
 }
 
 async fn plan_restore(
@@ -2693,6 +2806,57 @@ async fn plan_restore(
         &aggregate.recovery_point.representation,
     )?;
     ensure_restore_mode_matches(mode, &aggregate.recovery_point.representation)?;
+    let restore_scope = if mode == RestoreMode::FileArchive {
+        let manifest_binding = store::recovery_point_manifest_binding(pool, recovery_point_id)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let manifest_reference = RetainedManifestReference {
+            storage_ref: manifest_binding.storage_ref.ok_or_else(|| {
+                AppError::Blocked("the recovery point has no retained source manifest".to_owned())
+            })?,
+            artifact_sha256: manifest_binding.artifact_sha256.ok_or_else(|| {
+                AppError::Blocked("the recovery point has no retained source manifest".to_owned())
+            })?,
+            artifact_size_bytes: manifest_binding.artifact_size_bytes.ok_or_else(|| {
+                AppError::Blocked("the recovery point has no retained source manifest".to_owned())
+            })?,
+            manifest_digest: manifest_binding.manifest_digest.ok_or_else(|| {
+                AppError::Blocked("the recovery point has no retained source manifest".to_owned())
+            })?,
+        };
+        let permit = state
+            .retained_manifest_browser_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                AppError::Internal("manifest planning concurrency gate closed".to_owned())
+            })?;
+        let evidence_root = state.evidence_root.clone();
+        let requested_selection = request.selection.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let manifest = source_browser::load_retained_manifest(
+                &evidence_root,
+                &manifest_reference,
+                store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES,
+            )?;
+            resolve_manifest_selection(&manifest, &requested_selection)
+                .map_err(SelectiveRestorePlanningError::Selection)
+        })
+        .await
+        .map_err(|error| AppError::Internal(format!("restore selection task failed: {error}")))?
+        .map_err(map_selective_restore_planning_error)?;
+        RestorePlanningScope::AuthenticatedManifest(resolved)
+    } else {
+        planning_only_restore_scope(
+            &request.selection,
+            recovery_point_id,
+            mode,
+            &aggregate.recovery_point.representation,
+            request.estimated_required_bytes,
+        )?
+    };
     let conflict_policy = parse_conflict_policy(request.conflict_policy.as_deref())?;
 
     let chain_ids = dedupe_preserving_order(
@@ -2839,6 +3003,14 @@ async fn plan_restore(
             .dependencies
             .iter()
             .all(|dependency| dependency.manifest_digest.is_some());
+    // File-archive capacity authority comes from the authenticated retained
+    // manifest. Native-stream planning has no file manifest, so preserve the
+    // operator's explicitly estimate-only value instead of inventing one.
+    let estimated_required_bytes = if mode == RestoreMode::FileArchive {
+        Some(restore_scope.summary().logical_bytes)
+    } else {
+        request.estimated_required_bytes
+    };
 
     let destination_assessment = DestinationAssessment {
         approved: request.destination_approved,
@@ -2847,7 +3019,7 @@ async fn plan_restore(
         conflict_policy,
         acl_semantics_supported: request.acl_semantics_supported,
         identity_mapping_complete: request.identity_mapping_complete,
-        estimated_required_bytes: request.estimated_required_bytes,
+        estimated_required_bytes,
         available_bytes: request.available_bytes,
         required_free_reserve_bytes: request.required_free_reserve_bytes,
         administrator_reauthenticated: request.administrator_reauthenticated,
@@ -2932,12 +3104,35 @@ async fn plan_restore(
     if let Some(blocker) = &source_manifest_artifact_blocker {
         blockers.push(blocker.clone());
     }
-    let plan_ready = preflight.ready() && source_manifest_artifact_supported;
-    let warnings = preflight
+    let selected_multi_volume =
+        restore_scope.kind() == ManifestSelectionKind::SelectedPaths && aggregate.volumes.len() > 1;
+    if selected_multi_volume {
+        blockers.push(json!({
+            "code": "selected_restore_multivolume_unavailable",
+            "message": "Selected-path execution currently requires a single-volume recovery point. Use a complete-point restore for this multi-volume point; selected multi-volume execution remains blocked until TapeScale can retain truthful per-path media and per-volume read evidence.",
+            "volume_count": aggregate.volumes.len()
+        }));
+    }
+    let plan_ready =
+        preflight.ready() && source_manifest_artifact_supported && !selected_multi_volume;
+    let mut warnings = preflight
         .warnings
         .iter()
         .map(restore_warning_view)
         .collect::<Vec<_>>();
+    if restore_scope.kind() == ManifestSelectionKind::SelectedPaths && !selected_multi_volume {
+        warnings.push(json!({
+            "code": "complete_media_set_required",
+            "message": "Path selection narrows restored content, but the recovery point's single retained cartridge is still required."
+        }));
+        if !restore_scope.implicit_hard_link_paths().is_empty() {
+            warnings.push(json!({
+                "code": "hard_link_closure_added",
+                "message": "Additional hard-linked paths were included so the restored selection preserves authenticated hard-link relationships.",
+                "paths": restore_scope.implicit_hard_link_paths()
+            }));
+        }
+    }
     let required_media_ids =
         dedupe_preserving_order(aggregate.volumes.iter().map(|volume| volume.cartridge_id));
     let required_tape_ids = dedupe_preserving_order(
@@ -2956,10 +3151,16 @@ async fn plan_restore(
         "encoded_bytes": encoded_bytes,
         "media_count": required_media_ids.len(),
         "dependency_count": aggregate.dependencies.len(),
-        "destination_required_bytes": request.estimated_required_bytes,
+        "destination_required_bytes": estimated_required_bytes,
+        "client_estimated_required_bytes": request.estimated_required_bytes,
         "available_bytes": request.available_bytes,
         "required_free_reserve_bytes": request.required_free_reserve_bytes,
-        "estimate_only": true
+        "estimate_only": mode != RestoreMode::FileArchive,
+        "authority": if mode == RestoreMode::FileArchive {
+            "authenticated retained manifest selection"
+        } else {
+            "operator planning estimate"
+        }
     });
     let destination_view = json!({
         "path": destination,
@@ -2969,7 +3170,7 @@ async fn plan_restore(
         "conflict_policy": conflict_policy_name(conflict_policy),
         "acl_semantics_supported": request.acl_semantics_supported,
         "identity_mapping_complete": request.identity_mapping_complete,
-        "estimated_required_bytes": request.estimated_required_bytes,
+        "estimated_required_bytes": estimated_required_bytes,
         "available_bytes": request.available_bytes,
         "required_free_reserve_bytes": request.required_free_reserve_bytes,
         "administrator_reauthenticated": request.administrator_reauthenticated,
@@ -2987,8 +3188,7 @@ async fn plan_restore(
                 && verification.media_ids == required_media_ids
         })
         .and_then(|verification| verification.drive_id);
-    let rehearsal_capacity_ready = request
-        .estimated_required_bytes
+    let rehearsal_capacity_ready = estimated_required_bytes
         .and_then(|required| {
             required
                 .checked_add(request.required_free_reserve_bytes)
@@ -3039,6 +3239,7 @@ async fn plan_restore(
     };
     let execution_supported = state.lab_file_roundtrip_enabled
         && plan_ready
+        && !selected_multi_volume
         && mode == RestoreMode::FileArchive
         && aggregate.recovery_point.representation == "file"
         && aggregate.recovery_point.level == "full"
@@ -3070,8 +3271,15 @@ async fn plan_restore(
             .and_then(Value::as_str)
             .unwrap_or("The retained source manifest is outside the attended restore read bound.")
             .to_owned()
+    } else if selected_multi_volume {
+        "Selected-path execution is blocked for multi-volume recovery points until TapeScale can retain truthful per-path media and per-volume read evidence. Use a complete-point restore for this recovery point.".to_owned()
     } else if execution_supported {
-        "This verified full recovery point supports an attended, read-only ordered-media restore into the isolated destination.".to_owned()
+        match restore_scope.kind() {
+            ManifestSelectionKind::CompletePoint =>
+                "This verified full recovery point supports an attended, read-only ordered-media restore into the isolated destination.".to_owned(),
+            ManifestSelectionKind::SelectedPaths =>
+                "The selected retained paths support an attended, read-only restore from this single-volume recovery point into the isolated destination.".to_owned(),
+        }
     } else if !plan_ready {
         "Resolve every restore-planning blocker and generate a fresh plan before execution can be considered.".to_owned()
     } else {
@@ -3086,6 +3294,17 @@ async fn plan_restore(
         "origin_workflow_kind": aggregate.origin.workflow_kind.clone(),
         "required_media_ids": required_media_ids,
         "required_tape_ids": required_tape_ids,
+        "selection_supported": mode == RestoreMode::FileArchive,
+        "selection_hash": restore_scope.selection_hash(),
+        "restore_scope_kind": restore_scope.kind(),
+        "selected_path_count": restore_scope.summary().path_count,
+        "selected_entry_count": restore_scope.summary().entry_count,
+        "selected_logical_bytes": restore_scope.summary().logical_bytes,
+        "required_media_policy": match restore_scope.kind() {
+            ManifestSelectionKind::CompletePoint => "complete_recovery_point_media_set",
+            ManifestSelectionKind::SelectedPaths if selected_multi_volume => "selected_multivolume_execution_blocked",
+            ManifestSelectionKind::SelectedPaths => "single_volume_selected_restore"
+        },
         "volume_count": required_media_ids.len(),
         "multi_volume": required_media_ids.len() > 1,
         "source_manifest_artifact": {
@@ -3100,14 +3319,14 @@ async fn plan_restore(
         "writes_tape": false,
         "writes_only_to_isolated_destination": true
     });
-    let selection = json!({
+    let selection_request = json!({
         "recovery_point_id": recovery_point_id,
         "mode": restore_mode_name(mode),
         "representation": aggregate.recovery_point.representation.clone(),
-        "scope": aggregate.recovery_point.coverage.clone()
+        "restore_scope": restore_scope
     });
     let preview = json!({
-        "selection": selection,
+        "selection": restore_scope,
         "dependency_chain": chain_ids,
         "required_media_ids": required_media_ids,
         "required_tape_ids": required_tape_ids,
@@ -3122,7 +3341,7 @@ async fn plan_restore(
     });
     let preview_hash = format!("{:x}", Sha256::digest(canonical_json(&preview)?));
     let persisted_selection = json!({
-        "request": selection,
+        "request": selection_request,
         "ready": plan_ready,
         "execution_supported": execution_supported,
         "execution": execution,
@@ -3164,7 +3383,7 @@ async fn plan_restore(
                 "execution": execution,
                 "execution_drives": compatible_execution_drives,
                 "confirmation_phrase": format!("RESTORE PLAN {} TO ISOLATED DESTINATION", record.id),
-                "selection": selection,
+                "selection": restore_scope,
                 "recovery_point": aggregate.recovery_point,
                 "dependencies": aggregate.dependencies,
                 "dependency_chain": chain_ids,
@@ -4292,7 +4511,33 @@ fn map_source_browser_error(error: SourceBrowserError) -> AppError {
         | SourceBrowserError::ManifestOutsideRoot
         | SourceBrowserError::InvalidManifestBinding
         | SourceBrowserError::ManifestIntegrity
+        | SourceBrowserError::ManifestTooLarge
         | SourceBrowserError::Io(_) => AppError::Blocked(error.to_string()),
+    }
+}
+
+#[derive(Debug)]
+enum SelectiveRestorePlanningError {
+    Browser(SourceBrowserError),
+    Selection(ManifestError),
+}
+
+impl From<SourceBrowserError> for SelectiveRestorePlanningError {
+    fn from(error: SourceBrowserError) -> Self {
+        Self::Browser(error)
+    }
+}
+
+fn map_selective_restore_planning_error(error: SelectiveRestorePlanningError) -> AppError {
+    match error {
+        SelectiveRestorePlanningError::Browser(error) => map_source_browser_error(error),
+        SelectiveRestorePlanningError::Selection(
+            error @ (ManifestError::EmptyRestoreSelection
+            | ManifestError::RestoreSelectionTooLarge { .. }
+            | ManifestError::InvalidRestoreSelectionPath(_)
+            | ManifestError::RestoreSelectionPathNotFound(_)),
+        ) => AppError::Invalid(error.to_string()),
+        SelectiveRestorePlanningError::Selection(error) => AppError::Blocked(error.to_string()),
     }
 }
 
@@ -4856,6 +5101,67 @@ mod tests {
             parse_conflict_policy(None).expect("safe conflict default"),
             ConflictPolicy::Skip
         );
+    }
+
+    #[test]
+    fn restore_plan_defaults_to_a_complete_scope() {
+        let request: RestorePlanRequest = serde_json::from_value(json!({
+            "recovery_point_id": Uuid::now_v7(),
+            "destination": "rehearsals/default"
+        }))
+        .expect("the default restore request should deserialize");
+
+        assert_eq!(
+            request.selection,
+            ManifestSelectionRequest::CompletePoint { paths: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn native_planning_preserves_complete_scope_without_faking_a_file_manifest() {
+        let recovery_point_id = Uuid::now_v7();
+        let selection = ManifestSelectionRequest::CompletePoint { paths: Vec::new() };
+        let first = planning_only_restore_scope(
+            &selection,
+            recovery_point_id,
+            RestoreMode::NativeDataset,
+            "native_zfs",
+            Some(1_234),
+        )
+        .expect("complete native planning should remain available");
+        let retry = planning_only_restore_scope(
+            &selection,
+            recovery_point_id,
+            RestoreMode::NativeDataset,
+            "native_zfs",
+            Some(1_234),
+        )
+        .expect("identical native planning should be deterministic");
+        let value = serde_json::to_value(&first).expect("scope should serialize");
+        let retry_value = serde_json::to_value(&retry).expect("scope should serialize");
+
+        assert_eq!(value["kind"], "complete_point");
+        assert_eq!(value["planning_only"], true);
+        assert_eq!(value["summary"]["logical_bytes"], 1_234);
+        assert_eq!(value["selection_hash"], retry_value["selection_hash"]);
+        assert!(value.get("manifest_digest").is_none());
+        assert!(value.get("selected_manifest_digest").is_none());
+    }
+
+    #[test]
+    fn native_planning_rejects_path_selection_without_a_file_manifest() {
+        let result = planning_only_restore_scope(
+            &ManifestSelectionRequest::SelectedPaths {
+                paths: vec!["important".to_owned()],
+            },
+            Uuid::now_v7(),
+            RestoreMode::FilesFromNative,
+            "native_zfs",
+            Some(100),
+        );
+
+        assert!(matches!(result, Err(AppError::Invalid(message)) if
+            message.contains("authenticated retained file manifest")));
     }
 
     #[test]

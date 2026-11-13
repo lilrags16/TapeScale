@@ -2,8 +2,9 @@
 //!
 //! Live browsing never follows a symbolic link and never exposes the source
 //! root's absolute container path. Retained browsing uses only the durable,
-//! content-addressed source manifest; it does not read the original source or
-//! imply that path-selective restore execution is available.
+//! content-addressed source manifest and does not read the original source.
+//! Its selections are resolved again by restore planning; execution is limited
+//! to compatible single-volume recovery points in this alpha.
 
 use std::{
     cmp::Ordering,
@@ -27,7 +28,10 @@ use serde::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    data_path::{descriptor_is_on_read_only_mount, EntryKind, ManifestCoverage, ManifestEntry},
+    data_path::{
+        descriptor_is_on_read_only_mount, load_manifest_bytes, EntryKind, FileManifest,
+        ManifestCoverage, ManifestEntry,
+    },
     domain::path::validate_archive_path,
 };
 
@@ -61,6 +65,8 @@ pub enum SourceBrowserError {
     InvalidManifestBinding,
     #[error("retained manifest failed its content-addressed integrity check")]
     ManifestIntegrity,
+    #[error("retained manifest exceeds the supported selective-restore planning bound")]
+    ManifestTooLarge,
     #[error("directory or retained manifest could not be read")]
     Io(#[source] std::io::Error),
 }
@@ -133,6 +139,106 @@ pub fn browse_retained_manifest(
         requested_path,
         MAX_BROWSER_ENTRIES,
     )
+}
+
+/// Load one retained manifest for restore planning after proving its catalog
+/// binding, filesystem containment, byte size, and content-addressed identity.
+/// The caller supplies an explicit memory bound; browsing itself remains the
+/// streaming path for larger retained inventories.
+pub fn load_retained_manifest(
+    configured_evidence_root: &Path,
+    reference: &RetainedManifestReference,
+    maximum_bytes: u64,
+) -> Result<FileManifest, SourceBrowserError> {
+    validate_retained_reference(reference)?;
+    let expected_size = u64::try_from(reference.artifact_size_bytes)
+        .map_err(|_| SourceBrowserError::InvalidManifestBinding)?;
+    if expected_size == 0 || expected_size > maximum_bytes {
+        return Err(SourceBrowserError::ManifestTooLarge);
+    }
+    let root = configured_evidence_root
+        .canonicalize()
+        .map_err(|_| SourceBrowserError::ManifestUnavailable)?;
+    if !root.is_dir() {
+        return Err(SourceBrowserError::ManifestUnavailable);
+    }
+    let manifest_path = retained_manifest_path(configured_evidence_root, &root, reference)?;
+    let mut file =
+        fs::File::open(&manifest_path).map_err(|_| SourceBrowserError::ManifestUnavailable)?;
+    let before = file
+        .metadata()
+        .map_err(|_| SourceBrowserError::ManifestUnavailable)?;
+    if !before.is_file() || before.len() != expected_size {
+        return Err(SourceBrowserError::ManifestIntegrity);
+    }
+    let capacity =
+        usize::try_from(expected_size).map_err(|_| SourceBrowserError::ManifestTooLarge)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.by_ref()
+        .take(expected_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(SourceBrowserError::Io)?;
+    let after = file
+        .metadata()
+        .map_err(|_| SourceBrowserError::ManifestUnavailable)?;
+    let path_after = manifest_path
+        .symlink_metadata()
+        .map_err(|_| SourceBrowserError::ManifestUnavailable)?;
+    if bytes.len() as u64 != expected_size
+        || format!("{:x}", Sha256::digest(&bytes)) != reference.artifact_sha256
+        || metadata_identity(&before) != metadata_identity(&after)
+        || metadata_identity(&before) != metadata_identity(&path_after)
+    {
+        return Err(SourceBrowserError::ManifestIntegrity);
+    }
+    let manifest =
+        load_manifest_bytes(&bytes).map_err(|_| SourceBrowserError::ManifestIntegrity)?;
+    if manifest.digest_sha256 != reference.manifest_digest {
+        return Err(SourceBrowserError::ManifestIntegrity);
+    }
+    Ok(manifest)
+}
+
+fn validate_retained_reference(
+    reference: &RetainedManifestReference,
+) -> Result<(), SourceBrowserError> {
+    if reference.artifact_size_bytes <= 0
+        || reference.artifact_sha256.len() != 64
+        || !reference
+            .artifact_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || reference.manifest_digest.len() != 64
+        || !reference
+            .manifest_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || reference.storage_ref.chars().any(char::is_control)
+    {
+        Err(SourceBrowserError::InvalidManifestBinding)
+    } else {
+        Ok(())
+    }
+}
+
+fn retained_manifest_path(
+    configured_evidence_root: &Path,
+    canonical_root: &Path,
+    reference: &RetainedManifestReference,
+) -> Result<PathBuf, SourceBrowserError> {
+    let recorded = Path::new(&reference.storage_ref);
+    let relative = recorded
+        .strip_prefix(configured_evidence_root)
+        .or_else(|_| recorded.strip_prefix(canonical_root))
+        .map_err(|_| SourceBrowserError::ManifestOutsideRoot)?;
+    if relative.as_os_str().is_empty()
+        || relative.file_name().and_then(|name| name.to_str()) != Some("source-manifest.json")
+    {
+        return Err(SourceBrowserError::InvalidManifestBinding);
+    }
+    let safe_relative =
+        validate_archive_path(relative).map_err(|_| SourceBrowserError::ManifestOutsideRoot)?;
+    resolve_file_without_symlinks(canonical_root, safe_relative.as_path())
 }
 
 fn browse_source_with_limit(
@@ -448,7 +554,7 @@ fn browse_retained_manifest_with_limit(
         current_path,
         read_only: true,
         snapshot: false,
-        selectable: false,
+        selectable: !requested_relative.as_os_str().is_empty(),
         entries,
         truncated: scan.direct_entry_count > entry_limit,
         entry_limit,
@@ -725,7 +831,7 @@ fn retained_browser_entry(entry: &ManifestEntry) -> Result<BrowserEntry, SourceB
         symlink: kind == BrowserEntryKind::Symlink,
         snapshot: false,
         navigable: kind == BrowserEntryKind::Directory,
-        selectable: false,
+        selectable: true,
     })
 }
 
@@ -1248,7 +1354,8 @@ mod tests {
         let root = browse_retained_manifest(evidence.path(), &reference, "").expect("root");
         assert_eq!(root.entries[0].name, "photos");
         assert_eq!(root.entries[1].name, "notes.txt");
-        assert!(root.entries.iter().all(|entry| !entry.selectable));
+        assert!(!root.selectable, "the manifest root means complete restore");
+        assert!(root.entries.iter().all(|entry| entry.selectable));
         let partial = browse_retained_manifest_with_limit(evidence.path(), &reference, "", 1)
             .expect("bounded retained view");
         assert!(partial.truncated);
@@ -1257,8 +1364,10 @@ mod tests {
         assert_eq!(partial.entries[0].name, "photos");
         let photos =
             browse_retained_manifest(evidence.path(), &reference, "photos").expect("photos");
+        assert!(photos.selectable);
         assert_eq!(photos.entries.len(), 1);
         assert_eq!(photos.entries[0].name, "image.raw");
+        assert!(photos.entries[0].selectable);
 
         fs::write(&reference.storage_ref, b"{}").expect("tamper");
         assert!(matches!(

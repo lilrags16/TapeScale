@@ -2,6 +2,21 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.4] - 2026-11-13
+
+### Path-selective Restore runs
+
+- Recovery Vault can now turn retained-manifest browser selections into an attended restore plan for one or more files, symlinks, or recursive directories.
+- The API verifies the retained manifest, removes redundant descendant requests, includes every member of a selected hard-link group, and persists the normalized scope, selected-manifest digest, and deterministic selection hash. The worker repeats that resolution before reading media.
+- Bacula catalog lookups are parameterized and pinned to the original backup JobId. Only server-resolved numeric FileIndex and PathId values enter the restricted BVFS restore-table commands; operator-selected source paths never enter `bconsole`.
+- Selected-path execution is intentionally limited to a recovery point with exactly one retained volume. Multi-volume selected plans are blocked until TapeScale can retain an authenticated path-to-volume map and truthful per-volume read evidence; complete-point multi-volume restore remains available. A selected run restores only into a new isolated run directory and compares the recovered selected scope with the authenticated manifest projection.
+- Selected-path passes append `selective_restore_test` evidence and cannot satisfy the complete-point `restore_test` gate.
+
+### Alpha boundaries
+
+- Selective execution is limited to compatible, single-volume, unencrypted Full file points with the original Bacula catalog. Native streams, incrementals, encrypted or multi-volume points, lost-catalog recovery, destination replacement/merge, and automatic publication remain planning-only, blocked, or unavailable.
+- Path selection does not qualify an engine or format or prove clean-host recovery. Container CI exercises Bacula's BVFS extraction mechanism in spanning mode, but that is not evidence that TapeScale can yet execute a truthful multi-volume selected run.
+
 ## [0.1.0-alpha.3] - 2026-11-13
 
 ### Sustained tape writing
@@ -70,6 +85,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.4]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.1

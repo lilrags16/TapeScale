@@ -119,6 +119,8 @@
     recoveryFileBrowserLoading: new Set(),
     recoveryFileBrowserErrors: {},
     recoveryFileBrowserRequests: {},
+    recoveryFileBrowserCapabilities: {},
+    recoveryRestoreSelections: {},
     restoreRehearsalDetailLoading: new Set(),
     movementDetailLoading: new Set(),
     restorePlanDrafts: {},
@@ -1660,6 +1662,93 @@
     }).join("") + "</ol></details>";
   }
 
+  function retainedRestorePath(value) {
+    const path = String(value || "");
+    const segments = path.split("/");
+    if (!path || path.startsWith("/") || segments.some((segment) => !segment || segment === "." || segment === "..")) return "";
+    return path;
+  }
+
+  function recoveryRestoreSelection(pointId) {
+    const paths = state.recoveryRestoreSelections[pointId];
+    return Array.isArray(paths) ? paths : [];
+  }
+
+  function recoveryFileSelectionCapabilities(pointId, payload) {
+    const cached = state.recoveryFileBrowserCapabilities[pointId] || {};
+    const source = payload && typeof payload === "object" ? payload : {};
+    const advertised = source.selection_capabilities && typeof source.selection_capabilities === "object"
+      ? source.selection_capabilities
+      : cached.selection_capabilities || {};
+    const maximum = Number(pick(advertised, "maximum_paths"));
+    return {
+      supported: Object.prototype.hasOwnProperty.call(source, "path_selective_restore_supported")
+        ? source.path_selective_restore_supported === true
+        : cached.path_selective_restore_supported === true,
+      maximumPaths: Number.isInteger(maximum) && maximum > 0 ? maximum : 256,
+      recursiveDirectories: pick(advertised, "recursive_directories") === true
+    };
+  }
+
+  function recoveryRestorePathRelation(pointId, path) {
+    const exactPath = retainedRestorePath(path);
+    const selections = recoveryRestoreSelection(pointId);
+    if (selections.includes(exactPath)) return "selected";
+    return selections.some((selected) => exactPath.startsWith(selected + "/")) ? "included" : "unselected";
+  }
+
+  function toggleRecoveryRestorePath(pointId, path) {
+    const exactPath = retainedRestorePath(path);
+    if (!pointId || !exactPath) return;
+    const capabilities = recoveryFileSelectionCapabilities(pointId);
+    if (!capabilities.supported) return;
+    const current = recoveryRestoreSelection(pointId);
+    const relation = recoveryRestorePathRelation(pointId, exactPath);
+    if (relation === "included") return;
+    let next = relation === "selected"
+      ? current.filter((selected) => selected !== exactPath)
+      : current.filter((selected) => !selected.startsWith(exactPath + "/")).concat(exactPath);
+    next = Array.from(new Set(next)).sort((left, right) => left.localeCompare(right));
+    if (next.length > capabilities.maximumPaths) {
+      toast("Selection limit reached", "Choose a parent folder or clear another path. This recovery point accepts at most " + capabilities.maximumPaths + " selected paths per restore plan.");
+      return;
+    }
+    state.recoveryRestoreSelections[pointId] = next;
+    render();
+    live.textContent = relation === "selected"
+      ? exactPath + " removed from the restore selection. " + next.length + " paths remain selected."
+      : exactPath + " selected for restore. " + next.length + " paths are selected.";
+    window.requestAnimationFrame(() => {
+      const control = document.querySelector('[data-action="toggle-recovery-restore-path"][data-id="' + CSS.escape(pointId) + '"][data-path="' + CSS.escape(exactPath) + '"]');
+      if (control) control.focus();
+    });
+  }
+
+  function clearRecoveryRestoreSelection(pointId) {
+    if (!pointId) return;
+    state.recoveryRestoreSelections[pointId] = [];
+    render();
+    live.textContent = "Restore selection cleared. No retained paths are selected.";
+  }
+
+  function recoveryRestoreSelectionContract(pointId) {
+    const paths = recoveryRestoreSelection(pointId).slice();
+    return paths.length ? { kind: "selected_paths", paths } : { kind: "complete_point", paths: [] };
+  }
+
+  function renderRecoveryRestoreSelectionTray(pointId, capabilities, truncated) {
+    if (!capabilities.supported) return "";
+    const paths = recoveryRestoreSelection(pointId);
+    const shown = paths.slice(0, 5);
+    const pathList = shown.length
+      ? '<ul class="recovery-selection-paths" aria-label="Selected restore paths">' + shown.map((path) => '<li><code>' + esc(path) + "</code></li>").join("") + (paths.length > shown.length ? '<li class="more">+' + esc(paths.length - shown.length) + " more</li>" : "") + "</ul>"
+      : '<p class="recovery-selection-empty">Choose files or folders above. Nothing is selected yet.</p>';
+    const partial = truncated
+      ? '<p class="recovery-selection-partial"><span aria-hidden="true">!</span> Selecting a folder includes all descendants, including entries not shown in this partial directory view.</p>'
+      : "";
+    return '<aside class="recovery-selection-tray" aria-label="Restore selection"><div class="recovery-selection-summary" aria-live="polite"><span>Restore selection</span><strong>' + esc(paths.length) + " path" + (paths.length === 1 ? "" : "s") + ' selected</strong><small>' + (capabilities.recursiveDirectories ? "Folders include everything beneath them." : "Use only the selectable paths offered by the server.") + " Maximum " + esc(capabilities.maximumPaths) + ".</small></div>" + pathList + partial + '<div class="recovery-selection-actions"><button class="button button-quiet button-small" type="button" data-action="clear-recovery-restore-selection" data-id="' + esc(pointId) + '"' + (paths.length ? "" : " disabled") + '>Clear</button><button class="button button-primary button-small" type="button" data-action="plan-selected-restore" data-id="' + esc(pointId) + '"' + (paths.length ? "" : " disabled") + ">Plan selected restore</button></div></aside>";
+  }
+
   function recoveryFileBreadcrumbs(pointId, path) {
     const segments = String(path || "").split("/").filter(Boolean);
     const crumbs = ['<button class="source-browser-crumb" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path=""><span aria-hidden="true">⌂</span><span>backup root</span></button>'];
@@ -1671,7 +1760,7 @@
     return crumbs.join("");
   }
 
-  function recoveryFileEntry(entry, currentPath, pointId) {
+  function recoveryFileEntry(entry, currentPath, pointId, capabilities) {
     const kind = sourceBrowserEntryKind(entry);
     const name = String(pick(entry, "name", "display_name") || "Unnamed entry");
     const path = String(pick(entry, "path", "relative_path") || sourceBrowserJoin(currentPath, name));
@@ -1686,9 +1775,16 @@
     const nameControl = kind === "directory"
       ? '<button class="source-browser-name" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(path) + '" aria-label="Open retained folder ' + esc(name) + '"><strong>' + esc(name) + "</strong><small>" + esc(facts.join(" · ")) + "</small></button>"
       : '<div class="source-browser-name"><strong>' + esc(name) + "</strong><small>" + esc(facts.join(" · ")) + "</small></div>";
-    const action = kind === "directory"
+    const selectable = capabilities.supported && entry && entry.selectable === true && Boolean(retainedRestorePath(path));
+    const relation = selectable ? recoveryRestorePathRelation(pointId, path) : "unselected";
+    const selectionLabel = kind === "directory" ? "Select folder " + name + " and everything inside it" : "Select " + name + " for restore";
+    const selection = selectable
+      ? '<label class="recovery-entry-selection' + (relation === "included" ? " inherited" : "") + '"><input type="checkbox" data-action="toggle-recovery-restore-path" data-id="' + esc(pointId) + '" data-path="' + esc(path) + '" aria-label="' + esc(relation === "included" ? name + " is already included by a selected parent folder" : selectionLabel) + '"' + (relation === "selected" || relation === "included" ? " checked" : "") + (relation === "included" ? " disabled" : "") + '><span>' + (relation === "included" ? "Included" : relation === "selected" ? "Selected" : "Select") + "</span></label>"
+      : capabilities.supported ? '<span class="source-browser-entry-note">Not selectable</span>' : '<span class="source-browser-entry-note">Browse only</span>';
+    const open = kind === "directory"
       ? '<button class="button button-quiet button-small" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(path) + '">Open</button>'
-      : '<span class="source-browser-entry-note">Browse only</span>';
+      : "";
+    const action = selection + open;
     return '<div class="source-browser-entry ' + esc(kind) + '" role="listitem"><span class="source-browser-icon" aria-hidden="true">' + icon + '</span>' + nameControl + '<div class="source-browser-entry-action">' + action + "</div></div>";
   }
 
@@ -1708,6 +1804,11 @@
       const hasCurrent = payload && Object.prototype.hasOwnProperty.call(payload, "current_path");
       const currentPath = String(hasCurrent ? payload.current_path : pick(payload, "path", "relative_path") || requestedPath);
       const entries = payload && Array.isArray(payload.entries) ? payload.entries : payload && Array.isArray(payload.items) ? payload.items : [];
+      const priorCapabilities = state.recoveryFileBrowserCapabilities[pointId] || {};
+      state.recoveryFileBrowserCapabilities[pointId] = {
+        path_selective_restore_supported: Object.prototype.hasOwnProperty.call(payload || {}, "path_selective_restore_supported") ? payload.path_selective_restore_supported === true : priorCapabilities.path_selective_restore_supported === true,
+        selection_capabilities: payload && payload.selection_capabilities && typeof payload.selection_capabilities === "object" ? payload.selection_capabilities : priorCapabilities.selection_capabilities || {}
+      };
       state.recoveryFileBrowsers[pointId] = { payload: payload || {}, currentPath, entries };
       delete state.recoveryFileBrowserErrors[pointId];
     } catch (error) {
@@ -1765,6 +1866,7 @@
     if (!browser) return "";
     const currentPath = browser.currentPath;
     const payload = browser.payload;
+    const capabilities = recoveryFileSelectionCapabilities(pointId, payload);
     const parentPath = payload && Object.prototype.hasOwnProperty.call(payload, "parent_path") ? payload.parent_path : (currentPath ? sourceBrowserParent(currentPath) : null);
     const entries = browser.entries.slice().sort((left, right) => {
       const order = { directory: 0, file: 1, symlink: 2, other: 3 };
@@ -1776,14 +1878,17 @@
     const entryLimit = Number(pick(payload, "entry_limit")) || entries.length;
     const empty = '<div class="source-browser-empty"><span aria-hidden="true">□</span><strong>No retained entries in this directory</strong><small>The manifest reports an empty folder.</small></div>';
     const partialWarning = truncated
-      ? '<div class="notice warning source-browser-partial"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Showing the first ' + esc(entryLimit) + ' retained entries in this folder</strong><span>Only this browse-only directory view is bounded. The retained manifest and tape archive are complete, and the backup itself was not limited to these rows.</span></div></div>'
+      ? '<div class="notice warning source-browser-partial"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Showing the first ' + esc(entryLimit) + ' retained entries in this folder</strong><span>Only this directory view is bounded. The retained manifest and tape archive are complete, and the backup itself was not limited to these rows. A selected folder still includes descendants that are not displayed here.</span></div></div>'
       : "";
-    return '<section class="vault-dossier-section recovery-file-browser-shell" data-recovery-files="' + esc(pointId) + '"><div class="vault-section-head"><div><h3>Files & directories</h3><p>Catalog view from the content-addressed manifest.</p></div><button class="icon-button" type="button" data-action="close-recovery-files" data-id="' + esc(pointId) + '" aria-label="Close retained contents browser">&times;</button></div><div class="notice info recovery-files-boundary"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Browse-only recovery inventory</strong><span>This view does not read tape and does not change restore scope. A current Alpha Restore run, when explicitly offered by the server, restores the complete Full recovery point across its exact ordered archive. Selecting individual files or folders is not supported yet.</span></div></div>' + partialWarning + '<div class="backup-source-browser retained-browser"><div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(parentPath || "") + '" aria-label="Open parent retained directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Retained backup path">' + recoveryFileBreadcrumbs(pointId, currentPath) + '</nav></div><div class="source-browser-context"><div><span>Retained path</span><code>/' + esc(currentPath) + '</code></div><span class="source-browser-scope readonly"><span aria-hidden="true">◇</span> Manifest evidence</span></div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Action</span></div><div class="source-browser-entries" role="list" aria-label="Retained files and directories in ' + esc(currentPath || "backup root") + '">' + (entries.length ? entries.map((entry) => recoveryFileEntry(entry, currentPath, pointId)).join("") : empty) + '</div><p class="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + (truncated ? "+ retained entries available; partial view loaded" : " retained entries loaded")) + "</p></div></section>";
+    const boundary = capabilities.supported
+      ? '<div class="notice info recovery-files-boundary"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Choose files and folders to restore</strong><span>Selections use exact retained manifest paths. Folders include every descendant, and selecting a parent replaces any separately selected children. Nothing reads tape until a server-issued plan is explicitly started.</span></div></div>'
+      : '<div class="notice info recovery-files-boundary"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Browse retained recovery inventory</strong><span>This recovery point does not advertise path-selective restore. You can still inspect its manifest here and plan a complete-point restore from the dossier header.</span></div></div>';
+    return '<section class="vault-dossier-section recovery-file-browser-shell" data-recovery-files="' + esc(pointId) + '"><div class="vault-section-head"><div><h3>Files & directories</h3><p>Catalog view from the content-addressed manifest.</p></div><button class="icon-button" type="button" data-action="close-recovery-files" data-id="' + esc(pointId) + '" aria-label="Close retained contents browser">&times;</button></div>' + boundary + partialWarning + '<div class="backup-source-browser retained-browser"><div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(parentPath || "") + '" aria-label="Open parent retained directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Retained backup path">' + recoveryFileBreadcrumbs(pointId, currentPath) + '</nav></div><div class="source-browser-context"><div><span>Retained path</span><code>/' + esc(currentPath) + '</code></div><span class="source-browser-scope ' + (capabilities.supported ? "snapshot" : "readonly") + '"><span aria-hidden="true">◇</span> ' + (capabilities.supported ? "Selectable manifest" : "Manifest evidence") + '</span></div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>' + (capabilities.supported ? "Restore scope" : "Action") + '</span></div><div class="source-browser-entries" role="list" aria-label="Retained files and directories in ' + esc(currentPath || "backup root") + '">' + (entries.length ? entries.map((entry) => recoveryFileEntry(entry, currentPath, pointId, capabilities)).join("") : empty) + '</div><p class="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + (truncated ? "+ retained entries available; partial view loaded" : " retained entries loaded")) + "</p>" + renderRecoveryRestoreSelectionTray(pointId, capabilities, truncated) + "</div></section>";
   }
 
   const RESTORE_REHEARSAL_PHASES = [
     { name: "Preflight", detail: "Revalidate plan, drive, and tape", aliases: ["queued", "started", "preparing", "preflight"] },
-    { name: "Restore files", detail: "Read the complete backup across its ordered tapes", aliases: ["reading", "restoring", "engine_dispatched", "engine_restore", "waiting_for_media", "media_required"] },
+    { name: "Restore files", detail: "Read the planned scope across its ordered tapes", aliases: ["reading", "restoring", "engine_dispatched", "engine_restore", "waiting_for_media", "media_required"] },
     { name: "Verify files", detail: "Hash and compare restored content", aliases: ["comparing", "restored_manifest", "comparison"] },
     { name: "Complete", detail: "Retain restore evidence", aliases: ["passed", "verified", "completed", "complete"] }
   ];
@@ -1796,6 +1901,20 @@
   function restoreRehearsalDetailRecord(rehearsal) {
     const detail = restoreRehearsalDetailPayload(rehearsal);
     return detail && (detail.rehearsal || detail.run) || rehearsal;
+  }
+
+  function restoreRehearsalSelection(rehearsal) {
+    const detail = restoreRehearsalDetailPayload(rehearsal);
+    const record = restoreRehearsalDetailRecord(rehearsal) || {};
+    const result = record.result && typeof record.result === "object" ? record.result : {};
+    const selection = [pick(detail, "restore_scope", "selection", "restore_selection"), pick(record, "restore_scope", "selection", "restore_selection"), pick(result, "restore_scope", "selection", "restore_selection")]
+      .find((value) => value && typeof value === "object" && !Array.isArray(value)) || {};
+    const kind = String(pick(selection, "kind") || "complete_point");
+    return {
+      kind,
+      paths: kind === "selected_paths" ? arrayValue(selection, "normalized_paths", "paths", "requested_paths").map(String) : [],
+      selectionHash: pick(selection, "selection_hash", "sha256", "digest")
+    };
   }
 
   function restoreRehearsalEvents(rehearsal) {
@@ -1924,9 +2043,11 @@
     const currentState = restoreRehearsalState(restoreRehearsalDetailRecord(rehearsal));
     const passed = ["passed", "verified", "completed", "complete"].includes(currentState);
     const failed = ["failed", "blocked", "interrupted", "cancelled", "canceled"].includes(currentState);
+    const selectedScope = restoreRehearsalSelection(rehearsal).kind === "selected_paths";
     return '<div class="phase-track restore-rehearsal-track" aria-label="Restore run phases">' + RESTORE_REHEARSAL_PHASES.map((phase, index) => {
       const phaseClass = passed || index < current ? " done" : index === current ? failed ? " failed" : " current" : "";
-      return '<div class="phase' + phaseClass + '"' + (index === current && !passed ? ' aria-current="step"' : "") + '><span class="phase-marker">' + esc(passed || index < current ? "✓" : index + 1) + '</span><strong>' + esc(phase.name) + '</strong><small>' + esc(phase.detail) + "</small></div>";
+      const detail = phase.name === "Restore files" && selectedScope ? "Read only the server-planned selected scope" : phase.detail;
+      return '<div class="phase' + phaseClass + '"' + (index === current && !passed ? ' aria-current="step"' : "") + '><span class="phase-marker">' + esc(passed || index < current ? "✓" : index + 1) + '</span><strong>' + esc(phase.name) + '</strong><small>' + esc(detail) + "</small></div>";
     }).join("") + "</div>";
   }
 
@@ -1957,6 +2078,8 @@
     const resultDetail = pick(record, "failure_detail", "detail") || pick(result, "failure_detail", "detail", "message");
     const volumes = restoreRehearsalVolumes(rehearsal);
     const multiVolume = volumes.length > 1;
+    const selection = restoreRehearsalSelection(rehearsal);
+    const selectedScope = selection.kind === "selected_paths";
     const waiting = restoreHandoffWaiting(rehearsal);
     const mediaAccepted = restoreHandoffAccepted(rehearsal);
     const nextOrder = restoreHandoffOrder(rehearsal, "next");
@@ -1972,6 +2095,9 @@
       [volumes.length === 1 ? "Cartridge" : "Archive tapes", volumes.length ? volumes.map((volume) => volume.sequence + ". " + volume.label).join(" → ") : pick(record, "expected_volume_label", "cartridge_label", "expected_cartridge_label")],
       ["Current tape", currentVolume ? currentVolume.sequence + ". " + currentVolume.label : null],
       ["Next tape", waiting ? (nextOrder ? nextOrder + ". " : "") + (nextLabel || "Exact recorded tape") : null],
+      ["Restore scope", selectedScope ? selection.paths.length + " selected path" + (selection.paths.length === 1 ? "" : "s") : "Complete recovery point"],
+      ["Selected paths", selectedScope ? selection.paths.join(" · ") : null],
+      ["Selection SHA-256", selectedScope ? selection.selectionHash : null],
       ["Destination", pick(record, "destination_subpath", "destination", "restore_destination")],
       ["Started", date(pick(record, "started_at", "created_at"))],
       ["Finished", pick(record, "finished_at") ? date(pick(record, "finished_at")) : null]
@@ -1979,10 +2105,10 @@
     let outcome = '<div class="notice info"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>' + esc(human(restoreRehearsalPhase(rehearsal))) + '</strong><span>Keep ' + esc(currentVolume ? currentVolume.label : "the requested tape") + ' loaded and the isolated destination online. Cancellation is honored only at a safe boundary.</span></div></div>';
     if (mediaAccepted) outcome = '<div class="notice info restore-media-handoff"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Tape accepted; Restore run is resuming</strong><span>Keep the selected drive and exact loaded tape available while Bacula validates its on-tape label and continues the same restore job.</span></div></div>';
     if (waiting) outcome = '<div class="notice warning restore-media-handoff"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Load tape ' + esc(nextOrder || "?") + ' of ' + esc(totalVolumes || "?") + ': ' + esc(nextLabel || "exact recorded cartridge") + '</strong><span>The Restore run is durably paused at a read-only media boundary. Unload the previous tape, insert this exact next cartridge, and confirm it below. TapeScale will not erase, relabel, or append to it.</span></div><button class="button button-primary" type="button" data-action="open-restore-media-handoff" data-id="' + esc(id) + '">Load exact next tape</button></div>';
-    if (["passed", "verified", "completed", "complete"].includes(runState)) outcome = '<div class="notice success"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Restore run passed</strong><span>Bacula restored the complete retained recovery point from physical tape and TapeScale independently matched the restored manifest.</span></div></div>';
+    if (["passed", "verified", "completed", "complete"].includes(runState)) outcome = '<div class="notice success"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Restore run passed</strong><span>Bacula restored ' + (selectedScope ? "the planned selected content" : "the complete retained recovery point") + ' from physical tape and TapeScale independently matched the restored manifest evidence.</span></div></div>';
     if (["failed", "blocked", "interrupted", "cancelled", "canceled"].includes(runState)) outcome = '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Restore run ' + esc(runState) + '</strong><span>' + esc(resultDetail || "Inspect the durable activity below for the terminal evidence.") + "</span></div></div>";
     const cancel = active ? '<button class="button button-danger button-small" type="button" data-action="open-cancel-restore-rehearsal" data-id="' + esc(id) + '">Request safe cancel</button>' : "";
-    return '<article class="restore-rehearsal-run"><header><div><span class="vault-kicker">Attended ' + (multiVolume ? "multi-tape" : "single-tape") + ' restore</span><h4>Restore run</h4><code>' + esc(id) + '</code></div><div class="restore-rehearsal-actions">' + status(runState) + '<button class="button button-quiet button-small" type="button" data-action="download-restore-rehearsal-evidence" data-id="' + esc(id) + '">Download restore evidence</button>' + cancel + '</div></header>' + renderRestoreRehearsalTrack(rehearsal) + '<div class="restore-rehearsal-body">' + (error ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not refresh run evidence</strong><span>' + esc(errorMessage(error)) + '</span></div></div>' : "") + outcome + renderRestoreVolumeSequence(rehearsal) + '<dl class="restore-result-facts">' + facts.map(([name, value]) => '<dt>' + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-rehearsal-evidence-grid"><section><h5>Restore activity</h5>' + renderRestoreRehearsalTimeline(rehearsal) + '</section><section><h5>Restore evidence</h5>' + renderRestoreRehearsalArtifacts(rehearsal) + "</section></div></div></article>";
+    return '<article class="restore-rehearsal-run"><header><div><span class="vault-kicker">Attended ' + (multiVolume ? "multi-tape" : "single-tape") + " · " + (selectedScope ? "selected-path" : "complete-point") + ' restore</span><h4>Restore run</h4><code>' + esc(id) + '</code></div><div class="restore-rehearsal-actions">' + status(runState) + '<button class="button button-quiet button-small" type="button" data-action="download-restore-rehearsal-evidence" data-id="' + esc(id) + '">Download restore evidence</button>' + cancel + '</div></header>' + renderRestoreRehearsalTrack(rehearsal) + '<div class="restore-rehearsal-body">' + (error ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not refresh run evidence</strong><span>' + esc(errorMessage(error)) + '</span></div></div>' : "") + outcome + renderRestoreVolumeSequence(rehearsal) + '<dl class="restore-result-facts">' + facts.map(([name, value]) => '<dt>' + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-rehearsal-evidence-grid"><section><h5>Restore activity</h5>' + renderRestoreRehearsalTimeline(rehearsal) + '</section><section><h5>Restore evidence</h5>' + renderRestoreRehearsalArtifacts(rehearsal) + "</section></div></div></article>";
   }
 
   function renderRestoreRehearsals(pointId) {
@@ -2050,7 +2176,10 @@
     }, 0);
     const lastVerified = points.find((point) => recoveryPointState(point) === "verified");
     html += '<section class="panel metric-strip vault-metrics"><div class="metric"><span>Recovery points</span><strong>' + points.length + '</strong><small>All retained outcomes</small></div><div class="metric"><span>Verified</span><strong>' + verified + '</strong><small>Ready for prerequisite planning</small></div><div class="metric"><span>Cataloged media</span><strong>' + tapes.size + '</strong><small>Unique cartridge labels</small></div><div class="metric"><span>Protected data</span><strong>' + (logicalBytes ? esc(bytes(logicalBytes)) : "—") + '</strong><small>' + (lastVerified ? "Latest verified " + esc(date(pick(lastVerified, "recovery_time", "created_at"))) : "No verified point yet") + "</small></div></section>";
-    html += '<div class="vault-layout section">' + renderRecoveryPointCatalog(points, selected) + renderRecoveryPointDossier(selected) + "</div>";
+    const dossier = renderRecoveryPointDossier(selected)
+      .replace("A Restore run recovers the complete point across its exact ordered tape set into a new isolated destination after attended drive and media confirmation. File or directory selection, encrypted recovery points, and clean-catalog recovery are not available yet.", "A Restore run can recover the complete point across its exact ordered tape set. Server-normalized file or directory selection is executable only for a single-tape recovery point in this Alpha; multi-tape selected execution stays blocked until per-path media evidence is retained. Encrypted recovery points and clean-catalog recovery are not available yet.")
+      .replace(">Plan a restore</button>", ">Plan complete restore</button>");
+    html += '<div class="vault-layout section">' + renderRecoveryPointCatalog(points, selected) + dossier + "</div>";
     const selectedId = recordId(selected);
     if (selectedId && !recoveryPointDetail(selectedId) && !state.recoveryPointDetailLoading.has(selectedId) && !state.errors["recoveryPoint:" + selectedId]) {
       window.setTimeout(() => loadRecoveryPointDetail(selectedId), 0);
@@ -2838,9 +2967,11 @@
     if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === "function") returnFocus.focus();
   }
 
-  function recoveryPointPlanDraft(point) {
+  function recoveryPointPlanDraft(point, selection) {
     const id = recordId(point);
-    if (state.restorePlanDrafts[id]) return state.restorePlanDrafts[id];
+    if (state.restorePlanDrafts[id]) {
+      return selection ? Object.assign({}, state.restorePlanDrafts[id], { selection }) : state.restorePlanDrafts[id];
+    }
     const representation = recoveryPointRepresentation(point);
     const dataset = String(pick(point, "dataset_name", "source", "dataset") || "recovery");
     const slug = dataset.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "recovery";
@@ -2850,6 +2981,7 @@
     return {
       recovery_point_id: id,
       mode: representation === "native_zfs" ? "native_dataset" : "file_archive",
+      selection: selection || { kind: "complete_point", paths: [] },
       destination: "restores/" + stamp + "-" + slug,
       conflict_policy: "skip",
       key_available: !pick(point, "key_lineage_id"),
@@ -2876,16 +3008,26 @@
     return actual === expected ? " selected" : "";
   }
 
-  function openRestorePlan(id) {
+  function openRestorePlan(id, selection) {
     const summary = state.data.recoveryPoints.find((point) => recordId(point) === id);
     if (!summary) return;
     const detail = recoveryPointDetail(id);
     const point = detail && detail.recovery_point && typeof detail.recovery_point === "object" ? detail.recovery_point : summary;
-    const draft = recoveryPointPlanDraft(point);
+    const requestedSelection = selection || { kind: "complete_point", paths: [] };
+    const draft = recoveryPointPlanDraft(point, requestedSelection);
+    if (requestedSelection.kind === "selected_paths") draft.mode = "file_archive";
+    state.restorePlanDrafts[id] = draft;
     const media = recoveryPointVolumes(detail, point).map(volumeLabel);
     const keyLineage = pick(point, "key_lineage_id");
     const body = '<form id="restore-plan-form" data-recovery-point-id="' + esc(id) + '"><div class="restore-plan-banner"><span aria-hidden="true">◇</span><div><strong>Generate a readiness plan</strong><p>This evaluates durable catalog evidence and your destination assessment. It cannot read tape or restore data. When execution is explicitly offered, this Alpha restores the complete supported Full point across the server-returned ordered tape set.</p></div></div><div class="restore-plan-point"><div><small>Recovery point</small><strong>' + esc(label(pick(point, "dataset_name", "source", "dataset"))) + '</strong><code>' + esc(id) + '</code></div>' + status(recoveryPointState(point)) + '</div><div class="restore-plan-media"><span>Required media</span><strong>' + esc(media.length ? media.join(" → ") : "No ordered media returned") + '</strong></div><div class="form-grid restore-plan-fields"><div class="form-field"><label for="restore-plan-mode">Recovery mode</label><select class="select" id="restore-plan-mode" name="mode"><option value="file_archive"' + selectedOption(draft.mode, "file_archive") + '>File archive</option><option value="native_dataset"' + selectedOption(draft.mode, "native_dataset") + '>Native ZFS dataset</option><option value="files_from_native"' + selectedOption(draft.mode, "files_from_native") + '>Files from native stream</option></select><small>Native extraction may require temporary staging capacity.</small></div><div class="form-field"><label for="restore-conflict-policy">Existing-file behavior</label><select class="select" id="restore-conflict-policy" name="conflict_policy"><option value="skip"' + selectedOption(draft.conflict_policy, "skip") + '>Skip conflicts (safe default)</option><option value="rename"' + selectedOption(draft.conflict_policy, "rename") + '>Rename recovered files</option><option value="replace"' + selectedOption(draft.conflict_policy, "replace") + '>Replace existing data</option></select><small>Replacement stays blocked without administrator reauthentication and a destructive preview.</small></div><div class="form-field full"><label for="restore-destination">Destination inside the configured recovery root</label><input class="input input-mono" id="restore-destination" name="destination" value="' + esc(draft.destination) + '" maxlength="512" required placeholder="restores/2026-11-12-dataset"><small>Use a contained relative path. Absolute paths and parent traversal are rejected.</small></div><div class="form-field"><label for="restore-available-bytes">Available destination bytes</label><input class="input input-mono" id="restore-available-bytes" name="available_bytes" type="number" min="0" step="1" value="' + esc(draft.available_bytes == null ? "" : draft.available_bytes) + '" placeholder="Optional"><small>Leave blank to retain an explicit capacity-estimate warning.</small></div><div class="form-field"><label for="restore-reserve-bytes">Required free-space reserve</label><input class="input input-mono" id="restore-reserve-bytes" name="required_free_reserve_bytes" type="number" min="0" step="1" value="' + esc(draft.required_free_reserve_bytes) + '"><small>Logical recovery estimate: ' + esc(draft.estimated_required_bytes == null ? "not reported" : bytes(draft.estimated_required_bytes)) + '.</small></div><div class="form-field full"><fieldset class="restore-assessment"><legend>Destination assessment</legend><label class="check-option"><input type="checkbox" name="is_new_destination"' + checked(draft.is_new_destination) + '> This is a new, isolated destination.</label><label class="check-option"><input type="checkbox" name="destination_approved"' + checked(draft.destination_approved) + '> The path is inside the approved recovery area.</label><label class="check-option"><input type="checkbox" name="acl_semantics_supported"' + checked(draft.acl_semantics_supported) + '> The destination preserves the required ACL and metadata semantics.</label><label class="check-option"><input type="checkbox" name="identity_mapping_complete"' + checked(draft.identity_mapping_complete) + '> User and group identity mapping has been reviewed.</label>' + (keyLineage ? '<label class="check-option"><input type="checkbox" name="key_available"' + checked(draft.key_available) + '> Required key lineage <code>' + esc(keyLineage) + '</code> is available.</label><label class="check-option"><input type="checkbox" name="key_recovery_package_tested"' + checked(draft.key_recovery_package_tested) + '> The independent key recovery package has been tested.</label>' : '<div class="restore-no-key"><span aria-hidden="true">✓</span>No encryption key lineage is recorded for this point.</div>') + '</fieldset></div></div><div class="notice warning restore-replace-warning" id="restore-replace-warning"' + (draft.conflict_policy === "replace" ? "" : " hidden") + '><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Replacement cannot be authorized here</strong><span>The resulting plan will retain reauthentication and destructive-preview blockers. This form never executes the replacement.</span></div></div><p class="notice danger" id="restore-plan-error" hidden></p><div class="modal-foot restore-plan-submit"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Generate readiness plan</button></div></form>';
-    openModal("Plan a restore", body);
+    const selectedPaths = draft.selection && draft.selection.kind === "selected_paths" && Array.isArray(draft.selection.paths) ? draft.selection.paths : [];
+    const scopeMarkup = '<section class="restore-plan-scope" aria-label="Planned restore scope"><div><span>Restore scope</span><strong>' + (selectedPaths.length ? esc(selectedPaths.length) + " selected path" + (selectedPaths.length === 1 ? "" : "s") : "Complete recovery point") + '</strong><small>' + (selectedPaths.length ? "Folders recursively include everything beneath them." : "Every retained entry in this recovery point.") + '</small></div>' + (selectedPaths.length ? '<ul>' + selectedPaths.map((path) => '<li><code>' + esc(path) + "</code></li>").join("") + "</ul>" : "") + "</section>";
+    const scopedBody = body
+      .replace("this Alpha restores the complete supported Full point", selectedPaths.length ? "this Alpha restores the server-normalized selected paths only when this is a single-tape recovery point" : "this Alpha restores the complete supported Full point")
+      .replace('<option value="native_dataset"', selectedPaths.length ? '<option value="native_dataset" disabled' : '<option value="native_dataset"')
+      .replace('<option value="files_from_native"', selectedPaths.length ? '<option value="files_from_native" disabled' : '<option value="files_from_native"')
+      .replace('<div class="restore-plan-media">', scopeMarkup + '<div class="restore-plan-media">');
+    openModal(selectedPaths.length ? "Plan selected restore" : "Plan a complete restore", scopedBody);
     const modal = modalLayer.querySelector(".modal");
     if (modal) modal.classList.add("restore-plan-modal");
     const destination = document.querySelector("#restore-destination");
@@ -2936,6 +3078,27 @@
     return value && typeof value === "object" && !Array.isArray(value) ? value : {};
   }
 
+  function restorePlanSelection(plan) {
+    const execution = restorePlanExecution(plan);
+    const value = pick(plan, "selection", "restore_selection") || pick(execution, "selection", "restore_selection");
+    const selection = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    const kind = String(pick(selection, "kind") || "complete_point");
+    const normalized = arrayValue(selection, "normalized_paths", "paths", "requested_paths").map(String);
+    const summary = selection.summary && typeof selection.summary === "object" ? selection.summary : {};
+    return {
+      kind,
+      paths: kind === "selected_paths" ? normalized : [],
+      summary,
+      manifestDigest: pick(selection, "manifest_digest"),
+      selectedManifestDigest: pick(selection, "selected_manifest_digest"),
+      selectionHash: pick(selection, "selection_hash", "sha256", "digest") || pick(execution, "selection_hash")
+    };
+  }
+
+  function restorePlanHasSelectedScope(plan) {
+    return restorePlanSelection(plan).kind === "selected_paths";
+  }
+
   function restorePlanTapes(plan) {
     const direct = planArray(plan, "required_tape_ids", "required_tapes", "tapes");
     return direct.length ? direct : planArray(restorePlanExecution(plan), "required_tape_ids", "required_tapes", "tapes");
@@ -2977,6 +3140,11 @@
     const blockers = planArray(plan, "blockers");
     const warnings = planArray(plan, "warnings");
     const tapes = restorePlanTapes(plan);
+    const selection = restorePlanSelection(plan);
+    const selectedScope = selection.kind === "selected_paths";
+    const selectedEntryCount = pick(selection.summary, "entry_count", "entries");
+    const selectedFileCount = pick(selection.summary, "file_count", "files");
+    const selectedLogicalBytes = pick(selection.summary, "logical_bytes", "bytes");
     const multiVolume = tapes.length > 1;
     const volumeContractReady = restorePlanVolumeContractReady(plan);
     const dependencies = planArray(plan, "dependency_chain", "required_dependencies", "dependencies");
@@ -2988,7 +3156,8 @@
     const previewHash = pick(plan, "preview_hash", "sha256", "digest");
     const expiresAt = pick(plan, "expires_at");
     const executionOffered = pick(plan, "execution_supported") === true;
-    const executionSupported = ready && executionOffered && volumeContractReady;
+    const selectedMultiVolume = selectedScope && multiVolume;
+    const executionSupported = ready && executionOffered && volumeContractReady && !selectedMultiVolume;
     const executionDrives = restorePlanDrives(plan);
     const resultNotice = ready
       ? '<div class="restore-result-hero ready"><span aria-hidden="true">✓</span><div><small>Readiness result</small><h3>Prerequisites satisfied</h3><p>' + (executionSupported ? "This supported verified Full recovery point can advance to an attended " + (multiVolume ? tapes.length + "-tape" : "single-tape") + " Restore run." : "The plan is ready for review, but the server did not offer a matching attended execution contract for this ordered media set.") + '</p></div></div>'
@@ -3000,18 +3169,27 @@
       ["Expires", date(expiresAt)],
       ["Plan status", pick(plan, "status")],
       ["Recovery point", recordId(point)],
+      ["Restore scope", selectedScope ? selection.paths.length + " selected path" + (selection.paths.length === 1 ? "" : "s") : "Complete recovery point"],
+      ["Selected entries", selectedScope && selectedEntryCount != null ? selectedEntryCount : null],
+      ["Selected files", selectedScope && selectedFileCount != null ? selectedFileCount : null],
+      ["Selected logical size", selectedScope && selectedLogicalBytes != null ? bytes(selectedLogicalBytes) : null],
+      ["Selection SHA-256", selectedScope ? selection.selectionHash : null],
+      ["Source manifest", selectedScope ? selection.manifestDigest : null],
+      ["Selected content manifest", selectedScope ? selection.selectedManifestDigest : null],
       ["Restore media", tapes.length ? tapes.length + " ordered tape" + (tapes.length === 1 ? "" : "s") : null]
     ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "Not reported");
-    const executionDetail = executionOffered && !volumeContractReady
+    const executionDetail = selectedMultiVolume
+      ? "Selected-path execution requires a single-volume recovery point in this Alpha. Use a complete-point restore for this multi-tape point."
+      : executionOffered && !volumeContractReady
       ? "The server did not bind this multi-tape plan to both multi_volume=true and an exact matching volume_count. Generate a fresh plan before loading media."
       : pick(plan, "execution_detail") || (ready ? "This recovery format is not supported by the attended Restore run worker." : "Resolve every planning blocker and generate a fresh plan.");
     const mediaInstructions = multiVolume
       ? "Load tape 1 to start. TapeScale will pause durably at each media boundary and name the exact next cartridge before the same Bacula restore job continues."
       : "Load the one retained cartridge to start and keep it in the selected drive until the read completes.";
     const executionAction = executionSupported
-      ? '<section class="restore-execution-offer"><div><span class="lab-badge">Alpha · attended ' + (multiVolume ? "multi-tape" : "single-tape") + ' Restore run</span><h3>Restore this complete recovery point</h3><p>' + esc(mediaInstructions) + ' TapeScale writes only beneath the isolated destination and verifies the restored manifest. This flow remains Full-point-only and does not support file selection, encrypted recovery points, or clean-catalog recovery.</p>' + renderRestorePlanTapeSequence(tapes, 1) + '</div><button class="button button-primary" type="button" data-action="open-restore-rehearsal" data-plan-id="' + esc(planId) + '">Start Restore run</button></section>'
+      ? '<section class="restore-execution-offer"><div><span class="lab-badge">Alpha · attended ' + (multiVolume ? "multi-tape" : "single-tape") + ' Restore run</span><h3>' + (selectedScope ? "Restore the selected content" : "Restore this complete recovery point") + '</h3><p>' + esc(mediaInstructions) + ' TapeScale writes only beneath the isolated destination and verifies ' + (selectedScope ? "the server-normalized selected scope" : "the complete restored manifest") + '. Encrypted recovery points and clean-catalog recovery remain unavailable.</p>' + renderRestorePlanTapeSequence(tapes, 1) + '</div><button class="button button-primary" type="button" data-action="open-restore-rehearsal" data-plan-id="' + esc(planId) + '">Start Restore run</button></section>'
       : '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>' + (ready ? "This ready plan remains planning-only" : "Execution remains blocked") + '</strong><span>' + esc(executionDetail) + "</span></div></div>";
-    return resultNotice + '<div class="restore-result-boundary"><strong>Plan retained; nothing executed yet</strong><span>A Restore run starts only after exact-drive, first-tape, isolated-destination, and attended confirmation. Every later tape requires its own exact attended handoff.</span></div><dl class="restore-result-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-result-grid">' + renderPlanRequirements("Required media in order", tapes.map((tape, index) => (index + 1) + ". " + tape), "No media requirement was returned.") + renderPlanRequirements("Dependency chain", dependencies, "No earlier recovery point is required.") + renderPlanRequirements("Required keys", keys, "No recovery key requirement was returned.") + renderPlanRequirements("Verification gates", verification, "No verification prerequisite was returned.") + renderPlanRequirements("Destination", destination, "No destination assessment was returned.") + renderPlanRequirements("Read & staging estimate", estimates, "No work estimate was returned.") + renderPlanRequirements("Blockers", blockers.map(planIssueText), "No blocking prerequisite remains.") + renderPlanRequirements("Warnings", warnings.map(planIssueText), "No planning warning was returned.") + "</div>" + executionAction;
+    return resultNotice + '<div class="restore-result-boundary"><strong>Plan retained; nothing executed yet</strong><span>A Restore run starts only after exact-drive, first-tape, isolated-destination, and attended confirmation. Every later tape requires its own exact attended handoff.</span></div><dl class="restore-result-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-result-grid">' + renderPlanRequirements("Restore scope", selection.paths, selectedScope ? "The server did not return normalized selected paths." : "Complete recovery point: every retained entry is included.") + renderPlanRequirements("Required media in order", tapes.map((tape, index) => (index + 1) + ". " + tape), "No media requirement was returned.") + renderPlanRequirements("Dependency chain", dependencies, "No earlier recovery point is required.") + renderPlanRequirements("Required keys", keys, "No recovery key requirement was returned.") + renderPlanRequirements("Verification gates", verification, "No verification prerequisite was returned.") + renderPlanRequirements("Destination", destination, "No destination assessment was returned.") + renderPlanRequirements("Read & staging estimate", estimates, "No work estimate was returned.") + renderPlanRequirements("Blockers", blockers.map(planIssueText), "No blocking prerequisite remains.") + renderPlanRequirements("Warnings", warnings.map(planIssueText), "No planning warning was returned.") + "</div>" + executionAction;
   }
 
   async function submitRestorePlan(form) {
@@ -3028,9 +3206,18 @@
       return;
     }
     const current = recoveryPointPlanDraft(point);
+    const selection = current.selection && current.selection.kind === "selected_paths"
+      ? { kind: "selected_paths", paths: Array.isArray(current.selection.paths) ? current.selection.paths.slice() : [] }
+      : { kind: "complete_point", paths: [] };
+    if (selection.kind === "selected_paths" && !selection.paths.length) {
+      errorBox.textContent = "Select at least one retained file or folder, or plan a complete restore instead.";
+      errorBox.hidden = false;
+      return;
+    }
     const payload = {
       recovery_point_id: id,
       mode: String(values.get("mode") || "file_archive"),
+      selection,
       destination,
       conflict_policy: String(values.get("conflict_policy") || "skip"),
       key_available: values.get("key_available") === "on" || !pick(point, "key_lineage_id"),
@@ -3079,6 +3266,12 @@
     }
     const drives = restorePlanDrives(plan);
     const tapes = restorePlanTapes(plan);
+    const selection = restorePlanSelection(plan);
+    const selectedScope = selection.kind === "selected_paths";
+    if (selectedScope && tapes.length > 1) {
+      toast("Selected restore is not available", "Selected-path execution currently requires a single-volume recovery point. Generate a complete-point plan for this multi-tape backup.");
+      return;
+    }
     if (!restorePlanVolumeContractReady(plan)) {
       toast("Restore run is not available", tapes.length > 1 ? "The server did not explicitly offer multi-volume execution with a matching ordered volume count." : "The server did not return one exact retained cartridge for this execution.");
       return;
@@ -3095,10 +3288,14 @@
       return '<option value="' + esc(driveId) + '">' + esc(name || driveId) + (path ? " · " + esc(path) : "") + "</option>";
     });
     const boundary = multiVolume
-      ? "This Alpha restores the complete recovery point across " + tapes.length + " exact ordered cartridges. Load only tape 1 now; the run pauses durably and names each next tape before it can continue."
-      : "This Alpha restores the complete recovery point from one retained cartridge.";
+      ? "This Alpha restores " + (selectedScope ? "the planned selected scope" : "the complete recovery point") + " across " + tapes.length + " exact ordered cartridges. Load only tape 1 now; the run pauses durably and names each next tape before it can continue."
+      : "This Alpha restores " + (selectedScope ? "the planned selected scope" : "the complete recovery point") + " from one retained cartridge.";
     const body = '<form id="restore-rehearsal-form" data-plan-id="' + esc(planId) + '"><input type="hidden" name="preview_hash" value="' + esc(pick(plan, "preview_hash")) + '"><div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Attended ' + (multiVolume ? "multi-tape" : "single-tape") + ' Restore run</strong><span>' + esc(boundary) + ' It writes only beneath the new isolated destination and never writes to tape or source data. File or directory selection, encrypted recovery points, and clean-catalog recovery are not supported. This local console has no application sign-in, so use it only on a trusted management network and keep the operator present.</span></div></div><div class="restore-rehearsal-summary"><div><small>Ordered restore tapes</small><strong>' + esc(tapes.join(" → ")) + '</strong></div><div><small>Load first</small><strong>' + esc(firstTape) + '</strong></div><div><small>Isolated destination</small><strong class="mono">' + esc(destinationPath) + '</strong></div><div><small>Plan preview</small><code>' + esc(pick(plan, "preview_hash")) + '</code></div></div>' + renderRestorePlanTapeSequence(tapes, 1) + '<div class="form-grid"><div class="form-field full"><label for="restore-rehearsal-drive">Drive containing tape 1</label><select class="select" id="restore-rehearsal-drive" name="drive_id" required>' + driveOptions.join("") + '</select><small>The worker rechecks stable identity, path, firmware, cartridge, qualification, and plan hash before reading. Later tapes use separate exact handoffs.</small></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="tape_loaded_confirmed" required> I physically verified that tape 1, <strong>' + esc(firstTape) + '</strong>, is loaded in the selected drive.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="isolated_destination_confirmed" required> I verified that <strong class="mono">' + esc(destinationPath) + '</strong> is a new isolated recovery destination, not live data.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="attended_confirmed" required> I will remain available for every exact tape handoff and safe-cancellation prompt until this Restore run finishes.</label></div><div class="form-field full"><label for="restore-rehearsal-confirmation">Type the exact attended confirmation</label><input class="input input-mono" id="restore-rehearsal-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small>Required: <strong class="mono">' + esc(phrase) + '</strong></small></div><div class="form-field full"><label for="restore-rehearsal-actor">Operator</label><input class="input" id="restore-rehearsal-actor" name="actor" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="restore-rehearsal-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit"' + (drives.length ? "" : " disabled") + '>Start Restore run</button></div></form>';
-    openModal("Start Restore run", body);
+    const scopeSummary = '<div><small>Restore scope</small><strong>' + (selectedScope ? esc(selection.paths.length) + " selected path" + (selection.paths.length === 1 ? "" : "s") : "Complete recovery point") + "</strong></div>";
+    const scopedBody = body
+      .replace('<div><small>Plan preview</small>', scopeSummary + '<div><small>Plan preview</small>')
+      .replace("File or directory selection, encrypted recovery points, and clean-catalog recovery are not supported.", selectedScope ? "This run is immutably bound to the normalized paths and selection hash in the server-issued plan; encrypted recovery points and clean-catalog recovery are not supported." : "This run is immutably bound to the complete-point scope in the server-issued plan; encrypted recovery points and clean-catalog recovery are not supported.");
+    openModal("Start Restore run", scopedBody);
     const input = document.querySelector("#restore-rehearsal-confirmation");
     if (input) input.focus();
   }
@@ -5818,8 +6015,12 @@
     if (action === "open-recovery-files") openRecoveryPointFiles(target.dataset.id);
     if (action === "close-recovery-files") closeRecoveryPointFiles(target.dataset.id);
     if (action === "recovery-files-navigate") loadRecoveryPointFiles(target.dataset.id, target.dataset.path || "", true);
+    if (action === "toggle-recovery-restore-path") toggleRecoveryRestorePath(target.dataset.id, target.dataset.path);
+    if (action === "clear-recovery-restore-selection") clearRecoveryRestoreSelection(target.dataset.id);
+    if (action === "plan-selected-restore") openRestorePlan(target.dataset.id, recoveryRestoreSelectionContract(target.dataset.id));
     if (action === "download-recovery-evidence") downloadRecoveryEvidence(target);
-    if (action === "open-restore-plan" || action === "revise-restore-plan") openRestorePlan(target.dataset.id);
+    if (action === "open-restore-plan") openRestorePlan(target.dataset.id, { kind: "complete_point", paths: [] });
+    if (action === "revise-restore-plan") openRestorePlan(target.dataset.id, state.restorePlanDrafts[target.dataset.id] && state.restorePlanDrafts[target.dataset.id].selection || { kind: "complete_point", paths: [] });
     if (action === "open-restore-rehearsal") openRestoreRehearsal(target.dataset.planId);
     if (action === "select-restore-rehearsal") selectRestoreRehearsal(target.dataset.id);
     if (action === "open-restore-media-handoff") openRestoreMediaHandoff(target.dataset.id);

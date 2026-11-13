@@ -1577,8 +1577,12 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         Some(&header::HeaderValue::from_static("no-store"))
     );
     let manifest_response = response_json(manifest_response).await;
-    assert_eq!(manifest_response["browse_only"], true);
-    assert_eq!(manifest_response["path_selective_restore_supported"], false);
+    assert_eq!(manifest_response["browse_only"], false);
+    assert_eq!(manifest_response["path_selective_restore_supported"], true);
+    assert_eq!(
+        manifest_response["selection_capabilities"]["multi_volume_selected_execution"],
+        false
+    );
     assert_eq!(manifest_response["current_path"], "");
     assert_eq!(manifest_response["entries"][0]["name"], "payload.bin");
     assert_eq!(manifest_response["entries"][0]["kind"], "file");
@@ -1689,6 +1693,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(restore_plan["plan"]["execution_supported"], true);
     assert_eq!(restore_plan["plan"]["execution"]["volume_count"], 2);
     assert_eq!(restore_plan["plan"]["execution"]["multi_volume"], true);
+    assert_eq!(restore_plan["plan"]["selection"]["kind"], "complete_point");
     assert_eq!(
         restore_plan["plan"]["execution"]["origin_workflow_kind"],
         "backup"
@@ -1706,6 +1711,86 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         .is_some_and(|warnings| warnings
             .iter()
             .any(|warning| warning["code"] == "restore_test_not_passed")));
+
+    let selected_plan_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/restores/plan".to_owned(),
+        json!({
+            "recovery_point_id": recovery_point_id,
+            "mode": "file_archive",
+            "selection": {
+                "kind": "selected_paths",
+                "paths": ["payload.bin"]
+            },
+            "destination": "planned-restores/operational-multi-volume-selection",
+            "conflict_policy": "skip",
+            "destination_approved": true,
+            "is_new_destination": true,
+            "acl_semantics_supported": true,
+            "identity_mapping_complete": true,
+            "estimated_required_bytes": 1024,
+            "available_bytes": 1048576,
+            "required_free_reserve_bytes": 4096,
+            "automatic_publication_requested": false
+        }),
+    )
+    .await;
+    assert_eq!(selected_plan_response.status(), StatusCode::CREATED);
+    let selected_plan = response_json(selected_plan_response).await;
+    assert_eq!(selected_plan["plan"]["selection"]["kind"], "selected_paths");
+    assert_eq!(selected_plan["plan"]["ready"], false);
+    assert_eq!(selected_plan["plan"]["execution_supported"], false);
+    assert!(selected_plan["plan"]["blockers"]
+        .as_array()
+        .is_some_and(|blockers| blockers.iter().any(|blocker| {
+            blocker["code"] == "selected_restore_multivolume_unavailable"
+                && blocker["volume_count"] == 2
+        })));
+
+    // Simulate an alpha.4 upgrade encountering a selected multi-volume plan
+    // persisted by an earlier build. Queue-time validation must not trust the
+    // stale execution flags and must block before reserving drive or media.
+    let selected_plan_id = Uuid::parse_str(
+        selected_plan["plan"]["id"]
+            .as_str()
+            .expect("selected plan should have an id"),
+    )
+    .expect("selected plan id should parse");
+    sqlx::query(
+        "UPDATE restore_plans
+         SET selection = jsonb_set(
+                 jsonb_set(selection, '{ready}', 'true'::jsonb),
+                 '{execution_supported}', 'true'::jsonb
+             ),
+             blockers = '[]'::jsonb
+         WHERE id = $1",
+    )
+    .bind(selected_plan_id)
+    .execute(&pool)
+    .await
+    .expect("legacy selected plan fixture should expose stale execution flags");
+    let stale_selected_queue_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/restore-rehearsals".to_owned(),
+        json!({
+            "plan_id": selected_plan_id,
+            "preview_hash": selected_plan["plan"]["preview_hash"],
+            "drive_id": drive.id,
+            "confirmation": format!("RESTORE PLAN {selected_plan_id} TO ISOLATED DESTINATION"),
+            "tape_loaded_confirmed": true,
+            "isolated_destination_confirmed": true,
+            "attended_confirmed": true,
+            "actor": "Operational restore integration operator"
+        }),
+    )
+    .await;
+    assert_eq!(stale_selected_queue_response.status(), StatusCode::CONFLICT);
+    let stale_selected_queue = response_json(stale_selected_queue_response).await;
+    assert!(stale_selected_queue["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("single-volume recovery point")));
 
     let restore_plan_id = Uuid::parse_str(
         restore_plan["plan"]["id"]
@@ -1750,6 +1835,8 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         panic!("verified operational single-volume restore should be claimable");
     };
     assert_eq!(restore_claim.run.id, restore_rehearsal_id);
+    let complete_restore_scope = restore_claim.run.restore_scope.clone();
+    assert_eq!(complete_restore_scope["kind"], "complete_point");
     let restore_volumes = store::restore_rehearsal_volumes(&pool, restore_rehearsal_id)
         .await
         .expect("restore volume ledger should load");
@@ -1997,6 +2084,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
             "volume": engine_volume,
             "volume_count": 2,
             "volumes": ordered_restore_volumes,
+            "restore_scope": complete_restore_scope,
             "destination": restore_destination
         }),
     )
@@ -2031,6 +2119,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
                 "matched": true,
                 "expected_digest": source_manifest.digest_sha256,
                 "actual_digest": source_manifest.digest_sha256,
+                "restore_scope": complete_restore_scope,
                 "differences": 0
             }),
         ),
@@ -2044,8 +2133,10 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
                 "read_only_media_operation": true,
                 "volume_count": 2,
                 "volumes": ordered_restore_volumes,
+                "restore_scope": complete_restore_scope,
                 "source_manifest_digest": source_manifest.digest_sha256,
-                "restored_manifest_digest": source_manifest.digest_sha256
+                "restored_manifest_digest": source_manifest.digest_sha256,
+                "raw_restored_manifest_digest": source_manifest.digest_sha256
             }),
         ),
     ] {
@@ -2078,8 +2169,11 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
             },
             "volume_count": 2,
             "volumes": ordered_restore_volumes,
+            "restore_scope": complete_restore_scope,
+            "retained_manifest_digest": source_manifest.digest_sha256,
             "source_manifest_digest": source_manifest.digest_sha256,
             "restored_manifest_digest": source_manifest.digest_sha256,
+            "raw_restored_manifest_digest": source_manifest.digest_sha256,
             "restored_manifest_sha256": restored_artifact_sha256,
             "comparison": {
                 "matched": true,
@@ -2113,10 +2207,8 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         .fetch_one(&pool)
         .await
         .expect("operational restore-test verification should persist");
-    assert_eq!(
-        restore_scope["scope"],
-        "complete attended ordered-volume file recovery replay"
-    );
+    assert_eq!(restore_scope["kind"], "complete_point");
+    assert_eq!(restore_scope["restore_scope"], complete_restore_scope);
     assert_eq!(
         pass_result["execution_scope"],
         "attended_ordered_volume_file_restore"
