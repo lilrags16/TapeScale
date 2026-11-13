@@ -1308,6 +1308,21 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         2
     );
 
+    // Restore execution requires an explicit LTO read-matrix result in addition
+    // to the exact physical qualification. Model inference supplies this in a
+    // real probe; make the synthetic HH9 fixture equally explicit.
+    observation.generation = Some(9);
+    observation.observed_at = Utc::now();
+    store::record_drive_observation(&pool, &observation)
+        .await
+        .expect("restore fixture should retain the observed LTO generation");
+    assert!(matches!(
+        store::reconcile_drive(&pool, drive_id, "serial:IBM:ULTRIUM-HH9:DRIVE-001")
+            .await
+            .expect("restore fixture drive identity should reconcile"),
+        ReconcileDriveResult::Reconciled(_)
+    ));
+
     let ready_plan_response = api_request(
         &application,
         Method::POST,
@@ -1395,8 +1410,13 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         Some(queue_rehearsal_body.clone()),
     )
     .await;
-    assert_eq!(queued_rehearsal_response.status(), StatusCode::ACCEPTED);
+    let queued_rehearsal_status = queued_rehearsal_response.status();
     let queued_rehearsal = response_json(queued_rehearsal_response).await;
+    assert_eq!(
+        queued_rehearsal_status,
+        StatusCode::ACCEPTED,
+        "queue response: {queued_rehearsal}"
+    );
     let cancelled_rehearsal_id = uuid::Uuid::parse_str(
         queued_rehearsal["rehearsal"]["id"]
             .as_str()
@@ -1914,7 +1934,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     .fetch_one(&pool)
     .await
     .expect("drive audit query should succeed");
-    assert_eq!(reconcile_audit, 1);
+    assert_eq!(reconcile_audit, 2);
 
     // Exercise the complete Media Control Center contract against the same
     // cartridge, recovery point, drive, and custody history proved above.
