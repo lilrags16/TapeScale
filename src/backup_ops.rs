@@ -1,7 +1,7 @@
 //! Durable attended full-file backup policies and pre-assignment requests.
 //!
-//! The physical executor remains the fenced, pinned single-tape data path.  This
-//! module adds the missing operational boundary in front of it: a policy-backed
+//! The physical executor remains the fenced, pinned standalone-drive data path. This
+//! module adds the operational boundary in front of it: a policy-backed
 //! request and `job_runs` identity are committed in `waiting_for_media` before
 //! an operator selects destructive hardware.  Nothing in this module promotes
 //! the laboratory adapter, unencrypted format, or a hardware tuple to
@@ -54,6 +54,7 @@ pub struct BackupProfileRecord {
     pub representation: String,
     pub encryption_enabled: bool,
     pub compression_mode: String,
+    pub spanning_enabled: bool,
     pub verification_mode: String,
     pub engine_name: String,
     pub engine_version: String,
@@ -85,6 +86,7 @@ const BACKUP_PROFILE_SELECT: &str = r#"
            policy.representation,
            policy.encryption_enabled,
            policy.compression_mode,
+           policy.spanning_enabled,
            policy.verification_mode,
            data_profile.engine_name,
            data_profile.engine_version,
@@ -121,7 +123,9 @@ pub struct NewBackupProfile {
     pub verification_mode: String,
     #[serde(default)]
     pub encryption_enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_compression_mode")]
+    pub compression_mode: String,
+    #[serde(default = "default_spanning_enabled")]
     pub spanning_enabled: bool,
     #[serde(default = "default_actor")]
     pub actor_label: String,
@@ -141,7 +145,8 @@ impl NewBackupProfile {
             requested_level: default_full_level(),
             verification_mode: default_full_readback(),
             encryption_enabled: false,
-            spanning_enabled: false,
+            compression_mode: default_compression_mode(),
+            spanning_enabled: default_spanning_enabled(),
             actor_label: default_actor(),
         }
     }
@@ -167,13 +172,15 @@ impl NewBackupProfile {
         }
         if self.encryption_enabled {
             return Err(BackupOpsError::Invalid(
-                "encryption is not implemented by the pinned laboratory adapter".to_owned(),
+                "encryption is not implemented by the pinned preview adapter".to_owned(),
             ));
         }
-        if self.spanning_enabled {
+        if !matches!(
+            self.compression_mode.as_str(),
+            "auto" | "none" | "gzip" | "lzo"
+        ) {
             return Err(BackupOpsError::Invalid(
-                "multi-volume spanning is not implemented by the pinned single-tape adapter"
-                    .to_owned(),
+                "compression_mode must be auto, none, gzip, or lzo".to_owned(),
             ));
         }
         if !(1..=36_500).contains(&self.retention_days) {
@@ -215,6 +222,14 @@ fn default_full_level() -> String {
 
 fn default_full_readback() -> String {
     "full_readback".to_owned()
+}
+
+fn default_compression_mode() -> String {
+    "auto".to_owned()
+}
+
+const fn default_spanning_enabled() -> bool {
+    true
 }
 
 fn default_actor() -> String {
@@ -268,7 +283,7 @@ pub async fn create_backup_profile(
     if !source.enabled || !source.immutable_snapshot_confirmed || source.production_eligible {
         transaction.rollback().await?;
         return Err(BackupOpsError::Conflict(
-            "the source profile must be enabled, immutable-snapshot confirmed, and laboratory-only"
+            "the source profile must be enabled, immutable-snapshot confirmed, and preview-only"
                 .to_owned(),
         ));
     }
@@ -310,10 +325,10 @@ pub async fn create_backup_profile(
         "INSERT INTO protection_policies
             (id, name, source_id, representation, schedule_timezone,
              full_schedule, incremental_schedule, retention_days,
-             encryption_enabled, compression_mode, verification_mode,
-             config, enabled)
+             encryption_enabled, compression_mode, spanning_enabled,
+             verification_mode, config, enabled)
          VALUES ($1, $2, $3, 'file', $4, $5, 'disabled', $6,
-                 false, 'none', 'full_readback', $7, true)",
+                 false, $7, $8, 'full_readback', $9, true)",
     )
     .bind(policy_id)
     .bind(&source.name)
@@ -321,11 +336,15 @@ pub async fn create_backup_profile(
     .bind(&request.schedule_timezone)
     .bind(&request.full_schedule)
     .bind(request.retention_days)
+    .bind(&request.compression_mode)
+    .bind(request.spanning_enabled)
     .bind(json!({
         "workflow": "attended_full_file_backup",
         "requested_level": "full",
         "incremental_supported": false,
-        "spanning_supported": false,
+        "compression_mode": request.compression_mode,
+        "spanning_supported": true,
+        "spanning_enabled": request.spanning_enabled,
         "encryption_supported": false,
         "production_eligible": false,
         "schedule_enabled": request.schedule_enabled
@@ -368,7 +387,8 @@ pub async fn create_backup_profile(
             "requested_level": "full",
             "verification_mode": "full_readback",
             "encryption_enabled": false,
-            "spanning_enabled": false,
+            "compression_mode": request.compression_mode,
+            "spanning_enabled": request.spanning_enabled,
             "production_eligible": false
         }),
         "created",
@@ -572,13 +592,16 @@ async fn create_backup_request(
         production_eligible: bool,
         representation: String,
         encryption_enabled: bool,
+        compression_mode: String,
+        spanning_enabled: bool,
         verification_mode: String,
     }
     let profile = sqlx::query_as::<_, RequestProfile>(
         "SELECT data_profile.job_id, data_profile.source_snapshot_id,
                 data_profile.schedule_enabled, data_profile.enabled,
                 data_profile.production_eligible, policy.representation,
-                policy.encryption_enabled, policy.verification_mode
+                policy.encryption_enabled, policy.compression_mode,
+                policy.spanning_enabled, policy.verification_mode
            FROM single_tape_data_profiles data_profile
            JOIN protection_policies policy ON policy.id = data_profile.policy_id
           WHERE data_profile.id = $1 AND data_profile.workflow_kind = 'backup'
@@ -592,11 +615,15 @@ async fn create_backup_request(
         || profile.production_eligible
         || profile.representation != "file"
         || profile.encryption_enabled
+        || !matches!(
+            profile.compression_mode.as_str(),
+            "auto" | "none" | "gzip" | "lzo"
+        )
         || profile.verification_mode != "full_readback"
     {
         transaction.rollback().await?;
         return Err(BackupOpsError::Conflict(
-            "the profile no longer satisfies the laboratory full-file backup contract".to_owned(),
+            "the profile no longer satisfies the attended full-file backup contract".to_owned(),
         ));
     }
     if trigger_kind == BackupTriggerKind::Scheduled && !profile.schedule_enabled {
@@ -686,6 +713,8 @@ async fn create_backup_request(
             "backup_request_id": id,
             "trigger_kind": trigger_kind,
             "requested_level": "full",
+            "compression_mode": profile.compression_mode,
+            "spanning_enabled": profile.spanning_enabled,
             "production_eligible": false
         }),
         correlation_id,
@@ -700,6 +729,8 @@ async fn create_backup_request(
             "trigger_kind": trigger_kind,
             "scheduled_occurrence": scheduled_occurrence,
             "requested_level": "full",
+            "compression_mode": profile.compression_mode,
+            "spanning_enabled": profile.spanning_enabled,
             "production_eligible": false
         }),
         requested_by_label,
@@ -1365,7 +1396,8 @@ mod tests {
         assert_eq!(profile.retention_days, 28);
         assert!(!profile.schedule_enabled);
         assert!(!profile.encryption_enabled);
-        assert!(!profile.spanning_enabled);
+        assert!(profile.spanning_enabled);
+        assert_eq!(profile.compression_mode, "auto");
         profile.validate().expect("safe defaults should validate");
     }
 
@@ -1384,7 +1416,7 @@ mod tests {
         assert!(profile.validate().is_err());
 
         let mut profile = NewBackupProfile::attended_full_file(Uuid::nil());
-        profile.spanning_enabled = true;
+        profile.compression_mode = "zstd".to_owned();
         assert!(profile.validate().is_err());
     }
 

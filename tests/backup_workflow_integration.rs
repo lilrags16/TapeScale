@@ -160,6 +160,46 @@ async fn create_loaded_drive(pool: &PgPool) -> store::DriveRecord {
     *reconciled
 }
 
+async fn qualify_backup_media(
+    pool: &PgPool,
+    drive: &store::DriveRecord,
+    media: &store::MediaRecord,
+) {
+    let queued = store::queue_qualification_run(
+        pool,
+        drive.id,
+        &drive.stable_id,
+        media.id,
+        &media.internal_label,
+        true,
+        true,
+    )
+    .await
+    .expect("integration media qualification should queue");
+    let QueueQualificationRunResult::Queued(queued) = queued else {
+        panic!("fresh integration media should be eligible for qualification");
+    };
+    let claimed = store::claim_next_qualification_run(pool, Uuid::now_v7())
+        .await
+        .expect("qualification worker should claim integration media");
+    let ClaimQualificationRunResult::Claimed(claimed) = claimed else {
+        panic!("queued integration qualification should be claimable");
+    };
+    assert_eq!(claimed.run.id, queued.id);
+    assert!(store::finish_qualification_run(
+        pool,
+        &claimed,
+        QualificationTerminalState::Passed,
+        json!({
+            "detail": "manual-media state integration qualification",
+            "position_uncertain": false,
+            "engine_version": "15.0.3"
+        }),
+    )
+    .await
+    .expect("integration media qualification should finish"));
+}
+
 #[tokio::test]
 async fn operational_backup_requests_schedule_and_assign_media_durably() {
     let Some((pool, admin, schema)) = isolated_database().await else {
@@ -170,6 +210,8 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         create_backup_profile(&pool, "Manual backup integration", "manual-source", false).await;
     assert_eq!(manual_profile.representation, "file");
     assert_eq!(manual_profile.verification_mode, "full_readback");
+    assert_eq!(manual_profile.compression_mode, "auto");
+    assert!(manual_profile.spanning_enabled);
     assert!(!manual_profile.production_eligible);
 
     let empty_pool_id = Uuid::now_v7();
@@ -506,6 +548,507 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     .await
     .expect("qualification pass should persist"));
 
+    // Exercise the complete attended continuation/readback request contract on
+    // its own run so the later finalization fixture remains single-volume.
+    let continuation_first = store::create_media(
+        &pool,
+        &NewMedia {
+            internal_label: "BACKUP-INTEGRATION-SPAN-001".to_owned(),
+            barcode: Some("BISPAN001".to_owned()),
+            media_generation: 9,
+            media_format: "LTO-9".to_owned(),
+            worm: false,
+        },
+    )
+    .await
+    .expect("first spanning cartridge should persist");
+    let continuation_second = store::create_media(
+        &pool,
+        &NewMedia {
+            internal_label: "BACKUP-INTEGRATION-SPAN-002".to_owned(),
+            barcode: Some("BISPAN002".to_owned()),
+            media_generation: 9,
+            media_format: "LTO-9".to_owned(),
+            worm: false,
+        },
+    )
+    .await
+    .expect("second spanning cartridge should persist");
+    qualify_backup_media(&pool, &drive, &continuation_first).await;
+    qualify_backup_media(&pool, &drive, &continuation_second).await;
+
+    let continuation_profile = create_backup_profile(
+        &pool,
+        "Continuation state integration",
+        "continuation-source",
+        false,
+    )
+    .await;
+    let continuation_request = backup_ops::create_manual_backup_request(
+        &pool,
+        continuation_profile.id,
+        "integration-continuation-001",
+        "Backup integration operator",
+    )
+    .await
+    .expect("continuation request should persist")
+    .record()
+    .clone();
+    let continuation_run = store::attach_single_tape_backup_run(
+        &pool,
+        continuation_profile.id,
+        continuation_request.id,
+        continuation_request.job_run_id,
+        &continuation_request.trigger_kind,
+        continuation_request.scheduled_occurrence.as_deref(),
+        continuation_profile.retention_days,
+        drive.id,
+        &drive.stable_id,
+        continuation_first.id,
+        &continuation_first.internal_label,
+        true,
+        true,
+        true,
+    )
+    .await
+    .expect("first spanning cartridge should attach");
+    let QueueSingleTapeDataRunResult::Queued(continuation_run) = continuation_run else {
+        panic!("the spanning integration run should queue");
+    };
+    let continuation_claim = store::claim_next_single_tape_data_run(&pool, Uuid::now_v7())
+        .await
+        .expect("spanning integration run should be claimable");
+    let store::ClaimSingleTapeDataRunResult::Claimed(continuation_claim) = continuation_claim
+    else {
+        panic!("the spanning integration worker should own the run");
+    };
+    assert_eq!(continuation_claim.run.id, continuation_run.id);
+    assert!(store::transition_single_tape_data_phase(
+        &pool,
+        &continuation_claim,
+        store::SingleTapeDataPhase::Writing,
+        json!({"detail": "begin integration spanning write"}),
+    )
+    .await
+    .expect("spanning write phase should persist"));
+    let first_engine_volume = "TS-INTEGRATION-SPAN-V1";
+    assert!(store::mark_data_run_volume_write_started(
+        &pool,
+        &continuation_claim,
+        1,
+        first_engine_volume,
+    )
+    .await
+    .expect("first spanning write boundary should persist"));
+    let pending_write = store::ensure_data_run_media_request(
+        &pool,
+        &continuation_claim,
+        "backup_write",
+        2,
+        None,
+        None,
+    )
+    .await
+    .expect("continuation media request should persist");
+    let store::DataRunMediaRequestResult::Ready(pending_write) = pending_write else {
+        panic!("volume two should be requested");
+    };
+    assert_eq!(pending_write.state, "pending");
+
+    let pending_write_view = api_request(
+        &replay_application,
+        Method::GET,
+        format!("/api/v1/backup-runs/{}", continuation_request.id),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(pending_write_view.status(), StatusCode::OK);
+    let pending_write_view = response_json(pending_write_view).await;
+    assert_eq!(
+        pending_write_view["run"]["allowed_actions"]["assign_media"],
+        false
+    );
+    assert_eq!(
+        pending_write_view["run"]["allowed_actions"]["assign_next_media"],
+        true
+    );
+    assert_eq!(
+        pending_write_view["run"]["media_request"]["state"],
+        "pending"
+    );
+
+    let continuation_confirmation = format!(
+        "OVERWRITE {} FOR BACKUP {} VOLUME 2",
+        continuation_second.internal_label, continuation_request.id
+    );
+    let continuation_assignment = json!({
+        "drive_id": drive.id,
+        "expected_stable_id": drive.stable_id,
+        "cartridge_id": continuation_second.id,
+        "volume_sequence": 2,
+        "typed_cartridge_label": continuation_second.internal_label,
+        "loaded_media_confirmed": true,
+        "destructive_overwrite_confirmed": true,
+        "encryption_deviation_confirmed": true,
+        "confirmation": continuation_confirmation
+    });
+    let authorized_write = api_request(
+        &replay_application,
+        Method::POST,
+        format!("/api/v1/backup-runs/{}/media", continuation_request.id),
+        continuation_assignment.clone(),
+    )
+    .await;
+    assert_eq!(authorized_write.status(), StatusCode::ACCEPTED);
+    let authorized_write = response_json(authorized_write).await;
+    assert_eq!(authorized_write["media_request"]["state"], "authorized");
+    assert_eq!(authorized_write["idempotent_replay"], false);
+
+    let authorized_write_view = api_request(
+        &replay_application,
+        Method::GET,
+        format!("/api/v1/backup-runs/{}", continuation_request.id),
+        Value::Null,
+    )
+    .await;
+    let authorized_write_view = response_json(authorized_write_view).await;
+    assert_eq!(
+        authorized_write_view["run"]["allowed_actions"]["assign_media"],
+        false
+    );
+    assert_eq!(
+        authorized_write_view["run"]["allowed_actions"]["assign_next_media"],
+        false
+    );
+    assert_eq!(
+        authorized_write_view["run"]["media_request"]["state"],
+        "authorized"
+    );
+    let authorized_readiness = api_request(
+        &replay_application,
+        Method::GET,
+        format!(
+            "/api/v1/backup-runs/{}/media-readiness",
+            continuation_request.id
+        ),
+        Value::Null,
+    )
+    .await;
+    let authorized_readiness = response_json(authorized_readiness).await;
+    assert_eq!(
+        authorized_readiness["readiness"]["state"],
+        "media_authorized"
+    );
+    assert_eq!(
+        authorized_readiness["readiness"]["counts"]["candidates_returned"],
+        0
+    );
+
+    assert!(
+        store::mark_data_run_media_loaded(&pool, &continuation_claim, pending_write.id,)
+            .await
+            .expect("authorized volume two should become loaded")
+    );
+    let loaded_write_view = api_request(
+        &replay_application,
+        Method::GET,
+        format!("/api/v1/backup-runs/{}", continuation_request.id),
+        Value::Null,
+    )
+    .await;
+    let loaded_write_view = response_json(loaded_write_view).await;
+    assert_eq!(loaded_write_view["run"]["media_request"]["state"], "loaded");
+    assert_eq!(
+        loaded_write_view["run"]["allowed_actions"]["assign_media"],
+        false
+    );
+    assert_eq!(
+        loaded_write_view["run"]["allowed_actions"]["assign_next_media"],
+        false
+    );
+    let second_engine_volume = "TS-INTEGRATION-SPAN-V2";
+    assert!(store::mark_data_run_volume_write_started(
+        &pool,
+        &continuation_claim,
+        2,
+        second_engine_volume,
+    )
+    .await
+    .expect("second spanning write boundary should persist"));
+    assert!(store::complete_data_run_media_request(
+        &pool,
+        &continuation_claim,
+        pending_write.id,
+        true,
+    )
+    .await
+    .expect("volume two request should complete"));
+    assert!(
+        store::open_data_run_media_request(&pool, continuation_run.id)
+            .await
+            .expect("open request lookup should succeed")
+            .is_none()
+    );
+
+    let completed_write_replay = api_request(
+        &replay_application,
+        Method::POST,
+        format!("/api/v1/backup-runs/{}/media", continuation_request.id),
+        continuation_assignment,
+    )
+    .await;
+    assert_eq!(completed_write_replay.status(), StatusCode::OK);
+    let completed_write_replay = response_json(completed_write_replay).await;
+    assert_eq!(completed_write_replay["idempotent_replay"], true);
+    assert_eq!(
+        completed_write_replay["media_request"]["state"],
+        "completed"
+    );
+
+    sqlx::query(
+        "UPDATE single_tape_data_run_volumes
+            SET state = 'written', written_at = now(), updated_at = now()
+          WHERE single_tape_data_run_id = $1 AND volume_order = 1
+            AND state = 'write_started'",
+    )
+    .bind(continuation_run.id)
+    .execute(&pool)
+    .await
+    .expect("integration fixture should record volume one as written");
+    assert!(store::transition_single_tape_data_phase(
+        &pool,
+        &continuation_claim,
+        store::SingleTapeDataPhase::Written,
+        json!({"detail": "integration multi-volume write complete"}),
+    )
+    .await
+    .expect("written phase should persist"));
+    assert!(store::transition_single_tape_data_phase(
+        &pool,
+        &continuation_claim,
+        store::SingleTapeDataPhase::Verifying,
+        json!({"detail": "integration multi-volume readback"}),
+    )
+    .await
+    .expect("verifying phase should persist"));
+    let pending_readback = store::ensure_data_run_media_request(
+        &pool,
+        &continuation_claim,
+        "full_readback",
+        1,
+        Some(continuation_first.id),
+        Some(first_engine_volume),
+    )
+    .await
+    .expect("ordered readback request should persist");
+    let store::DataRunMediaRequestResult::Ready(pending_readback) = pending_readback else {
+        panic!("archive volume one should be requested for readback");
+    };
+
+    sqlx::query("UPDATE cartridges SET identity_status = 'mismatch' WHERE id = $1")
+        .bind(continuation_first.id)
+        .execute(&pool)
+        .await
+        .expect("identity-conflict fixture should persist");
+    let conflicted_readiness = api_request(
+        &replay_application,
+        Method::GET,
+        format!(
+            "/api/v1/backup-runs/{}/media-readiness",
+            continuation_request.id
+        ),
+        Value::Null,
+    )
+    .await;
+    let conflicted_readiness = response_json(conflicted_readiness).await;
+    assert_eq!(conflicted_readiness["readiness"]["state"], "blocked");
+    assert!(conflicted_readiness["readiness"]["blockers"]
+        .as_array()
+        .expect("readback blockers should be an array")
+        .iter()
+        .any(|blocker| blocker["code"] == "media_identity_conflict"));
+    sqlx::query("UPDATE cartridges SET identity_status = 'unknown' WHERE id = $1")
+        .bind(continuation_first.id)
+        .execute(&pool)
+        .await
+        .expect("post-write unknown identity fixture should be restored");
+
+    let pending_readback_view = api_request(
+        &replay_application,
+        Method::GET,
+        format!("/api/v1/backup-runs/{}", continuation_request.id),
+        Value::Null,
+    )
+    .await;
+    let pending_readback_view = response_json(pending_readback_view).await;
+    assert_eq!(
+        pending_readback_view["run"]["allowed_actions"]["assign_media"],
+        true
+    );
+    assert_eq!(
+        pending_readback_view["run"]["allowed_actions"]["assign_next_media"],
+        false
+    );
+    let readback_confirmation = format!(
+        "LOAD {} FOR BACKUP {} READBACK VOLUME 1",
+        continuation_first.internal_label, continuation_request.id
+    );
+    let readback_assignment = json!({
+        "drive_id": drive.id,
+        "expected_stable_id": drive.stable_id,
+        "cartridge_id": continuation_first.id,
+        "volume_sequence": 1,
+        "typed_cartridge_label": continuation_first.internal_label,
+        "loaded_media_confirmed": true,
+        "destructive_overwrite_confirmed": false,
+        "encryption_deviation_confirmed": false,
+        "confirmation": readback_confirmation
+    });
+    let authorized_readback = api_request(
+        &replay_application,
+        Method::POST,
+        format!("/api/v1/backup-runs/{}/media", continuation_request.id),
+        readback_assignment.clone(),
+    )
+    .await;
+    assert_eq!(authorized_readback.status(), StatusCode::ACCEPTED);
+    let authorized_readback = response_json(authorized_readback).await;
+    assert_eq!(authorized_readback["media_request"]["state"], "authorized");
+    assert_eq!(authorized_readback["destructive"], false);
+    assert_eq!(
+        authorized_readback["media_request"]["confirmation_evidence"]["drive_id"],
+        json!(drive.id)
+    );
+    assert_eq!(
+        authorized_readback["media_request"]["confirmation_evidence"]["expected_stable_id"],
+        json!(drive.stable_id)
+    );
+    assert_eq!(
+        authorized_readback["media_request"]["confirmation_evidence"]["typed_cartridge_label"],
+        json!(continuation_first.internal_label)
+    );
+    let authorized_readback_view = api_request(
+        &replay_application,
+        Method::GET,
+        format!("/api/v1/backup-runs/{}", continuation_request.id),
+        Value::Null,
+    )
+    .await;
+    let authorized_readback_view = response_json(authorized_readback_view).await;
+    assert_eq!(
+        authorized_readback_view["run"]["allowed_actions"]["assign_media"],
+        false
+    );
+    assert_eq!(
+        authorized_readback_view["run"]["allowed_actions"]["assign_next_media"],
+        false
+    );
+    let mut changed_drive_replay = readback_assignment.clone();
+    changed_drive_replay["drive_id"] = json!(Uuid::now_v7());
+    changed_drive_replay["expected_stable_id"] = json!("scsi.naa.integration-other-drive");
+    let changed_drive_replay = api_request(
+        &replay_application,
+        Method::POST,
+        format!("/api/v1/backup-runs/{}/media", continuation_request.id),
+        changed_drive_replay,
+    )
+    .await;
+    assert_eq!(changed_drive_replay.status(), StatusCode::CONFLICT);
+    assert!(
+        store::mark_data_run_media_loaded(&pool, &continuation_claim, pending_readback.id,)
+            .await
+            .expect("authorized readback tape should become loaded")
+    );
+    let loaded_readback_view = api_request(
+        &replay_application,
+        Method::GET,
+        format!("/api/v1/backup-runs/{}", continuation_request.id),
+        Value::Null,
+    )
+    .await;
+    let loaded_readback_view = response_json(loaded_readback_view).await;
+    assert_eq!(
+        loaded_readback_view["run"]["media_request"]["state"],
+        "loaded"
+    );
+    assert_eq!(
+        loaded_readback_view["run"]["allowed_actions"]["assign_media"],
+        false
+    );
+    assert_eq!(
+        loaded_readback_view["run"]["allowed_actions"]["assign_next_media"],
+        false
+    );
+    assert!(store::complete_data_run_media_request(
+        &pool,
+        &continuation_claim,
+        pending_readback.id,
+        false,
+    )
+    .await
+    .expect("readback request should complete"));
+    let next_readback = store::ensure_data_run_media_request(
+        &pool,
+        &continuation_claim,
+        "full_readback",
+        2,
+        Some(continuation_second.id),
+        Some(second_engine_volume),
+    )
+    .await
+    .expect("next ordered readback request should persist");
+    let store::DataRunMediaRequestResult::Ready(next_readback) = next_readback else {
+        panic!("archive volume two should be requested for readback");
+    };
+    assert_eq!(next_readback.state, "pending");
+    assert_ne!(next_readback.id, pending_readback.id);
+    let mut changed_readback_evidence = readback_assignment.clone();
+    changed_readback_evidence["encryption_deviation_confirmed"] = json!(true);
+    let changed_readback_replay = api_request(
+        &replay_application,
+        Method::POST,
+        format!("/api/v1/backup-runs/{}/media", continuation_request.id),
+        changed_readback_evidence,
+    )
+    .await;
+    assert!(matches!(
+        changed_readback_replay.status(),
+        StatusCode::BAD_REQUEST | StatusCode::CONFLICT
+    ));
+    let completed_readback_replay = api_request(
+        &replay_application,
+        Method::POST,
+        format!("/api/v1/backup-runs/{}/media", continuation_request.id),
+        readback_assignment,
+    )
+    .await;
+    assert_eq!(completed_readback_replay.status(), StatusCode::OK);
+    let completed_readback_replay = response_json(completed_readback_replay).await;
+    assert_eq!(completed_readback_replay["idempotent_replay"], true);
+    assert_eq!(
+        completed_readback_replay["media_request"]["state"],
+        "completed"
+    );
+    assert_eq!(
+        completed_readback_replay["run"]["media_request"]["id"],
+        json!(next_readback.id)
+    );
+    assert_eq!(
+        completed_readback_replay["run"]["media_request"]["state"],
+        "pending"
+    );
+    assert!(store::finish_single_tape_data_run(
+        &pool,
+        &continuation_claim,
+        store::SingleTapeDataTerminalState::Blocked,
+        json!({
+            "detail": "integration media-request state contract complete",
+            "position_uncertain": false
+        }),
+    )
+    .await
+    .expect("integration spanning run should release its resources"));
+
     sqlx::query(
         "INSERT INTO cartridges
             (internal_label, media_generation, media_format, worm)
@@ -650,6 +1193,16 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(assignment.trigger_kind, "manual");
     assert_eq!(assignment.requested_level, "full");
     assert_eq!(assignment.retention_days, assignment_profile.retention_days);
+    assert_eq!(assignment.compression_mode, "auto");
+    assert_eq!(assignment.resolved_compression, "gzip");
+    assert!(assignment.spanning_enabled);
+    let assignment_volumes = store::data_run_volumes(&pool, assignment.id)
+        .await
+        .expect("the ordered initial tape assignment should reload");
+    assert_eq!(assignment_volumes.len(), 1);
+    assert_eq!(assignment_volumes[0].volume_order, 1);
+    assert_eq!(assignment_volumes[0].cartridge_id, scratch.id);
+    assert_eq!(assignment_volumes[0].state, "authorized");
     let assigned_request = backup_ops::get_backup_request(&pool, assignment_request.id)
         .await
         .expect("assigned request should reload")

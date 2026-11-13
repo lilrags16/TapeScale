@@ -7,7 +7,7 @@
 
 use std::{
     fmt,
-    num::NonZeroU64,
+    num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -47,6 +47,88 @@ pub const FILESET_NAME: &str = "TS-Source";
 pub const BACKUP_JOB_NAME: &str = "TS-Full";
 pub const VERIFY_JOB_NAME: &str = "TS-VerifyData";
 pub const RESTORE_JOB_NAME: &str = "TS-Restore";
+
+/// File-level compression performed by the Bacula File Daemon before data is
+/// sent to the tape drive.  The explicit levels keep the on-media format
+/// reproducible instead of relying on a host-specific default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaculaCompression {
+    #[default]
+    None,
+    GzipFast,
+    GzipBalanced,
+    GzipBest,
+    Lzo,
+}
+
+impl BaculaCompression {
+    /// Translate the stable policy/API names into an explicit Bacula codec.
+    /// `auto` intentionally selects fast, universally available gzip rather
+    /// than making the result depend on daemon build flags or host defaults.
+    pub fn from_policy_mode(value: &str) -> Result<Self, BaculaValidationError> {
+        match value {
+            "none" => Ok(Self::None),
+            "auto" => Ok(Self::GzipFast),
+            "gzip" => Ok(Self::GzipBalanced),
+            "lzo" => Ok(Self::Lzo),
+            _ => Err(BaculaValidationError::InvalidValue {
+                field: "compression_mode",
+            }),
+        }
+    }
+
+    const fn directive(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::GzipFast => Some("GZIP1"),
+            Self::GzipBalanced => Some("GZIP6"),
+            Self::GzipBest => Some("GZIP9"),
+            Self::Lzo => Some("LZO"),
+        }
+    }
+}
+
+/// Data-plane settings that change the physical representation of a backup.
+/// `maximum_volumes = None` deliberately renders Bacula's value `0`, meaning
+/// no configured volume-count ceiling; the finite set of TapeScale-authorized
+/// cartridges remains the safety boundary for each run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BaculaDataOptions {
+    pub compression: BaculaCompression,
+    pub maximum_volumes: Option<NonZeroU32>,
+}
+
+impl BaculaDataOptions {
+    #[must_use]
+    pub const fn single_volume(compression: BaculaCompression) -> Self {
+        Self {
+            compression,
+            maximum_volumes: NonZeroU32::new(1),
+        }
+    }
+
+    #[must_use]
+    pub const fn spanning(compression: BaculaCompression) -> Self {
+        Self {
+            compression,
+            maximum_volumes: None,
+        }
+    }
+
+    const fn rendered_maximum_volumes(self) -> u32 {
+        match self.maximum_volumes {
+            Some(limit) => limit.get(),
+            None => 0,
+        }
+    }
+}
+
+impl Default for BaculaDataOptions {
+    fn default() -> Self {
+        Self::single_volume(BaculaCompression::None)
+    }
+}
 
 const SOURCE_ROOT: &str = "/source";
 const RESTORE_ROOT: &str = "/restore";
@@ -511,6 +593,7 @@ pub struct BaculaConfig {
     endpoints: BaculaEndpoints,
     credentials: BaculaCredentials,
     pool_name: BaculaPoolName,
+    data_options: BaculaDataOptions,
 }
 
 impl BaculaConfig {
@@ -525,7 +608,15 @@ impl BaculaConfig {
             endpoints,
             credentials,
             pool_name,
+            data_options: BaculaDataOptions::default(),
         }
+    }
+
+    /// Select compression and pool spanning behavior for this isolated run.
+    #[must_use]
+    pub const fn with_data_options(mut self, data_options: BaculaDataOptions) -> Self {
+        self.data_options = data_options;
+        self
     }
 
     #[must_use]
@@ -542,6 +633,14 @@ impl BaculaConfig {
         let endpoint = &self.endpoints;
         let credentials = &self.credentials;
         let pool_name = self.pool_name.as_str();
+        let maximum_volumes = self.data_options.rendered_maximum_volumes();
+        let compression_directive = self
+            .data_options
+            .compression
+            .directive()
+            .map_or_else(String::new, |algorithm| {
+                format!("      Compression = {algorithm}\n")
+            });
         format!(
             r#"Director {{
   Name = {DIRECTOR_NAME}
@@ -597,7 +696,7 @@ Pool {{
   Pool Type = Backup
   Recycle = no
   Auto Prune = no
-  Maximum Volumes = 1
+  Maximum Volumes = {maximum_volumes}
 }}
 
 FileSet {{
@@ -609,7 +708,7 @@ FileSet {{
       XATTR Support = yes
       One FS = yes
       Sparse = yes
-    }}
+{compression_directive}    }}
     File = "{source_selection}"
   }}
 }}
@@ -696,6 +795,8 @@ Messages {{
             storage_password = credentials.storage_password,
             console_password = credentials.console_password,
             source_selection = self.paths.source_selection.as_path().display(),
+            maximum_volumes = maximum_volumes,
+            compression_directive = compression_directive,
         )
     }
 
@@ -877,6 +978,8 @@ impl BaculaPoolName {
 #[serde(rename_all = "snake_case")]
 pub enum BaculaOperationKind {
     Label,
+    Mount,
+    Release,
     FullBackup,
     DataVerify,
     FullRestore,
@@ -974,6 +1077,27 @@ impl BaculaCommands {
                 pool.as_str(),
                 volume.as_str()
             ),
+            false,
+        )
+    }
+
+    /// Ask the Storage Daemon to consume the currently loaded authorized
+    /// volume after an operator or changer completes a media swap.
+    #[must_use]
+    pub fn mount() -> BconsoleScript {
+        BconsoleScript::console_command(
+            BaculaOperationKind::Mount,
+            format_args!("mount storage={STORAGE_NAME}"),
+            false,
+        )
+    }
+
+    /// Release the current volume before a manual or robotic media change.
+    #[must_use]
+    pub fn release() -> BconsoleScript {
+        BconsoleScript::console_command(
+            BaculaOperationKind::Release,
+            format_args!("release storage={STORAGE_NAME}"),
             false,
         )
     }
@@ -1228,6 +1352,7 @@ pub enum BaculaJobState {
     Blocked,
     WaitingForFileDaemon,
     WaitingForStorageDaemon,
+    WaitingForMount,
     WaitingForMedia,
     WaitingForResource,
     Running,
@@ -1274,7 +1399,11 @@ fn map_job_status(status: char, errors: u64) -> BaculaJobState {
         'F' => BaculaJobState::WaitingForFileDaemon,
         'I' => BaculaJobState::Incomplete,
         'L' | 'a' | 'i' | 'l' => BaculaJobState::Committing,
-        'M' | 'm' | 'v' => BaculaJobState::WaitingForMedia,
+        // Bacula's catalog contract distinguishes a request to mount the
+        // current volume (`M`) from a request for a new volume (`m`). They
+        // must never share a destructive continuation path.
+        'M' => BaculaJobState::WaitingForMount,
+        'm' => BaculaJobState::WaitingForMedia,
         'R' | 'u' | 'w' => BaculaJobState::Running,
         'S' => BaculaJobState::WaitingForStorageDaemon,
         'T' if errors == 0 => BaculaJobState::Succeeded,
@@ -1650,6 +1779,28 @@ mod tests {
         assert!(rendered.director.contains("TLS Enable = no"));
         assert!(rendered.director.contains("TLS Require = yes"));
         assert!(rendered.director.contains("TLS PSK Enable = yes"));
+        assert!(rendered.director.contains("Maximum Volumes = 1"));
+        assert!(!rendered.director.contains("Compression ="));
+    }
+
+    #[test]
+    fn renderer_supports_unlimited_spanning_and_explicit_compression() {
+        let rendered = config()
+            .with_data_options(BaculaDataOptions::spanning(BaculaCompression::GzipBalanced))
+            .render();
+        assert!(rendered.director.contains("Maximum Volumes = 0"));
+        assert!(rendered.director.contains("Compression = GZIP6"));
+        assert!(rendered.director.contains("Recycle = no"));
+        assert!(rendered.director.contains("Auto Prune = no"));
+        assert_eq!(
+            BaculaCompression::from_policy_mode("auto").expect("auto"),
+            BaculaCompression::GzipFast
+        );
+        assert_eq!(
+            BaculaCompression::from_policy_mode("lzo").expect("lzo"),
+            BaculaCompression::Lzo
+        );
+        assert!(BaculaCompression::from_policy_mode("zstd").is_err());
     }
 
     #[test]
@@ -1701,6 +1852,22 @@ mod tests {
     }
 
     #[test]
+    fn media_change_commands_are_fixed_and_non_interactive() {
+        let mount = BaculaCommands::mount();
+        assert_eq!(mount.kind(), BaculaOperationKind::Mount);
+        assert_eq!(
+            std::str::from_utf8(mount.stdin()).expect("utf8"),
+            ".api 2 api_opts=j\nmount storage=TS-LTO\n.quit\n"
+        );
+        let release = BaculaCommands::release();
+        assert_eq!(release.kind(), BaculaOperationKind::Release);
+        assert_eq!(
+            std::str::from_utf8(release.stdin()).expect("utf8"),
+            ".api 2 api_opts=j\nrelease storage=TS-LTO\n.quit\n"
+        );
+    }
+
+    #[test]
     fn restore_destination_is_server_generated_and_contained() {
         let job_id = BaculaJobId::new(42).expect("job id");
         let run_id = Uuid::parse_str("018f7cac-2e2a-7dc5-b70c-78a46a6f6f01").expect("uuid");
@@ -1747,6 +1914,13 @@ mod tests {
         assert!(records[1..]
             .iter()
             .all(|record| !record.is_strict_success()));
+    }
+
+    #[test]
+    fn mount_wait_is_distinct_from_new_media_wait() {
+        assert_eq!(map_job_status('M', 0), BaculaJobState::WaitingForMount);
+        assert_eq!(map_job_status('m', 0), BaculaJobState::WaitingForMedia);
+        assert_eq!(map_job_status('v', 0), BaculaJobState::Unknown);
     }
 
     #[test]

@@ -1,6 +1,7 @@
-//! Attended single-cartridge Bacula backup and physical recovery execution.
+//! Attended Bacula backup and physical recovery execution, including ordered multi-volume runs.
 
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,25 +19,26 @@ use uuid::Uuid;
 
 use crate::{
     bacula_catalog::{
-        validate_backup_job, validate_labeled_volume, validate_restore_job, validate_verify_job,
-        BaculaBackupCatalogEvidence, BaculaRestoreCatalogEvidence, BaculaVerifyCatalogEvidence,
+        validate_backup_job_on_volumes, validate_labeled_volumes, validate_restore_job,
+        validate_verify_job, BaculaBackupCatalogEvidence, BaculaRestoreCatalogEvidence,
+        BaculaVerifyCatalogEvidence,
     },
     bacula_runtime::{BaculaRuntime, BaculaRuntimeEvidence},
     config::Config,
     data_path::{
-        build_manifest_with_cancel, compare_manifests, create_isolated_restore_destination,
-        persist_json_artifact, persist_manifest, resolve_existing_zfs_snapshot_selection,
-        source_manifests_stable, verify_read_only_mount, FileManifest, JsonArtifactSummary,
-        ManifestArtifactSummary, ManifestComparison,
+        build_and_persist_manifest_with_cancel, build_manifest_with_cancel, compare_manifests,
+        create_isolated_restore_destination, persist_json_artifact, persist_manifest,
+        resolve_existing_zfs_snapshot_selection, source_manifests_stable, verify_read_only_mount,
+        FileManifest, JsonArtifactSummary, ManifestArtifactSummary, ManifestComparison,
     },
     device::{
         clear_sas_scratch_label, discover_sas_drives, execute_sas_motion, SasDiscoveryConfig,
         SasMotionError, SasMotionOperation, SasProbeResult,
     },
     engine::bacula::{
-        BaculaAdapter, BaculaCommands, BaculaJobEvidence, BaculaJobId, BaculaJobResource,
-        BaculaPaths, BaculaPoolName, BaculaRestoreSubpath, CorrelatedJobDispatch,
-        DirectBconsoleExecutor, VolumeLabel,
+        BaculaAdapter, BaculaCommands, BaculaCompression, BaculaDataOptions, BaculaJobEvidence,
+        BaculaJobId, BaculaJobResource, BaculaJobState, BaculaPaths, BaculaPoolName,
+        BaculaRestoreSubpath, CorrelatedJobDispatch, DirectBconsoleExecutor, VolumeLabel,
     },
     store,
     tool_runner::ToolError,
@@ -48,6 +50,30 @@ enum FailureClass {
     Failed,
     Interrupted,
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BaculaMediaPhase {
+    BackupWrite,
+    FullReadback,
+}
+
+impl BaculaMediaPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BackupWrite => "backup_write",
+            Self::FullReadback => "full_readback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveManualMedia {
+    request_id: Uuid,
+    volume_order: i32,
+    observed_job_progress: bool,
+    files_at_mount: u64,
+    bytes_at_mount: u64,
 }
 
 #[derive(Debug)]
@@ -88,7 +114,7 @@ impl ExerciseFailure {
 
 #[derive(Debug)]
 struct CompletedExercise {
-    source_manifest: FileManifest,
+    source_manifest: RetainedSourceManifest,
     restored_manifest: Option<FileManifest>,
     comparison: Option<ManifestComparison>,
     backup: BaculaJobEvidence,
@@ -99,6 +125,48 @@ struct CompletedExercise {
     restore_catalog: Option<BaculaRestoreCatalogEvidence>,
     engine_volume_name: String,
     restore_destination: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+enum RetainedSourceManifest {
+    Legacy {
+        manifest: FileManifest,
+        artifact: ManifestArtifactSummary,
+    },
+    Streaming(ManifestArtifactSummary),
+}
+
+impl RetainedSourceManifest {
+    fn artifact(&self) -> &ManifestArtifactSummary {
+        match self {
+            Self::Legacy { artifact, .. } | Self::Streaming(artifact) => artifact,
+        }
+    }
+
+    fn legacy(&self) -> Result<&FileManifest, ExerciseFailure> {
+        match self {
+            Self::Legacy { manifest, .. } => Ok(manifest),
+            Self::Streaming(_) => Err(ExerciseFailure::failed(
+                "a recovery comparison unexpectedly received a streaming-only source manifest",
+            )),
+        }
+    }
+
+    fn digest_sha256(&self) -> &str {
+        &self.artifact().manifest_digest
+    }
+
+    fn logical_bytes(&self) -> u64 {
+        self.artifact().logical_bytes
+    }
+
+    fn file_count(&self) -> u64 {
+        self.artifact().file_count
+    }
+
+    fn coverage(&self) -> &crate::data_path::ManifestCoverage {
+        &self.artifact().coverage
+    }
 }
 
 pub async fn process_single_tape_data_runs(
@@ -306,30 +374,41 @@ async fn perform_exercise(
             ));
         }
 
-        let source_manifest = scan_manifest_with_lease(
-            pool,
-            claim,
-            PathBuf::from(&claim.run.source_mount_path),
-            deadline,
-            cancellation,
-        )
-        .await?;
-        let source_artifact = persist_manifest(
-            evidence_directory,
-            "source-manifest",
-            &source_manifest,
-        )
-        .map_err(|error| ExerciseFailure::blocked(error.to_string()))?;
+        let source_manifest = if claim.run.workflow_kind == "backup" {
+            RetainedSourceManifest::Streaming(
+                scan_and_persist_manifest_with_lease(
+                    pool,
+                    claim,
+                    PathBuf::from(&claim.run.source_mount_path),
+                    evidence_directory.to_owned(),
+                    "source-manifest".to_owned(),
+                    deadline,
+                    cancellation,
+                )
+                .await?,
+            )
+        } else {
+            let manifest = scan_manifest_with_lease(
+                pool,
+                claim,
+                PathBuf::from(&claim.run.source_mount_path),
+                deadline,
+                cancellation,
+            )
+            .await?;
+            let artifact = persist_manifest(evidence_directory, "source-manifest", &manifest)
+                .map_err(|error| ExerciseFailure::blocked(error.to_string()))?;
+            RetainedSourceManifest::Legacy { manifest, artifact }
+        };
         append_manifest_artifact(
             pool,
             claim,
             "source_manifest",
-            &source_artifact,
-            &source_manifest,
+            source_manifest.artifact(),
         )
         .await?;
 
-        if Instant::now() >= deadline {
+        if claim.run.workflow_kind != "backup" && Instant::now() >= deadline {
             return Err(ExerciseFailure::blocked(
                 "source inventory consumed the entire recovery-exercise deadline; no tape command was dispatched",
             ));
@@ -339,21 +418,30 @@ async fn perform_exercise(
                 "worker shutdown was requested before any tape command",
             ));
         }
+        let data_options = bacula_data_options(claim)?;
         transition(
             pool,
             claim,
             store::SingleTapeDataPhase::Writing,
             json!({
-                "detail": "source manifest retained; beginning destructive single-volume Bacula write",
-                "source_manifest_sha256": source_manifest.digest_sha256,
-                "file_count": source_manifest.file_count,
-                "logical_bytes": source_manifest.logical_bytes,
+                "detail": if claim.run.spanning_enabled {
+                    "source manifest retained; beginning Bacula write with authorized tape spanning"
+                } else {
+                    "source manifest retained; beginning destructive single-volume Bacula write"
+                },
+                "source_manifest_sha256": source_manifest.artifact().manifest_digest,
+                "file_count": source_manifest.artifact().file_count,
+                "logical_bytes": source_manifest.artifact().logical_bytes,
+                "compression_mode": claim.run.compression_mode,
+                "resolved_compression": claim.run.resolved_compression,
+                "spanning_enabled": claim.run.spanning_enabled,
                 "production_eligible": false
             }),
         )
         .await?;
 
         let volume = engine_volume_label(&claim.run.expected_cartridge_label, claim.run.id)?;
+        let initial_authorized_volumes = vec![volume.clone()];
         let bacula_pool = BaculaPoolName::for_run(claim.run.id);
         renew_claim(pool, claim, "before entering the irreversible media-write boundary").await?;
         if !store::mark_single_tape_media_write_started(pool, claim, volume.as_str())
@@ -456,11 +544,12 @@ async fn perform_exercise(
         )
         .map_err(|error| ExerciseFailure::blocked(error.to_string()))?;
         runtime = Some(
-            BaculaRuntime::start(
+            BaculaRuntime::start_with_data_options(
                 pool,
                 database_url,
                 claim.run.id,
                 paths,
+                data_options,
                 evidence_directory,
                 cancellation,
             )
@@ -469,7 +558,16 @@ async fn perform_exercise(
         );
 
         let adapter = BaculaAdapter::new(DirectBconsoleExecutor::default());
-        wait_for_console(pool, claim, &adapter, deadline, cancellation).await?;
+        // Operational inventory may legitimately run longer than the legacy
+        // G0.2 wall-clock envelope. Give daemon startup its own bounded window
+        // so a very large completed inventory is not rejected by a stale
+        // absolute deadline.
+        let console_deadline = if claim.run.workflow_kind == "backup" {
+            Instant::now() + Duration::from_secs(30)
+        } else {
+            deadline
+        };
+        wait_for_console(pool, claim, &adapter, console_deadline, cancellation).await?;
         let label_output = adapter
             .dispatch(&BaculaCommands::label(&volume, &bacula_pool))
             .await
@@ -477,13 +575,32 @@ async fn perform_exercise(
                 ExerciseFailure::failed(format!("Bacula volume labeling failed: {error}"))
             })?;
         validate_console_output("label", &label_output.stdout, &label_output.stderr)?;
-        let labeled_volume = validate_labeled_volume(pool, &volume, &bacula_pool)
+        let mount_output = adapter
+            .dispatch(&BaculaCommands::mount())
             .await
             .map_err(|error| {
                 ExerciseFailure::failed(format!(
-                    "Bacula did not catalog the exact new label in its isolated one-volume pool: {error}"
+                    "Bacula could not mount the newly labeled first archive volume: {error}"
                 ))
             })?;
+        validate_console_output(
+            "mount first archive volume",
+            &mount_output.stdout,
+            &mount_output.stderr,
+        )?;
+        let mut labeled_volumes = validate_labeled_volumes(
+            pool,
+            &initial_authorized_volumes,
+            &bacula_pool,
+            data_options.maximum_volumes.map_or(0, |limit| limit.get()),
+        )
+            .await
+            .map_err(|error| {
+                ExerciseFailure::failed(format!(
+                    "Bacula did not catalog the exact authorized label in its isolated run pool: {error}"
+                ))
+            })?;
+        let labeled_volume = labeled_volumes.remove(0);
 
         let backup_dispatch = adapter
             .dispatch_and_correlate(BaculaJobResource::Backup, &BaculaCommands::full_backup())
@@ -494,18 +611,21 @@ async fn perform_exercise(
         record_engine_dispatch(pool, claim, "backup", &backup_dispatch, &adapter).await?;
         let backup = wait_for_job(
             pool,
+            sas_config,
             claim,
             &adapter,
             backup_dispatch.job_id,
             "full backup",
-            deadline,
+            (claim.run.workflow_kind == "backup").then_some(BaculaMediaPhase::BackupWrite),
+            config.data_run_timeout,
             cancellation,
         )
         .await?;
-        let backup_catalog = validate_backup_job(
+        let authorized_volumes = data_run_engine_volumes(pool, claim).await?;
+        let backup_catalog = validate_backup_job_on_volumes(
             pool,
             backup.job_id,
-            &volume,
+            &authorized_volumes,
             &bacula_pool,
         )
         .await
@@ -514,6 +634,25 @@ async fn perform_exercise(
                 "Bacula backup catalog/media proof failed: {error}"
             ))
         })?;
+        if claim.run.workflow_kind == "backup" {
+            let catalog_volume_names = backup_catalog
+                .volumes
+                .iter()
+                .map(|volume| volume.volume_name.clone())
+                .collect::<Vec<_>>();
+            if !store::mark_data_run_backup_volumes_written(pool, claim, &catalog_volume_names)
+                .await
+                .map_err(|error| {
+                    ExerciseFailure::interrupted(format!(
+                        "could not retain the catalog-proven archive write boundary: {error}"
+                    ))
+                })?
+            {
+                return Err(ExerciseFailure::interrupted(
+                    "the fenced run could not match every authorized tape to the completed Bacula catalog",
+                ));
+            }
+        }
         let engine_write = json!({
             "engine": "Bacula Community",
             "engine_version": "15.0.3",
@@ -523,6 +662,12 @@ async fn perform_exercise(
             "catalog": backup_catalog,
             "finalized": true,
             "single_volume": backup_catalog.segments.iter().all(|segment| segment.media_id == backup_catalog.volume.media_id),
+            "volume_count": backup_catalog.volumes.len(),
+            "compression": {
+                "requested": claim.run.compression_mode,
+                "resolved": claim.run.resolved_compression
+            },
+            "spanning_enabled": claim.run.spanning_enabled,
             "encryption": if claim.run.workflow_kind == "backup" {
                 "disabled_by_explicit_test_slice_deviation"
             } else {
@@ -544,11 +689,15 @@ async fn perform_exercise(
                 "finalized": true,
                 "job_id": backup.job_id,
                 "volume": volume.as_str(),
+                "volumes": backup_catalog.volumes,
+                "volume_count": backup_catalog.volumes.len(),
                 "media_id": backup_catalog.volume.media_id,
                 "segments": backup_catalog.segments,
                 "files": backup.files,
                 "job_bytes": backup.bytes,
-                "volume_bytes": backup_catalog.volume.volume_bytes
+                "volume_bytes": backup_catalog.volumes.iter().map(|volume| volume.volume_bytes).sum::<u64>(),
+                "compression": claim.run.resolved_compression,
+                "spanning_enabled": claim.run.spanning_enabled
             }),
         )
         .await?;
@@ -586,11 +735,13 @@ async fn perform_exercise(
         record_engine_dispatch(pool, claim, "verify", &verify_dispatch, &adapter).await?;
         let verify = wait_for_job(
             pool,
+            sas_config,
             claim,
             &adapter,
             verify_dispatch.job_id,
             "Data verify",
-            deadline,
+            (claim.run.workflow_kind == "backup").then_some(BaculaMediaPhase::FullReadback),
+            config.data_run_timeout,
             cancellation,
         )
         .await?;
@@ -600,15 +751,28 @@ async fn perform_exercise(
             ExerciseFailure::failed(format!("Bacula Data verify catalog proof failed: {error}"))
         })?;
         if claim.run.workflow_kind == "backup" {
-            let source_after = scan_manifest_with_lease(
+            let source_after = scan_and_persist_manifest_with_lease(
                 pool,
                 claim,
                 PathBuf::from(&claim.run.source_mount_path),
+                evidence_directory.to_owned(),
+                "source-stability-after".to_owned(),
                 deadline,
                 cancellation,
             )
             .await?;
-            if !source_manifests_stable(&source_manifest, &source_after) {
+            let stable = source_manifest
+                .artifact()
+                .source_stability_digest_sha256
+                == source_after.source_stability_digest_sha256;
+            if let Err(error) = fs::remove_file(&source_after.storage_path) {
+                warn!(
+                    path = %source_after.storage_path.display(),
+                    %error,
+                    "could not remove temporary post-backup stability manifest"
+                );
+            }
+            if !stable {
                 return Err(ExerciseFailure::failed(
                     "the supposedly immutable source changed during backup; no recovery point can be committed",
                 ));
@@ -676,11 +840,13 @@ async fn perform_exercise(
         record_engine_dispatch(pool, claim, "restore", &restore_dispatch, &adapter).await?;
         let restore = wait_for_job(
             pool,
+            sas_config,
             claim,
             &adapter,
             restore_dispatch.job_id,
             "full restore",
-            deadline,
+            None,
+            config.data_run_timeout,
             cancellation,
         )
         .await?;
@@ -732,7 +898,6 @@ async fn perform_exercise(
             claim,
             "restored_manifest",
             &restored_artifact,
-            &restored_manifest,
         )
         .await?;
 
@@ -744,12 +909,13 @@ async fn perform_exercise(
             cancellation,
         )
         .await?;
-        if !source_manifests_stable(&source_manifest, &source_after) {
+        let legacy_source = source_manifest.legacy()?;
+        if !source_manifests_stable(legacy_source, &source_after) {
             return Err(ExerciseFailure::failed(
                 "the source changed during the exercise; restore proof is invalid",
             ));
         }
-        let comparison = compare_manifests(&source_manifest, &restored_manifest);
+        let comparison = compare_manifests(legacy_source, &restored_manifest);
         let comparison_artifact =
             persist_json_artifact(evidence_directory, "comparison", &comparison)
                 .map_err(|error| ExerciseFailure::failed(error.to_string()))?;
@@ -867,7 +1033,7 @@ async fn complete_exercise(
                 "data_verify_catalog": completed.verify_catalog,
                 "restore_job": restore,
                 "restore_catalog": restore_catalog,
-                "source_manifest_digest": completed.source_manifest.digest_sha256,
+                "source_manifest_digest": completed.source_manifest.digest_sha256(),
                 "restored_manifest_digest": restored_manifest.digest_sha256,
                 "comparison": comparison,
                 "restore_destination": restore_destination,
@@ -908,10 +1074,10 @@ async fn complete_exercise(
                         "file={}:block={}",
                         last_segment.end_file, last_segment.end_block
                     )),
-                    logical_bytes: completed.source_manifest.logical_bytes,
+                    logical_bytes: completed.source_manifest.logical_bytes(),
                     encoded_bytes: completed.backup_catalog.volume.volume_bytes,
-                    file_count: completed.source_manifest.file_count,
-                    coverage: serde_json::to_value(&completed.source_manifest.coverage)
+                    file_count: completed.source_manifest.file_count(),
+                    coverage: serde_json::to_value(completed.source_manifest.coverage())
                         .map_err(|error| error.to_string())?,
                     full_readback_evidence: json!({
                         "physical_media_readback": true,
@@ -924,7 +1090,7 @@ async fn complete_exercise(
                         "matched": true,
                         "job": restore,
                         "catalog": restore_catalog,
-                        "source_manifest_digest": completed.source_manifest.digest_sha256,
+                        "source_manifest_digest": completed.source_manifest.digest_sha256(),
                         "restored_manifest_digest": restored_manifest.digest_sha256,
                         "restore_destination": restore_destination
                     }),
@@ -1059,17 +1225,46 @@ async fn complete_backup(
         .segments
         .last()
         .expect("catalog validation requires JobMedia evidence");
+    let encoded_bytes = completed
+        .backup_catalog
+        .volumes
+        .iter()
+        .map(|volume| volume.volume_bytes)
+        .sum::<u64>();
+    let volume_count = completed.backup_catalog.volumes.len();
+    let mut limitations = vec![
+        "full_only",
+        "unencrypted",
+        "server_verified_read_only_source",
+    ];
+    if !claim.run.spanning_enabled {
+        limitations.insert(0, "single_volume");
+    }
     let report = json!({
-        "scope": "attended single-volume full-file backup with complete physical-media readback",
+        "scope": if volume_count > 1 {
+            "attended multi-volume full-file backup with complete physical-media readback"
+        } else {
+            "attended single-volume full-file backup with complete physical-media readback"
+        },
         "qualification": "test_slice",
         "production_eligible": false,
-        "limitations": ["single_volume", "full_only", "unencrypted", "server_verified_read_only_source"],
+        "limitations": limitations,
+        "compression": {
+            "requested": claim.run.compression_mode,
+            "resolved": claim.run.resolved_compression
+        },
+        "media": {
+            "spanning_enabled": claim.run.spanning_enabled,
+            "volume_count": volume_count,
+            "volumes": &completed.backup_catalog.volumes,
+            "encoded_bytes": encoded_bytes
+        },
         "engine": {"name":"Bacula Community","version":"15.0.3"},
         "backup_job": &completed.backup,
         "backup_catalog": &completed.backup_catalog,
         "data_verify_job": &completed.verify,
         "data_verify_catalog": &completed.verify_catalog,
-        "source_manifest_digest": &completed.source_manifest.digest_sha256,
+        "source_manifest_digest": completed.source_manifest.digest_sha256(),
         "runtime": runtime_evidence,
         "cleanup": cleanup_evidence,
         "encryption": "disabled_by_explicit_test_slice_deviation",
@@ -1136,10 +1331,10 @@ async fn complete_backup(
             "file={}:block={}",
             last_segment.end_file, last_segment.end_block
         )),
-        logical_bytes: completed.source_manifest.logical_bytes,
-        encoded_bytes: completed.backup_catalog.volume.volume_bytes,
-        file_count: completed.source_manifest.file_count,
-        coverage: serde_json::to_value(&completed.source_manifest.coverage)
+        logical_bytes: completed.source_manifest.logical_bytes(),
+        encoded_bytes,
+        file_count: completed.source_manifest.file_count(),
+        coverage: serde_json::to_value(completed.source_manifest.coverage())
             .map_err(|error| anyhow::anyhow!(error))?,
         full_readback_evidence: json!({
             "physical_media_readback": true,
@@ -1266,6 +1461,53 @@ async fn scan_manifest_with_lease(
     Err(failure)
 }
 
+async fn scan_and_persist_manifest_with_lease(
+    pool: &PgPool,
+    claim: &store::ClaimedSingleTapeDataRun,
+    path: PathBuf,
+    run_directory: PathBuf,
+    artifact_name: String,
+    _deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<ManifestArtifactSummary, ExerciseFailure> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let scan_stop = Arc::clone(&stop);
+    let mut scan = tokio::task::spawn_blocking(move || {
+        build_and_persist_manifest_with_cancel(
+            &path,
+            &run_directory,
+            &artifact_name,
+            scan_stop.as_ref(),
+        )
+    });
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+    let failure = loop {
+        tokio::select! {
+            result = &mut scan => {
+                return result
+                    .map_err(|error| ExerciseFailure::failed(format!("streaming manifest worker failed: {error}")))?
+                    .map_err(|error| ExerciseFailure::blocked(error.to_string()));
+            }
+            () = cancellation.cancelled() => {
+                break ExerciseFailure::interrupted(
+                    "worker shutdown was requested during streaming file inventory",
+                );
+            }
+            _ = heartbeat.tick() => {
+                match renew_claim(pool, claim, "during streaming file inventory").await {
+                    Ok(()) => {}
+                    Err(error) => break error,
+                }
+            }
+        }
+    };
+    stop.store(true, Ordering::Release);
+    let _ = scan.await;
+    Err(failure)
+}
+
 async fn wait_for_console(
     pool: &PgPool,
     claim: &store::ClaimedSingleTapeDataRun,
@@ -1296,28 +1538,64 @@ async fn wait_for_console(
     )))
 }
 
+fn observe_manual_media_progress(active: &mut ActiveManualMedia, evidence: &BaculaJobEvidence) {
+    if matches!(
+        evidence.state,
+        BaculaJobState::Running | BaculaJobState::Committing
+    ) || evidence.files != active.files_at_mount
+        || evidence.bytes != active.bytes_at_mount
+    {
+        active.observed_job_progress = true;
+    }
+}
+
+const fn mount_wait_can_request_media(phase: Option<BaculaMediaPhase>) -> bool {
+    matches!(phase, Some(BaculaMediaPhase::FullReadback))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingWriteMountAction {
+    WaitForAuthorization,
+    FulfillAuthorization,
+    LostLoadedState,
+    Conflict,
+}
+
+fn existing_write_mount_action(phase: &str, state: &str) -> ExistingWriteMountAction {
+    if phase != BaculaMediaPhase::BackupWrite.as_str() {
+        ExistingWriteMountAction::Conflict
+    } else {
+        match state {
+            "pending" => ExistingWriteMountAction::WaitForAuthorization,
+            "authorized" => ExistingWriteMountAction::FulfillAuthorization,
+            "loaded" => ExistingWriteMountAction::LostLoadedState,
+            _ => ExistingWriteMountAction::Conflict,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn wait_for_job(
     pool: &PgPool,
+    sas_config: &SasDiscoveryConfig,
     claim: &store::ClaimedSingleTapeDataRun,
     adapter: &BaculaAdapter<DirectBconsoleExecutor>,
     job_id: BaculaJobId,
     operation: &str,
-    deadline: Instant,
+    media_phase: Option<BaculaMediaPhase>,
+    no_progress_timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<BaculaJobEvidence, ExerciseFailure> {
     let mut consecutive_poll_failures = 0_u8;
+    let mut last_progress = None;
+    let mut last_progress_at = Instant::now();
+    let mut active_manual_media: Option<ActiveManualMedia> = None;
+    let mut next_readback_volume = 1_i32;
     loop {
         if cancellation.is_cancelled() {
             let cancellation_result = cancel_and_observe(adapter, job_id).await;
             return Err(ExerciseFailure::interrupted(format!(
                 "worker shutdown requested cancellation of Bacula {operation} JobId {job_id}; {cancellation_result}"
-            )));
-        }
-        if Instant::now() >= deadline {
-            let cancellation_result = cancel_and_observe(adapter, job_id).await;
-            return Err(ExerciseFailure::interrupted(format!(
-                "Bacula {operation} JobId {job_id} exceeded the physical-data deadline; {cancellation_result}"
             )));
         }
         if let Err(error) = renew_claim(pool, claim, &format!("during Bacula {operation}")).await {
@@ -1344,18 +1622,631 @@ async fn wait_for_job(
                 continue;
             }
         };
+
+        let progress = (
+            evidence.state,
+            evidence.files,
+            evidence.bytes,
+            evidence.errors,
+        );
+        if last_progress.as_ref() != Some(&progress) {
+            last_progress = Some(progress);
+            last_progress_at = Instant::now();
+        }
+
         if evidence.is_terminal() {
-            return if evidence.is_strict_success() {
-                Ok(evidence)
-            } else {
-                Err(ExerciseFailure::failed(format!(
+            if !evidence.is_strict_success() {
+                return Err(ExerciseFailure::failed(format!(
                     "Bacula {operation} JobId {job_id} ended as {:?} with {} errors",
                     evidence.state, evidence.errors
-                )))
-            };
+                )));
+            }
+            if active_manual_media.is_none()
+                && store::open_data_run_media_request(pool, claim.run.id)
+                    .await
+                    .map_err(|error| {
+                        ExerciseFailure::interrupted(format!(
+                            "could not inspect final manual-media state: {error}"
+                        ))
+                    })?
+                    .is_some()
+            {
+                return Err(ExerciseFailure::failed(
+                    "Bacula completed while an unfulfilled manual-media request remained open",
+                ));
+            }
+            if media_phase == Some(BaculaMediaPhase::FullReadback) {
+                let volumes =
+                    store::data_run_volumes(pool, claim.run.id)
+                        .await
+                        .map_err(|error| {
+                            ExerciseFailure::interrupted(format!(
+                                "could not validate the final ordered readback volume: {error}"
+                            ))
+                        })?;
+                if volumes.len() > 1 {
+                    let expected_last = i32::try_from(volumes.len()).map_err(|_| {
+                        ExerciseFailure::failed("archive volume count exceeds the order range")
+                    })?;
+                    if active_manual_media
+                        .as_ref()
+                        .is_none_or(|active| active.volume_order != expected_last)
+                    {
+                        return Err(ExerciseFailure::failed(
+                            "Bacula completed before the final ordered archive volume was presented for readback",
+                        ));
+                    }
+                }
+            }
+            if let Some(active) = active_manual_media {
+                complete_manual_media_request(pool, claim, active.request_id, false).await?;
+            }
+            return Ok(evidence);
+        }
+
+        if evidence.state == BaculaJobState::WaitingForMount {
+            if mount_wait_can_request_media(media_phase) {
+                if let Some(active) = active_manual_media.as_mut() {
+                    observe_manual_media_progress(active, &evidence);
+                }
+                if active_manual_media
+                    .as_ref()
+                    .is_some_and(|active| active.observed_job_progress)
+                {
+                    let completed = active_manual_media
+                        .take()
+                        .expect("the progress check established active readback media");
+                    complete_manual_media_request(pool, claim, completed.request_id, true).await?;
+                    next_readback_volume =
+                        completed.volume_order.checked_add(1).ok_or_else(|| {
+                            ExerciseFailure::failed("archive volume order overflowed")
+                        })?;
+                } else if active_manual_media.is_some() {
+                    // The known read volume has been presented but Bacula has
+                    // not yet been observed accepting it. Retrying a mount is
+                    // non-destructive; do not advance the ordered request.
+                    let mount = adapter
+                        .dispatch(&BaculaCommands::mount())
+                        .await
+                        .map_err(|error| {
+                            ExerciseFailure::failed(format!(
+                                "Bacula could not mount the current readback volume for {operation}: {error}"
+                            ))
+                        })?;
+                    validate_console_output(
+                        "mount current readback volume",
+                        &mount.stdout,
+                        &mount.stderr,
+                    )?;
+                    if last_progress_at.elapsed() >= no_progress_timeout {
+                        let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                        return Err(ExerciseFailure::interrupted(format!(
+                            "Bacula {operation} JobId {job_id} did not accept the current readback volume within {} seconds; {cancellation_result}",
+                            no_progress_timeout.as_secs()
+                        )));
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+
+                // A read job's `M` state names a known volume to mount. It may
+                // create or advance an exact, non-destructive ordered readback
+                // request. Destructive write continuations are never created
+                // from this state; only Bacula's `m` state may trigger those.
+                active_manual_media = prepare_manual_media(
+                    pool,
+                    sas_config,
+                    claim,
+                    adapter,
+                    BaculaMediaPhase::FullReadback,
+                    next_readback_volume,
+                    cancellation,
+                )
+                .await?;
+                if let Some(active) = active_manual_media.as_mut() {
+                    active.files_at_mount = evidence.files;
+                    active.bytes_at_mount = evidence.bytes;
+                }
+                last_progress_at = Instant::now();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            if media_phase == Some(BaculaMediaPhase::BackupWrite) && active_manual_media.is_none() {
+                if let Some(request) = store::open_data_run_media_request(pool, claim.run.id)
+                    .await
+                    .map_err(|error| {
+                        ExerciseFailure::interrupted(format!(
+                            "could not inspect the destructive media request while Bacula was waiting for a mount: {error}"
+                        ))
+                    })?
+                {
+                    match existing_write_mount_action(&request.phase, &request.state) {
+                        ExistingWriteMountAction::WaitForAuthorization => {
+                            // The destructive request was created only while
+                            // Bacula reported `m`; a later `M` must not create
+                            // or allocate another tape while the operator waits.
+                            last_progress_at = Instant::now();
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+                        ExistingWriteMountAction::FulfillAuthorization => {
+                            // `M` may fulfill an exact, already-persisted and
+                            // operator-authorized request whose origin was `m`.
+                            // It still cannot originate a destructive request.
+                            active_manual_media = prepare_manual_media(
+                                pool,
+                                sas_config,
+                                claim,
+                                adapter,
+                                BaculaMediaPhase::BackupWrite,
+                                next_readback_volume,
+                                cancellation,
+                            )
+                            .await?;
+                            if let Some(active) = active_manual_media.as_mut() {
+                                active.files_at_mount = evidence.files;
+                                active.bytes_at_mount = evidence.bytes;
+                            }
+                            last_progress_at = Instant::now();
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+                        ExistingWriteMountAction::LostLoadedState => {
+                            return Err(ExerciseFailure::interrupted(
+                                "the worker lost in-memory state after a destructive continuation tape was loaded",
+                            ));
+                        }
+                        ExistingWriteMountAction::Conflict => {
+                            return Err(ExerciseFailure::failed(
+                                "Bacula's write mount wait conflicted with its durable media request",
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // `M` means Bacula wants the currently authorized volume mounted;
+            // it does not mean the write tape is full. Never originate or
+            // allocate a new BackupWrite cartridge from this state.
+            let mount = adapter
+                .dispatch(&BaculaCommands::mount())
+                .await
+                .map_err(|error| {
+                    ExerciseFailure::failed(format!(
+                        "Bacula could not mount the current archive volume for {operation}: {error}"
+                    ))
+                })?;
+            validate_console_output("mount current archive volume", &mount.stdout, &mount.stderr)?;
+            if let Some(active) = active_manual_media.as_mut() {
+                observe_manual_media_progress(active, &evidence);
+            }
+            if last_progress_at.elapsed() >= no_progress_timeout {
+                let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                return Err(ExerciseFailure::interrupted(format!(
+                    "Bacula {operation} JobId {job_id} remained waiting to mount the current volume for {} seconds; {cancellation_result}",
+                    no_progress_timeout.as_secs()
+                )));
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        if evidence.state == BaculaJobState::WaitingForMedia {
+            if let Some(phase) = media_phase {
+                if let Some(active) = active_manual_media.as_mut() {
+                    observe_manual_media_progress(active, &evidence);
+                    if !active.observed_job_progress {
+                        if last_progress_at.elapsed() >= no_progress_timeout {
+                            let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                            return Err(ExerciseFailure::interrupted(format!(
+                                "Bacula {operation} JobId {job_id} did not accept archive volume {} within the no-progress window; {cancellation_result}",
+                                active.volume_order
+                            )));
+                        }
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }
+
+                if let Some(active) = active_manual_media.take() {
+                    complete_manual_media_request(pool, claim, active.request_id, true).await?;
+                    if phase == BaculaMediaPhase::FullReadback {
+                        next_readback_volume =
+                            active.volume_order.checked_add(1).ok_or_else(|| {
+                                ExerciseFailure::failed("archive volume order overflowed")
+                            })?;
+                    }
+                }
+
+                active_manual_media = prepare_manual_media(
+                    pool,
+                    sas_config,
+                    claim,
+                    adapter,
+                    phase,
+                    next_readback_volume,
+                    cancellation,
+                )
+                .await?;
+                if let Some(active) = active_manual_media.as_mut() {
+                    active.files_at_mount = evidence.files;
+                    active.bytes_at_mount = evidence.bytes;
+                }
+
+                // A pending request is an operator wait, not stalled tape I/O.
+                // A newly mounted tape gets a fresh watchdog window.
+                last_progress_at = Instant::now();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        } else if let Some(active) = active_manual_media.as_mut() {
+            observe_manual_media_progress(active, &evidence);
+        }
+
+        if last_progress_at.elapsed() >= no_progress_timeout {
+            let cancellation_result = cancel_and_observe(adapter, job_id).await;
+            return Err(ExerciseFailure::interrupted(format!(
+                "Bacula {operation} JobId {job_id} made no observable progress for {} seconds; {cancellation_result}",
+                no_progress_timeout.as_secs()
+            )));
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+async fn complete_manual_media_request(
+    pool: &PgPool,
+    claim: &store::ClaimedSingleTapeDataRun,
+    request_id: Uuid,
+    media_exhausted: bool,
+) -> Result<(), ExerciseFailure> {
+    match store::complete_data_run_media_request(pool, claim, request_id, media_exhausted).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ExerciseFailure::interrupted(
+            "the fenced run could not durably complete its manual-media request",
+        )),
+        Err(error) => Err(ExerciseFailure::interrupted(format!(
+            "could not durably complete the manual-media request: {error}"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_manual_media(
+    pool: &PgPool,
+    sas_config: &SasDiscoveryConfig,
+    claim: &store::ClaimedSingleTapeDataRun,
+    adapter: &BaculaAdapter<DirectBconsoleExecutor>,
+    phase: BaculaMediaPhase,
+    next_readback_volume: i32,
+    cancellation: &CancellationToken,
+) -> Result<Option<ActiveManualMedia>, ExerciseFailure> {
+    let existing = store::open_data_run_media_request(pool, claim.run.id)
+        .await
+        .map_err(|error| {
+            ExerciseFailure::interrupted(format!(
+                "could not inspect the durable manual-media request: {error}"
+            ))
+        })?;
+
+    let request = if let Some(existing) = existing {
+        if existing.phase != phase.as_str() {
+            return Err(ExerciseFailure::failed(format!(
+                "the durable media request is for {}, but Bacula is waiting during {}",
+                existing.phase,
+                phase.as_str()
+            )));
+        }
+        if existing.state == "loaded" {
+            return Err(ExerciseFailure::interrupted(
+                "the worker lost in-memory state after a tape was loaded; refusing to guess whether the media was already changed",
+            ));
+        }
+        if phase == BaculaMediaPhase::FullReadback && existing.volume_order != next_readback_volume
+        {
+            return Err(ExerciseFailure::failed(format!(
+                "the durable readback request is for volume {}, but the ordered readback expects volume {next_readback_volume}",
+                existing.volume_order
+            )));
+        }
+        existing
+    } else {
+        let release = adapter
+            .dispatch(&BaculaCommands::release())
+            .await
+            .map_err(|error| {
+                ExerciseFailure::failed(format!(
+                    "Bacula could not release the current tape before a manual change: {error}"
+                ))
+            })?;
+        validate_console_output(
+            "release current archive volume",
+            &release.stdout,
+            &release.stderr,
+        )?;
+
+        let volumes = store::data_run_volumes(pool, claim.run.id)
+            .await
+            .map_err(|error| {
+                ExerciseFailure::interrupted(format!(
+                    "could not load the ordered archive volumes: {error}"
+                ))
+            })?;
+        let (volume_order, expected_cartridge_id, expected_engine_volume_name) = match phase {
+            BaculaMediaPhase::BackupWrite => {
+                let volume_order = volumes
+                    .iter()
+                    .map(|volume| volume.volume_order)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| ExerciseFailure::failed("archive volume order overflowed"))?;
+                (volume_order, None, None)
+            }
+            BaculaMediaPhase::FullReadback => {
+                let volume = volumes
+                    .iter()
+                    .find(|volume| volume.volume_order == next_readback_volume)
+                    .ok_or_else(|| {
+                        ExerciseFailure::failed(format!(
+                            "Bacula requested another readback tape after all {} retained archive volumes were presented",
+                            volumes.len()
+                        ))
+                    })?;
+                let engine_name = volume.engine_volume_name.clone().ok_or_else(|| {
+                    ExerciseFailure::failed(format!(
+                        "archive volume {} has no retained Bacula label",
+                        volume.volume_order
+                    ))
+                })?;
+                (
+                    volume.volume_order,
+                    Some(volume.cartridge_id),
+                    Some(engine_name),
+                )
+            }
+        };
+
+        match store::ensure_data_run_media_request(
+            pool,
+            claim,
+            phase.as_str(),
+            volume_order,
+            expected_cartridge_id,
+            expected_engine_volume_name.as_deref(),
+        )
+        .await
+        .map_err(|error| {
+            ExerciseFailure::interrupted(format!(
+                "could not retain Bacula's manual-media request: {error}"
+            ))
+        })? {
+            store::DataRunMediaRequestResult::Ready(request) => *request,
+            store::DataRunMediaRequestResult::FencedOut => {
+                return Err(ExerciseFailure::interrupted(
+                    "the run was fenced out while requesting another archive tape",
+                ))
+            }
+            store::DataRunMediaRequestResult::Blocked(reason) => {
+                return Err(ExerciseFailure::blocked(reason))
+            }
+        }
+    };
+
+    let Some((authorized_request, volume)) = store::authorized_data_run_media_request(pool, claim)
+        .await
+        .map_err(|error| {
+            ExerciseFailure::interrupted(format!(
+                "could not inspect authorized continuation media: {error}"
+            ))
+        })?
+    else {
+        return Ok(None);
+    };
+    if authorized_request.id != request.id
+        || authorized_request.phase != phase.as_str()
+        || authorized_request.volume_order != request.volume_order
+        || volume.volume_order != request.volume_order
+    {
+        return Err(ExerciseFailure::failed(
+            "the authorized continuation tape does not match Bacula's active media request",
+        ));
+    }
+
+    let observations = discover_and_persist(pool, sas_config)
+        .await
+        .map_err(|error| {
+            ExerciseFailure::interrupted(format!(
+                "could not revalidate the loaded drive before media motion: {error}"
+            ))
+        })?;
+    let observation = matching_observation(
+        &observations,
+        &claim.run.expected_path,
+        &claim.run.expected_stable_id,
+    )
+    .ok_or_else(|| {
+        ExerciseFailure::blocked(
+            "the exact assigned tape drive disappeared before the media change",
+        )
+    })?;
+    if let Some(reason) = observation_blocker(observation, &claim.run) {
+        return Err(ExerciseFailure::blocked(format!(
+            "the loaded continuation tape is not ready: {reason}"
+        )));
+    }
+
+    if !store::mark_data_run_media_loaded(pool, claim, request.id)
+        .await
+        .map_err(|error| {
+            ExerciseFailure::interrupted(format!(
+                "could not durably accept the loaded archive tape: {error}"
+            ))
+        })?
+    {
+        return Err(ExerciseFailure::interrupted(
+            "the fenced run could not accept the loaded archive tape",
+        ));
+    }
+
+    match phase {
+        BaculaMediaPhase::BackupWrite => {
+            let engine_volume = engine_volume_label_for_order(
+                &volume.expected_cartridge_label,
+                claim.run.id,
+                volume.volume_order,
+            )?;
+            if !store::mark_data_run_volume_write_started(
+                pool,
+                claim,
+                volume.volume_order,
+                engine_volume.as_str(),
+            )
+            .await
+            .map_err(|error| {
+                ExerciseFailure::interrupted(format!(
+                    "could not commit the continuation-tape write boundary: {error}"
+                ))
+            })? {
+                return Err(ExerciseFailure::interrupted(
+                    "the continuation tape was not durably quarantined before tape motion",
+                ));
+            }
+
+            execute_sas_motion(
+                sas_config,
+                Path::new(&claim.run.expected_path),
+                SasMotionOperation::Rewind,
+                cancellation,
+            )
+            .await
+            .map_err(|error| {
+                ExerciseFailure::failed(format!(
+                    "continuation-tape pre-write rewind failed: {}",
+                    sas_command_error_detail(&error)
+                ))
+            })?;
+            let label_clear = clear_sas_scratch_label(
+                sas_config,
+                Path::new(&claim.run.expected_path),
+                cancellation,
+            )
+            .await
+            .map_err(|error| {
+                ExerciseFailure::failed(format!(
+                    "could not clear prior contents on archive volume {}: {}",
+                    volume.volume_order,
+                    sas_command_error_detail(&error)
+                ))
+            })?;
+            if !store::append_single_tape_data_evidence_event(
+                pool,
+                claim,
+                "media_prepared",
+                json!({
+                    "phase": "writing",
+                    "volume_order": volume.volume_order,
+                    "cartridge_id": volume.cartridge_id,
+                    "operation": "clear_prior_scratch_header",
+                    "device": claim.run.expected_path,
+                    "tool": label_clear,
+                    "detail": "continuation scratch contents at BOT were invalidated before Bacula labeling"
+                }),
+            )
+            .await
+            .map_err(|error| ExerciseFailure::interrupted(error.to_string()))?
+            {
+                return Err(ExerciseFailure::interrupted(
+                    "the fenced run could not retain continuation-media preparation evidence",
+                ));
+            }
+            execute_sas_motion(
+                sas_config,
+                Path::new(&claim.run.expected_path),
+                SasMotionOperation::Rewind,
+                cancellation,
+            )
+            .await
+            .map_err(|error| {
+                ExerciseFailure::failed(format!(
+                    "continuation-tape post-invalidation rewind failed: {}",
+                    sas_command_error_detail(&error)
+                ))
+            })?;
+
+            let bacula_pool = BaculaPoolName::for_run(claim.run.id);
+            let label = adapter
+                .dispatch(&BaculaCommands::label(&engine_volume, &bacula_pool))
+                .await
+                .map_err(|error| {
+                    ExerciseFailure::failed(format!(
+                        "Bacula could not label archive volume {}: {error}",
+                        volume.volume_order
+                    ))
+                })?;
+            validate_console_output(
+                "label continuation archive volume",
+                &label.stdout,
+                &label.stderr,
+            )?;
+            let authorized_volumes = data_run_engine_volumes(pool, claim).await?;
+            validate_labeled_volumes(
+                pool,
+                &authorized_volumes,
+                &bacula_pool,
+                if claim.run.spanning_enabled { 0 } else { 1 },
+            )
+            .await
+            .map_err(|error| {
+                ExerciseFailure::failed(format!(
+                    "Bacula did not retain the exact ordered archive-volume set after labeling: {error}"
+                ))
+            })?;
+        }
+        BaculaMediaPhase::FullReadback => {
+            if volume.engine_volume_name.as_deref()
+                != authorized_request.expected_engine_volume_name.as_deref()
+            {
+                return Err(ExerciseFailure::failed(
+                    "the authorized readback tape does not match its retained Bacula label",
+                ));
+            }
+            execute_sas_motion(
+                sas_config,
+                Path::new(&claim.run.expected_path),
+                SasMotionOperation::Rewind,
+                cancellation,
+            )
+            .await
+            .map_err(|error| {
+                ExerciseFailure::failed(format!(
+                    "archive readback rewind failed for volume {}: {}",
+                    volume.volume_order,
+                    sas_command_error_detail(&error)
+                ))
+            })?;
+        }
+    }
+
+    let mount = adapter
+        .dispatch(&BaculaCommands::mount())
+        .await
+        .map_err(|error| {
+            ExerciseFailure::failed(format!(
+                "Bacula could not mount archive volume {}: {error}",
+                volume.volume_order
+            ))
+        })?;
+    validate_console_output("mount archive volume", &mount.stdout, &mount.stderr)?;
+
+    Ok(Some(ActiveManualMedia {
+        request_id: request.id,
+        volume_order: volume.volume_order,
+        observed_job_progress: false,
+        files_at_mount: 0,
+        bytes_at_mount: 0,
+    }))
 }
 
 fn engine_wait_failure(error: ExerciseFailure, cancellation_result: &str) -> ExerciseFailure {
@@ -1365,6 +2256,56 @@ fn engine_wait_failure(error: ExerciseFailure, cancellation_result: &str) -> Exe
     } else {
         ExerciseFailure::interrupted(detail)
     }
+}
+
+fn bacula_data_options(
+    claim: &store::ClaimedSingleTapeDataRun,
+) -> Result<BaculaDataOptions, ExerciseFailure> {
+    if claim.run.workflow_kind != "backup" {
+        return Ok(BaculaDataOptions::single_volume(BaculaCompression::None));
+    }
+    let compression =
+        BaculaCompression::from_policy_mode(&claim.run.compression_mode).map_err(|error| {
+            ExerciseFailure::blocked(format!(
+                "the persisted backup compression mode is not executable: {error}"
+            ))
+        })?;
+    Ok(if claim.run.spanning_enabled {
+        BaculaDataOptions::spanning(compression)
+    } else {
+        BaculaDataOptions::single_volume(compression)
+    })
+}
+
+async fn data_run_engine_volumes(
+    pool: &PgPool,
+    claim: &store::ClaimedSingleTapeDataRun,
+) -> Result<Vec<VolumeLabel>, ExerciseFailure> {
+    let rows = store::data_run_volumes(pool, claim.run.id)
+        .await
+        .map_err(|error| {
+            ExerciseFailure::failed(format!(
+                "could not load the authorized archive-volume set: {error}"
+            ))
+        })?;
+    let mut labels = Vec::new();
+    for row in rows {
+        let Some(engine_volume_name) = row.engine_volume_name else {
+            continue;
+        };
+        labels.push(VolumeLabel::parse(engine_volume_name).map_err(|error| {
+            ExerciseFailure::failed(format!(
+                "persisted archive volume {} has an invalid Bacula label: {error}",
+                row.volume_order
+            ))
+        })?);
+    }
+    if labels.is_empty() {
+        return Err(ExerciseFailure::failed(
+            "the completed Bacula job has no durably authorized archive volumes",
+        ));
+    }
+    Ok(labels)
 }
 
 async fn record_engine_dispatch(
@@ -1470,6 +2411,19 @@ fn engine_volume_label(
     registered_label: &str,
     run_id: Uuid,
 ) -> Result<VolumeLabel, ExerciseFailure> {
+    engine_volume_label_for_order(registered_label, run_id, 1)
+}
+
+fn engine_volume_label_for_order(
+    registered_label: &str,
+    run_id: Uuid,
+    volume_order: i32,
+) -> Result<VolumeLabel, ExerciseFailure> {
+    if volume_order <= 0 {
+        return Err(ExerciseFailure::blocked(
+            "archive volume order must be positive",
+        ));
+    }
     let mut normalized = registered_label
         .chars()
         .map(|character| {
@@ -1486,6 +2440,9 @@ fn engine_volume_label(
     }
     normalized.push('-');
     normalized.push_str(&run_id.simple().to_string()[..12]);
+    if volume_order > 1 {
+        normalized.push_str(&format!("-V{volume_order:04}"));
+    }
     VolumeLabel::parse(normalized).map_err(|error| ExerciseFailure::blocked(error.to_string()))
 }
 
@@ -1536,7 +2493,6 @@ async fn append_manifest_artifact(
     claim: &store::ClaimedSingleTapeDataRun,
     kind: &str,
     artifact: &ManifestArtifactSummary,
-    manifest: &FileManifest,
 ) -> Result<(), ExerciseFailure> {
     append_artifact(
         pool,
@@ -1546,11 +2502,11 @@ async fn append_manifest_artifact(
         &artifact.artifact_sha256,
         artifact.size_bytes,
         json!({
-            "manifest_digest": manifest.digest_sha256,
-            "entry_count": manifest.entry_count,
-            "file_count": manifest.file_count,
-            "logical_bytes": manifest.logical_bytes,
-            "coverage": manifest.coverage
+            "manifest_digest": artifact.manifest_digest,
+            "entry_count": artifact.entry_count,
+            "file_count": artifact.file_count,
+            "logical_bytes": artifact.logical_bytes,
+            "coverage": artifact.coverage
         }),
     )
     .await
@@ -1863,5 +2819,82 @@ mod tests {
             "cancel command accepted",
         );
         assert_eq!(failure.class, FailureClass::Interrupted);
+    }
+
+    #[test]
+    fn mount_wait_advances_only_non_destructive_readback_media() {
+        assert!(mount_wait_can_request_media(Some(
+            BaculaMediaPhase::FullReadback
+        )));
+        assert!(!mount_wait_can_request_media(Some(
+            BaculaMediaPhase::BackupWrite
+        )));
+        assert!(!mount_wait_can_request_media(None));
+    }
+
+    #[test]
+    fn mount_wait_can_fulfill_but_never_originate_a_write_continuation() {
+        assert_eq!(
+            existing_write_mount_action("backup_write", "pending"),
+            ExistingWriteMountAction::WaitForAuthorization
+        );
+        assert_eq!(
+            existing_write_mount_action("backup_write", "authorized"),
+            ExistingWriteMountAction::FulfillAuthorization
+        );
+        assert_eq!(
+            existing_write_mount_action("backup_write", "loaded"),
+            ExistingWriteMountAction::LostLoadedState
+        );
+        assert_eq!(
+            existing_write_mount_action("full_readback", "authorized"),
+            ExistingWriteMountAction::Conflict
+        );
+    }
+
+    #[test]
+    fn active_job_state_proves_a_mounted_tape_was_accepted_without_byte_progress() {
+        let mut active = ActiveManualMedia {
+            request_id: Uuid::now_v7(),
+            volume_order: 2,
+            observed_job_progress: false,
+            files_at_mount: 7,
+            bytes_at_mount: 4096,
+        };
+        let mut evidence = BaculaJobEvidence {
+            job_id: BaculaJobId::new(42).unwrap(),
+            resource_name: None,
+            unique_name: None,
+            raw_status: 'R',
+            state: BaculaJobState::Running,
+            files: 7,
+            bytes: 4096,
+            errors: 0,
+            start_time: None,
+            end_time: None,
+        };
+        observe_manual_media_progress(&mut active, &evidence);
+        assert!(active.observed_job_progress);
+
+        active.observed_job_progress = false;
+        evidence.raw_status = 'M';
+        evidence.state = BaculaJobState::WaitingForMount;
+        observe_manual_media_progress(&mut active, &evidence);
+        assert!(!active.observed_job_progress);
+
+        evidence.bytes += 1;
+        observe_manual_media_progress(&mut active, &evidence);
+        assert!(active.observed_job_progress);
+    }
+
+    #[test]
+    fn archive_volume_labels_are_stable_and_unique_per_tape() {
+        let run_id = Uuid::parse_str("018f7cac-2e2a-7dc5-b70c-78a46a6f6f01").unwrap();
+        let first = engine_volume_label_for_order("AA 0344", run_id, 1).unwrap();
+        let second = engine_volume_label_for_order("AA 0345", run_id, 2).unwrap();
+        assert_eq!(first.as_str(), "AA-0344-018f7cac2e2a");
+        assert_eq!(second.as_str(), "AA-0345-018f7cac2e2a-V0002");
+        assert_ne!(first, second);
+        assert!(engine_volume_label_for_order("AA0346", run_id, 0).is_err());
     }
 }

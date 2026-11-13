@@ -5,7 +5,7 @@ use clap::Parser;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tapescale::{
-    bacula_catalog::{validate_backup_job, validate_restore_job, validate_verify_job},
+    bacula_catalog::{validate_backup_job_on_volumes, validate_restore_job, validate_verify_job},
     bacula_runtime::{validate_packaged_catalog_schema, BaculaRuntime},
     config::Config,
     data_run,
@@ -85,9 +85,10 @@ struct Arguments {
     #[arg(long, requires = "validate_bacula_roundtrip_catalog")]
     catalog_run_id: Option<Uuid>,
 
-    /// Exact Bacula volume label used by the backup.
+    /// Exact Bacula volume label used by the backup. Repeat in archive order
+    /// for a spanning backup.
     #[arg(long, requires = "validate_bacula_roundtrip_catalog")]
-    catalog_volume: Option<String>,
+    catalog_volume: Vec<String>,
 }
 
 #[tokio::main]
@@ -141,21 +142,26 @@ async fn main() -> Result<()> {
         let run_id = arguments
             .catalog_run_id
             .ok_or_else(|| anyhow::anyhow!("--catalog-run-id is required"))?;
-        let volume = VolumeLabel::parse(
-            arguments
-                .catalog_volume
-                .ok_or_else(|| anyhow::anyhow!("--catalog-volume is required"))?,
-        )?;
+        let volumes = arguments
+            .catalog_volume
+            .into_iter()
+            .map(VolumeLabel::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        if volumes.is_empty() {
+            anyhow::bail!("at least one --catalog-volume is required");
+        }
         let bacula_pool = BaculaPoolName::for_run(run_id);
 
-        let backup = validate_backup_job(database, backup_job_id, &volume, &bacula_pool).await?;
+        let backup =
+            validate_backup_job_on_volumes(database, backup_job_id, &volumes, &bacula_pool).await?;
         let verify = validate_verify_job(database, verify_job_id, backup_job_id).await?;
         let restore = validate_restore_job(database, restore_job_id, backup_job_id).await?;
         info!(
             backup_job_id = backup.job.job_id.get(),
             verify_job_id = verify.job.job_id.get(),
             restore_job_id = restore.job.job_id.get(),
-            volume = %backup.volume.volume_name,
+            first_volume = %backup.volume.volume_name,
+            volume_count = backup.volumes.len(),
             pool = %backup.volume.pool_name,
             "completed Bacula roundtrip catalog evidence passed"
         );
@@ -186,7 +192,7 @@ async fn main() -> Result<()> {
             source_root = %config.source_root.display(),
             restore_root = %config.restore_root.display(),
             timeout_seconds = config.data_run_timeout.as_secs(),
-            "attended Bacula single-tape Full backup, physical readback, and recovery-exercise execution is enabled; it is not production-qualified"
+            "attended Bacula compressed multi-tape Full backup, ordered physical readback, and single-volume recovery-exercise execution are enabled; they are not production-qualified"
         );
     }
     let btape_config = BtapeQualificationConfig {
@@ -1278,9 +1284,12 @@ mod tests {
             "01a1d15f-c6ae-768a-85ff-27b5121d5c05",
             "--catalog-volume",
             "AA0344",
+            "--catalog-volume",
+            "AA0345",
         ])
         .expect("complete catalog tuple");
         assert!(arguments.validate_bacula_roundtrip_catalog);
+        assert_eq!(arguments.catalog_volume, ["AA0344", "AA0345"]);
     }
 
     #[test]

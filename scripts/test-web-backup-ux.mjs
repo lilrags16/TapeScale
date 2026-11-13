@@ -39,9 +39,82 @@ test("the start flow requires a currently eligible drive and tape", () => {
 test("creating a request continues directly into final tape authorization", () => {
   const submit = section("  async function submitStartBackup(", "  function backupMediaConfirmation(");
 
-  assert.match(submit, /backupRunState\(retained\) === "waiting_for_media"/);
+  assert.match(submit, /backupRunState\(retained\) === "waiting_for_media" \|\| backupNeedsNextMedia\(retained\)/);
   assert.match(submit, /openAssignBackupMedia\(state\.selectedBackupRunId, \{ driveId, cartridgeId, guided: true \}\)/);
+  assert.match(submit, /compression_mode: backupCompressionMode/);
+  assert.match(submit, /spanning_enabled: backupSpanningEnabled/);
   assert.doesNotMatch(submit, /toast\("Full backup queued"/);
+});
+
+test("backup policy exposes compression and spanning without a one-tape ceiling", () => {
+  const open = section("  function openBackupProfile(", "  async function submitBackupProfile(");
+  const submit = section("  async function submitBackupProfile(", "  function backupCapacityPlan(");
+
+  assert.match(open, /name="compression_mode"/);
+  assert.match(open, /value="auto" selected/);
+  assert.match(open, /value="gzip"/);
+  assert.match(open, /value="lzo"/);
+  assert.match(open, /value="none"/);
+  assert.match(open, /name="spanning_enabled" checked/);
+  assert.match(open, /spans tapes as needed/);
+  assert.match(submit, /compression_mode: String\(values\.get\("compression_mode"\) \|\| "auto"\)/);
+  assert.match(submit, /spanning_enabled: values\.get\("spanning_enabled"\) === "on"/);
+});
+
+test("unsupported legacy compression is shown and blocked instead of becoming auto", () => {
+  const helpers = section("  function backupCompressionMode(", "  function backupSpanningEnabled(");
+  const testPick = (object, ...keys) => {
+    if (!object || typeof object !== "object") return null;
+    for (const key of keys) if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+    return null;
+  };
+  const evaluate = Function(
+    "pick",
+    "backupProfileForRun",
+    "backupEvidenceValue",
+    '"use strict";\n' + helpers + "\nreturn [backupCompressionMode, backupCompressionSupported, backupCompressionLabel];"
+  )(testPick, () => null, () => null);
+  const legacy = { compression_mode: "zstd" };
+  assert.equal(evaluate[0](legacy), "zstd");
+  assert.equal(evaluate[1](legacy), false);
+  assert.equal(evaluate[2](legacy), "Unsupported (zstd)");
+
+  const profiles = section("  function renderBackupProfiles(", "  function renderBackupRunTable(");
+  assert.match(profiles, /!compressionSupported/);
+  assert.match(profiles, /disabled title="Create a new backup plan with a supported compression mode\./);
+  assert.match(profiles, /unsupported legacy compression mode/);
+});
+
+test("the separate G0.2 phase track remains single-tape and uncompressed", () => {
+  const phases = section("  const RECOVERY_PHASES = [", "  const RECOVERY_TERMINAL_STATES");
+  assert.match(phases, /name: "Write tape", detail: "Full single-tape backup"/);
+  assert.doesNotMatch(phases, /Compressed full backup|as many authorized tapes/);
+});
+
+test("bounded source and retained browsers disclose partial directory views", () => {
+  const source = section("  function renderSourceBrowser(", "  async function loadSourceBrowser(");
+  const retained = section("  function renderRecoveryPointFiles(", "  const RESTORE_REHEARSAL_PHASES");
+
+  assert.match(source, /payload\.truncated === true/);
+  assert.match(source, /This is a partial browser view/);
+  assert.match(source, /type a known snapshot path/);
+  assert.match(source, /no TapeScale total file-count limit/);
+  assert.match(retained, /payload\.truncated === true/);
+  assert.match(retained, /Only this browse-only directory view is bounded/);
+  assert.match(retained, /retained manifest and tape archive are complete/);
+  assert.match(retained, /backup itself was not limited/);
+});
+
+test("capacity planning is explicitly estimated and supports unknown archive size", () => {
+  const capacity = section("  function backupCapacityPlan(", "  async function openStartBackup(");
+
+  assert.match(capacity, /Estimated tapes/);
+  assert.match(capacity, /Determined while writing/);
+  assert.match(capacity, /planning guidance, not a guaranteed fit/);
+  assert.match(capacity, /If another tape is needed/);
+  assert.match(capacity, /create a new backup plan for this snapshot with media spanning enabled/);
+  assert.doesNotMatch(app, /will estimate the tape count/);
+  assert.doesNotMatch(capacity, /will fit/);
 });
 
 test("final authorization is explicit without asking for the cartridge label twice", () => {
@@ -54,14 +127,15 @@ test("final authorization is explicit without asking for the cartridge label twi
   assert.match(open, /aria-describedby="backup-media-confirmation-help"/);
   assert.match(open, /id="backup-media-confirmation-help" aria-live="polite"/);
   assert.doesNotMatch(open, /backup-typed-cartridge/);
-  assert.equal((open.match(/name="backup_authority_confirmed"/g) || []).length, 1);
+  assert.equal((open.match(/name="backup_authority_confirmed"/g) || []).length, 2, "each mutually exclusive write/readback branch has one authority checkbox");
 
   assert.match(submit, /await loadBackupMediaReadiness\("run", runId\)/);
   assert.match(submit, /required_confirmation/);
   assert.match(submit, /typed_cartridge_label: exactLabel/);
+  assert.match(submit, /volume_sequence: volumeSequence/);
   assert.match(submit, /loaded_media_confirmed: authorized/);
-  assert.match(submit, /destructive_overwrite_confirmed: authorized/);
-  assert.match(submit, /encryption_deviation_confirmed: authorized/);
+  assert.match(submit, /destructive_overwrite_confirmed: !readbackMedia && authorized/);
+  assert.match(submit, /encryption_deviation_confirmed: !readbackMedia && authorized/);
   assert.match(submit, /String\(values\.get\("confirmation"\) \|\| ""\) !== expectedConfirmation/);
 
   const validation = submit.indexOf('await loadBackupMediaReadiness("run", runId)');
@@ -146,8 +220,69 @@ test("run summaries distinguish planned, active, complete, and failed readback",
   const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
   assert.doesNotMatch(detail, /Full backup · complete readback/);
   assert.match(detail, /backupReadbackSummary\(run\)/);
-  assert.match(app, /\{ name: "Confirm tape", detail: "Choose drive and tape"/);
+  assert.match(app, /\{ name: "Confirm first tape", detail: "Choose the first archive volume"/);
   assert.match(app, /\{ name: "Starting", detail: "Waiting for the worker", aliases: \["queued", "media_assigned", "preparing"\] \}/);
+});
+
+test("multi-tape runs ask for each ordered continuation volume", () => {
+  const helpers = section("  function backupNeedsNextMedia(", "  function backupRunRouteId(");
+  const open = section("  async function openAssignBackupMedia(", "  function updateBackupMediaForDrive(");
+  const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
+
+  assert.match(helpers, /waiting_for_next_media/);
+  assert.match(helpers, /next_volume_sequence/);
+  assert.match(open, /objectValue\(readiness, "media_request"\)/);
+  assert.match(open, /"volume_order", "volume_sequence", "media_sequence"/);
+  assert.match(open, /data-volume-sequence/);
+  assert.match(open, /Erase tape and continue archive/);
+  assert.match(detail, /Load next tape/);
+  assert.match(detail, /Unload and remove it, then insert and confirm a different prepared scratch tape/);
+  assert.match(open, /Unload and remove the previous archive tape before inserting this one/);
+  assert.match(detail, /Every tape in the archive was written, completely read back/);
+  assert.match(detail, /pick\(allowedActions, readbackMedia \? "assign_media" : nextMedia \? "assign_next_media" : "assign_media"\) === true/);
+  assert.doesNotMatch(detail, /assign_next_media" : "assign_media"\) !== false/);
+  assert.match(detail, /Tape accepted; worker is rechecking it/);
+  assert.match(detail, /No further tape selection is needed for this request/);
+  assert.match(app, /runs\.filter\(backupWaitingForOperator\)\.length/);
+  assert.match(app, /backupWaitingForOperator\(active\) \? "Continue backup" : "View progress"/);
+});
+
+test("readback media handoffs load exact ordered tapes without destructive copy", () => {
+  const helpers = section("  function backupMediaRequestPhase(", "  function backupCompressionMode(");
+  const phase = section("  function backupPhaseIndex(", "  function renderBackupPhaseTrack(");
+  const open = section("  async function openAssignBackupMedia(", "  function updateBackupMediaForDrive(");
+  const submit = section("  async function submitBackupMedia(", "  function prepareBackupTape(");
+  const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
+
+  assert.match(helpers, /backupMediaRequestPhase\(source\) === "full_readback"/);
+  assert.match(helpers, /if \(backupMediaIsReadback\(run\)\) return false/);
+  assert.match(phase, /backupMediaIsReadback\(run\).*aliases\.includes\("readback"\)/s);
+  assert.match(open, /data-media-phase=/);
+  assert.match(open, /Load recorded archive tape/);
+  assert.match(open, /Unload and remove the current tape before inserting this one/);
+  assert.match(open, /will not erase, relabel, or append/);
+  assert.match(open, /Readback order/);
+  assert.match(open, /Confirm tape and continue readback/);
+  assert.match(open, /server confirmation/);
+  assert.match(submit, /currentPhase !== mediaPhase \|\| currentSequence !== volumeSequence/);
+  assert.match(submit, /destructive_overwrite_confirmed: !readbackMedia && authorized/);
+  assert.match(submit, /encryption_deviation_confirmed: !readbackMedia && authorized/);
+  assert.match(open, /Standalone SAS drives cannot report the physical cartridge label/);
+  assert.match(open, /Bacula validates its on-tape volume label after rewind/);
+  assert.doesNotMatch(open, /reject a different label before any tape operation/);
+  assert.match(submit, /accepted your physical-label attestation/);
+  assert.match(submit, /validate the on-tape volume label after rewind/);
+  assert.doesNotMatch(submit, /reading the exact ordered archive tape/);
+  assert.match(detail, /Load tape .* for readback/);
+  assert.match(detail, /without erasing or relabeling it/);
+});
+
+test("ordered archive evidence uses durable volume order and cartridge labels", () => {
+  const volumes = section("  function backupRunVolumes(", "  function backupTapeSummary(");
+  assert.match(volumes, /"expected_cartridge_label"/);
+  assert.match(volumes, /"engine_volume_name"/);
+  assert.match(volumes, /"volume_order", "sequence"/);
+  assert.match(volumes, /sort\(\(left, right\) => left\.sequence - right\.sequence\)/);
 });
 
 test("verified backups lead directly to the retained file browser", () => {

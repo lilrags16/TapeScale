@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs::{self, File, Metadata},
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     os::fd::AsFd,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
@@ -29,6 +29,7 @@ const MANIFEST_FORMAT: &str = "tapescale-file-manifest-v2";
 const MAX_DIFFERENCES: usize = 1_000;
 pub const MAX_G02_MANIFEST_ENTRIES: u64 = 100_000;
 pub const MAX_G02_LOGICAL_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+const STREAMING_MANIFEST_SORT_CHUNK_ENTRIES: usize = 1_024;
 
 #[derive(Debug, Error)]
 pub enum ManifestError {
@@ -48,11 +49,11 @@ pub enum ManifestError {
     ChangedDuringRead(String),
     #[error("manifest inventory was cancelled")]
     Cancelled,
-    #[error("G0.2 currently requires UTF-8 path and symlink names: {0}")]
+    #[error("backup manifests require UTF-8 path and symlink names: {0}")]
     NonUtf8Path(PathBuf),
     #[error("unsafe archive path or symlink target at {0}")]
     UnsafeArchivePath(String),
-    #[error("nested filesystem boundary is outside the G0.2 OneFS capture at {0}")]
+    #[error("nested filesystem boundary is outside the selected one-filesystem capture at {0}")]
     FilesystemBoundary(PathBuf),
     #[error("G0.2 fixture exceeds the laboratory {kind} limit of {limit}")]
     FixtureLimit { kind: &'static str, limit: u64 },
@@ -171,8 +172,11 @@ pub struct ManifestArtifactSummary {
     pub artifact_sha256: String,
     pub size_bytes: u64,
     pub manifest_digest: String,
+    pub source_stability_digest_sha256: String,
     pub entry_count: u64,
+    pub file_count: u64,
     pub logical_bytes: u64,
+    pub coverage: ManifestCoverage,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -544,6 +548,44 @@ pub fn build_manifest_with_cancel(
     })
 }
 
+/// Inventory and persist a manifest without retaining the complete file tree in memory.
+///
+/// This is the migration path for operational backups whose file count or logical size is
+/// larger than the original G0.2 laboratory envelope. Entries are captured into fixed-size
+/// sorted runs on the evidence filesystem and merged with at most two entries resident at a
+/// time. The emitted artifact remains `tapescale-file-manifest-v2`, so existing recovery tools
+/// can consume it once their own whole-file read bounds are replaced with streaming readers.
+/// No total entry-count or logical-byte policy limit is applied; only integer overflow, local
+/// evidence-storage exhaustion, cancellation, and source-integrity failures can stop the scan.
+pub fn build_and_persist_manifest_with_cancel(
+    root: &Path,
+    run_directory: &Path,
+    artifact_name: &str,
+    cancellation: &AtomicBool,
+) -> Result<ManifestArtifactSummary, ManifestError> {
+    validate_artifact_name(artifact_name)?;
+    fs::create_dir_all(run_directory).map_err(|source| ManifestError::Io {
+        path: run_directory.to_owned(),
+        source,
+    })?;
+    let destination = run_directory.join(format!("{artifact_name}.json"));
+    if destination.exists() {
+        return Err(ManifestError::ArtifactExists(destination));
+    }
+
+    let workspace = StreamingWorkspace::new(run_directory, artifact_name)?;
+    let mut sorter =
+        RawEntryExternalSorter::new(workspace.path(), STREAMING_MANIFEST_SORT_CHUNK_ENTRIES);
+    scan_raw_entries_to_sorter(root, cancellation, &mut sorter)?;
+    let sorted_entries = sorter.finish()?;
+    write_streaming_manifest_artifact(
+        &sorted_entries,
+        workspace.path(),
+        &destination,
+        cancellation,
+    )
+}
+
 /// Compare two scans of the same mounted source using exact filesystem
 /// identity and nanosecond timestamps. This is deliberately separate from the
 /// recovery manifest, whose mtime precision matches Bacula's whole seconds.
@@ -567,8 +609,11 @@ pub fn persist_manifest(
         artifact_sha256: artifact.artifact_sha256,
         size_bytes: artifact.size_bytes,
         manifest_digest: manifest.digest_sha256.clone(),
+        source_stability_digest_sha256: manifest.source_stability_digest_sha256.clone(),
         entry_count: manifest.entry_count,
+        file_count: manifest.file_count,
         logical_bytes: manifest.logical_bytes,
+        coverage: manifest.coverage.clone(),
     })
 }
 
@@ -587,14 +632,7 @@ fn persist_artifact_bytes(
     artifact_name: &str,
     bytes: &[u8],
 ) -> Result<JsonArtifactSummary, ManifestError> {
-    if artifact_name.is_empty()
-        || artifact_name.len() > 64
-        || !artifact_name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(ManifestError::InvalidRelativePath);
-    }
+    validate_artifact_name(artifact_name)?;
     fs::create_dir_all(run_directory).map_err(|source| ManifestError::Io {
         path: run_directory.to_owned(),
         source,
@@ -639,6 +677,19 @@ fn persist_artifact_bytes(
         artifact_sha256: format!("{:x}", Sha256::digest(bytes)),
         size_bytes: bytes.len() as u64,
     })
+}
+
+fn validate_artifact_name(artifact_name: &str) -> Result<(), ManifestError> {
+    if artifact_name.is_empty()
+        || artifact_name.len() > 64
+        || !artifact_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Err(ManifestError::InvalidRelativePath)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn load_manifest(path: &Path) -> Result<FileManifest, ManifestError> {
@@ -810,7 +861,7 @@ fn ensure_same_filesystem(
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RawEntry {
     path: String,
     kind: EntryKind,
@@ -897,6 +948,561 @@ impl RawEntry {
             sparse,
         })
     }
+}
+
+struct StreamingWorkspace {
+    path: PathBuf,
+}
+
+impl StreamingWorkspace {
+    fn new(run_directory: &Path, artifact_name: &str) -> Result<Self, ManifestError> {
+        let path = run_directory.join(format!(
+            ".{artifact_name}.{}.manifest-work",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir(&path).map_err(|source| ManifestError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StreamingWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+struct RawEntryExternalSorter {
+    workspace: PathBuf,
+    chunk_entries: usize,
+    buffer: Vec<RawEntry>,
+    levels: Vec<Option<PathBuf>>,
+    sequence: u64,
+    max_buffered_entries: usize,
+}
+
+impl RawEntryExternalSorter {
+    fn new(workspace: &Path, chunk_entries: usize) -> Self {
+        debug_assert!(chunk_entries > 0);
+        Self {
+            workspace: workspace.to_owned(),
+            chunk_entries,
+            buffer: Vec::with_capacity(chunk_entries),
+            levels: Vec::new(),
+            sequence: 0,
+            max_buffered_entries: 0,
+        }
+    }
+
+    fn push(&mut self, entry: RawEntry) -> Result<(), ManifestError> {
+        self.buffer.push(entry);
+        self.max_buffered_entries = self.max_buffered_entries.max(self.buffer.len());
+        if self.buffer.len() == self.chunk_entries {
+            self.flush_buffer()?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<PathBuf, ManifestError> {
+        self.flush_buffer()?;
+        let mut merged: Option<PathBuf> = None;
+        for path in self.levels.into_iter().flatten() {
+            merged = Some(match merged {
+                None => path,
+                Some(left) => {
+                    let destination =
+                        next_sort_path(&self.workspace, &mut self.sequence, "final-merge")?;
+                    merge_raw_entry_files(&left, &path, &destination)?;
+                    remove_streaming_file(&left)?;
+                    remove_streaming_file(&path)?;
+                    destination
+                }
+            });
+        }
+        merged.ok_or(ManifestError::Integrity(
+            "streaming manifest produced no root entry",
+        ))
+    }
+
+    fn flush_buffer(&mut self) -> Result<(), ManifestError> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.buffer
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        if self
+            .buffer
+            .windows(2)
+            .any(|entries| entries[0].path == entries[1].path)
+        {
+            return Err(ManifestError::Integrity(
+                "streaming manifest contains duplicate paths",
+            ));
+        }
+        let path = next_sort_path(&self.workspace, &mut self.sequence, "run")?;
+        write_raw_entry_file(&path, &self.buffer)?;
+        self.buffer.clear();
+        self.insert_run(path, 0)
+    }
+
+    fn insert_run(&mut self, mut path: PathBuf, mut level: usize) -> Result<(), ManifestError> {
+        loop {
+            if self.levels.len() <= level {
+                self.levels.resize_with(level + 1, || None);
+            }
+            let Some(existing) = self.levels[level].take() else {
+                self.levels[level] = Some(path);
+                return Ok(());
+            };
+            let merged = next_sort_path(&self.workspace, &mut self.sequence, "merge")?;
+            merge_raw_entry_files(&existing, &path, &merged)?;
+            remove_streaming_file(&existing)?;
+            remove_streaming_file(&path)?;
+            path = merged;
+            level = level
+                .checked_add(1)
+                .ok_or(ManifestError::Integrity("streaming sort level overflow"))?;
+        }
+    }
+}
+
+fn next_sort_path(
+    workspace: &Path,
+    sequence: &mut u64,
+    kind: &str,
+) -> Result<PathBuf, ManifestError> {
+    let current = *sequence;
+    *sequence = sequence
+        .checked_add(1)
+        .ok_or(ManifestError::Integrity("streaming sort sequence overflow"))?;
+    Ok(workspace.join(format!("{kind}-{current:020}.jsonl")))
+}
+
+fn write_raw_entry_file(path: &Path, entries: &[RawEntry]) -> Result<(), ManifestError> {
+    let file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|source| ManifestError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    let mut writer = BufWriter::new(file);
+    for entry in entries {
+        serde_json::to_writer(&mut writer, entry)?;
+        writer
+            .write_all(b"\n")
+            .map_err(|source| ManifestError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+    }
+    writer.flush().map_err(|source| ManifestError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|source| ManifestError::Io {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+fn merge_raw_entry_files(
+    left: &Path,
+    right: &Path,
+    destination: &Path,
+) -> Result<(), ManifestError> {
+    let mut left_reader = open_streaming_reader(left)?;
+    let mut right_reader = open_streaming_reader(right)?;
+    let output = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .map_err(|source| ManifestError::Io {
+            path: destination.to_owned(),
+            source,
+        })?;
+    let mut writer = BufWriter::new(output);
+    let mut left_line = String::new();
+    let mut right_line = String::new();
+    let mut left_entry = read_raw_entry(&mut left_reader, left, &mut left_line)?;
+    let mut right_entry = read_raw_entry(&mut right_reader, right, &mut right_line)?;
+    while left_entry.is_some() || right_entry.is_some() {
+        let take_left = match (&left_entry, &right_entry) {
+            (Some(left), Some(right)) if left.path == right.path => {
+                return Err(ManifestError::Integrity(
+                    "streaming manifest contains duplicate paths",
+                ))
+            }
+            (Some(left), Some(right)) => left.path < right.path,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_left {
+            let entry = left_entry
+                .take()
+                .expect("left merge entry is present when selected");
+            write_raw_entry(&mut writer, destination, &entry)?;
+            left_entry = read_raw_entry(&mut left_reader, left, &mut left_line)?;
+        } else {
+            let entry = right_entry
+                .take()
+                .expect("right merge entry is present when selected");
+            write_raw_entry(&mut writer, destination, &entry)?;
+            right_entry = read_raw_entry(&mut right_reader, right, &mut right_line)?;
+        }
+    }
+    writer.flush().map_err(|source| ManifestError::Io {
+        path: destination.to_owned(),
+        source,
+    })?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|source| ManifestError::Io {
+            path: destination.to_owned(),
+            source,
+        })
+}
+
+fn open_streaming_reader(path: &Path) -> Result<BufReader<File>, ManifestError> {
+    File::open(path)
+        .map(BufReader::new)
+        .map_err(|source| ManifestError::Io {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+fn read_raw_entry(
+    reader: &mut impl BufRead,
+    path: &Path,
+    line: &mut String,
+) -> Result<Option<RawEntry>, ManifestError> {
+    line.clear();
+    let read = reader.read_line(line).map_err(|source| ManifestError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    if read == 0 {
+        return Ok(None);
+    }
+    let encoded = line.trim_end_matches(['\r', '\n']);
+    serde_json::from_str(encoded)
+        .map(Some)
+        .map_err(ManifestError::Serialization)
+}
+
+fn write_raw_entry(
+    writer: &mut impl Write,
+    path: &Path,
+    entry: &RawEntry,
+) -> Result<(), ManifestError> {
+    serde_json::to_writer(&mut *writer, entry)?;
+    writer.write_all(b"\n").map_err(|source| ManifestError::Io {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn remove_streaming_file(path: &Path) -> Result<(), ManifestError> {
+    fs::remove_file(path).map_err(|source| ManifestError::Io {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn scan_raw_entries_to_sorter(
+    root: &Path,
+    cancellation: &AtomicBool,
+    sorter: &mut RawEntryExternalSorter,
+) -> Result<(), ManifestError> {
+    let root = root.canonicalize().map_err(|source| ManifestError::Io {
+        path: root.to_owned(),
+        source,
+    })?;
+    if !root.is_dir() {
+        return Err(ManifestError::InvalidRoot(root));
+    }
+    let root_metadata = fs::symlink_metadata(&root).map_err(|source| ManifestError::Io {
+        path: root.clone(),
+        source,
+    })?;
+    let root_device = root_metadata.dev();
+    sorter.push(RawEntry::capture(
+        &root,
+        Path::new(""),
+        root_metadata,
+        EntryKind::Directory,
+        cancellation,
+    )?)?;
+    let root_directory = fs::read_dir(&root).map_err(|source| ManifestError::Io {
+        path: root.clone(),
+        source,
+    })?;
+    let mut directories = vec![(PathBuf::new(), root_directory)];
+    while !directories.is_empty() {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(ManifestError::Cancelled);
+        }
+        let next = {
+            let (relative, directory) = directories
+                .last_mut()
+                .expect("non-empty directory stack has a final iterator");
+            directory.next().map(|entry| (relative.clone(), entry))
+        };
+        let Some((parent, entry)) = next else {
+            directories.pop();
+            continue;
+        };
+        let entry = entry.map_err(|source| ManifestError::Io {
+            path: root.join(&parent),
+            source,
+        })?;
+        let relative = parent.join(entry.file_name());
+        if relative.to_str().is_none() {
+            return Err(ManifestError::NonUtf8Path(relative));
+        }
+        let absolute = root.join(&relative);
+        let metadata = fs::symlink_metadata(&absolute).map_err(|source| ManifestError::Io {
+            path: absolute.clone(),
+            source,
+        })?;
+        ensure_same_filesystem(root_device, metadata.dev(), &relative)?;
+        let kind = entry_kind(&metadata, &relative)?;
+        sorter.push(RawEntry::capture(
+            &absolute,
+            &relative,
+            metadata,
+            kind,
+            cancellation,
+        )?)?;
+        if kind == EntryKind::Directory {
+            let directory = fs::read_dir(&absolute).map_err(|source| ManifestError::Io {
+                path: absolute,
+                source,
+            })?;
+            directories.push((relative, directory));
+        }
+    }
+    Ok(())
+}
+
+fn write_streaming_manifest_artifact(
+    sorted_entries: &Path,
+    workspace: &Path,
+    destination: &Path,
+    cancellation: &AtomicBool,
+) -> Result<ManifestArtifactSummary, ManifestError> {
+    let hard_links = workspace.join("hard-links");
+    fs::create_dir(&hard_links).map_err(|source| ManifestError::Io {
+        path: hard_links.clone(),
+        source,
+    })?;
+    let temporary = workspace.join("manifest.json");
+    let output = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|source| ManifestError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+    let mut writer = BufWriter::new(output);
+    writer
+        .write_all(b"{\"format\":\"tapescale-file-manifest-v2\",\"entries\":[")
+        .map_err(|source| ManifestError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+    let mut manifest_digest = Sha256::new();
+    let mut stability_digest = Sha256::new();
+    manifest_digest.update(b"[");
+    stability_digest.update(b"[");
+    let mut reader = open_streaming_reader(sorted_entries)?;
+    let mut line = String::new();
+    let mut entry_count = 0_u64;
+    let mut file_count = 0_u64;
+    let mut logical_bytes = 0_u64;
+    let mut next_hard_link_group = 1_u64;
+    let mut first = true;
+    while let Some(raw) = read_raw_entry(&mut reader, sorted_entries, &mut line)? {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(ManifestError::Cancelled);
+        }
+        let raw_bytes = serde_json::to_vec(&raw)?;
+        let entry = manifest_entry_from_raw(raw, &hard_links, &mut next_hard_link_group)?;
+        let entry_bytes = serde_json::to_vec(&entry)?;
+        if !first {
+            writer.write_all(b",").map_err(|source| ManifestError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+            manifest_digest.update(b",");
+            stability_digest.update(b",");
+        }
+        first = false;
+        writer
+            .write_all(&entry_bytes)
+            .map_err(|source| ManifestError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        manifest_digest.update(&entry_bytes);
+        stability_digest.update(&raw_bytes);
+        entry_count = entry_count
+            .checked_add(1)
+            .ok_or(ManifestError::Integrity("manifest entry count overflow"))?;
+        if entry.kind == EntryKind::File {
+            file_count = file_count
+                .checked_add(1)
+                .ok_or(ManifestError::Integrity("manifest file count overflow"))?;
+            logical_bytes = logical_bytes.checked_add(entry.size.unwrap_or(0)).ok_or(
+                ManifestError::Integrity("manifest logical byte count overflow"),
+            )?;
+        }
+    }
+    manifest_digest.update(b"]");
+    stability_digest.update(b"]");
+    let digest_sha256 = format!("{:x}", manifest_digest.finalize());
+    let source_stability_digest_sha256 = format!("{:x}", stability_digest.finalize());
+    let coverage = serde_json::to_vec(&ManifestCoverage::default())?;
+    let suffix = format!(
+        "],\"entry_count\":{entry_count},\"file_count\":{file_count},\"logical_bytes\":{logical_bytes},\"digest_sha256\":\"{digest_sha256}\",\"coverage\":"
+    );
+    writer
+        .write_all(suffix.as_bytes())
+        .and_then(|()| writer.write_all(&coverage))
+        .and_then(|()| writer.write_all(b"}"))
+        .and_then(|()| writer.flush())
+        .map_err(|source| ManifestError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|source| ManifestError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+    drop(writer);
+    let (artifact_sha256, size_bytes) = digest_file(&temporary)?;
+    if let Err(source) = fs::hard_link(&temporary, destination) {
+        return if source.kind() == io::ErrorKind::AlreadyExists {
+            Err(ManifestError::ArtifactExists(destination.to_owned()))
+        } else {
+            Err(ManifestError::Io {
+                path: destination.to_owned(),
+                source,
+            })
+        };
+    }
+    Ok(ManifestArtifactSummary {
+        storage_path: destination.to_owned(),
+        artifact_sha256,
+        size_bytes,
+        manifest_digest: digest_sha256,
+        source_stability_digest_sha256,
+        entry_count,
+        file_count,
+        logical_bytes,
+        coverage: ManifestCoverage::default(),
+    })
+}
+
+fn manifest_entry_from_raw(
+    raw: RawEntry,
+    hard_link_directory: &Path,
+    next_hard_link_group: &mut u64,
+) -> Result<ManifestEntry, ManifestError> {
+    let hard_link_group = raw
+        .hard_link_identity
+        .map(|identity| hard_link_group(hard_link_directory, identity, next_hard_link_group))
+        .transpose()?;
+    Ok(ManifestEntry {
+        path: raw.path,
+        kind: raw.kind,
+        mode: raw.mode,
+        uid: raw.uid,
+        gid: raw.gid,
+        mtime_seconds: raw.mtime_seconds,
+        size: raw.size,
+        content_sha256: raw.content_sha256,
+        symlink_target: raw.symlink_target,
+        hard_link_group,
+    })
+}
+
+fn hard_link_group(
+    directory: &Path,
+    (device, inode): (u64, u64),
+    next_hard_link_group: &mut u64,
+) -> Result<String, ManifestError> {
+    let mapping = directory.join(format!("{device:016x}-{inode:016x}"));
+    let group = format!("link-{}", *next_hard_link_group);
+    match fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&mapping)
+    {
+        Ok(mut file) => {
+            file.write_all(group.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|source| ManifestError::Io {
+                    path: mapping,
+                    source,
+                })?;
+            *next_hard_link_group = next_hard_link_group
+                .checked_add(1)
+                .ok_or(ManifestError::Integrity("hard-link group count overflow"))?;
+            Ok(group)
+        }
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            fs::read_to_string(&mapping).map_err(|source| ManifestError::Io {
+                path: mapping,
+                source,
+            })
+        }
+        Err(source) => Err(ManifestError::Io {
+            path: mapping,
+            source,
+        }),
+    }
+}
+
+fn digest_file(path: &Path) -> Result<(String, u64), ManifestError> {
+    let mut file = File::open(path).map_err(|source| ManifestError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut digest = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| ManifestError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        size = size
+            .checked_add(read as u64)
+            .ok_or(ManifestError::Integrity("manifest artifact size overflow"))?;
+    }
+    Ok((format!("{:x}", digest.finalize()), size))
 }
 
 fn metadata_identity(metadata: &Metadata) -> (u64, u64, u64, i64, i64) {
@@ -1229,6 +1835,124 @@ mod tests {
             load_manifest_bytes_with_limit(&bytes, 2).expect("limit permits manifest"),
             manifest
         );
+    }
+
+    fn synthetic_file_entry(path: String, size: u64) -> RawEntry {
+        RawEntry {
+            path,
+            kind: EntryKind::File,
+            mode: 0o644,
+            uid: 1_000,
+            gid: 1_000,
+            mtime_seconds: 1_700_000_000,
+            mtime_nanoseconds: 123_456_789,
+            size: Some(size),
+            content_sha256: Some("0".repeat(64)),
+            symlink_target: None,
+            hard_link_identity: None,
+            sparse: Some(size > 0),
+        }
+    }
+
+    #[test]
+    fn streaming_manifest_matches_the_legacy_v2_artifact() {
+        let source = tempdir().expect("source");
+        fs::create_dir(source.path().join("nested")).expect("directory");
+        fs::write(source.path().join("nested/original"), b"recoverable").expect("file");
+        fs::hard_link(
+            source.path().join("nested/original"),
+            source.path().join("linked"),
+        )
+        .expect("hard link");
+        symlink("nested/original", source.path().join("shortcut")).expect("symlink");
+        let legacy = build_manifest(source.path()).expect("legacy manifest");
+        let evidence = tempdir().expect("evidence");
+        let artifact = build_and_persist_manifest_with_cancel(
+            source.path(),
+            evidence.path(),
+            "streamed",
+            &AtomicBool::new(false),
+        )
+        .expect("streaming manifest");
+        let streamed = load_manifest(&artifact.storage_path).expect("load streamed artifact");
+
+        assert_eq!(streamed, legacy);
+        assert_eq!(artifact.manifest_digest, legacy.digest_sha256);
+        assert_eq!(
+            artifact.source_stability_digest_sha256,
+            legacy.source_stability_digest_sha256
+        );
+        assert_eq!(artifact.entry_count, legacy.entry_count);
+        assert_eq!(artifact.logical_bytes, legacy.logical_bytes);
+    }
+
+    #[test]
+    fn external_sorter_bounds_the_entry_buffer_and_orders_runs() {
+        let workspace = tempdir().expect("workspace");
+        let mut sorter = RawEntryExternalSorter::new(workspace.path(), 3);
+        for index in (0..100).rev() {
+            sorter
+                .push(synthetic_file_entry(format!("file-{index:03}"), 0))
+                .expect("spool entry");
+        }
+        assert!(sorter.max_buffered_entries <= 3);
+        let sorted = sorter.finish().expect("finish sort");
+        let mut reader = open_streaming_reader(&sorted).expect("open sorted run");
+        let mut line = String::new();
+        let mut previous = None;
+        let mut count = 0;
+        while let Some(entry) = read_raw_entry(&mut reader, &sorted, &mut line).expect("entry") {
+            if let Some(previous) = &previous {
+                assert!(previous < &entry.path);
+            }
+            previous = Some(entry.path);
+            count += 1;
+        }
+        assert_eq!(count, 100);
+    }
+
+    #[test]
+    fn streaming_artifact_has_no_total_entry_or_logical_byte_ceiling() {
+        let evidence = tempdir().expect("evidence");
+        let workspace = evidence.path().join("work");
+        fs::create_dir(&workspace).expect("workspace");
+        let sorted = workspace.join("sorted.jsonl");
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&sorted)
+            .expect("sorted run");
+        let mut writer = BufWriter::new(file);
+        let count = MAX_G02_MANIFEST_ENTRIES + 1;
+        for index in 0..count {
+            let size = if index == 0 {
+                MAX_G02_LOGICAL_BYTES + 1
+            } else {
+                0
+            };
+            write_raw_entry(
+                &mut writer,
+                &sorted,
+                &synthetic_file_entry(format!("file-{index:06}"), size),
+            )
+            .expect("write synthetic entry");
+        }
+        writer.flush().expect("flush sorted run");
+        drop(writer);
+        let destination = evidence.path().join("large.json");
+        let summary = write_streaming_manifest_artifact(
+            &sorted,
+            &workspace,
+            &destination,
+            &AtomicBool::new(false),
+        )
+        .expect("large streaming manifest");
+
+        assert_eq!(summary.entry_count, count);
+        assert_eq!(summary.logical_bytes, MAX_G02_LOGICAL_BYTES + 1);
+        assert!(summary.storage_path.is_file());
+        assert_eq!(summary.artifact_sha256.len(), 64);
+        assert_eq!(summary.manifest_digest.len(), 64);
     }
 
     #[test]

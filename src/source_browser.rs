@@ -7,7 +7,9 @@
 
 use std::{
     cmp::Ordering,
+    collections::BTreeMap,
     fs,
+    io::{BufReader, Read},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
@@ -18,17 +20,20 @@ use rustix::{
     fs::{open, openat, openat2, statat, AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags, Stat},
     io::Errno,
 };
-use serde::Serialize;
+use serde::{
+    de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
+    Serialize,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    data_path::{descriptor_is_on_read_only_mount, load_manifest_bytes, EntryKind, FileManifest},
+    data_path::{descriptor_is_on_read_only_mount, EntryKind, ManifestCoverage, ManifestEntry},
     domain::path::validate_archive_path,
 };
 
 pub const MAX_BROWSER_ENTRIES: usize = 2_000;
 const MAX_BROWSER_PATH_BYTES: usize = 4_096;
-const MAX_MANIFEST_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
+const RETAINED_MANIFEST_FORMAT: &str = "tapescale-file-manifest-v2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceBrowserError {
@@ -48,8 +53,6 @@ pub enum SourceBrowserError {
     NonUtf8Name,
     #[error("directory contains a path that cannot be represented safely")]
     UnsafeEntryName,
-    #[error("directory contains more than {limit} entries")]
-    TooManyEntries { limit: usize },
     #[error("retained manifest is not available to the API")]
     ManifestUnavailable,
     #[error("retained manifest is outside the configured evidence root")]
@@ -124,8 +127,12 @@ pub fn browse_retained_manifest(
     reference: &RetainedManifestReference,
     requested_path: &str,
 ) -> Result<BrowserListing, SourceBrowserError> {
-    let manifest = load_retained_manifest(configured_evidence_root, reference)?;
-    browse_manifest_with_limit(&manifest, requested_path, MAX_BROWSER_ENTRIES)
+    browse_retained_manifest_with_limit(
+        configured_evidence_root,
+        reference,
+        requested_path,
+        MAX_BROWSER_ENTRIES,
+    )
 }
 
 fn browse_source_with_limit(
@@ -137,7 +144,8 @@ fn browse_source_with_limit(
     let root = open_source_root(configured_root)?;
     let directory = open_source_directory(&root, &relative)?;
     let read_only = read_only_directory(&directory);
-    let entries = live_entries_from_directory(&directory, &relative, read_only, entry_limit)?;
+    let (entries, truncated) =
+        live_entries_from_directory(&directory, &relative, read_only, entry_limit)?;
 
     let snapshot = is_snapshot_path(&relative);
     Ok(BrowserListing {
@@ -152,8 +160,7 @@ fn browse_source_with_limit(
         read_only,
         snapshot,
         entries,
-        // Oversized directories fail instead of returning a partial view.
-        truncated: false,
+        truncated,
         entry_limit,
     })
 }
@@ -226,8 +233,9 @@ fn live_entries_from_directory(
     parent: &Path,
     read_only: bool,
     entry_limit: usize,
-) -> Result<Vec<BrowserEntry>, SourceBrowserError> {
-    let mut entries = Vec::new();
+) -> Result<(Vec<BrowserEntry>, bool), SourceBrowserError> {
+    let mut entries = BTreeMap::new();
+    let mut direct_entry_count = 0_usize;
     let mut saw_hidden_zfs = false;
     let reader = Dir::read_from(directory).map_err(map_rustix_io)?;
     for item in reader {
@@ -235,9 +243,6 @@ fn live_entries_from_directory(
         let raw_name = item.file_name().to_bytes();
         if raw_name == b"." || raw_name == b".." {
             continue;
-        }
-        if entries.len() == entry_limit {
-            return Err(SourceBrowserError::TooManyEntries { limit: entry_limit });
         }
         let name = std::str::from_utf8(raw_name)
             .map_err(|_| SourceBrowserError::NonUtf8Name)?
@@ -249,7 +254,12 @@ fn live_entries_from_directory(
             AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
         )
         .map_err(map_rustix_io)?;
-        entries.push(live_entry_from_stat(parent, &name, &metadata, read_only)?);
+        direct_entry_count = direct_entry_count.saturating_add(1);
+        retain_bounded_live_entry(
+            &mut entries,
+            live_entry_from_stat(parent, &name, &metadata, read_only)?,
+            entry_limit,
+        );
     }
 
     // TrueNAS can make `<dataset>/.zfs` directly accessible while omitting it
@@ -262,15 +272,38 @@ fn live_entries_from_directory(
             AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
         ) {
             if FileType::from_raw_mode(metadata.st_mode).is_dir() {
-                if entries.len() == entry_limit {
-                    return Err(SourceBrowserError::TooManyEntries { limit: entry_limit });
-                }
-                entries.push(live_entry_from_stat(parent, ".zfs", &metadata, read_only)?);
+                direct_entry_count = direct_entry_count.saturating_add(1);
+                retain_bounded_live_entry(
+                    &mut entries,
+                    live_entry_from_stat(parent, ".zfs", &metadata, read_only)?,
+                    entry_limit,
+                );
             }
         }
     }
-    entries.sort_by(compare_entries);
-    Ok(entries)
+    Ok((
+        entries.into_values().collect(),
+        direct_entry_count > entry_limit,
+    ))
+}
+
+fn retain_bounded_live_entry(
+    entries: &mut BTreeMap<(u8, String, String), BrowserEntry>,
+    entry: BrowserEntry,
+    entry_limit: usize,
+) {
+    if entry_limit == 0 {
+        return;
+    }
+    let key = (
+        entry_rank(entry.kind),
+        entry.name.to_lowercase(),
+        entry.name.clone(),
+    );
+    entries.insert(key, entry);
+    if entries.len() > entry_limit {
+        entries.pop_last();
+    }
 }
 
 fn live_entry_from_stat(
@@ -320,14 +353,13 @@ fn live_entry_from_stat(
     })
 }
 
-fn load_retained_manifest(
+fn browse_retained_manifest_with_limit(
     configured_evidence_root: &Path,
     reference: &RetainedManifestReference,
-) -> Result<FileManifest, SourceBrowserError> {
+    requested_path: &str,
+    entry_limit: usize,
+) -> Result<BrowserListing, SourceBrowserError> {
     if reference.artifact_size_bytes <= 0
-        || u64::try_from(reference.artifact_size_bytes)
-            .ok()
-            .is_none_or(|size| size > MAX_MANIFEST_ARTIFACT_BYTES)
         || reference.artifact_sha256.len() != 64
         || !reference
             .artifact_sha256
@@ -361,127 +393,382 @@ fn load_retained_manifest(
     let safe_relative =
         validate_archive_path(relative).map_err(|_| SourceBrowserError::ManifestOutsideRoot)?;
     let manifest_path = resolve_file_without_symlinks(&root, safe_relative.as_path())?;
-    let before = manifest_path
-        .symlink_metadata()
+    let file =
+        fs::File::open(&manifest_path).map_err(|_| SourceBrowserError::ManifestUnavailable)?;
+    let before = file
+        .metadata()
         .map_err(|_| SourceBrowserError::ManifestUnavailable)?;
     let expected_size = u64::try_from(reference.artifact_size_bytes)
         .map_err(|_| SourceBrowserError::InvalidManifestBinding)?;
     if !before.is_file() || before.len() != expected_size {
         return Err(SourceBrowserError::ManifestIntegrity);
     }
-    // Read once. The artifact digest and manifest validation below must apply to
-    // this exact byte snapshot; reopening the pathname would introduce a race.
-    let bytes = fs::read(&manifest_path).map_err(|_| SourceBrowserError::ManifestUnavailable)?;
-    if u64::try_from(bytes.len()).ok() != Some(expected_size)
-        || format!("{:x}", Sha256::digest(&bytes)) != reference.artifact_sha256
-    {
-        return Err(SourceBrowserError::ManifestIntegrity);
-    }
-    let manifest =
-        load_manifest_bytes(&bytes).map_err(|_| SourceBrowserError::ManifestIntegrity)?;
-    let after = manifest_path
+
+    let (requested_relative, current_path) = normalized_browser_path(requested_path)?;
+    let mut reader = HashingReader::new(BufReader::new(file));
+    let scan = {
+        let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
+        let scan = RetainedManifestSeed {
+            requested_relative: &requested_relative,
+            current_path: &current_path,
+            entry_limit,
+        }
+        .deserialize(&mut deserializer)
+        .map_err(|_| SourceBrowserError::ManifestIntegrity)?;
+        deserializer
+            .end()
+            .map_err(|_| SourceBrowserError::ManifestIntegrity)?;
+        scan
+    };
+    let (reader, artifact_digest, bytes_read) = reader.finish();
+    let after = reader
+        .get_ref()
+        .metadata()
+        .map_err(|_| SourceBrowserError::ManifestUnavailable)?;
+    let path_after = manifest_path
         .symlink_metadata()
         .map_err(|_| SourceBrowserError::ManifestUnavailable)?;
-    if metadata_identity(&before) != metadata_identity(&after)
-        || manifest.digest_sha256 != reference.manifest_digest
+    if bytes_read != expected_size
+        || artifact_digest != reference.artifact_sha256
+        || metadata_identity(&before) != metadata_identity(&after)
+        || metadata_identity(&before) != metadata_identity(&path_after)
     {
         return Err(SourceBrowserError::ManifestIntegrity);
     }
-    validate_manifest_paths(&manifest)?;
-    Ok(manifest)
-}
-
-fn browse_manifest_with_limit(
-    manifest: &FileManifest,
-    requested_path: &str,
-    entry_limit: usize,
-) -> Result<BrowserListing, SourceBrowserError> {
-    let (relative, current_path) = normalized_browser_path(requested_path)?;
-    if !relative.as_os_str().is_empty()
-        && !manifest
-            .entries
-            .iter()
-            .any(|entry| entry.kind == EntryKind::Directory && entry.path == current_path)
-    {
+    scan.validate(reference)?;
+    if !requested_relative.as_os_str().is_empty() && !scan.requested_directory_found {
         return Err(SourceBrowserError::NotDirectory);
     }
-
-    let mut entries = Vec::new();
-    for entry in &manifest.entries {
-        if entry.path == "." {
-            continue;
-        }
-        let path = Path::new(&entry.path);
-        let parent = path.parent().unwrap_or_else(|| Path::new(""));
-        if parent != relative {
-            continue;
-        }
-        if entries.len() == entry_limit {
-            return Err(SourceBrowserError::TooManyEntries { limit: entry_limit });
-        }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(SourceBrowserError::NonUtf8Name)?
-            .to_owned();
-        let kind = match entry.kind {
-            EntryKind::Directory => BrowserEntryKind::Directory,
-            EntryKind::File => BrowserEntryKind::File,
-            EntryKind::Symlink => BrowserEntryKind::Symlink,
-        };
-        entries.push(BrowserEntry {
-            name,
-            path: entry.path.clone(),
-            kind,
-            size_bytes: entry.size,
-            modified_at: DateTime::<Utc>::from_timestamp(entry.mtime_seconds, 0),
-            read_only: true,
-            symlink: kind == BrowserEntryKind::Symlink,
-            snapshot: false,
-            navigable: kind == BrowserEntryKind::Directory,
-            // Browsing retained contents is not path-selective restore authority.
-            selectable: false,
-        });
-    }
+    let mut entries = scan.entries;
     entries.sort_by(compare_entries);
+    entries.truncate(entry_limit);
     Ok(BrowserListing {
-        parent_path: relative.parent().map(portable_path).transpose()?,
-        breadcrumbs: breadcrumbs(&relative)?,
+        parent_path: requested_relative.parent().map(portable_path).transpose()?,
+        breadcrumbs: breadcrumbs(&requested_relative)?,
         current_path,
         read_only: true,
         snapshot: false,
         selectable: false,
         entries,
-        truncated: false,
+        truncated: scan.direct_entry_count > entry_limit,
         entry_limit,
     })
 }
 
-fn validate_manifest_paths(manifest: &FileManifest) -> Result<(), SourceBrowserError> {
-    let mut root_seen = false;
-    let mut previous: Option<&str> = None;
-    for entry in &manifest.entries {
-        if previous.is_some_and(|path| path >= entry.path.as_str()) {
-            return Err(SourceBrowserError::ManifestIntegrity);
+struct HashingReader<R> {
+    inner: R,
+    digest: Sha256,
+    bytes_read: u64,
+}
+
+impl<R> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            digest: Sha256::new(),
+            bytes_read: 0,
         }
-        previous = Some(&entry.path);
-        if entry.path == "." {
-            if root_seen || entry.kind != EntryKind::Directory {
-                return Err(SourceBrowserError::ManifestIntegrity);
-            }
-            root_seen = true;
-            continue;
-        }
-        if entry.path.chars().any(char::is_control) {
-            return Err(SourceBrowserError::ManifestIntegrity);
-        }
-        validate_archive_path(Path::new(&entry.path))
-            .map_err(|_| SourceBrowserError::ManifestIntegrity)?;
     }
-    if root_seen {
-        Ok(())
+
+    fn finish(self) -> (R, String, u64) {
+        (
+            self.inner,
+            format!("{:x}", self.digest.finalize()),
+            self.bytes_read,
+        )
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.digest.update(&buffer[..read]);
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("manifest byte count overflow"))?;
+        Ok(read)
+    }
+}
+
+struct RetainedManifestSeed<'a> {
+    requested_relative: &'a Path,
+    current_path: &'a str,
+    entry_limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for RetainedManifestSeed<'_> {
+    type Value = RetainedManifestScan;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for RetainedManifestSeed<'_> {
+    type Value = RetainedManifestScan;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a TapeScale v2 file manifest")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut format = None;
+        let mut entries = None;
+        let mut entry_count = None;
+        let mut file_count = None;
+        let mut logical_bytes = None;
+        let mut digest_sha256 = None;
+        let mut coverage = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "format" => set_manifest_field(&mut format, map.next_value()?, "format")?,
+                "entries" => {
+                    let value = map.next_value_seed(ManifestEntriesSeed {
+                        requested_relative: self.requested_relative,
+                        current_path: self.current_path,
+                        entry_limit: self.entry_limit,
+                    })?;
+                    set_manifest_field(&mut entries, value, "entries")?;
+                }
+                "entry_count" => {
+                    set_manifest_field(&mut entry_count, map.next_value()?, "entry_count")?;
+                }
+                "file_count" => {
+                    set_manifest_field(&mut file_count, map.next_value()?, "file_count")?;
+                }
+                "logical_bytes" => {
+                    set_manifest_field(&mut logical_bytes, map.next_value()?, "logical_bytes")?;
+                }
+                "digest_sha256" => {
+                    set_manifest_field(&mut digest_sha256, map.next_value()?, "digest_sha256")?;
+                }
+                "coverage" => {
+                    set_manifest_field(&mut coverage, map.next_value()?, "coverage")?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let entries = entries.ok_or_else(|| de::Error::missing_field("entries"))?;
+        Ok(RetainedManifestScan {
+            format: format.ok_or_else(|| de::Error::missing_field("format"))?,
+            entries: entries.entries,
+            direct_entry_count: entries.direct_entry_count,
+            requested_directory_found: entries.requested_directory_found,
+            computed_entry_count: entries.entry_count,
+            computed_file_count: entries.file_count,
+            computed_logical_bytes: entries.logical_bytes,
+            computed_digest_sha256: entries.digest_sha256,
+            declared_entry_count: entry_count
+                .ok_or_else(|| de::Error::missing_field("entry_count"))?,
+            declared_file_count: file_count
+                .ok_or_else(|| de::Error::missing_field("file_count"))?,
+            declared_logical_bytes: logical_bytes
+                .ok_or_else(|| de::Error::missing_field("logical_bytes"))?,
+            declared_digest_sha256: digest_sha256
+                .ok_or_else(|| de::Error::missing_field("digest_sha256"))?,
+            coverage: coverage.ok_or_else(|| de::Error::missing_field("coverage"))?,
+        })
+    }
+}
+
+fn set_manifest_field<E: de::Error, T>(
+    field: &mut Option<T>,
+    value: T,
+    name: &'static str,
+) -> Result<(), E> {
+    if field.replace(value).is_some() {
+        Err(E::duplicate_field(name))
     } else {
-        Err(SourceBrowserError::ManifestIntegrity)
+        Ok(())
+    }
+}
+
+struct ManifestEntriesSeed<'a> {
+    requested_relative: &'a Path,
+    current_path: &'a str,
+    entry_limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ManifestEntriesSeed<'_> {
+    type Value = ManifestEntriesScan;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ManifestEntriesSeed<'_> {
+    type Value = ManifestEntriesScan;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a sorted sequence of manifest entries")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut entry_count = 0_u64;
+        let mut file_count = 0_u64;
+        let mut logical_bytes = 0_u64;
+        let mut previous_path: Option<String> = None;
+        let mut root_seen = false;
+        let mut requested_directory_found = self.requested_relative.as_os_str().is_empty();
+        let mut direct_entry_count = 0_usize;
+        // Each kind retains at most one directory-page worth of rows. This is
+        // bounded even for a manifest containing millions of direct children,
+        // while final sorting preserves the existing directories-first view.
+        let mut entries_by_kind = [Vec::new(), Vec::new(), Vec::new()];
+        let mut digest = Sha256::new();
+        digest.update(b"[");
+        while let Some(entry) = sequence.next_element::<ManifestEntry>()? {
+            if entry_count > 0 {
+                digest.update(b",");
+            }
+            let encoded = serde_json::to_vec(&entry).map_err(de::Error::custom)?;
+            digest.update(encoded);
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or_else(|| de::Error::custom("manifest entry count overflow"))?;
+            if previous_path
+                .as_deref()
+                .is_some_and(|path| path >= entry.path.as_str())
+            {
+                return Err(de::Error::custom(
+                    "manifest paths are duplicated or not strictly sorted",
+                ));
+            }
+            previous_path = Some(entry.path.clone());
+            if entry.path == "." {
+                if root_seen || entry.kind != EntryKind::Directory {
+                    return Err(de::Error::custom("manifest root entry is invalid"));
+                }
+                root_seen = true;
+            } else {
+                if entry.path.chars().any(char::is_control)
+                    || validate_archive_path(Path::new(&entry.path)).is_err()
+                {
+                    return Err(de::Error::custom("manifest entry path is unsafe"));
+                }
+                if entry.kind == EntryKind::Directory && entry.path == self.current_path {
+                    requested_directory_found = true;
+                }
+                let path = Path::new(&entry.path);
+                if path.parent().unwrap_or_else(|| Path::new("")) == self.requested_relative {
+                    direct_entry_count = direct_entry_count.saturating_add(1);
+                    let browser_entry = retained_browser_entry(&entry)
+                        .map_err(|error| de::Error::custom(error.to_string()))?;
+                    let rank = usize::from(entry_rank(browser_entry.kind));
+                    if entries_by_kind[rank].len() < self.entry_limit {
+                        entries_by_kind[rank].push(browser_entry);
+                    }
+                }
+            }
+            if entry.kind == EntryKind::File {
+                file_count = file_count
+                    .checked_add(1)
+                    .ok_or_else(|| de::Error::custom("manifest file count overflow"))?;
+            }
+            if let Some(size) = entry.size {
+                logical_bytes = logical_bytes
+                    .checked_add(size)
+                    .ok_or_else(|| de::Error::custom("manifest logical byte count overflow"))?;
+            }
+        }
+        digest.update(b"]");
+        if !root_seen {
+            return Err(de::Error::custom("manifest root entry is missing"));
+        }
+        Ok(ManifestEntriesScan {
+            entries: entries_by_kind.into_iter().flatten().collect(),
+            direct_entry_count,
+            requested_directory_found,
+            entry_count,
+            file_count,
+            logical_bytes,
+            digest_sha256: format!("{:x}", digest.finalize()),
+        })
+    }
+}
+
+fn retained_browser_entry(entry: &ManifestEntry) -> Result<BrowserEntry, SourceBrowserError> {
+    let path = Path::new(&entry.path);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(SourceBrowserError::NonUtf8Name)?
+        .to_owned();
+    let kind = match entry.kind {
+        EntryKind::Directory => BrowserEntryKind::Directory,
+        EntryKind::File => BrowserEntryKind::File,
+        EntryKind::Symlink => BrowserEntryKind::Symlink,
+    };
+    Ok(BrowserEntry {
+        name,
+        path: entry.path.clone(),
+        kind,
+        size_bytes: entry.size,
+        modified_at: DateTime::<Utc>::from_timestamp(entry.mtime_seconds, 0),
+        read_only: true,
+        symlink: kind == BrowserEntryKind::Symlink,
+        snapshot: false,
+        navigable: kind == BrowserEntryKind::Directory,
+        selectable: false,
+    })
+}
+
+struct ManifestEntriesScan {
+    entries: Vec<BrowserEntry>,
+    direct_entry_count: usize,
+    requested_directory_found: bool,
+    entry_count: u64,
+    file_count: u64,
+    logical_bytes: u64,
+    digest_sha256: String,
+}
+
+struct RetainedManifestScan {
+    format: String,
+    entries: Vec<BrowserEntry>,
+    direct_entry_count: usize,
+    requested_directory_found: bool,
+    computed_entry_count: u64,
+    computed_file_count: u64,
+    computed_logical_bytes: u64,
+    computed_digest_sha256: String,
+    declared_entry_count: u64,
+    declared_file_count: u64,
+    declared_logical_bytes: u64,
+    declared_digest_sha256: String,
+    coverage: ManifestCoverage,
+}
+
+impl RetainedManifestScan {
+    fn validate(&self, reference: &RetainedManifestReference) -> Result<(), SourceBrowserError> {
+        if self.format != RETAINED_MANIFEST_FORMAT
+            || self.declared_entry_count != self.computed_entry_count
+            || self.declared_file_count != self.computed_file_count
+            || self.declared_logical_bytes != self.computed_logical_bytes
+            || self.declared_digest_sha256 != self.computed_digest_sha256
+            || self.declared_digest_sha256 != reference.manifest_digest
+            || self.coverage != ManifestCoverage::default()
+        {
+            Err(SourceBrowserError::ManifestIntegrity)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -640,13 +927,128 @@ fn map_rustix_io(error: Errno) -> SourceBrowserError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::symlink};
+    use std::{
+        fs,
+        io::{BufWriter, Read, Write},
+        os::unix::fs::symlink,
+    };
 
     use tempfile::tempdir;
 
     use crate::data_path::{build_manifest, persist_manifest};
 
     use super::*;
+
+    fn write_large_retained_manifest(
+        evidence_root: &Path,
+        bucket_count: usize,
+        files_per_bucket: usize,
+    ) -> RetainedManifestReference {
+        let run = evidence_root.join("large-run");
+        fs::create_dir(&run).expect("large run directory");
+        let path = run.join("source-manifest.json");
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .expect("large manifest artifact");
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(b"{\"format\":\"tapescale-file-manifest-v2\",\"entries\":[")
+            .expect("manifest header");
+        let mut entry_digest = Sha256::new();
+        entry_digest.update(b"[");
+        let mut first = true;
+        let mut entry_count = 0_u64;
+        let mut file_count = 0_u64;
+        let mut logical_bytes = 0_u64;
+        let mut append = |entry: &ManifestEntry| {
+            if !first {
+                writer.write_all(b",").expect("entry separator");
+                entry_digest.update(b",");
+            }
+            first = false;
+            let encoded = serde_json::to_vec(entry).expect("synthetic manifest entry");
+            writer.write_all(&encoded).expect("manifest entry");
+            entry_digest.update(&encoded);
+            entry_count += 1;
+            if entry.kind == EntryKind::File {
+                file_count += 1;
+            }
+            logical_bytes += entry.size.unwrap_or(0);
+        };
+        append(&ManifestEntry {
+            path: ".".to_owned(),
+            kind: EntryKind::Directory,
+            mode: 0o755,
+            uid: 1_000,
+            gid: 1_000,
+            mtime_seconds: 1_700_000_000,
+            size: None,
+            content_sha256: None,
+            symlink_target: None,
+            hard_link_group: None,
+        });
+        for bucket in 0..bucket_count {
+            let directory = format!("bucket-{bucket:03}");
+            append(&ManifestEntry {
+                path: directory.clone(),
+                kind: EntryKind::Directory,
+                mode: 0o755,
+                uid: 1_000,
+                gid: 1_000,
+                mtime_seconds: 1_700_000_000,
+                size: None,
+                content_sha256: None,
+                symlink_target: None,
+                hard_link_group: None,
+            });
+            for file in 0..files_per_bucket {
+                append(&ManifestEntry {
+                    path: format!("{directory}/file-{file:04}.bin"),
+                    kind: EntryKind::File,
+                    mode: 0o644,
+                    uid: 1_000,
+                    gid: 1_000,
+                    mtime_seconds: 1_700_000_000,
+                    size: Some(1),
+                    content_sha256: Some("0".repeat(64)),
+                    symlink_target: None,
+                    hard_link_group: None,
+                });
+            }
+        }
+        entry_digest.update(b"]");
+        let manifest_digest = format!("{:x}", entry_digest.finalize());
+        write!(
+            writer,
+            "],\"entry_count\":{entry_count},\"file_count\":{file_count},\"logical_bytes\":{logical_bytes},\"digest_sha256\":\"{manifest_digest}\",\"coverage\":"
+        )
+        .expect("manifest summary");
+        serde_json::to_writer(&mut writer, &ManifestCoverage::default()).expect("coverage");
+        writer.write_all(b"}").expect("manifest footer");
+        writer.flush().expect("flush large manifest");
+        writer.get_ref().sync_all().expect("sync large manifest");
+        drop(writer);
+
+        let mut artifact_file = fs::File::open(&path).expect("reopen large manifest");
+        let artifact_size_bytes = artifact_file.metadata().expect("artifact metadata").len();
+        let mut artifact_digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = artifact_file.read(&mut buffer).expect("hash artifact");
+            if read == 0 {
+                break;
+            }
+            artifact_digest.update(&buffer[..read]);
+        }
+        RetainedManifestReference {
+            storage_ref: path.to_string_lossy().into_owned(),
+            artifact_sha256: format!("{:x}", artifact_digest.finalize()),
+            artifact_size_bytes: i64::try_from(artifact_size_bytes).expect("artifact size"),
+            manifest_digest,
+        }
+    }
 
     #[test]
     fn lists_directories_files_and_breadcrumbs_without_absolute_paths() {
@@ -747,8 +1149,10 @@ mod tests {
         symlink(outside.path(), root.path().join("selected"))
             .expect("replacement link should exist");
 
-        let entries = live_entries_from_directory(&selected_descriptor, selected, false, 10)
-            .expect("the held descriptor should remain listable");
+        let (entries, truncated) =
+            live_entries_from_directory(&selected_descriptor, selected, false, 10)
+                .expect("the held descriptor should remain listable");
+        assert!(!truncated);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "original.txt");
         assert!(entries.iter().all(|entry| entry.name != "secret.txt"));
@@ -781,15 +1185,18 @@ mod tests {
     }
 
     #[test]
-    fn oversized_directory_fails_instead_of_returning_a_partial_view() {
+    fn oversized_directory_returns_a_deterministic_partial_view() {
         let root = tempdir().expect("source root");
-        for name in ["one", "two", "three"] {
+        for name in ["z-last", "b-second", "a-first"] {
             fs::write(root.path().join(name), b"").expect("entry");
         }
-        assert!(matches!(
-            browse_source_with_limit(root.path(), "", 2),
-            Err(SourceBrowserError::TooManyEntries { limit: 2 })
-        ));
+        let listing = browse_source_with_limit(root.path(), "", 2)
+            .expect("oversized directories should remain browsable");
+        assert!(listing.truncated);
+        assert_eq!(listing.entry_limit, 2);
+        assert_eq!(listing.entries.len(), 2);
+        assert_eq!(listing.entries[0].name, "a-first");
+        assert_eq!(listing.entries[1].name, "b-second");
     }
 
     #[test]
@@ -842,6 +1249,12 @@ mod tests {
         assert_eq!(root.entries[0].name, "photos");
         assert_eq!(root.entries[1].name, "notes.txt");
         assert!(root.entries.iter().all(|entry| !entry.selectable));
+        let partial = browse_retained_manifest_with_limit(evidence.path(), &reference, "", 1)
+            .expect("bounded retained view");
+        assert!(partial.truncated);
+        assert_eq!(partial.entry_limit, 1);
+        assert_eq!(partial.entries.len(), 1);
+        assert_eq!(partial.entries[0].name, "photos");
         let photos =
             browse_retained_manifest(evidence.path(), &reference, "photos").expect("photos");
         assert_eq!(photos.entries.len(), 1);
@@ -852,5 +1265,24 @@ mod tests {
             browse_retained_manifest(evidence.path(), &reference, ""),
             Err(SourceBrowserError::ManifestIntegrity)
         ));
+    }
+
+    #[test]
+    fn retained_browser_streams_manifests_beyond_the_g02_entry_limit() {
+        let evidence = tempdir().expect("evidence");
+        let reference = write_large_retained_manifest(evidence.path(), 101, 1_000);
+
+        let root = browse_retained_manifest(evidence.path(), &reference, "")
+            .expect("large manifest root should be browsable");
+        assert_eq!(root.entries.len(), 101);
+        assert!(!root.truncated);
+        assert_eq!(root.entries[0].name, "bucket-000");
+        assert_eq!(root.entries[100].name, "bucket-100");
+
+        let bucket = browse_retained_manifest(evidence.path(), &reference, "bucket-100")
+            .expect("nested directory after 100,000 entries should be browsable");
+        assert_eq!(bucket.entries.len(), 1_000);
+        assert!(!bucket.truncated);
+        assert_eq!(bucket.entries[999].name, "file-0999.bin");
     }
 }

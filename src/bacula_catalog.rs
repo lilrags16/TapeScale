@@ -1,5 +1,7 @@
 //! Fail-closed evidence read directly from the pinned Bacula PostgreSQL catalog.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::Serialize;
 use sqlx::{FromRow, PgPool};
 
@@ -38,6 +40,12 @@ pub enum BaculaCatalogEvidenceError {
     InvalidNumber { field: &'static str },
     #[error("Bacula backup JobId {job_id} has no ordered JobMedia segments")]
     MissingJobMedia { job_id: BaculaJobId },
+    #[error("at least one authorized Bacula volume is required")]
+    EmptyVolumeSet,
+    #[error("authorized Bacula volume {0} was listed more than once")]
+    DuplicateAuthorizedVolume(String),
+    #[error("Bacula job used unauthorized volume {0}")]
+    UnauthorizedJobVolume(String),
     #[error("Bacula JobMedia segment {segment_id} has invalid or reversed coordinates")]
     InvalidJobMediaCoordinates { segment_id: u64 },
     #[error(
@@ -95,7 +103,12 @@ pub struct BaculaJobMediaSegment {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BaculaBackupCatalogEvidence {
     pub job: BaculaCatalogJobEvidence,
+    /// The first physical volume, retained for compatibility with existing
+    /// single-volume evidence consumers.
     pub volume: BaculaCatalogVolumeEvidence,
+    /// Every physical volume actually used by the job, in Bacula volume-index
+    /// order.  A spanning archive therefore remains explicit and auditable.
+    pub volumes: Vec<BaculaCatalogVolumeEvidence>,
     pub segments: Vec<BaculaJobMediaSegment>,
 }
 
@@ -169,6 +182,21 @@ pub async fn validate_labeled_volume(
     volume: &VolumeLabel,
     pool: &BaculaPoolName,
 ) -> Result<BaculaCatalogVolumeEvidence, BaculaCatalogEvidenceError> {
+    let mut volumes =
+        validate_labeled_volumes(database, std::slice::from_ref(volume), pool, 1).await?;
+    Ok(volumes.remove(0))
+}
+
+/// Prove all labels exist in the isolated, non-recycling per-run pool.
+/// `expected_max_volumes = 0` is Bacula's unlimited-spanning representation;
+/// the exact authorized labels still bound which physical media may be used.
+pub async fn validate_labeled_volumes(
+    database: &PgPool,
+    volumes: &[VolumeLabel],
+    pool: &BaculaPoolName,
+    expected_max_volumes: u32,
+) -> Result<Vec<BaculaCatalogVolumeEvidence>, BaculaCatalogEvidenceError> {
+    validate_authorized_volume_labels(volumes)?;
     let pools = sqlx::query_as::<_, CatalogPoolRow>(
         "SELECT poolid AS pool_id, name, maxvols AS max_volumes,
                 recycle, autoprune AS auto_prune
@@ -180,7 +208,12 @@ pub async fn validate_labeled_volume(
     require_exactly_one("pool", pools.len())?;
     let pool_row = &pools[0];
     expect("pool.name", pool.as_str(), &pool_row.name)?;
-    expect_number("pool.max_volumes", 1, i64::from(pool_row.max_volumes))?;
+    let expected_max_volumes = i64::from(expected_max_volumes);
+    expect_number(
+        "pool.max_volumes",
+        expected_max_volumes,
+        i64::from(pool_row.max_volumes),
+    )?;
     expect_number("pool.recycle", 0, i64::from(pool_row.recycle))?;
     expect_number("pool.auto_prune", 0, i64::from(pool_row.auto_prune))?;
     let _pool_id = nonnegative_i32("pool.id", pool_row.pool_id)?;
@@ -192,11 +225,15 @@ pub async fn validate_labeled_volume(
     .bind(pool.as_str())
     .fetch_one(database)
     .await?;
-    expect_number("pool.volume_count", 1, pool_volume_count)?;
+    expect_number(
+        "pool.volume_count",
+        i64::try_from(volumes.len()).map_err(|_| BaculaCatalogEvidenceError::InvalidNumber {
+            field: "pool.volume_count",
+        })?,
+        pool_volume_count,
+    )?;
 
-    let rows = load_volumes(database, volume).await?;
-    require_exactly_one("volume", rows.len())?;
-    validated_volume(&rows[0], volume, pool)
+    load_authorized_volumes(database, volumes, pool).await
 }
 
 pub async fn validate_backup_job(
@@ -205,12 +242,30 @@ pub async fn validate_backup_job(
     volume: &VolumeLabel,
     pool: &BaculaPoolName,
 ) -> Result<BaculaBackupCatalogEvidence, BaculaCatalogEvidenceError> {
+    validate_backup_job_on_volumes(database, job_id, std::slice::from_ref(volume), pool).await
+}
+
+/// Validate a completed backup whose JobMedia chain may span any of the exact
+/// TapeScale-authorized labels.  Catalog media outside this set fail closed.
+pub async fn validate_backup_job_on_volumes(
+    database: &PgPool,
+    job_id: BaculaJobId,
+    authorized_volumes: &[VolumeLabel],
+    pool: &BaculaPoolName,
+) -> Result<BaculaBackupCatalogEvidence, BaculaCatalogEvidenceError> {
+    validate_authorized_volume_labels(authorized_volumes)?;
     let job = load_job(database, job_id).await?;
     validate_backup_job_record(&job, pool)?;
 
-    let volume_rows = load_volumes(database, volume).await?;
-    require_exactly_one("volume", volume_rows.len())?;
-    let catalog_volume = validated_volume(&volume_rows[0], volume, pool)?;
+    let catalog_volumes = load_authorized_volumes(database, authorized_volumes, pool).await?;
+    let catalog_by_name = catalog_volumes
+        .iter()
+        .map(|volume| (volume.volume_name.clone(), volume.clone()))
+        .collect::<HashMap<_, _>>();
+    let media_by_name = catalog_volumes
+        .iter()
+        .map(|volume| (volume.volume_name.clone(), volume.media_id))
+        .collect::<HashMap<_, _>>();
     let rows = sqlx::query_as::<_, CatalogJobMediaRow>(
         "SELECT jm.jobmediaid AS job_media_id, jm.mediaid AS media_id,
                 m.volumename AS volume_name, p.name AS pool_name,
@@ -230,10 +285,25 @@ pub async fn validate_backup_job(
     if rows.is_empty() {
         return Err(BaculaCatalogEvidenceError::MissingJobMedia { job_id });
     }
-    let segments = validate_segments(rows, volume, pool, catalog_volume.media_id)?;
+    let segments = validate_segments_for_volumes(rows, pool, &media_by_name)?;
+    let mut seen = HashSet::new();
+    let mut used_volumes = Vec::new();
+    for segment in &segments {
+        if seen.insert(segment.volume_name.clone()) {
+            let volume = catalog_by_name.get(&segment.volume_name).ok_or_else(|| {
+                BaculaCatalogEvidenceError::UnauthorizedJobVolume(segment.volume_name.clone())
+            })?;
+            used_volumes.push(volume.clone());
+        }
+    }
+    let first_volume = used_volumes
+        .first()
+        .cloned()
+        .ok_or(BaculaCatalogEvidenceError::MissingJobMedia { job_id })?;
     Ok(BaculaBackupCatalogEvidence {
         job,
-        volume: catalog_volume,
+        volume: first_volume,
+        volumes: used_volumes,
         segments,
     })
 }
@@ -346,21 +416,66 @@ fn restore_relationship_log(restore_job_id: BaculaJobId, backup_job_id: BaculaJo
     )
 }
 
-async fn load_volumes(
+fn validate_authorized_volume_labels(
+    volumes: &[VolumeLabel],
+) -> Result<(), BaculaCatalogEvidenceError> {
+    if volumes.is_empty() {
+        return Err(BaculaCatalogEvidenceError::EmptyVolumeSet);
+    }
+    let mut seen = HashSet::new();
+    for volume in volumes {
+        if !seen.insert(volume.as_str()) {
+            return Err(BaculaCatalogEvidenceError::DuplicateAuthorizedVolume(
+                volume.as_str().to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn load_authorized_volumes(
     database: &PgPool,
-    volume: &VolumeLabel,
-) -> Result<Vec<CatalogVolumeRow>, sqlx::Error> {
-    sqlx::query_as::<_, CatalogVolumeRow>(
+    volumes: &[VolumeLabel],
+    pool: &BaculaPoolName,
+) -> Result<Vec<BaculaCatalogVolumeEvidence>, BaculaCatalogEvidenceError> {
+    validate_authorized_volume_labels(volumes)?;
+    let names = volumes
+        .iter()
+        .map(|volume| volume.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let rows = sqlx::query_as::<_, CatalogVolumeRow>(
         "SELECT m.mediaid AS media_id, m.volumename AS volume_name,
                 p.name AS pool_name, m.mediatype AS media_type,
                 m.volstatus AS volume_status, m.enabled, m.recycle,
                 m.volbytes AS volume_bytes
          FROM media m JOIN pool p ON p.poolid = m.poolid
-         WHERE m.volumename = $1",
+         WHERE m.volumename = ANY($1::text[])",
     )
-    .bind(volume.as_str())
+    .bind(&names)
     .fetch_all(database)
-    .await
+    .await?;
+    if rows.len() != volumes.len() {
+        return Err(BaculaCatalogEvidenceError::Mismatch {
+            field: "authorized_volume.count",
+            expected: volumes.len().to_string(),
+            actual: rows.len().to_string(),
+        });
+    }
+    let mut rows_by_name = rows
+        .into_iter()
+        .map(|row| (row.volume_name.clone(), row))
+        .collect::<HashMap<_, _>>();
+    let mut evidence = Vec::with_capacity(volumes.len());
+    for volume in volumes {
+        let row = rows_by_name.remove(volume.as_str()).ok_or_else(|| {
+            BaculaCatalogEvidenceError::Missing {
+                kind: "volume",
+                identifier: volume.as_str().to_owned(),
+            }
+        })?;
+        evidence.push(validated_volume(&row, volume, pool)?);
+    }
+    Ok(evidence)
 }
 
 async fn load_job(
@@ -452,15 +567,31 @@ fn validated_volume(
     })
 }
 
+#[cfg(test)]
 fn validate_segments(
     rows: Vec<CatalogJobMediaRow>,
     volume: &VolumeLabel,
     pool: &BaculaPoolName,
     media_id: u64,
 ) -> Result<Vec<BaculaJobMediaSegment>, BaculaCatalogEvidenceError> {
+    validate_segments_for_volumes(
+        rows,
+        pool,
+        &HashMap::from([(volume.as_str().to_owned(), media_id)]),
+    )
+}
+
+fn validate_segments_for_volumes(
+    rows: Vec<CatalogJobMediaRow>,
+    pool: &BaculaPoolName,
+    authorized_media: &HashMap<String, u64>,
+) -> Result<Vec<BaculaJobMediaSegment>, BaculaCatalogEvidenceError> {
+    let mut previous_order = None;
     rows.into_iter()
         .map(|row| {
-            expect("job_media.volume", volume.as_str(), &row.volume_name)?;
+            let expected_media_id = authorized_media.get(&row.volume_name).ok_or_else(|| {
+                BaculaCatalogEvidenceError::UnauthorizedJobVolume(row.volume_name.clone())
+            })?;
             expect("job_media.pool", pool.as_str(), &row.pool_name)?;
             let segment = BaculaJobMediaSegment {
                 job_media_id: nonnegative_i32("job_media.id", row.job_media_id)?,
@@ -475,7 +606,8 @@ fn validate_segments(
                 end_file: nonnegative_i32("job_media.end_file", row.end_file)?,
                 end_block: nonnegative_i64("job_media.end_block", row.end_block)?,
             };
-            if segment.media_id != media_id
+            if segment.media_id != *expected_media_id
+                || segment.volume_index == 0
                 || segment.first_index > segment.last_index
                 || (segment.start_file, segment.start_block) > (segment.end_file, segment.end_block)
             {
@@ -483,6 +615,13 @@ fn validate_segments(
                     segment_id: segment.job_media_id,
                 });
             }
+            let order = (segment.volume_index, segment.job_media_id);
+            if previous_order.is_some_and(|previous| previous > order) {
+                return Err(BaculaCatalogEvidenceError::InvalidJobMediaCoordinates {
+                    segment_id: segment.job_media_id,
+                });
+            }
+            previous_order = Some(order);
             Ok(segment)
         })
         .collect()
@@ -572,6 +711,82 @@ mod tests {
         }];
         let segments = validate_segments(rows, &volume, &pool(), 7).expect("segments");
         assert_eq!(segments[0].end_block, 2048);
+    }
+
+    #[test]
+    fn validates_ordered_segments_across_authorized_volumes() {
+        let first = VolumeLabel::parse("ARCHIVE-0001").expect("volume");
+        let second = VolumeLabel::parse("ARCHIVE-0002").expect("volume");
+        let rows = vec![
+            CatalogJobMediaRow {
+                job_media_id: 8,
+                media_id: 7,
+                volume_name: first.as_str().to_owned(),
+                pool_name: pool().as_str().to_owned(),
+                volume_index: 1,
+                first_index: 1,
+                last_index: 42,
+                start_file: 0,
+                start_block: 0,
+                end_file: 1,
+                end_block: 2048,
+            },
+            CatalogJobMediaRow {
+                job_media_id: 9,
+                media_id: 11,
+                volume_name: second.as_str().to_owned(),
+                pool_name: pool().as_str().to_owned(),
+                volume_index: 2,
+                first_index: 43,
+                last_index: 84,
+                start_file: 0,
+                start_block: 0,
+                end_file: 1,
+                end_block: 4096,
+            },
+        ];
+        let segments = validate_segments_for_volumes(
+            rows,
+            &pool(),
+            &HashMap::from([
+                (first.as_str().to_owned(), 7),
+                (second.as_str().to_owned(), 11),
+            ]),
+        )
+        .expect("segments");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].volume_index, 1);
+        assert_eq!(segments[1].volume_index, 2);
+    }
+
+    #[test]
+    fn rejects_duplicate_or_unauthorized_archive_volumes() {
+        let volume = VolumeLabel::parse("ARCHIVE-0001").expect("volume");
+        assert!(matches!(
+            validate_authorized_volume_labels(&[volume.clone(), volume.clone()]),
+            Err(BaculaCatalogEvidenceError::DuplicateAuthorizedVolume(_))
+        ));
+        let row = CatalogJobMediaRow {
+            job_media_id: 8,
+            media_id: 7,
+            volume_name: "FOREIGN-0001".to_owned(),
+            pool_name: pool().as_str().to_owned(),
+            volume_index: 1,
+            first_index: 1,
+            last_index: 42,
+            start_file: 0,
+            start_block: 0,
+            end_file: 1,
+            end_block: 2048,
+        };
+        assert!(matches!(
+            validate_segments_for_volumes(
+                vec![row],
+                &pool(),
+                &HashMap::from([(volume.as_str().to_owned(), 7)])
+            ),
+            Err(BaculaCatalogEvidenceError::UnauthorizedJobVolume(_))
+        ));
     }
 
     #[test]

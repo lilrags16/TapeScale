@@ -802,6 +802,9 @@ pub struct SingleTapeDataRunRecord {
     pub requested_level: String,
     pub scheduled_occurrence: Option<String>,
     pub retention_days: i32,
+    pub compression_mode: String,
+    pub resolved_compression: String,
+    pub spanning_enabled: bool,
     pub cancel_requested_at: Option<DateTime<Utc>>,
     pub cancel_requested_by_label: Option<String>,
     pub state: String,
@@ -816,6 +819,79 @@ pub struct SingleTapeDataRunRecord {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize, PartialEq, Eq)]
+pub struct DataRunVolumeRecord {
+    pub id: Uuid,
+    pub single_tape_data_run_id: Uuid,
+    pub volume_order: i32,
+    pub cartridge_id: Uuid,
+    pub expected_cartridge_label: String,
+    pub expected_media_generation: Option<i16>,
+    pub expected_media_format: Option<String>,
+    pub engine_volume_name: Option<String>,
+    pub engine_media_id: Option<i64>,
+    pub state: String,
+    pub media_lease_id: Option<Uuid>,
+    pub media_fencing_token: Option<i64>,
+    pub media_write_started_at: Option<DateTime<Utc>>,
+    pub written_at: Option<DateTime<Utc>>,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub encoded_bytes: Option<i64>,
+    pub first_record: Option<String>,
+    pub last_record: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize, PartialEq, Eq)]
+pub struct DataRunMediaRequestRecord {
+    pub id: Uuid,
+    pub single_tape_data_run_id: Uuid,
+    pub request_sequence: i32,
+    pub phase: String,
+    pub volume_order: i32,
+    pub expected_cartridge_id: Option<Uuid>,
+    pub expected_engine_volume_name: Option<String>,
+    pub state: String,
+    pub authorized_cartridge_id: Option<Uuid>,
+    pub requested_at: DateTime<Utc>,
+    pub authorized_at: Option<DateTime<Utc>>,
+    pub loaded_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub confirmation_evidence: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewDataRunMediaAuthorization<'a> {
+    pub data_run_id: Uuid,
+    pub request_id: Uuid,
+    pub drive_id: Uuid,
+    pub expected_stable_id: &'a str,
+    pub cartridge_id: Uuid,
+    pub typed_cartridge_label: &'a str,
+    pub loaded_media_confirmed: bool,
+    pub destructive_overwrite_confirmed: bool,
+    pub confirmation_evidence: Value,
+}
+
+#[derive(Clone, Debug)]
+pub enum DataRunMediaRequestResult {
+    Ready(Box<DataRunMediaRequestRecord>),
+    FencedOut,
+    Blocked(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum AuthorizeDataRunMediaResult {
+    Authorized {
+        request: Box<DataRunMediaRequestRecord>,
+        volume: Box<DataRunVolumeRecord>,
+        idempotent_replay: bool,
+    },
+    NotFound,
+    Blocked(String),
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -1014,6 +1090,203 @@ pub struct SingleTapePassEvidence {
     pub full_readback_evidence: Value,
     pub restore_test_evidence: Value,
     pub result: Value,
+}
+
+#[derive(Clone, Debug)]
+struct FinalizedBackupVolume {
+    run_volume_id: Uuid,
+    volume_order: i32,
+    cartridge_id: Uuid,
+    engine_volume_name: String,
+    engine_media_id: i64,
+    first_record: String,
+    last_record: Option<String>,
+    encoded_bytes: i64,
+    engine_record_id: String,
+}
+
+fn validated_backup_volume_evidence(
+    run_volumes: &[DataRunVolumeRecord],
+    engine_write_metadata: &Value,
+    evidence: &SingleTapePassEvidence,
+) -> std::result::Result<Vec<FinalizedBackupVolume>, String> {
+    if run_volumes.is_empty() {
+        return Err("the backup has no ordered archive volumes".to_owned());
+    }
+    if run_volumes
+        .iter()
+        .enumerate()
+        .any(|(index, volume)| volume.volume_order != i32::try_from(index + 1).unwrap_or(i32::MAX))
+    {
+        return Err("archive volume order is incomplete or non-contiguous".to_owned());
+    }
+    if run_volumes.iter().any(|volume| {
+        volume.media_write_started_at.is_none()
+            || matches!(
+                volume.state.as_str(),
+                "authorized" | "write_unverified" | "failed"
+            )
+    }) {
+        return Err(
+            "one or more archive volumes lack a durable successful write boundary".to_owned(),
+        );
+    }
+
+    let Some(catalog_volumes) = engine_write_metadata
+        .get("volumes")
+        .and_then(Value::as_array)
+    else {
+        // Compatibility for pre-spanning, single-volume evidence retained by
+        // older test fixtures and installations upgraded in place.
+        if run_volumes.len() != 1 {
+            return Err(
+                "multi-volume engine evidence is missing its ordered volume list".to_owned(),
+            );
+        }
+        let run_volume = &run_volumes[0];
+        if run_volume.engine_volume_name.as_deref() != Some(&evidence.engine_volume_name) {
+            return Err("the engine volume does not match the authorized first tape".to_owned());
+        }
+        let engine_media_id = evidence
+            .engine_record_id
+            .strip_prefix("bacula-media:")
+            .and_then(|value| value.split(':').next())
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "the Bacula MediaId is invalid".to_owned())?;
+        return Ok(vec![FinalizedBackupVolume {
+            run_volume_id: run_volume.id,
+            volume_order: 1,
+            cartridge_id: run_volume.cartridge_id,
+            engine_volume_name: evidence.engine_volume_name.clone(),
+            engine_media_id,
+            first_record: evidence.first_record.clone(),
+            last_record: evidence.last_record.clone(),
+            encoded_bytes: i64::try_from(evidence.encoded_bytes)
+                .map_err(|_| "encoded byte count exceeds the catalog range".to_owned())?,
+            engine_record_id: evidence.engine_record_id.clone(),
+        }]);
+    };
+    if catalog_volumes.len() != run_volumes.len() {
+        return Err(format!(
+            "Bacula reported {} archive volumes but TapeScale authorized {}",
+            catalog_volumes.len(),
+            run_volumes.len()
+        ));
+    }
+    let segments = engine_write_metadata
+        .get("segments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "multi-volume engine evidence is missing JobMedia segments".to_owned())?;
+    let backup_job_id = evidence
+        .engine_operation_id
+        .strip_prefix("bacula-job:")
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| "the Bacula backup operation identity is invalid".to_owned())?;
+    let mut finalized = Vec::with_capacity(run_volumes.len());
+    for (index, (run_volume, catalog_volume)) in
+        run_volumes.iter().zip(catalog_volumes.iter()).enumerate()
+    {
+        let volume_name = catalog_volume
+            .get("volume_name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+            .ok_or_else(|| format!("archive volume {} has no valid engine label", index + 1))?;
+        if run_volume.engine_volume_name.as_deref() != Some(volume_name) {
+            return Err(format!(
+                "archive volume {} does not match its authorized engine label",
+                index + 1
+            ));
+        }
+        let engine_media_id = catalog_volume
+            .get("media_id")
+            .and_then(Value::as_u64)
+            .and_then(|value| i64::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("archive volume {} has no valid Bacula MediaId", index + 1))?;
+        let encoded_bytes = catalog_volume
+            .get("volume_bytes")
+            .and_then(Value::as_u64)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| format!("archive volume {} has an invalid byte count", index + 1))?;
+        let volume_segments = segments
+            .iter()
+            .filter(|segment| {
+                segment.get("volume_name").and_then(Value::as_str) == Some(volume_name)
+            })
+            .collect::<Vec<_>>();
+        let first_segment = volume_segments
+            .first()
+            .ok_or_else(|| format!("archive volume {} has no JobMedia segment", index + 1))?;
+        let last_segment = volume_segments
+            .last()
+            .expect("the first segment established a non-empty list");
+        let coordinate = |segment: &Value, file_key: &str, block_key: &str| {
+            let file = segment.get(file_key).and_then(Value::as_u64)?;
+            let block = segment.get(block_key).and_then(Value::as_u64)?;
+            Some(format!("file={file}:block={block}"))
+        };
+        let first_record = coordinate(first_segment, "start_file", "start_block")
+            .ok_or_else(|| format!("archive volume {} has invalid start coordinates", index + 1))?;
+        let last_record = coordinate(last_segment, "end_file", "end_block")
+            .ok_or_else(|| format!("archive volume {} has invalid end coordinates", index + 1))?;
+        finalized.push(FinalizedBackupVolume {
+            run_volume_id: run_volume.id,
+            volume_order: run_volume.volume_order,
+            cartridge_id: run_volume.cartridge_id,
+            engine_volume_name: volume_name.to_owned(),
+            engine_media_id,
+            first_record,
+            last_record: Some(last_record),
+            encoded_bytes,
+            engine_record_id: format!("bacula-media:{engine_media_id}:job:{backup_job_id}"),
+        });
+    }
+    let total_encoded = finalized.iter().try_fold(0_i64, |total, volume| {
+        total.checked_add(volume.encoded_bytes)
+    });
+    if total_encoded != i64::try_from(evidence.encoded_bytes).ok() {
+        return Err("ordered archive bytes do not match the retained backup evidence".to_owned());
+    }
+    let first = finalized.first().expect("the volume list is non-empty");
+    let last = finalized.last().expect("the volume list is non-empty");
+    if evidence.engine_volume_name != first.engine_volume_name
+        || evidence.engine_record_id != first.engine_record_id
+        || evidence.first_record != first.first_record
+        || evidence.last_record != last.last_record
+    {
+        return Err("summary evidence does not match the ordered Bacula volume chain".to_owned());
+    }
+    Ok(finalized)
+}
+
+fn validate_catalog_written_volume_chain(
+    run_volumes: &[DataRunVolumeRecord],
+    catalog_volume_names: &[String],
+) -> std::result::Result<(), String> {
+    if run_volumes.is_empty() || run_volumes.len() != catalog_volume_names.len() {
+        return Err(
+            "the catalog-proven volume count does not match the authorized archive".to_owned(),
+        );
+    }
+    for (index, (volume, catalog_name)) in run_volumes
+        .iter()
+        .zip(catalog_volume_names.iter())
+        .enumerate()
+    {
+        let expected_order = i32::try_from(index + 1).unwrap_or(i32::MAX);
+        if volume.volume_order != expected_order
+            || volume.media_write_started_at.is_none()
+            || !matches!(volume.state.as_str(), "write_started" | "written")
+            || volume.engine_volume_name.as_deref() != Some(catalog_name.as_str())
+        {
+            return Err(format!(
+                "archive volume {} does not match the strict completed-backup catalog proof",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2985,11 +3258,27 @@ const SINGLE_TAPE_DATA_RUN_SELECT: &str = "SELECT id, profile_id, job_run_id,
             encryption_deviation_confirmed,
             media_write_started, media_write_started_at,
             workflow_kind, trigger_kind, requested_level, scheduled_occurrence,
-            retention_days, cancel_requested_at, cancel_requested_by_label,
+            retention_days, compression_mode, resolved_compression, spanning_enabled,
+            cancel_requested_at, cancel_requested_by_label,
             state, requested_by_label, correlation_id,
             drive_lease_id, drive_fencing_token, media_lease_id, media_fencing_token,
             attempt, result, created_at, started_at, finished_at
      FROM single_tape_data_runs";
+
+const DATA_RUN_VOLUME_SELECT: &str = "SELECT id, single_tape_data_run_id,
+            volume_order, cartridge_id, expected_cartridge_label,
+            expected_media_generation, expected_media_format,
+            engine_volume_name, engine_media_id, state, media_lease_id,
+            media_fencing_token, media_write_started_at, written_at, verified_at,
+            encoded_bytes, first_record, last_record, created_at, updated_at
+     FROM single_tape_data_run_volumes";
+
+const DATA_RUN_MEDIA_REQUEST_SELECT: &str = "SELECT id, single_tape_data_run_id,
+            request_sequence, phase, volume_order, expected_cartridge_id,
+            expected_engine_volume_name, state, authorized_cartridge_id,
+            requested_at, authorized_at, loaded_at, completed_at,
+            confirmation_evidence
+     FROM single_tape_data_media_requests";
 
 #[derive(Clone, Debug, FromRow)]
 struct SingleTapeSnapshotBinding {
@@ -3296,6 +3585,58 @@ pub async fn get_single_tape_data_run(
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+pub async fn data_run_volumes(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Vec<DataRunVolumeRecord>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "{DATA_RUN_VOLUME_SELECT}
+         WHERE single_tape_data_run_id = $1 ORDER BY volume_order"
+    ))
+    .bind(id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn open_data_run_media_request(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<DataRunMediaRequestRecord>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "{DATA_RUN_MEDIA_REQUEST_SELECT}
+         WHERE single_tape_data_run_id = $1
+           AND state IN ('pending', 'authorized', 'loaded')
+         ORDER BY request_sequence DESC LIMIT 1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn replayable_data_run_media_request(
+    pool: &PgPool,
+    id: Uuid,
+    volume_order: i32,
+    cartridge_id: Uuid,
+    confirmation_evidence: &Value,
+) -> Result<Option<DataRunMediaRequestRecord>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "{DATA_RUN_MEDIA_REQUEST_SELECT}
+         WHERE single_tape_data_run_id = $1 AND volume_order = $2
+           AND authorized_cartridge_id = $3
+           AND state IN ('authorized', 'loaded', 'completed')
+           AND confirmation_evidence =
+               jsonb_build_object('phase', phase) || $4::jsonb
+         ORDER BY request_sequence DESC LIMIT 1"
+    ))
+    .bind(id)
+    .bind(volume_order)
+    .bind(cartridge_id)
+    .bind(confirmation_evidence)
+    .fetch_optional(pool)
+    .await
 }
 
 pub async fn single_tape_data_artifacts(
@@ -3660,6 +4001,336 @@ fn cartridge_readiness_code(reason: &str) -> (&'static str, &'static str) {
     }
 }
 
+fn missing_readback_qualification_blocker(
+    drive_id: Uuid,
+    cartridge_id: Uuid,
+) -> BackupMediaReadinessBlocker {
+    backup_media_blocker(
+        "readback_setup_evidence_missing",
+        "pair",
+        Some(drive_id),
+        Some(cartridge_id),
+        "the retained setup evidence for this exact drive and archive tape is missing; do not run a destructive tape-preparation test on archive media",
+        "open_backup",
+    )
+}
+
+fn readback_identity_status_blocker(identity_status: &str) -> Option<&'static str> {
+    matches!(identity_status, "foreign" | "mismatch")
+        .then_some("the archive tape has a known foreign or mismatched identity")
+}
+
+/// Returns a live preview for the exact ordered archive volume requested by a
+/// Bacula full-readback job. Already-written media is intentionally eligible,
+/// but the retained hardware binding, drive motion gates, worker lease, and
+/// exact passed drive/cartridge qualification must all still hold. The media
+/// authorization transaction repeats these checks under locks.
+pub async fn backup_readback_media_readiness(
+    pool: &PgPool,
+    profile_id: Uuid,
+    backup_request_id: Uuid,
+    data_run_id: Uuid,
+    media_request_id: Uuid,
+) -> Result<BackupMediaReadinessResult, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let run = sqlx::query_as::<_, SingleTapeDataRunRecord>(&format!(
+        "{SINGLE_TAPE_DATA_RUN_SELECT} WHERE id = $1 AND profile_id = $2"
+    ))
+    .bind(data_run_id)
+    .bind(profile_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(run) = run else {
+        transaction.rollback().await?;
+        return Ok(BackupMediaReadinessResult::NotFound);
+    };
+    let media_request = sqlx::query_as::<_, DataRunMediaRequestRecord>(&format!(
+        "{DATA_RUN_MEDIA_REQUEST_SELECT}
+         WHERE id = $1 AND single_tape_data_run_id = $2"
+    ))
+    .bind(media_request_id)
+    .bind(run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(media_request) = media_request else {
+        transaction.rollback().await?;
+        return Ok(BackupMediaReadinessResult::NotFound);
+    };
+    let volume = sqlx::query_as::<_, DataRunVolumeRecord>(&format!(
+        "{DATA_RUN_VOLUME_SELECT}
+         WHERE single_tape_data_run_id = $1 AND volume_order = $2"
+    ))
+    .bind(run.id)
+    .bind(media_request.volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let drive = sqlx::query_as::<_, DriveRecord>(&format!("{DRIVE_SELECT} WHERE d.id = $1"))
+        .bind(run.drive_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+    let cartridge = if let Some(volume) = &volume {
+        sqlx::query_as::<_, QualificationCartridge>(&format!(
+            "{QUALIFICATION_CARTRIDGE_SELECT} WHERE c.id = $1"
+        ))
+        .bind(volume.cartridge_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+    } else {
+        None
+    };
+    let parent_waiting = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM backup_requests request
+             JOIN job_runs job ON job.id = request.job_run_id
+             WHERE request.id = $1 AND request.profile_id = $2
+               AND request.assigned_data_run_id = $3
+               AND request.cancelled_at IS NULL
+               AND job.id = $4 AND job.state = 'waiting_for_media'
+               AND job.finished_at IS NULL)",
+    )
+    .bind(backup_request_id)
+    .bind(profile_id)
+    .bind(run.id)
+    .bind(run.job_run_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let drive_lease_live = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM resource_leases lease
+             WHERE lease.id = $1 AND lease.resource_kind = 'drive'
+               AND lease.resource_id = $2::text
+               AND lease.fencing_token = $3
+               AND lease.released_at IS NULL AND lease.expires_at > now())",
+    )
+    .bind(run.drive_lease_id)
+    .bind(run.drive_id)
+    .bind(run.drive_fencing_token)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let volume_lease_live = if let Some(volume) = &volume {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM resource_leases media_lease
+                   JOIN resource_leases drive_lease ON drive_lease.id = $1
+                  WHERE media_lease.id = $2
+                    AND media_lease.resource_kind = 'media'
+                    AND media_lease.resource_id = $3::text
+                    AND media_lease.fencing_token = $4
+                    AND media_lease.owner_id = drive_lease.owner_id
+                    AND media_lease.released_at IS NULL
+                    AND media_lease.expires_at > now()
+                    AND drive_lease.released_at IS NULL
+                    AND drive_lease.expires_at > now())",
+        )
+        .bind(run.drive_lease_id)
+        .bind(volume.media_lease_id)
+        .bind(volume.cartridge_id)
+        .bind(volume.media_fencing_token)
+        .fetch_one(&mut *transaction)
+        .await?
+    } else {
+        false
+    };
+
+    let mut blockers = Vec::new();
+    if run.workflow_kind != "backup"
+        || run.state != "running"
+        || media_request.phase != "full_readback"
+        || media_request.state != "pending"
+        || !parent_waiting
+    {
+        blockers.push(backup_media_blocker(
+            "request_not_waiting_for_media",
+            "request",
+            Some(backup_request_id),
+            Some(media_request.id),
+            "the backup is no longer waiting for this readback tape",
+            "open_backup",
+        ));
+    }
+    if !drive_lease_live {
+        blockers.push(backup_media_blocker(
+            "resource_lease_lost",
+            "drive",
+            Some(run.drive_id),
+            None,
+            "the backup worker no longer owns the tape drive",
+            "refresh",
+        ));
+    }
+    if !volume_lease_live {
+        blockers.push(backup_media_blocker(
+            "media_lease_lost",
+            "media",
+            volume.as_ref().map(|volume| volume.cartridge_id),
+            volume.as_ref().map(|volume| volume.id),
+            "the backup worker no longer owns the requested archive tape",
+            "refresh",
+        ));
+    }
+    if volume.as_ref().is_none_or(|volume| {
+        media_request.expected_cartridge_id != Some(volume.cartridge_id)
+            || media_request.expected_engine_volume_name.as_deref()
+                != volume.engine_volume_name.as_deref()
+            || !matches!(volume.state.as_str(), "written" | "verified")
+    }) {
+        blockers.push(backup_media_blocker(
+            "archive_volume_mismatch",
+            "media",
+            media_request.expected_cartridge_id,
+            Some(media_request.id),
+            "the requested readback tape no longer matches the retained archive order",
+            "open_backup",
+        ));
+    }
+
+    let mut qualification_run_id = None;
+    if let Some(drive) = &drive {
+        if drive.stable_id != run.expected_stable_id
+            || drive.observed_path.as_deref() != Some(run.expected_path.as_str())
+            || drive.vendor != run.expected_vendor
+            || drive.model != run.expected_model
+            || drive.serial != run.expected_serial
+            || drive.wwn != run.expected_wwn
+            || drive.firmware != run.expected_firmware
+        {
+            blockers.push(backup_media_blocker(
+                "drive_binding_changed",
+                "drive",
+                Some(drive.id),
+                None,
+                "the tape drive no longer matches the hardware binding retained by this backup",
+                "reconcile_drive",
+            ));
+        } else if let Some(reason) = drive_motion_blocker(drive) {
+            let (code, action) = drive_readiness_code(&reason);
+            blockers.push(backup_media_blocker(
+                code,
+                "drive",
+                Some(drive.id),
+                None,
+                reason,
+                action,
+            ));
+        }
+    } else {
+        blockers.push(backup_media_blocker(
+            "drive_not_present",
+            "drive",
+            Some(run.drive_id),
+            None,
+            "the retained tape drive is no longer registered",
+            "connect_drive",
+        ));
+    }
+
+    if let (Some(drive), Some(volume), Some(cartridge)) = (&drive, &volume, &cartridge) {
+        if let Some(reason) = readback_identity_status_blocker(&cartridge.identity_status) {
+            blockers.push(backup_media_blocker(
+                "media_identity_conflict",
+                "media",
+                Some(cartridge.id),
+                Some(volume.id),
+                reason,
+                "reconcile_media",
+            ));
+        } else if cartridge.internal_label != volume.expected_cartridge_label
+            || cartridge.media_generation != volume.expected_media_generation
+            || cartridge.media_format != volume.expected_media_format
+        {
+            blockers.push(backup_media_blocker(
+                "media_identity_conflict",
+                "media",
+                Some(cartridge.id),
+                Some(volume.id),
+                "the registered tape metadata no longer matches the retained archive volume",
+                "reconcile_media",
+            ));
+        } else {
+            qualification_run_id =
+                single_tape_qualification_passed_id(&mut transaction, drive, cartridge.id).await?;
+            if qualification_run_id.is_none() {
+                blockers.push(missing_readback_qualification_blocker(
+                    drive.id,
+                    cartridge.id,
+                ));
+            }
+        }
+    } else if volume.is_some() && cartridge.is_none() {
+        blockers.push(backup_media_blocker(
+            "media_not_registered",
+            "media",
+            volume.as_ref().map(|volume| volume.cartridge_id),
+            volume.as_ref().map(|volume| volume.id),
+            "the requested archive tape is no longer registered",
+            "reconcile_media",
+        ));
+    }
+
+    let candidate = if blockers.is_empty() {
+        let drive = drive
+            .as_ref()
+            .expect("readback readiness checked the drive");
+        let volume = volume
+            .as_ref()
+            .expect("readback readiness checked the volume");
+        let cartridge = cartridge
+            .as_ref()
+            .expect("readback readiness checked the cartridge");
+        Some(BackupMediaReadinessCandidate {
+            drive_id: drive.id,
+            stable_id: drive.stable_id.clone(),
+            device_path: drive
+                .observed_path
+                .clone()
+                .expect("motion-safe readiness requires an observed path"),
+            cartridge_id: cartridge.id,
+            cartridge_label: cartridge.internal_label.clone(),
+            media_generation: cartridge.media_generation,
+            media_format: cartridge.media_format.clone(),
+            qualification_run_id: qualification_run_id
+                .expect("readback readiness requires a passed setup test"),
+            required_confirmation: Some(format!(
+                "LOAD {} FOR BACKUP {} READBACK VOLUME {}",
+                volume.expected_cartridge_label, backup_request_id, volume.volume_order
+            )),
+        })
+    } else {
+        None
+    };
+    let candidates = candidate.iter().cloned().collect::<Vec<_>>();
+    let blockers_matched = blockers.len();
+    let candidate_count = usize::from(candidate.is_some());
+    let readiness = BackupMediaReadiness {
+        state: if candidate.is_some() {
+            "ready".to_owned()
+        } else {
+            "blocked".to_owned()
+        },
+        profile_id,
+        backup_request_id: Some(backup_request_id),
+        candidates,
+        recommended_candidate: candidate,
+        blockers,
+        counts: BackupMediaReadinessCounts {
+            drives_total: i64::from(drive.is_some()),
+            drives_evaluated: usize::from(drive.is_some()),
+            cartridges_total: i64::from(cartridge.is_some()),
+            cartridges_evaluated: usize::from(cartridge.is_some()),
+            pairs_evaluated: usize::from(drive.is_some() && cartridge.is_some()),
+            candidates_matched: candidate_count,
+            candidates_returned: candidate_count,
+            blockers_matched,
+            blockers_returned: blockers_matched,
+        },
+        limits: backup_media_readiness_limits(),
+        truncated: BackupMediaReadinessTruncation::default(),
+    };
+    transaction.commit().await?;
+    Ok(BackupMediaReadinessResult::Readiness(Box::new(readiness)))
+}
+
 #[derive(Debug, FromRow)]
 struct BackupMediaReadinessPairRow {
     drive_id: Uuid,
@@ -3676,6 +4347,23 @@ pub async fn backup_media_readiness(
     pool: &PgPool,
     profile_id: Uuid,
     backup_request: Option<(Uuid, Uuid)>,
+) -> Result<BackupMediaReadinessResult, sqlx::Error> {
+    backup_media_readiness_inner(pool, profile_id, backup_request, None).await
+}
+
+pub async fn backup_continuation_media_readiness(
+    pool: &PgPool,
+    profile_id: Uuid,
+    data_run_id: Uuid,
+) -> Result<BackupMediaReadinessResult, sqlx::Error> {
+    backup_media_readiness_inner(pool, profile_id, None, Some(data_run_id)).await
+}
+
+async fn backup_media_readiness_inner(
+    pool: &PgPool,
+    profile_id: Uuid,
+    backup_request: Option<(Uuid, Uuid)>,
+    ignored_data_run_id: Option<Uuid>,
 ) -> Result<BackupMediaReadinessResult, sqlx::Error> {
     let mut transaction = pool.begin().await?;
     let profile = sqlx::query_as::<_, SingleTapeDataProfileRecord>(&format!(
@@ -3950,6 +4638,7 @@ pub async fn backup_media_readiness(
                         WHERE (data_run.profile_id = $3
                                OR data_run.drive_id = pair.drive_id
                                OR data_run.cartridge_id = pair.cartridge_id)
+                          AND ($5::uuid IS NULL OR data_run.id <> $5)
                           AND data_run.state IN ('queued', 'running')
                         UNION ALL
                         SELECT 1 FROM resource_leases lease
@@ -3958,6 +4647,15 @@ pub async fn backup_media_readiness(
                                OR (lease.resource_kind = 'media'
                                    AND lease.resource_id = pair.cartridge_id::text))
                           AND lease.released_at IS NULL AND lease.expires_at > now()
+                          AND NOT ($5::uuid IS NOT NULL AND (
+                              lease.id = (SELECT drive_lease_id
+                                            FROM single_tape_data_runs
+                                           WHERE id = $5)
+                              OR lease.id IN (
+                                  SELECT media_lease_id
+                                    FROM single_tape_data_run_volumes
+                                   WHERE single_tape_data_run_id = $5
+                                     AND media_lease_id IS NOT NULL)))
                     ) AS busy
              FROM pairs pair
              JOIN drives drive ON drive.id = pair.drive_id
@@ -3993,6 +4691,7 @@ pub async fn backup_media_readiness(
         .bind(&ready_cartridge_ids)
         .bind(profile_id)
         .bind(BACKUP_READINESS_PAIR_LIMIT as i64)
+        .bind(ignored_data_run_id)
         .fetch_all(&mut *transaction)
         .await?
     };
@@ -4192,6 +4891,42 @@ async fn queue_single_tape_data_run_inner(
     };
 
     let is_backup = backup_request.is_some();
+    let (compression_mode, resolved_compression, spanning_enabled) = if is_backup {
+        let Some(policy_id) = profile.policy_id else {
+            transaction.rollback().await?;
+            return Ok(QueueSingleTapeDataRunResult::Blocked(
+                "the backup profile has no protection policy".to_owned(),
+            ));
+        };
+        let settings = sqlx::query_as::<_, (String, bool)>(
+            "SELECT compression_mode, spanning_enabled
+               FROM protection_policies WHERE id = $1 FOR SHARE",
+        )
+        .bind(policy_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((requested, spanning)) = settings else {
+            transaction.rollback().await?;
+            return Ok(QueueSingleTapeDataRunResult::Blocked(
+                "the backup protection policy is unavailable".to_owned(),
+            ));
+        };
+        let resolved = match requested.as_str() {
+            "auto" => "gzip",
+            "none" => "none",
+            "gzip" => "gzip",
+            "lzo" => "lzo",
+            _ => {
+                transaction.rollback().await?;
+                return Ok(QueueSingleTapeDataRunResult::Blocked(
+                    "the configured compression mode is unsupported".to_owned(),
+                ));
+            }
+        };
+        (requested, resolved.to_owned(), spanning)
+    } else {
+        ("none".to_owned(), "none".to_owned(), false)
+    };
     if let Some(request) = &backup_request {
         let valid_request = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
@@ -4393,11 +5128,12 @@ async fn queue_single_tape_data_run_inner(
              scratch_media_confirmed, destructive_overwrite_confirmed,
              encryption_deviation_confirmed, workflow_kind, trigger_kind,
              requested_level, scheduled_occurrence, retention_days,
+             compression_mode, resolved_compression, spanning_enabled,
              requested_by_label, correlation_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                  $11, $12, $13, $14, $15, $16, $17, $18, $19,
                  $20, $21, $22, $23, $24, $25, $26, $27, $28,
-                 'full', $29, $30, 'local-api', $31)",
+                 'full', $29, $30, $31, $32, $33, 'local-api', $34)",
     )
     .bind(id)
     .bind(profile_id)
@@ -4429,7 +5165,24 @@ async fn queue_single_tape_data_run_inner(
     .bind(&trigger_kind)
     .bind(&scheduled_occurrence)
     .bind(retention_days)
+    .bind(&compression_mode)
+    .bind(&resolved_compression)
+    .bind(spanning_enabled)
     .bind(correlation_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO single_tape_data_run_volumes
+            (single_tape_data_run_id, volume_order, cartridge_id,
+             expected_cartridge_label, expected_media_generation,
+             expected_media_format, state)
+         VALUES ($1, 1, $2, $3, $4, $5, 'authorized')",
+    )
+    .bind(id)
+    .bind(cartridge_id)
+    .bind(&cartridge.internal_label)
+    .bind(cartridge.media_generation)
+    .bind(&cartridge.media_format)
     .execute(&mut *transaction)
     .await?;
     if let Some(request) = &backup_request {
@@ -4528,6 +5281,9 @@ async fn queue_single_tape_data_run_inner(
             "engine": profile.engine_name,
             "engine_version": profile.engine_version,
             "encryption_deviation_confirmed": encryption_deviation_confirmed,
+            "compression_mode": &compression_mode,
+            "resolved_compression": &resolved_compression,
+            "spanning_enabled": spanning_enabled,
             "workflow_kind": &workflow_kind,
             "trigger_kind": &trigger_kind,
             "scheduled_occurrence": &scheduled_occurrence,
@@ -4746,6 +5502,25 @@ pub async fn claim_next_single_tape_data_run(
     .bind(run.id)
     .execute(&mut *transaction)
     .await?;
+    let volume_lease_updated = sqlx::query(
+        "UPDATE single_tape_data_run_volumes
+            SET media_lease_id = $1, media_fencing_token = $2, updated_at = now()
+          WHERE single_tape_data_run_id = $3 AND volume_order = 1
+            AND cartridge_id = $4 AND media_lease_id IS NULL",
+    )
+    .bind(media_lease_id)
+    .bind(media_fencing_token)
+    .bind(run.id)
+    .bind(run.cartridge_id)
+    .execute(&mut *transaction)
+    .await?;
+    if volume_lease_updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(ClaimSingleTapeDataRunResult::Blocked {
+            id: run.id,
+            reason: "the first ordered tape assignment could not be fenced".to_owned(),
+        });
+    }
     sqlx::query(
         "UPDATE job_runs SET state = 'preparing', started_at = now()
          WHERE id = $1 AND state = 'queued'",
@@ -4808,6 +5583,781 @@ pub async fn claim_next_single_tape_data_run(
     )))
 }
 
+/// Publish one durable manual-media request while the same fenced Bacula job
+/// remains active.  Operator wait time is represented as state rather than as
+/// a failed or restarted backup.
+pub async fn ensure_data_run_media_request(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    phase: &str,
+    volume_order: i32,
+    expected_cartridge_id: Option<Uuid>,
+    expected_engine_volume_name: Option<&str>,
+) -> Result<DataRunMediaRequestResult, sqlx::Error> {
+    let active_phase = match phase {
+        "backup_write" => "writing",
+        "full_readback" => "verifying",
+        "restore" => "restoring",
+        _ => {
+            return Ok(DataRunMediaRequestResult::Blocked(
+                "media request phase is unsupported".to_owned(),
+            ))
+        }
+    };
+    if volume_order <= 0
+        || expected_engine_volume_name.is_some_and(|value| {
+            value.is_empty()
+                || value.len() > 127
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    {
+        return Ok(DataRunMediaRequestResult::Blocked(
+            "media request identity is invalid".to_owned(),
+        ));
+    }
+    if phase == "backup_write"
+        && (expected_cartridge_id.is_some() || expected_engine_volume_name.is_some())
+    {
+        return Ok(DataRunMediaRequestResult::Blocked(
+            "a write continuation must request a new eligible scratch tape".to_owned(),
+        ));
+    }
+    if phase != "backup_write"
+        && (expected_cartridge_id.is_none() || expected_engine_volume_name.is_none())
+    {
+        return Ok(DataRunMediaRequestResult::Blocked(
+            "read requests must name the exact retained tape and engine volume".to_owned(),
+        ));
+    }
+
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(DataRunMediaRequestResult::FencedOut);
+    }
+    let existing = sqlx::query_as::<_, DataRunMediaRequestRecord>(&format!(
+        "{DATA_RUN_MEDIA_REQUEST_SELECT}
+         WHERE single_tape_data_run_id = $1
+           AND state IN ('pending', 'authorized', 'loaded')
+         ORDER BY request_sequence DESC LIMIT 1 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if let Some(existing) = existing {
+        let exact = existing.phase == phase
+            && existing.volume_order == volume_order
+            && existing.expected_cartridge_id == expected_cartridge_id
+            && existing.expected_engine_volume_name.as_deref() == expected_engine_volume_name;
+        transaction.commit().await?;
+        return if exact {
+            Ok(DataRunMediaRequestResult::Ready(Box::new(existing)))
+        } else {
+            Ok(DataRunMediaRequestResult::Blocked(
+                "a different media request is already active for this backup".to_owned(),
+            ))
+        };
+    }
+    if claim.run.workflow_kind != "backup" {
+        transaction.rollback().await?;
+        return Ok(DataRunMediaRequestResult::Blocked(
+            "manual multi-volume continuation is enabled only for operational backups".to_owned(),
+        ));
+    }
+    if phase == "backup_write" && (!claim.run.spanning_enabled || volume_order <= 1) {
+        transaction.rollback().await?;
+        return Ok(DataRunMediaRequestResult::Blocked(
+            "this backup policy does not allow another tape".to_owned(),
+        ));
+    }
+    let current =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(claim.run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if current != active_phase {
+        transaction.rollback().await?;
+        return Ok(DataRunMediaRequestResult::Blocked(format!(
+            "the backup is in {current}, not {active_phase}"
+        )));
+    }
+    if phase == "backup_write" {
+        let next_order = sqlx::query_scalar::<_, i32>(
+            "SELECT COALESCE(max(volume_order), 0) + 1
+               FROM single_tape_data_run_volumes
+              WHERE single_tape_data_run_id = $1",
+        )
+        .bind(claim.run.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if volume_order != next_order {
+            transaction.rollback().await?;
+            return Ok(DataRunMediaRequestResult::Blocked(
+                "the continuation tape order is not the next archive volume".to_owned(),
+            ));
+        }
+    } else {
+        let exact_retained = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM single_tape_data_run_volumes
+                  WHERE single_tape_data_run_id = $1 AND volume_order = $2
+                    AND cartridge_id = $3 AND engine_volume_name = $4)",
+        )
+        .bind(claim.run.id)
+        .bind(volume_order)
+        .bind(expected_cartridge_id)
+        .bind(expected_engine_volume_name)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !exact_retained {
+            transaction.rollback().await?;
+            return Ok(DataRunMediaRequestResult::Blocked(
+                "the requested read tape is not part of this ordered archive".to_owned(),
+            ));
+        }
+    }
+
+    let request_sequence = sqlx::query_scalar::<_, i32>(
+        "SELECT COALESCE(max(request_sequence), 0) + 1
+           FROM single_tape_data_media_requests
+          WHERE single_tape_data_run_id = $1",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let request_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO single_tape_data_media_requests
+            (id, single_tape_data_run_id, request_sequence, phase, volume_order,
+             expected_cartridge_id, expected_engine_volume_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(request_id)
+    .bind(claim.run.id)
+    .bind(request_sequence)
+    .bind(phase)
+    .bind(volume_order)
+    .bind(expected_cartridge_id)
+    .bind(expected_engine_volume_name)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("UPDATE job_runs SET state = 'waiting_for_media' WHERE id = $1")
+        .bind(claim.run.job_run_id)
+        .execute(&mut *transaction)
+        .await?;
+    let evidence = json!({
+        "phase": phase,
+        "volume_order": volume_order,
+        "expected_cartridge_id": expected_cartridge_id,
+        "expected_engine_volume_name": expected_engine_volume_name,
+        "detail": if phase == "backup_write" {
+            format!("load and authorize an eligible scratch tape for archive volume {volume_order}")
+        } else {
+            format!("load the exact archive tape required for {phase}, volume {volume_order}")
+        }
+    });
+    append_job_transition(
+        &mut transaction,
+        claim.run.job_run_id,
+        Some(active_phase),
+        "waiting_for_media",
+        "Bacula requires a manual tape change",
+        evidence.clone(),
+        claim.run.correlation_id,
+    )
+    .await?;
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "media_required",
+        evidence,
+        "tapescale-worker",
+    )
+    .await?;
+    let record = sqlx::query_as::<_, DataRunMediaRequestRecord>(&format!(
+        "{DATA_RUN_MEDIA_REQUEST_SELECT} WHERE id = $1"
+    ))
+    .bind(request_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(DataRunMediaRequestResult::Ready(Box::new(record)))
+}
+
+/// Authorize the inventory identity that the operator attests is currently
+/// loaded for a pending manual-media request. The worker still revalidates the
+/// drive before motion; standalone SAS drives generally cannot machine-read a
+/// scratch cartridge barcode, so this is not a claim of automatic wrong-media
+/// detection.
+pub async fn authorize_data_run_media(
+    pool: &PgPool,
+    authorization: &NewDataRunMediaAuthorization<'_>,
+) -> Result<AuthorizeDataRunMediaResult, sqlx::Error> {
+    if !authorization.loaded_media_confirmed || !authorization.confirmation_evidence.is_object() {
+        return Ok(AuthorizeDataRunMediaResult::Blocked(
+            "loaded-media confirmation and structured confirmation evidence are required"
+                .to_owned(),
+        ));
+    }
+    let mut transaction = pool.begin().await?;
+    let run = sqlx::query_as::<_, SingleTapeDataRunRecord>(&format!(
+        "{SINGLE_TAPE_DATA_RUN_SELECT} WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(authorization.data_run_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(run) = run else {
+        transaction.rollback().await?;
+        return Ok(AuthorizeDataRunMediaResult::NotFound);
+    };
+    let request = sqlx::query_as::<_, DataRunMediaRequestRecord>(&format!(
+        "{DATA_RUN_MEDIA_REQUEST_SELECT}
+         WHERE id = $1 AND single_tape_data_run_id = $2 FOR UPDATE"
+    ))
+    .bind(authorization.request_id)
+    .bind(run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(request) = request else {
+        transaction.rollback().await?;
+        return Ok(AuthorizeDataRunMediaResult::NotFound);
+    };
+    if request.state != "pending" {
+        if request.authorized_cartridge_id == Some(authorization.cartridge_id)
+            && request.confirmation_evidence == authorization.confirmation_evidence
+        {
+            let volume = sqlx::query_as::<_, DataRunVolumeRecord>(&format!(
+                "{DATA_RUN_VOLUME_SELECT}
+                 WHERE single_tape_data_run_id = $1 AND volume_order = $2"
+            ))
+            .bind(run.id)
+            .bind(request.volume_order)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if let Some(volume) = volume {
+                transaction.commit().await?;
+                return Ok(AuthorizeDataRunMediaResult::Authorized {
+                    request: Box::new(request),
+                    volume: Box::new(volume),
+                    idempotent_replay: true,
+                });
+            }
+        }
+        transaction.rollback().await?;
+        return Ok(AuthorizeDataRunMediaResult::Blocked(
+            "the media request was already answered differently".to_owned(),
+        ));
+    }
+    if run.state != "running" || run.workflow_kind != "backup" {
+        transaction.rollback().await?;
+        return Ok(AuthorizeDataRunMediaResult::Blocked(
+            "the backup is not actively waiting for a tape".to_owned(),
+        ));
+    }
+    if !matches!(request.phase.as_str(), "backup_write" | "full_readback") {
+        transaction.rollback().await?;
+        return Ok(AuthorizeDataRunMediaResult::Blocked(
+            "the backup media request has an unsupported phase".to_owned(),
+        ));
+    }
+    let job_state =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if job_state != "waiting_for_media" {
+        transaction.rollback().await?;
+        return Ok(AuthorizeDataRunMediaResult::Blocked(
+            "the parent backup is no longer waiting for media".to_owned(),
+        ));
+    }
+    let drive = sqlx::query_as::<_, DriveRecord>(&format!(
+        "{DRIVE_SELECT} WHERE d.id = $1 FOR UPDATE OF d"
+    ))
+    .bind(authorization.drive_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let cartridge = sqlx::query_as::<_, QualificationCartridge>(&format!(
+        "{QUALIFICATION_CARTRIDGE_SELECT} WHERE c.id = $1 FOR UPDATE OF c"
+    ))
+    .bind(authorization.cartridge_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let (Some(drive), Some(cartridge)) = (drive, cartridge) else {
+        transaction.rollback().await?;
+        return Ok(AuthorizeDataRunMediaResult::NotFound);
+    };
+    if drive.id != run.drive_id
+        || drive.stable_id != run.expected_stable_id
+        || drive.stable_id != authorization.expected_stable_id
+        || drive.observed_path.as_deref() != Some(run.expected_path.as_str())
+        || cartridge.internal_label != authorization.typed_cartridge_label
+    {
+        transaction.rollback().await?;
+        return Ok(AuthorizeDataRunMediaResult::Blocked(
+            "the loaded drive or cartridge does not match the pending media request".to_owned(),
+        ));
+    }
+    if let Some(reason) = drive_motion_blocker(&drive) {
+        transaction.rollback().await?;
+        return Ok(AuthorizeDataRunMediaResult::Blocked(reason));
+    }
+    if request.phase == "full_readback"
+        && !single_tape_qualification_passed(&mut transaction, &drive, cartridge.id).await?
+    {
+        transaction.rollback().await?;
+        return Ok(AuthorizeDataRunMediaResult::Blocked(
+            "the retained setup evidence for this exact drive and archive tape is missing; do not run a destructive tape-preparation test on archive media"
+                .to_owned(),
+        ));
+    }
+    if request.phase == "full_readback" {
+        if let Some(reason) = readback_identity_status_blocker(&cartridge.identity_status) {
+            transaction.rollback().await?;
+            return Ok(AuthorizeDataRunMediaResult::Blocked(reason.to_owned()));
+        }
+    }
+    let owner_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT owner_id FROM resource_leases
+          WHERE id = $1 AND resource_kind = 'drive' AND resource_id = $2::text
+            AND fencing_token = $3 AND released_at IS NULL AND expires_at > now()",
+    )
+    .bind(run.drive_lease_id)
+    .bind(run.drive_id)
+    .bind(run.drive_fencing_token)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(owner_id) = owner_id else {
+        transaction.rollback().await?;
+        return Ok(AuthorizeDataRunMediaResult::Blocked(
+            "the backup worker no longer owns the drive".to_owned(),
+        ));
+    };
+
+    let volume = if request.phase == "backup_write" {
+        if !run.spanning_enabled || !authorization.destructive_overwrite_confirmed {
+            transaction.rollback().await?;
+            return Ok(AuthorizeDataRunMediaResult::Blocked(
+                "another destructive tape requires a spanning-enabled policy and overwrite confirmation"
+                    .to_owned(),
+            ));
+        }
+        let profile_pool = sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT media_pool_id FROM single_tape_data_profiles WHERE id = $1 FOR SHARE",
+        )
+        .bind(run.profile_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if profile_pool.is_some_and(|pool_id| cartridge.pool_id != Some(pool_id)) {
+            transaction.rollback().await?;
+            return Ok(AuthorizeDataRunMediaResult::Blocked(
+                "the continuation tape is not in this backup's media pool".to_owned(),
+            ));
+        }
+        let expected_reservation = format!("single_tape_data:{}", run.id);
+        if let Some(reason) = qualification_cartridge_blocker(&cartridge, None) {
+            transaction.rollback().await?;
+            return Ok(AuthorizeDataRunMediaResult::Blocked(reason));
+        }
+        if !single_tape_qualification_passed(&mut transaction, &drive, cartridge.id).await? {
+            transaction.rollback().await?;
+            return Ok(AuthorizeDataRunMediaResult::Blocked(
+                "the exact drive and continuation cartridge need a current passed qualification"
+                    .to_owned(),
+            ));
+        }
+        let already_used = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM single_tape_data_run_volumes
+                  WHERE single_tape_data_run_id = $1 AND cartridge_id = $2)",
+        )
+        .bind(run.id)
+        .bind(cartridge.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if already_used {
+            transaction.rollback().await?;
+            return Ok(AuthorizeDataRunMediaResult::Blocked(
+                "a continuation tape cannot be reused within the same archive".to_owned(),
+            ));
+        }
+        let media_lease_id = Uuid::now_v7();
+        let media_fencing_token = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO resource_leases
+                (id, resource_kind, resource_id, owner_id, fencing_token, expires_at)
+             VALUES ($1, 'media', $2::text, $3, nextval('resource_fencing_token_seq'),
+                     now() + interval '30 minutes')
+             ON CONFLICT DO NOTHING RETURNING fencing_token",
+        )
+        .bind(media_lease_id)
+        .bind(cartridge.id)
+        .bind(owner_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(media_fencing_token) = media_fencing_token else {
+            transaction.rollback().await?;
+            return Ok(AuthorizeDataRunMediaResult::Blocked(
+                "the continuation tape is reserved by another operation".to_owned(),
+            ));
+        };
+        sqlx::query("UPDATE cartridges SET reserved_by = $1, updated_at = now() WHERE id = $2")
+            .bind(&expected_reservation)
+            .bind(cartridge.id)
+            .execute(&mut *transaction)
+            .await?;
+        let volume_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO single_tape_data_run_volumes
+                (id, single_tape_data_run_id, volume_order, cartridge_id,
+                 expected_cartridge_label, expected_media_generation,
+                 expected_media_format, media_lease_id, media_fencing_token, state)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'authorized')",
+        )
+        .bind(volume_id)
+        .bind(run.id)
+        .bind(request.volume_order)
+        .bind(cartridge.id)
+        .bind(&cartridge.internal_label)
+        .bind(cartridge.media_generation)
+        .bind(&cartridge.media_format)
+        .bind(media_lease_id)
+        .bind(media_fencing_token)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query_as::<_, DataRunVolumeRecord>(&format!("{DATA_RUN_VOLUME_SELECT} WHERE id = $1"))
+            .bind(volume_id)
+            .fetch_one(&mut *transaction)
+            .await?
+    } else {
+        if request.expected_cartridge_id != Some(cartridge.id) {
+            transaction.rollback().await?;
+            return Ok(AuthorizeDataRunMediaResult::Blocked(
+                "the loaded tape is not the exact archive volume requested for readback".to_owned(),
+            ));
+        }
+        let volume = sqlx::query_as::<_, DataRunVolumeRecord>(&format!(
+            "{DATA_RUN_VOLUME_SELECT}
+             WHERE single_tape_data_run_id = $1 AND volume_order = $2
+               AND cartridge_id = $3 FOR UPDATE"
+        ))
+        .bind(run.id)
+        .bind(request.volume_order)
+        .bind(cartridge.id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(volume) = volume else {
+            transaction.rollback().await?;
+            return Ok(AuthorizeDataRunMediaResult::Blocked(
+                "the requested readback volume is missing from the archive".to_owned(),
+            ));
+        };
+        if volume.expected_cartridge_label != authorization.typed_cartridge_label
+            || volume.engine_volume_name.as_deref()
+                != request.expected_engine_volume_name.as_deref()
+        {
+            transaction.rollback().await?;
+            return Ok(AuthorizeDataRunMediaResult::Blocked(
+                "the loaded tape label does not match the required engine volume".to_owned(),
+            ));
+        }
+        let media_lease_live = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM resource_leases
+                  WHERE id = $1 AND resource_kind = 'media'
+                    AND resource_id = $2::text AND owner_id = $3
+                    AND fencing_token = $4 AND released_at IS NULL
+                    AND expires_at > now())",
+        )
+        .bind(volume.media_lease_id)
+        .bind(volume.cartridge_id)
+        .bind(owner_id)
+        .bind(volume.media_fencing_token)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !media_lease_live {
+            transaction.rollback().await?;
+            return Ok(AuthorizeDataRunMediaResult::Blocked(
+                "the backup worker no longer owns the requested archive tape".to_owned(),
+            ));
+        }
+        volume
+    };
+
+    sqlx::query(
+        "UPDATE single_tape_data_media_requests
+            SET state = 'authorized', authorized_cartridge_id = $1,
+                authorized_at = now(), confirmation_evidence = $2
+          WHERE id = $3 AND state = 'pending'",
+    )
+    .bind(cartridge.id)
+    .bind(&authorization.confirmation_evidence)
+    .bind(request.id)
+    .execute(&mut *transaction)
+    .await?;
+    append_single_tape_data_event(
+        &mut transaction,
+        run.id,
+        run.correlation_id,
+        "media_authorized",
+        json!({
+            "media_request_id": request.id,
+            "phase": request.phase,
+            "volume_order": request.volume_order,
+            "cartridge_id": cartridge.id,
+            "cartridge_label": cartridge.internal_label,
+            "destructive": request.phase == "backup_write",
+            "loaded_media_identity_basis": "operator_attestation_and_inventory_binding",
+            "machine_verified_loaded_cartridge": false
+        }),
+        "local-api",
+    )
+    .await?;
+    let request = sqlx::query_as::<_, DataRunMediaRequestRecord>(&format!(
+        "{DATA_RUN_MEDIA_REQUEST_SELECT} WHERE id = $1"
+    ))
+    .bind(request.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(AuthorizeDataRunMediaResult::Authorized {
+        request: Box::new(request),
+        volume: Box::new(volume),
+        idempotent_replay: false,
+    })
+}
+
+pub async fn authorized_data_run_media_request(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+) -> Result<Option<(DataRunMediaRequestRecord, DataRunVolumeRecord)>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+    let request = sqlx::query_as::<_, DataRunMediaRequestRecord>(&format!(
+        "{DATA_RUN_MEDIA_REQUEST_SELECT}
+         WHERE single_tape_data_run_id = $1 AND state = 'authorized'
+         ORDER BY request_sequence DESC LIMIT 1 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(request) = request else {
+        transaction.commit().await?;
+        return Ok(None);
+    };
+    let volume = sqlx::query_as::<_, DataRunVolumeRecord>(&format!(
+        "{DATA_RUN_VOLUME_SELECT}
+         WHERE single_tape_data_run_id = $1 AND volume_order = $2"
+    ))
+    .bind(claim.run.id)
+    .bind(request.volume_order)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Some((request, volume)))
+}
+
+pub async fn mark_data_run_media_loaded(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    request_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let request = sqlx::query_as::<_, DataRunMediaRequestRecord>(&format!(
+        "{DATA_RUN_MEDIA_REQUEST_SELECT} WHERE id = $1
+           AND single_tape_data_run_id = $2 FOR UPDATE"
+    ))
+    .bind(request_id)
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(request) = request else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    if request.state == "loaded" {
+        transaction.commit().await?;
+        return Ok(true);
+    }
+    if request.state != "authorized" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let resume_state = match request.phase.as_str() {
+        "backup_write" => "writing",
+        "full_readback" => "verifying",
+        "restore" => "restoring",
+        _ => {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+    };
+    sqlx::query(
+        "UPDATE single_tape_data_media_requests
+            SET state = 'loaded', loaded_at = now()
+          WHERE id = $1 AND state = 'authorized'",
+    )
+    .bind(request.id)
+    .execute(&mut *transaction)
+    .await?;
+    let parent = sqlx::query(
+        "UPDATE job_runs SET state = $1
+          WHERE id = $2 AND state = 'waiting_for_media'",
+    )
+    .bind(resume_state)
+    .bind(claim.run.job_run_id)
+    .execute(&mut *transaction)
+    .await?;
+    if parent.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let evidence = json!({
+        "media_request_id": request.id,
+        "phase": request.phase,
+        "volume_order": request.volume_order,
+        "cartridge_id": request.authorized_cartridge_id,
+        "engine_volume_name": request.expected_engine_volume_name
+    });
+    append_job_transition(
+        &mut transaction,
+        claim.run.job_run_id,
+        Some("waiting_for_media"),
+        resume_state,
+        "authorized tape loaded; resuming the same Bacula job",
+        evidence.clone(),
+        claim.run.correlation_id,
+    )
+    .await?;
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "media_loaded",
+        evidence,
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+pub async fn complete_data_run_media_request(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    request_id: Uuid,
+    media_exhausted: bool,
+) -> Result<bool, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let request = sqlx::query_as::<_, DataRunMediaRequestRecord>(&format!(
+        "{DATA_RUN_MEDIA_REQUEST_SELECT} WHERE id = $1
+           AND single_tape_data_run_id = $2 FOR UPDATE"
+    ))
+    .bind(request_id)
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(request) = request else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    if request.state == "completed" {
+        transaction.commit().await?;
+        return Ok(true);
+    }
+    if request.state != "loaded" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE single_tape_data_media_requests
+            SET state = 'completed', completed_at = now()
+          WHERE id = $1 AND state = 'loaded'",
+    )
+    .bind(request.id)
+    .execute(&mut *transaction)
+    .await?;
+    match request.phase.as_str() {
+        "backup_write" => {
+            let updated = sqlx::query(
+                "UPDATE single_tape_data_run_volumes
+                    SET state = 'written', written_at = COALESCE(written_at, now()),
+                        updated_at = now()
+                  WHERE single_tape_data_run_id = $1 AND volume_order = $2
+                    AND state IN ('write_started', 'written')",
+            )
+            .bind(claim.run.id)
+            .bind(request.volume_order)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() != 1 {
+                transaction.rollback().await?;
+                return Ok(false);
+            }
+        }
+        "full_readback" => {
+            let updated = sqlx::query(
+                "UPDATE single_tape_data_run_volumes
+                    SET state = 'written', written_at = COALESCE(written_at, now()),
+                        verified_at = NULL, updated_at = now()
+                  WHERE single_tape_data_run_id = $1 AND volume_order = $2
+                    AND media_write_started_at IS NOT NULL
+                    AND state IN ('write_started', 'written', 'verified')",
+            )
+            .bind(claim.run.id)
+            .bind(request.volume_order)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() != 1 {
+                transaction.rollback().await?;
+                return Ok(false);
+            }
+        }
+        "restore" => {}
+        _ => {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+    }
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        match request.phase.as_str() {
+            // This proves Bacula advanced past the presented tape. The entire
+            // archive becomes verified only when the verify Job terminates
+            // successfully and atomic finalization validates every volume.
+            "full_readback" => "media_read",
+            "backup_write" if media_exhausted => "media_full",
+            _ => "written",
+        },
+        json!({
+            "media_request_id": request.id,
+            "phase": request.phase,
+            "volume_order": request.volume_order,
+            "cartridge_id": request.authorized_cartridge_id,
+            "media_exhausted": media_exhausted
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
 pub async fn renew_single_tape_data_run_leases(
     pool: &PgPool,
     claim: &ClaimedSingleTapeDataRun,
@@ -4839,6 +6389,32 @@ pub async fn renew_single_tape_data_run_leases(
     .execute(&mut *transaction)
     .await?;
     if drive.rows_affected() != 1 || media.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let additional_expected = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM single_tape_data_run_volumes
+          WHERE single_tape_data_run_id = $1 AND volume_order > 1
+            AND media_lease_id IS NOT NULL",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let additional = sqlx::query(
+        "UPDATE resource_leases lease
+            SET expires_at = now() + interval '30 minutes'
+           FROM single_tape_data_run_volumes volume
+          WHERE volume.single_tape_data_run_id = $1 AND volume.volume_order > 1
+            AND volume.media_lease_id = lease.id
+            AND volume.media_fencing_token = lease.fencing_token
+            AND lease.owner_id = $2 AND lease.released_at IS NULL
+            AND lease.expires_at > now()",
+    )
+    .bind(claim.run.id)
+    .bind(claim.worker_id)
+    .execute(&mut *transaction)
+    .await?;
+    if i64::try_from(additional.rows_affected()).unwrap_or(i64::MAX) != additional_expected {
         transaction.rollback().await?;
         return Ok(false);
     }
@@ -4906,12 +6482,24 @@ pub async fn mark_single_tape_media_write_started(
     claim: &ClaimedSingleTapeDataRun,
     expected_engine_volume: &str,
 ) -> Result<bool, sqlx::Error> {
+    mark_data_run_volume_write_started(pool, claim, 1, expected_engine_volume).await
+}
+
+pub async fn mark_data_run_volume_write_started(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    volume_order: i32,
+    expected_engine_volume: &str,
+) -> Result<bool, sqlx::Error> {
     if expected_engine_volume.is_empty()
         || expected_engine_volume.len() > 127
         || !expected_engine_volume
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
+        return Ok(false);
+    }
+    if volume_order <= 0 {
         return Ok(false);
     }
     let mut transaction = pool.begin().await?;
@@ -4928,19 +6516,57 @@ pub async fn mark_single_tape_media_write_started(
         transaction.rollback().await?;
         return Ok(false);
     }
-    let updated = sqlx::query(
-        "UPDATE single_tape_data_runs
-         SET media_write_started = true, media_write_started_at = now(),
-             result = result || jsonb_build_object(
-                 'media_write_started', true,
-                 'expected_engine_volume', $1::text)
-         WHERE id = $2 AND state = 'running' AND NOT media_write_started",
+    let volume = sqlx::query_as::<_, DataRunVolumeRecord>(&format!(
+        "{DATA_RUN_VOLUME_SELECT}
+         WHERE single_tape_data_run_id = $1 AND volume_order = $2 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(volume) = volume else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    if volume.state == "write_started"
+        && volume.engine_volume_name.as_deref() == Some(expected_engine_volume)
+    {
+        transaction.commit().await?;
+        return Ok(true);
+    }
+    if volume.state != "authorized" || volume.engine_volume_name.is_some() {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    if volume_order == 1 {
+        let updated = sqlx::query(
+            "UPDATE single_tape_data_runs
+             SET media_write_started = true, media_write_started_at = now(),
+                 result = result || jsonb_build_object(
+                     'media_write_started', true,
+                     'expected_engine_volume', $1::text)
+             WHERE id = $2 AND state = 'running' AND NOT media_write_started",
+        )
+        .bind(expected_engine_volume)
+        .bind(claim.run.id)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+    }
+    let volume_updated = sqlx::query(
+        "UPDATE single_tape_data_run_volumes
+            SET state = 'write_started', media_write_started_at = now(),
+                engine_volume_name = $1, updated_at = now()
+          WHERE id = $2 AND state = 'authorized' AND engine_volume_name IS NULL",
     )
     .bind(expected_engine_volume)
-    .bind(claim.run.id)
+    .bind(volume.id)
     .execute(&mut *transaction)
     .await?;
-    if updated.rows_affected() != 1 {
+    if volume_updated.rows_affected() != 1 {
         transaction.rollback().await?;
         return Ok(false);
     }
@@ -4950,7 +6576,7 @@ pub async fn mark_single_tape_media_write_started(
              health_status = 'write_in_progress', updated_at = now()
          WHERE id = $1 AND reserved_by = $2",
     )
-    .bind(claim.run.cartridge_id)
+    .bind(volume.cartridge_id)
     .bind(format!("single_tape_data:{}", claim.run.id))
     .execute(&mut *transaction)
     .await?;
@@ -4966,12 +6592,79 @@ pub async fn mark_single_tape_media_write_started(
         json!({
             "phase": "writing",
             "media_write_started": true,
+            "volume_order": volume_order,
+            "cartridge_id": volume.cartridge_id,
             "expected_engine_volume": expected_engine_volume,
             "detail": "durable media-write boundary committed before Bacula label dispatch"
         }),
         "tapescale-worker",
     )
     .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// Promote every authorized archive volume to `written` only after the
+/// completed Bacula backup has supplied an exact, ordered JobMedia/catalog
+/// proof. This closes the initial-volume gap: volume one has no manual-media
+/// request to complete, so it cannot be inferred written from request state.
+pub async fn mark_data_run_backup_volumes_written(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    catalog_volume_names: &[String],
+) -> Result<bool, sqlx::Error> {
+    if catalog_volume_names.is_empty()
+        || catalog_volume_names.iter().any(|name| {
+            name.is_empty()
+                || name.len() > 127
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    {
+        return Ok(false);
+    }
+
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let job_state =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(claim.run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if claim.run.workflow_kind != "backup" || job_state != "writing" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let volumes = sqlx::query_as::<_, DataRunVolumeRecord>(&format!(
+        "{DATA_RUN_VOLUME_SELECT}
+         WHERE single_tape_data_run_id = $1 ORDER BY volume_order FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    if validate_catalog_written_volume_chain(&volumes, catalog_volume_names).is_err() {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+
+    let updated = sqlx::query(
+        "UPDATE single_tape_data_run_volumes
+            SET state = 'written', written_at = COALESCE(written_at, now()),
+                updated_at = now()
+          WHERE single_tape_data_run_id = $1
+            AND state IN ('write_started', 'written')",
+    )
+    .bind(claim.run.id)
+    .execute(&mut *transaction)
+    .await?;
+    if usize::try_from(updated.rows_affected()).ok() != Some(volumes.len()) {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
     transaction.commit().await?;
     Ok(true)
 }
@@ -5005,8 +6698,9 @@ pub async fn append_single_tape_data_evidence_event(
 }
 
 /// A worker that has lost its fencing lease may still know that physical media
-/// was touched. Quarantine that exact run's cartridge and revoke drive trust,
-/// but never release or rewrite resources owned by a newer controller.
+/// was touched. Quarantine every ordered cartridge whose durable write
+/// boundary was crossed and revoke drive trust, but never release or rewrite
+/// resources owned by a newer controller.
 pub async fn quarantine_fenced_single_tape_write(
     pool: &PgPool,
     claim: &ClaimedSingleTapeDataRun,
@@ -5036,13 +6730,26 @@ pub async fn quarantine_fenced_single_tape_write(
         transaction.rollback().await?;
         return Ok(false);
     }
-    sqlx::query(
-        "UPDATE cartridges
-         SET on_tape_identity = NULL, identity_status = 'unknown',
-             health_status = 'write_unverified', updated_at = now()
-         WHERE id = $1",
+    let quarantined_media_ids = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE cartridges cartridge
+            SET on_tape_identity = NULL, identity_status = 'unknown',
+                health_status = 'write_unverified', updated_at = now()
+           FROM single_tape_data_run_volumes volume
+          WHERE volume.single_tape_data_run_id = $1
+            AND volume.cartridge_id = cartridge.id
+            AND volume.media_write_started_at IS NOT NULL
+          RETURNING cartridge.id",
     )
-    .bind(cartridge_id)
+    .bind(claim.run.id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "UPDATE single_tape_data_run_volumes
+            SET state = 'write_unverified', updated_at = now()
+          WHERE single_tape_data_run_id = $1
+            AND media_write_started_at IS NOT NULL",
+    )
+    .bind(claim.run.id)
     .execute(&mut *transaction)
     .await?;
     mark_drive_motion_uncertain(&mut transaction, drive_id, detail).await?;
@@ -5063,6 +6770,7 @@ pub async fn quarantine_fenced_single_tape_write(
             json!({
                 "detail": detail,
                 "media_write_started": true,
+                "quarantined_media_ids": quarantined_media_ids,
                 "position_uncertain": true,
                 "reconciliation_required": true
             }),
@@ -5212,15 +6920,45 @@ pub async fn finish_single_tape_data_run(
         mark_drive_motion_uncertain(&mut transaction, claim.run.drive_id, detail).await?;
     }
     if media_write_started {
-        sqlx::query(
-            "UPDATE cartridges
-             SET on_tape_identity = NULL, identity_status = 'unknown',
-                 health_status = 'write_unverified', updated_at = now()
-             WHERE id = $1",
+        let quarantined_media_ids = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE cartridges cartridge
+                SET on_tape_identity = NULL, identity_status = 'unknown',
+                    health_status = 'write_unverified', updated_at = now()
+               FROM single_tape_data_run_volumes volume
+              WHERE volume.single_tape_data_run_id = $1
+                AND volume.cartridge_id = cartridge.id
+                AND volume.media_write_started_at IS NOT NULL
+              RETURNING cartridge.id",
         )
-        .bind(claim.run.cartridge_id)
+        .bind(claim.run.id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE single_tape_data_run_volumes
+                SET state = 'write_unverified', updated_at = now()
+              WHERE single_tape_data_run_id = $1
+                AND media_write_started_at IS NOT NULL",
+        )
+        .bind(claim.run.id)
         .execute(&mut *transaction)
         .await?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "quarantined_media_ids".to_owned(),
+                serde_json::to_value(quarantined_media_ids)
+                    .expect("UUID lists always serialize as JSON"),
+            );
+        }
+        sqlx::query("UPDATE single_tape_data_runs SET result = $1 WHERE id = $2")
+            .bind(&result)
+            .bind(claim.run.id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE job_runs SET failure_detail = $1 WHERE id = $2")
+            .bind(&result)
+            .bind(claim.run.job_run_id)
+            .execute(&mut *transaction)
+            .await?;
     }
     if state == SingleTapeDataTerminalState::Cancelled {
         let cancel_actor = cancel_requested_by_label
@@ -5640,6 +7378,21 @@ pub async fn finalize_single_tape_backup_pass(
                 .to_owned(),
         ));
     }
+    let run_volumes = sqlx::query_as::<_, DataRunVolumeRecord>(&format!(
+        "{DATA_RUN_VOLUME_SELECT}
+         WHERE single_tape_data_run_id = $1 ORDER BY volume_order FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let finalized_volumes =
+        match validated_backup_volume_evidence(&run_volumes, &engine_write.metadata, evidence) {
+            Ok(volumes) => volumes,
+            Err(reason) => {
+                transaction.rollback().await?;
+                return Ok(FinalizeSingleTapeDataResult::Rejected(reason));
+            }
+        };
 
     let (source_id, source_scope_hash) = sqlx::query_as::<_, (Uuid, String)>(
         "SELECT profile.source_id, source.scope_hash
@@ -5652,14 +7405,46 @@ pub async fn finalize_single_tape_backup_pass(
     .fetch_one(&mut *transaction)
     .await?;
     let recovery_point_id = Uuid::now_v7();
-    let volume_record_id = Uuid::now_v7();
+    let volume_record_ids = finalized_volumes
+        .iter()
+        .map(|_| Uuid::now_v7())
+        .collect::<Vec<_>>();
+    let volume_record_id = volume_record_ids[0];
+    let media_ids = finalized_volumes
+        .iter()
+        .map(|volume| volume.cartridge_id)
+        .collect::<Vec<_>>();
     let recovery_time = Utc::now();
     let manifest_digest = manifest_digest.expect("manifest digest was validated");
+    let limitations = if finalized_volumes.len() == 1 && !claim.run.spanning_enabled {
+        json!([
+            "single_volume",
+            "full_only",
+            "unencrypted",
+            "server_verified_read_only_source"
+        ])
+    } else {
+        json!([
+            "full_only",
+            "unencrypted",
+            "server_verified_read_only_source"
+        ])
+    };
     let coverage = json!({
-        "scope": "attended full-file backup with complete physical-media readback",
+        "scope": if finalized_volumes.len() > 1 {
+            "attended multi-volume full-file backup with complete physical-media readback"
+        } else {
+            "attended single-volume full-file backup with complete physical-media readback"
+        },
         "qualification": "test_slice",
         "production_eligible": false,
-        "limitations": ["single_volume", "full_only", "unencrypted", "server_verified_read_only_source"],
+        "limitations": limitations,
+        "volume_count": finalized_volumes.len(),
+        "spanning_enabled": claim.run.spanning_enabled,
+        "compression": {
+            "requested": claim.run.compression_mode,
+            "resolved": claim.run.resolved_compression
+        },
         "logical_root": claim.run.logical_root,
         "source_snapshot_id": claim.run.source_snapshot_id,
         "file_count": evidence.file_count,
@@ -5688,28 +7473,47 @@ pub async fn finalize_single_tape_backup_pass(
     .bind(manifest_digest)
     .execute(&mut *transaction)
     .await?;
-    sqlx::query(
-        "INSERT INTO volume_records
-            (id, recovery_point_id, cartridge_id, volume_order,
-             first_record, last_record, encoded_bytes, finalized, engine_record_id)
-         VALUES ($1, $2, $3, 1, $4, $5, $6, true, $7)",
-    )
-    .bind(volume_record_id)
-    .bind(recovery_point_id)
-    .bind(claim.run.cartridge_id)
-    .bind(&evidence.first_record)
-    .bind(&evidence.last_record)
-    .bind(i64::try_from(evidence.encoded_bytes).expect("size was checked"))
-    .bind(&evidence.engine_record_id)
-    .execute(&mut *transaction)
-    .await?;
+    for (volume, record_id) in finalized_volumes.iter().zip(volume_record_ids.iter()) {
+        sqlx::query(
+            "INSERT INTO volume_records
+                (id, recovery_point_id, cartridge_id, volume_order,
+                 first_record, last_record, encoded_bytes, finalized, engine_record_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8)",
+        )
+        .bind(record_id)
+        .bind(recovery_point_id)
+        .bind(volume.cartridge_id)
+        .bind(volume.volume_order)
+        .bind(&volume.first_record)
+        .bind(&volume.last_record)
+        .bind(volume.encoded_bytes)
+        .bind(&volume.engine_record_id)
+        .execute(&mut *transaction)
+        .await?;
+    }
 
     let verification_scope = json!({
-        "scope": "complete single-volume full-file backup",
+        "scope": "complete ordered-volume full-file backup",
+        "volume_count": finalized_volumes.len(),
         "file_count": evidence.file_count,
         "logical_bytes": evidence.logical_bytes,
         "manifest_digest": manifest_digest
     });
+    let ordered_volume_evidence = finalized_volumes
+        .iter()
+        .map(|volume| {
+            json!({
+                "volume_order": volume.volume_order,
+                "cartridge_id": volume.cartridge_id,
+                "engine_volume_name": volume.engine_volume_name,
+                "engine_media_id": volume.engine_media_id,
+                "first_record": volume.first_record,
+                "last_record": volume.last_record,
+                "encoded_bytes": volume.encoded_bytes,
+                "engine_record_id": volume.engine_record_id
+            })
+        })
+        .collect::<Vec<_>>();
     for (kind, verification_evidence) in [
         (
             "write_complete",
@@ -5719,6 +7523,7 @@ pub async fn finalize_single_tape_backup_pass(
                 "engine_volume_name": evidence.engine_volume_name,
                 "artifact_id": engine_write.id,
                 "artifact_sha256": engine_write.sha256,
+                "volumes": ordered_volume_evidence,
                 "finalized": true
             }),
         ),
@@ -5728,7 +7533,7 @@ pub async fn finalize_single_tape_backup_pass(
             "INSERT INTO verification_records
                 (id, recovery_point_id, kind, scope, outcome, drive_id, media_ids,
                  evidence, correlation_id, started_at, finished_at)
-             VALUES ($1, $2, $3, $4, 'passed', $5, ARRAY[$6]::uuid[],
+             VALUES ($1, $2, $3, $4, 'passed', $5, $6,
                      $7, $8, $9, now())",
         )
         .bind(Uuid::now_v7())
@@ -5736,7 +7541,7 @@ pub async fn finalize_single_tape_backup_pass(
         .bind(kind)
         .bind(&verification_scope)
         .bind(claim.run.drive_id)
-        .bind(claim.run.cartridge_id)
+        .bind(&media_ids)
         .bind(verification_evidence)
         .bind(claim.run.correlation_id)
         .bind(
@@ -5750,7 +7555,11 @@ pub async fn finalize_single_tape_backup_pass(
     }
 
     let result = json!({
-        "detail": "the full-file source was written through Bacula and read back completely from physical tape",
+        "detail": if finalized_volumes.len() > 1 {
+            "the full-file source was written through Bacula across an ordered tape set and read back completely from physical media"
+        } else {
+            "the full-file source was written through Bacula and read back completely from physical tape"
+        },
         "workflow_kind": "backup",
         "qualification": "test_slice",
         "production_eligible": false,
@@ -5758,6 +7567,15 @@ pub async fn finalize_single_tape_backup_pass(
         "engine_volume_name": evidence.engine_volume_name,
         "recovery_point_id": recovery_point_id,
         "volume_record_id": volume_record_id,
+        "volume_record_ids": volume_record_ids,
+        "volume_count": finalized_volumes.len(),
+        "media_ids": media_ids,
+        "volumes": ordered_volume_evidence,
+        "spanning_enabled": claim.run.spanning_enabled,
+        "compression": {
+            "requested": claim.run.compression_mode,
+            "resolved": claim.run.resolved_compression
+        },
         "source_manifest_digest": manifest_digest,
         "source_manifest_artifact_sha256": source_manifest.sha256,
         "logical_bytes": evidence.logical_bytes,
@@ -5796,16 +7614,53 @@ pub async fn finalize_single_tape_backup_pass(
             "the parent job was no longer in physical readback".to_owned(),
         ));
     }
-    sqlx::query(
-        "UPDATE cartridges
-         SET on_tape_identity = $1, identity_status = 'reconciled',
-             health_status = 'written_verified', updated_at = now()
-         WHERE id = $2",
-    )
-    .bind(&evidence.engine_volume_name)
-    .bind(claim.run.cartridge_id)
-    .execute(&mut *transaction)
-    .await?;
+    for volume in &finalized_volumes {
+        let cartridge_updated = sqlx::query(
+            "UPDATE cartridges
+                SET on_tape_identity = $1, identity_status = 'reconciled',
+                    health_status = 'written_verified', updated_at = now()
+              WHERE id = $2",
+        )
+        .bind(&volume.engine_volume_name)
+        .bind(volume.cartridge_id)
+        .execute(&mut *transaction)
+        .await?;
+        if cartridge_updated.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(FinalizeSingleTapeDataResult::Rejected(format!(
+                "archive volume {} cartridge disappeared during finalization",
+                volume.volume_order
+            )));
+        }
+        let run_volume_updated = sqlx::query(
+            "UPDATE single_tape_data_run_volumes
+                SET state = 'verified', engine_media_id = $1,
+                    written_at = COALESCE(written_at, now()), verified_at = now(),
+                    encoded_bytes = $2, first_record = $3, last_record = $4,
+                    updated_at = now()
+              WHERE id = $5 AND single_tape_data_run_id = $6
+                AND cartridge_id = $7 AND engine_volume_name = $8
+                AND media_write_started_at IS NOT NULL
+                AND state IN ('write_started', 'written', 'verified')",
+        )
+        .bind(volume.engine_media_id)
+        .bind(volume.encoded_bytes)
+        .bind(&volume.first_record)
+        .bind(&volume.last_record)
+        .bind(volume.run_volume_id)
+        .bind(claim.run.id)
+        .bind(volume.cartridge_id)
+        .bind(&volume.engine_volume_name)
+        .execute(&mut *transaction)
+        .await?;
+        if run_volume_updated.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(FinalizeSingleTapeDataResult::Rejected(format!(
+                "archive volume {} changed during finalization",
+                volume.volume_order
+            )));
+        }
+    }
     append_job_transition(
         &mut transaction,
         claim.run.job_run_id,
@@ -5863,7 +7718,17 @@ pub async fn recover_expired_single_tape_data_runs(pool: &PgPool) -> Result<u64,
                AND (drive_lease.id IS NULL OR drive_lease.released_at IS NOT NULL
                     OR drive_lease.expires_at <= now()
                     OR media_lease.id IS NULL OR media_lease.released_at IS NOT NULL
-                    OR media_lease.expires_at <= now())
+                    OR media_lease.expires_at <= now()
+                    OR EXISTS (
+                        SELECT 1
+                          FROM single_tape_data_run_volumes volume
+                          LEFT JOIN resource_leases extra_media_lease
+                            ON extra_media_lease.id = volume.media_lease_id
+                         WHERE volume.single_tape_data_run_id = data_run.id
+                           AND volume.volume_order > 1
+                           AND (extra_media_lease.id IS NULL
+                                OR extra_media_lease.released_at IS NOT NULL
+                                OR extra_media_lease.expires_at <= now())))
          ) FOR UPDATE"
     ))
     .fetch_all(&mut *transaction)
@@ -5927,12 +7792,24 @@ pub async fn recover_expired_single_tape_data_runs(pool: &PgPool) -> Result<u64,
         mark_drive_motion_uncertain(&mut transaction, run.drive_id, detail).await?;
         if run.media_write_started {
             sqlx::query(
-                "UPDATE cartridges
-                 SET on_tape_identity = NULL, identity_status = 'unknown',
-                     health_status = 'write_unverified', updated_at = now()
-                 WHERE id = $1",
+                "UPDATE cartridges cartridge
+                    SET on_tape_identity = NULL, identity_status = 'unknown',
+                        health_status = 'write_unverified', updated_at = now()
+                   FROM single_tape_data_run_volumes volume
+                  WHERE volume.single_tape_data_run_id = $1
+                    AND volume.cartridge_id = cartridge.id
+                    AND volume.media_write_started_at IS NOT NULL",
             )
-            .bind(run.cartridge_id)
+            .bind(run.id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE single_tape_data_run_volumes
+                    SET state = 'write_unverified', updated_at = now()
+                  WHERE single_tape_data_run_id = $1
+                    AND media_write_started_at IS NOT NULL",
+            )
+            .bind(run.id)
             .execute(&mut *transaction)
             .await?;
         }
@@ -6140,6 +8017,18 @@ async fn lock_valid_single_tape_claim(
            AND media_lease.owner_id = $6
            AND media_lease.fencing_token = $5
            AND media_lease.released_at IS NULL AND media_lease.expires_at > now()
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM single_tape_data_run_volumes volume
+                 LEFT JOIN resource_leases extra_media_lease
+                   ON extra_media_lease.id = volume.media_lease_id
+                WHERE volume.single_tape_data_run_id = data_run.id
+                  AND volume.volume_order > 1
+                  AND (extra_media_lease.id IS NULL
+                       OR extra_media_lease.owner_id <> $6
+                       OR extra_media_lease.fencing_token <> volume.media_fencing_token
+                       OR extra_media_lease.released_at IS NOT NULL
+                       OR extra_media_lease.expires_at <= now()))
          FOR UPDATE OF data_run, drive_lease, media_lease",
     )
     .bind(claim.run.id)
@@ -6157,6 +8046,18 @@ async fn release_single_tape_data_resources(
     transaction: &mut Transaction<'_, Postgres>,
     run: &SingleTapeDataRunRecord,
 ) -> Result<(), sqlx::Error> {
+    // No terminal run may retain an actionable operator prompt. This also
+    // closes a pending request when cancellation arrives while Bacula is
+    // paused for a manual tape change.
+    sqlx::query(
+        "UPDATE single_tape_data_media_requests
+            SET state = 'cancelled'
+          WHERE single_tape_data_run_id = $1
+            AND state IN ('pending', 'authorized', 'loaded')",
+    )
+    .bind(run.id)
+    .execute(&mut **transaction)
+    .await?;
     if let Some(drive_lease_id) = run.drive_lease_id {
         sqlx::query(
             "UPDATE resource_leases SET released_at = now()
@@ -6166,6 +8067,19 @@ async fn release_single_tape_data_resources(
         .execute(&mut **transaction)
         .await?;
     }
+    // The scalar media lease remains the compatibility mirror for volume one.
+    // Release every ordered-volume lease as the authoritative operation so a
+    // completed or failed spanning backup cannot strand continuation media.
+    sqlx::query(
+        "UPDATE resource_leases lease SET released_at = now()
+           FROM single_tape_data_run_volumes volume
+          WHERE volume.single_tape_data_run_id = $1
+            AND volume.media_lease_id = lease.id
+            AND lease.released_at IS NULL",
+    )
+    .bind(run.id)
+    .execute(&mut **transaction)
+    .await?;
     if let Some(media_lease_id) = run.media_lease_id {
         sqlx::query(
             "UPDATE resource_leases SET released_at = now()
@@ -6176,10 +8090,14 @@ async fn release_single_tape_data_resources(
         .await?;
     }
     sqlx::query(
-        "UPDATE cartridges SET reserved_by = NULL, updated_at = now()
-         WHERE id = $1 AND reserved_by = $2",
+        "UPDATE cartridges cartridge
+            SET reserved_by = NULL, updated_at = now()
+           FROM single_tape_data_run_volumes volume
+          WHERE volume.single_tape_data_run_id = $1
+            AND volume.cartridge_id = cartridge.id
+            AND cartridge.reserved_by = $2",
     )
-    .bind(run.cartridge_id)
+    .bind(run.id)
     .bind(format!("single_tape_data:{}", run.id))
     .execute(&mut **transaction)
     .await?;
@@ -9020,6 +10938,32 @@ pub async fn inventory_counts(pool: &PgPool) -> Result<InventoryCounts, sqlx::Er
 mod recovery_vault_tests {
     use super::*;
 
+    fn run_volume(run_id: Uuid, order: i32, name: &str) -> DataRunVolumeRecord {
+        let now = Utc::now();
+        DataRunVolumeRecord {
+            id: Uuid::now_v7(),
+            single_tape_data_run_id: run_id,
+            volume_order: order,
+            cartridge_id: Uuid::now_v7(),
+            expected_cartridge_label: format!("TAPE-{order}"),
+            expected_media_generation: Some(9),
+            expected_media_format: Some("LTO-9".to_owned()),
+            engine_volume_name: Some(name.to_owned()),
+            engine_media_id: None,
+            state: "written".to_owned(),
+            media_lease_id: Some(Uuid::now_v7()),
+            media_fencing_token: Some(i64::from(order)),
+            media_write_started_at: Some(now),
+            written_at: Some(now),
+            verified_at: None,
+            encoded_bytes: None,
+            first_record: None,
+            last_record: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     fn volume(cartridge_id: Uuid) -> RecoveryVolumeRow {
         RecoveryVolumeRow {
             id: Uuid::now_v7(),
@@ -9063,6 +11007,23 @@ mod recovery_vault_tests {
     }
 
     #[test]
+    fn missing_readback_setup_evidence_never_offers_destructive_preparation() {
+        let blocker = missing_readback_qualification_blocker(Uuid::now_v7(), Uuid::now_v7());
+        assert_eq!(blocker.code, "readback_setup_evidence_missing");
+        assert_eq!(blocker.action, "open_backup");
+        assert_ne!(blocker.action, "prepare_tape");
+        assert!(blocker.message.contains("do not run a destructive"));
+    }
+
+    #[test]
+    fn readback_rejects_known_identity_conflicts_but_allows_post_write_unknown() {
+        assert!(readback_identity_status_blocker("foreign").is_some());
+        assert!(readback_identity_status_blocker("mismatch").is_some());
+        assert!(readback_identity_status_blocker("unknown").is_none());
+        assert!(readback_identity_status_blocker("reconciled").is_none());
+    }
+
+    #[test]
     fn lto_matrix_never_substitutes_for_exact_physical_pair() {
         let volume = volume(Uuid::now_v7());
         assert!(compatible_recovery_drive(&drive(json!([])), &volume).is_none());
@@ -9094,5 +11055,114 @@ mod recovery_vault_tests {
         assert!(bounded
             .as_str()
             .is_some_and(|value| value.ends_with("…[truncated]")));
+    }
+
+    #[test]
+    fn ordered_bacula_evidence_maps_every_authorized_archive_volume() {
+        let run_id = Uuid::now_v7();
+        let run_volumes = vec![
+            run_volume(run_id, 1, "ARCHIVE-V0001"),
+            run_volume(run_id, 2, "ARCHIVE-V0002"),
+        ];
+        let metadata = json!({
+            "volumes": [
+                {"media_id": 11, "volume_name": "ARCHIVE-V0001", "volume_bytes": 100},
+                {"media_id": 12, "volume_name": "ARCHIVE-V0002", "volume_bytes": 200}
+            ],
+            "segments": [
+                {"volume_name":"ARCHIVE-V0001", "start_file":0, "start_block":0,
+                 "end_file":1, "end_block":10},
+                {"volume_name":"ARCHIVE-V0002", "start_file":0, "start_block":0,
+                 "end_file":2, "end_block":20}
+            ]
+        });
+        let evidence = SingleTapePassEvidence {
+            engine_operation_id: "bacula-job:44".to_owned(),
+            engine_volume_name: "ARCHIVE-V0001".to_owned(),
+            engine_record_id: "bacula-media:11:job:44".to_owned(),
+            first_record: "file=0:block=0".to_owned(),
+            last_record: Some("file=2:block=20".to_owned()),
+            logical_bytes: 250,
+            encoded_bytes: 300,
+            file_count: 2,
+            coverage: json!({"complete":true}),
+            full_readback_evidence: json!({"physical_media_readback":true}),
+            restore_test_evidence: json!({"outcome":"not_run"}),
+            result: json!({}),
+        };
+
+        let finalized = validated_backup_volume_evidence(&run_volumes, &metadata, &evidence)
+            .expect("ordered multi-volume catalog proof should validate");
+        assert_eq!(finalized.len(), 2);
+        assert_eq!(finalized[1].engine_media_id, 12);
+        assert_eq!(finalized[1].engine_record_id, "bacula-media:12:job:44");
+        assert_eq!(finalized[1].last_record.as_deref(), Some("file=2:block=20"));
+    }
+
+    #[test]
+    fn ordered_bacula_evidence_rejects_a_swapped_cartridge_chain() {
+        let run_id = Uuid::now_v7();
+        let run_volumes = vec![
+            run_volume(run_id, 1, "ARCHIVE-V0001"),
+            run_volume(run_id, 2, "ARCHIVE-V0002"),
+        ];
+        let metadata = json!({
+            "volumes": [
+                {"media_id": 12, "volume_name": "ARCHIVE-V0002", "volume_bytes": 200},
+                {"media_id": 11, "volume_name": "ARCHIVE-V0001", "volume_bytes": 100}
+            ],
+            "segments": [
+                {"volume_name":"ARCHIVE-V0002", "start_file":0, "start_block":0,
+                 "end_file":1, "end_block":1},
+                {"volume_name":"ARCHIVE-V0001", "start_file":0, "start_block":0,
+                 "end_file":1, "end_block":1}
+            ]
+        });
+        let evidence = SingleTapePassEvidence {
+            engine_operation_id: "bacula-job:44".to_owned(),
+            engine_volume_name: "ARCHIVE-V0001".to_owned(),
+            engine_record_id: "bacula-media:11:job:44".to_owned(),
+            first_record: "file=0:block=0".to_owned(),
+            last_record: Some("file=1:block=1".to_owned()),
+            logical_bytes: 250,
+            encoded_bytes: 300,
+            file_count: 2,
+            coverage: json!({"complete":true}),
+            full_readback_evidence: json!({"physical_media_readback":true}),
+            restore_test_evidence: json!({"outcome":"not_run"}),
+            result: json!({}),
+        };
+
+        assert!(validated_backup_volume_evidence(&run_volumes, &metadata, &evidence).is_err());
+    }
+
+    #[test]
+    fn completed_catalog_proof_promotes_the_initial_and_continuation_volumes() {
+        let run_id = Uuid::now_v7();
+        let mut first = run_volume(run_id, 1, "ARCHIVE-V0001");
+        first.state = "write_started".to_owned();
+        first.written_at = None;
+        let volumes = vec![first, run_volume(run_id, 2, "ARCHIVE-V0002")];
+        let catalog = vec!["ARCHIVE-V0001".to_owned(), "ARCHIVE-V0002".to_owned()];
+
+        validate_catalog_written_volume_chain(&volumes, &catalog)
+            .expect("strict catalog order should prove both written tapes");
+    }
+
+    #[test]
+    fn completed_catalog_proof_rejects_missing_or_swapped_tapes() {
+        let run_id = Uuid::now_v7();
+        let volumes = vec![
+            run_volume(run_id, 1, "ARCHIVE-V0001"),
+            run_volume(run_id, 2, "ARCHIVE-V0002"),
+        ];
+        assert!(validate_catalog_written_volume_chain(
+            &volumes,
+            &["ARCHIVE-V0002".to_owned(), "ARCHIVE-V0001".to_owned()]
+        )
+        .is_err());
+        assert!(
+            validate_catalog_written_volume_chain(&volumes, &["ARCHIVE-V0001".to_owned()]).is_err()
+        );
     }
 }

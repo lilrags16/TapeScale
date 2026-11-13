@@ -28,8 +28,8 @@ use uuid::Uuid;
 
 use crate::{
     engine::bacula::{
-        BaculaConfig, BaculaCredentials, BaculaDaemon, BaculaEndpoints, BaculaPaths,
-        BaculaPoolName, RenderedBaculaConfigs, BCONSOLE_CONFIG, DIRECTOR_CONFIG,
+        BaculaConfig, BaculaCredentials, BaculaDaemon, BaculaDataOptions, BaculaEndpoints,
+        BaculaPaths, BaculaPoolName, RenderedBaculaConfigs, BCONSOLE_CONFIG, DIRECTOR_CONFIG,
         FILE_DAEMON_CONFIG, STORAGE_DAEMON_CONFIG,
     },
     tool_runner::{self, ToolCommand},
@@ -197,6 +197,31 @@ impl BaculaRuntime {
         evidence_directory: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Self, BaculaRuntimeError> {
+        Self::start_with_data_options(
+            pool,
+            database_url,
+            run_id,
+            paths,
+            BaculaDataOptions::default(),
+            evidence_directory,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Start a run-scoped data plane with an explicit on-media compression and
+    /// volume-spanning policy.  The legacy `start` entrypoint remains a strict
+    /// uncompressed, single-volume default for recovery exercises.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_data_options(
+        pool: &PgPool,
+        database_url: &str,
+        run_id: Uuid,
+        paths: BaculaPaths,
+        data_options: BaculaDataOptions,
+        evidence_directory: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, BaculaRuntimeError> {
         let catalog = BaculaCatalogConnection::parse(database_url)?;
         let catalog_schema_version = ensure_catalog_schema(pool, &catalog, cancellation).await?;
         prepare_runtime_directories(evidence_directory)?;
@@ -226,6 +251,7 @@ impl BaculaRuntime {
             credentials,
             BaculaPoolName::for_run(run_id),
         )
+        .with_data_options(data_options)
         .render();
         let mut evidence = write_configs(&rendered)?;
         evidence.catalog_schema_version = catalog_schema_version;

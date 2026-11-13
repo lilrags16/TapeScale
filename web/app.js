@@ -36,12 +36,12 @@
   ];
   const RECOVERY_TERMINAL_STATES = new Set(["passed", "verified", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
   const BACKUP_PHASES = [
-    { name: "Confirm tape", detail: "Choose drive and tape", aliases: ["waiting_for_media"] },
+    { name: "Confirm first tape", detail: "Choose the first archive volume", aliases: ["waiting_for_media"] },
     { name: "Starting", detail: "Waiting for the worker", aliases: ["queued", "media_assigned", "preparing"] },
     { name: "Scan files", detail: "Read the snapshot", aliases: ["inventorying", "manifesting", "source_manifest"] },
-    { name: "Write tape", detail: "Copy the full backup", aliases: ["writing", "media_write_started", "engine_dispatched"] },
-    { name: "Close tape", detail: "Finish the backup set", aliases: ["written", "finalizing"] },
-    { name: "Read back", detail: "Verify the physical tape", aliases: ["verifying", "reading", "readback"] },
+    { name: "Write archive", detail: "Copy across tapes as needed", aliases: ["writing", "media_write_started", "engine_dispatched", "waiting_for_next_media", "next_media", "media_required"] },
+    { name: "Close archive", detail: "Finish the complete backup set", aliases: ["written", "finalizing"] },
+    { name: "Read back", detail: "Verify every physical tape", aliases: ["verifying", "reading", "readback"] },
     { name: "Protected", detail: "Retain recovery evidence", aliases: ["verified", "passed", "completed", "complete"] }
   ];
   const BACKUP_TERMINAL_STATES = new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
@@ -455,10 +455,37 @@
     return String(pick(run, "state", "status") || "queued").toLowerCase();
   }
 
+  function backupMediaRequestPhase(source) {
+    const request = objectValue(source, "media_request");
+    return String(pick(request, "phase") || "").toLowerCase();
+  }
+
+  function backupMediaRequestState(source) {
+    const request = objectValue(source, "media_request");
+    return String(pick(request, "state") || "").toLowerCase();
+  }
+
+  function backupMediaIsReadback(source) {
+    return backupMediaRequestPhase(source) === "full_readback";
+  }
+
+  function backupWaitingForOperator(run) {
+    const waiting = backupRunState(run) === "waiting_for_media" || backupNeedsNextMedia(run);
+    const requestState = backupMediaRequestState(run);
+    return waiting && !["authorized", "loaded"].includes(requestState);
+  }
+
   function backupRunStateLabel(run) {
+    if (backupRunState(run) === "waiting_for_media" && backupMediaRequestState(run) === "authorized") return "Tape accepted";
+    if (backupRunState(run) === "waiting_for_media" && backupMediaRequestState(run) === "loaded") return "Resuming";
+    if (backupRunState(run) === "waiting_for_media" && backupMediaIsReadback(run)) return "Tape needed for readback";
+    if (backupRunState(run) === "waiting_for_media" && backupNeedsNextMedia(run)) return "Next tape needed";
     const labels = {
       queued: "Waiting to start",
       waiting_for_media: "Tape needed",
+      waiting_for_next_media: "Next tape needed",
+      next_media: "Next tape needed",
+      media_required: "Next tape needed",
       preparing: "Starting backup",
       inventorying: "Scanning files",
       writing: "Writing tape",
@@ -480,6 +507,80 @@
 
   function backupRunActive(run) {
     return !BACKUP_TERMINAL_STATES.has(backupRunState(run));
+  }
+
+  function backupNeedsNextMedia(run) {
+    const runState = backupRunState(run);
+    if (backupMediaIsReadback(run)) return false;
+    if (["waiting_for_next_media", "next_media", "media_required"].includes(runState)) return true;
+    const mediaRequest = objectValue(run, "media_request");
+    const phase = String(pick(mediaRequest, "phase") || "").toLowerCase();
+    if (phase === "next_media") return true;
+    if (runState !== "waiting_for_media") return false;
+    const sequence = Number(pick(mediaRequest, "volume_order", "volume_sequence", "media_sequence") ?? backupEvidenceValue(run, "next_volume_sequence", "volume_sequence", "media_sequence"));
+    return Number.isInteger(sequence) && sequence > 1;
+  }
+
+  function backupCompressionMode(source) {
+    const profile = source && pick(source, "profile_id", "backup_profile_id") ? backupProfileForRun(source) : null;
+    const value = String(pick(source, "compression_mode", "compression") || pick(profile, "compression_mode", "compression") || "auto").toLowerCase();
+    return value || "auto";
+  }
+
+  function backupCompressionSupported(source) {
+    return ["auto", "none", "gzip", "lzo"].includes(backupCompressionMode(source));
+  }
+
+  function backupCompressionLabel(source) {
+    const mode = backupCompressionMode(source);
+    const resolved = String(backupEvidenceValue(source, "resolved_compression") || "").toLowerCase();
+    if (!backupCompressionSupported(source)) return "Unsupported (" + mode + ")";
+    if (mode === "auto") return resolved && resolved !== "gzip" ? "Automatic → " + resolved.toUpperCase() : "Automatic → GZIP1 (fast)";
+    if (mode === "gzip") return "GZIP6 (balanced)";
+    return mode === "none" ? "No compression" : "LZO (fastest)";
+  }
+
+  function backupSpanningEnabled(source) {
+    const profile = source && pick(source, "profile_id", "backup_profile_id") ? backupProfileForRun(source) : null;
+    const explicit = pick(source, "spanning_enabled", "allow_media_spanning", "multi_volume") ?? pick(profile, "spanning_enabled", "allow_media_spanning", "multi_volume");
+    return explicit === null ? true : explicit === true;
+  }
+
+  function backupRunVolumes(run) {
+    const detail = backupRunDetail(run);
+    const result = objectValue(run, "result");
+    const evidence = objectValue(result, "evidence");
+    const sources = [run, result, evidence, detail || {}];
+    let values = [];
+    for (const source of sources) {
+      values = arrayValue(source, "volumes", "archive_volumes", "media_set", "volume_set", "media", "volume_labels");
+      if (values.length) break;
+    }
+    const normalized = values.map((volume, index) => {
+      if (typeof volume === "string") return { label: volume, sequence: index + 1 };
+      return {
+        label: String(pick(volume, "expected_cartridge_label", "cartridge_label", "engine_volume_name", "volume_name", "internal_label", "label") || "Tape " + (index + 1)),
+        sequence: Number(pick(volume, "volume_order", "sequence", "volume_sequence", "media_sequence")) || index + 1,
+        state: String(pick(volume, "state", "status") || "recorded")
+      };
+    }).sort((left, right) => left.sequence - right.sequence);
+    const current = pick(run, "expected_cartridge_label", "cartridge_label") || backupEvidenceValue(run, "engine_volume_name", "volume_name", "expected_cartridge_label");
+    if (current && !normalized.some((volume) => volume.label === String(current))) normalized.push({ label: String(current), sequence: normalized.length + 1, state: "current" });
+    return normalized;
+  }
+
+  function backupTapeSummary(run) {
+    const volumes = backupRunVolumes(run);
+    if (volumes.length > 1) return volumes.length + " tapes";
+    if (volumes.length === 1) return volumes[0].label;
+    return backupNeedsNextMedia(run) || backupRunState(run) === "waiting_for_media" ? "Choose tape" : "Not assigned";
+  }
+
+  function backupNextVolumeSequence(run) {
+    const mediaRequest = objectValue(run, "media_request");
+    const explicit = Number(pick(mediaRequest, "volume_order", "volume_sequence", "media_sequence") ?? backupEvidenceValue(run, "next_volume_sequence", "volume_sequence", "media_sequence"));
+    if (Number.isInteger(explicit) && explicit > 0) return explicit;
+    return backupRunVolumes(run).length + 1;
   }
 
   function backupRunRouteId() {
@@ -606,6 +707,8 @@
   function backupPhaseIndex(run) {
     const runState = backupRunState(run);
     if (["verified", "passed", "completed", "complete"].includes(runState)) return BACKUP_PHASES.length - 1;
+    if (backupMediaIsReadback(run)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("readback"));
+    if (backupNeedsNextMedia(run)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("next_media"));
     const explicit = Number(backupEvidenceValue(run, "phase_index"));
     if (Number.isInteger(explicit) && explicit >= 0 && explicit < BACKUP_PHASES.length) return explicit;
     const evidencePhase = String(backupEvidenceValue(run, "phase", "event_type") || runState).toLowerCase();
@@ -689,10 +792,13 @@
       const source = pick(profile, "source_subpath", "source_path", "logical_root") || "Source not reported";
       const retention = count(pick(profile, "retention_days")) || 28;
       const pool = pick(profile, "media_pool_name") || "any eligible scratch pool";
+      const compressionSupported = backupCompressionSupported(profile);
+      const archivePolicy = backupCompressionLabel(profile) + " · " + (backupSpanningEnabled(profile) ? "spans tapes as needed" : "one tape maximum");
       const action = active
-        ? '<button class="button button-small button-primary" type="button" data-action="select-backup-run" data-id="' + esc(recordId(active)) + '">' + (backupRunState(active) === "waiting_for_media" ? "Continue backup" : "View progress") + '</button>'
-        : '<button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(id) + '"' + (pick(profile, "enabled") === false ? " disabled" : "") + '>' + (latest ? "Back up again" : "Start backup") + '</button>';
-      return '<article class="backup-profile-card"><div class="backup-profile-mark" aria-hidden="true">◆</div><div class="backup-profile-copy"><span><strong>' + esc(backupProfileName(profile)) + '</strong>' + status(human(pick(profile, "enabled") === false ? "disabled" : "snapshot saved")) + '</span><code>' + esc(source) + '</code><small>Keep verified backup ' + retention + " days · " + esc(pool) + '</small></div><div class="backup-profile-actions"><span>' + (latest ? esc(backupRunStateLabel(latest)) + " · " + esc(date(pick(latest, "finished_at", "created_at", "started_at"))) : "Not backed up yet") + "</span>" + action + "</div></article>";
+        ? '<button class="button button-small button-primary" type="button" data-action="select-backup-run" data-id="' + esc(recordId(active)) + '">' + (backupWaitingForOperator(active) ? "Continue backup" : "View progress") + '</button>'
+        : '<button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(id) + '"' + (pick(profile, "enabled") === false || !compressionSupported ? ' disabled title="Create a new backup plan with a supported compression mode."' : "") + '>' + (latest ? "Back up again" : "Start backup") + '</button>';
+      const compatibility = compressionSupported ? "" : '<small class="backup-profile-warning">This saved plan uses an unsupported legacy compression mode. Create a new snapshot backup plan before starting it.</small>';
+      return '<article class="backup-profile-card"><div class="backup-profile-mark" aria-hidden="true">◆</div><div class="backup-profile-copy"><span><strong>' + esc(backupProfileName(profile)) + '</strong>' + status(human(pick(profile, "enabled") === false ? "disabled" : compressionSupported ? "snapshot saved" : "needs new plan")) + '</span><code>' + esc(source) + '</code><small>Keep verified backup ' + retention + " days · " + esc(pool) + '</small><small>' + esc(archivePolicy) + '</small>' + compatibility + '</div><div class="backup-profile-actions"><span>' + (latest ? esc(backupRunStateLabel(latest)) + " · " + esc(date(pick(latest, "finished_at", "created_at", "started_at"))) : "Not backed up yet") + "</span>" + action + "</div></article>";
     }).join("");
     return '<section class="panel backup-profiles"><div class="panel-head"><div><h2>Saved snapshot backups</h2><p>Availability and read-only state are checked again before every new request.</p></div><button class="button button-small" type="button" data-action="create-backup-profile">Choose snapshot</button></div><div class="backup-profile-list">' + (cards || '<div class="media-inline-empty">No snapshot has been selected yet. Choose a named ZFS snapshot folder to begin.</div>') + "</div></section>";
   }
@@ -701,13 +807,13 @@
     const rows = runs.map((run) => {
       const id = recordId(run);
       const source = pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root");
-      const tape = pick(run, "expected_cartridge_label", "cartridge_label") || (backupRunState(run) === "waiting_for_media" ? "Choose tape" : "Not assigned");
+      const tape = backupTapeSummary(run);
       const logical = backupEvidenceValue(run, "logical_bytes", "source_bytes");
       const progress = backupProgressPercent(run);
       const searchable = [id, backupRunProfileName(run), source, tape, backupRunState(run)].filter(Boolean).join(" ").toLowerCase();
       return '<tr class="row-action" tabindex="0" data-action="select-backup-run" data-backup-run data-id="' + esc(id) + '" data-state="' + esc(backupRunState(run)) + '" data-search="' + esc(searchable) + '"' + (backupRunMatches(run) ? "" : " hidden") + '><td class="primary-cell" data-label="Backup"><strong>' + esc(backupRunProfileName(run)) + '</strong><small>' + esc(label(source)) + '</small></td><td data-label="Status">' + status(backupRunStateLabel(run)) + (progress == null ? "" : '<small class="backup-table-progress">' + progress + "%</small>") + '</td><td data-label="Tape">' + esc(tape) + '</td><td data-label="Data">' + esc(logical == null ? "Pending" : bytes(logical)) + '</td><td data-label="Activity">' + esc(date(pick(run, "finished_at", "started_at", "created_at"))) + "</td></tr>";
     }).join("");
-    const filterOptions = ["queued", "waiting_for_media", "preparing", "inventorying", "writing", "written", "verifying", "verified", "failed", "blocked", "interrupted", "cancelled"].map((value) => '<option value="' + value + '"' + (state.backupStateFilter === value ? " selected" : "") + '>' + esc(backupRunStateLabel({ state: value })) + "</option>").join("");
+    const filterOptions = ["queued", "waiting_for_media", "waiting_for_next_media", "preparing", "inventorying", "writing", "written", "verifying", "verified", "failed", "blocked", "interrupted", "cancelled"].map((value) => '<option value="' + value + '"' + (state.backupStateFilter === value ? " selected" : "") + '>' + esc(backupRunStateLabel({ state: value })) + "</option>").join("");
     const visible = runs.filter(backupRunMatches).length;
     return '<section class="panel backup-run-table">' +
       '<div class="table-toolbar"><div class="toolbar-start">' +
@@ -722,6 +828,7 @@
     const logical = backupEvidenceValue(run, "logical_bytes", "source_bytes");
     const encoded = backupEvidenceValue(run, "encoded_bytes", "media_bytes", "bytes_written");
     const throughput = backupEvidenceValue(run, "throughput_bytes_per_second", "bytes_per_second");
+    const volumes = backupRunVolumes(run);
     const values = [
       ["Source entries", backupEvidenceValue(run, "source_entry_count", "entry_count", "file_count")],
       ["Logical bytes", logical == null ? null : bytes(logical)],
@@ -729,7 +836,9 @@
       ["Throughput", throughput == null ? null : bytes(throughput) + "/s"],
       ["Source manifest", backupEvidenceValue(run, "source_manifest_sha256", "source_manifest_digest", "manifest_sha256")],
       ["Bacula JobId", backupEvidenceValue(run, "backup_job_id", "engine_job_id", "bacula_job_id", "engine_operation_id")],
-      ["Volume", backupEvidenceValue(run, "engine_volume_name", "volume_name", "expected_cartridge_label") || pick(run, "expected_cartridge_label")],
+      ["Compression", backupCompressionLabel(run)],
+      ["Tapes used", volumes.length || null],
+      ["Archive volumes", volumes.length ? volumes.map((volume) => volume.sequence + ". " + volume.label).join(" · ") : null],
       ["Recovery point", backupEvidenceValue(run, "recovery_point_id") || pick(run, "recovery_point_id")]
     ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "");
     if (!values.length) return '<p class="recovery-evidence-pending">Evidence will appear as the source inventory, tape write, and readback complete.</p>';
@@ -739,7 +848,8 @@
   function renderBackupOutcome(run) {
     const entries = backupEvidenceValue(run, "source_entry_count", "entry_count", "file_count");
     const logical = backupEvidenceValue(run, "logical_bytes", "source_bytes");
-    const tape = backupEvidenceValue(run, "engine_volume_name", "volume_name", "expected_cartridge_label") || pick(run, "expected_cartridge_label", "cartridge_label");
+    const volumes = backupRunVolumes(run);
+    const tape = volumes.length ? volumes.map((volume) => volume.label).join(", ") : backupTapeSummary(run);
     const runState = backupRunState(run);
     const successful = ["verified", "passed", "completed", "complete"].includes(runState);
     const unsuccessful = BACKUP_TERMINAL_STATES.has(runState) && !successful;
@@ -748,7 +858,8 @@
     const values = [
       ["Files and folders", measurement(entries, (value) => value)],
       ["Data", measurement(logical, bytes)],
-      ["Tape", tape || "Not selected"],
+      [volumes.length === 1 ? "Tape" : "Archive tapes", tape || "Not selected"],
+      ["Compression", backupCompressionLabel(run)],
       ["Physical readback", readback]
     ];
     return '<div class="backup-evidence-grid backup-outcome-grid">' + values.map(([name, value]) => '<div><span>' + esc(name) + '</span><strong>' + esc(value) + "</strong></div>").join("") + "</div>";
@@ -791,28 +902,35 @@
     const runState = backupRunState(run);
     const progress = backupProgressPercent(run);
     const detailError = state.errors["backupRun:" + id];
-    const waiting = runState === "waiting_for_media";
+    const waiting = runState === "waiting_for_media" || backupNeedsNextMedia(run);
+    const readbackMedia = waiting && backupMediaIsReadback(run);
+    const nextMedia = backupNeedsNextMedia(run);
+    const mediaRequestState = backupMediaRequestState(run);
+    const mediaAccepted = waiting && ["authorized", "loaded"].includes(mediaRequestState);
     const allowedActions = objectValue(run, "allowed_actions");
-    const canAssign = waiting && pick(allowedActions, "assign_media") !== false;
-    const canCancel = backupRunActive(run) && pick(allowedActions, "cancel") !== false;
+    const canAssign = waiting && pick(allowedActions, readbackMedia ? "assign_media" : nextMedia ? "assign_next_media" : "assign_media") === true;
+    const canCancel = backupRunActive(run) && pick(allowedActions, "cancel") === true;
     const successful = ["verified", "passed", "completed", "complete"].includes(runState);
     const failed = BACKUP_TERMINAL_STATES.has(runState) && !successful && !["cancelled", "canceled"].includes(runState);
     const failure = backupOperatorFailure(run);
     const recoveryPointId = String(backupEvidenceValue(run, "recovery_point_id") || pick(run, "recovery_point_id") || "");
     let notice = "";
-    if (waiting) notice = '<div class="notice warning backup-run-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Choose the tape for this backup</strong><span>Confirm the loaded scratch tape and authorize its overwrite. Nothing has been written yet.</span></div>' + (canAssign ? '<button class="button button-primary" type="button" data-action="assign-backup-media" data-id="' + esc(id) + '">Continue with tape</button>' : "") + "</div>";
-    else if (successful) notice = '<div class="notice success backup-run-notice"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Backup verified and cataloged for recovery</strong><span>The tape was written, completely read back, and retained as a recovery point. Restore testing remains a separate assurance step.</span></div>' + (recoveryPointId ? '<div class="backup-complete-actions"><button class="button button-primary button-small" type="button" data-action="browse-backup-files" data-id="' + esc(recoveryPointId) + '">Browse backed-up files</button><button class="button button-small" type="button" data-action="select-recovery-point" data-id="' + esc(recoveryPointId) + '">Recovery options</button></div>' : "") + "</div>";
+    if (mediaAccepted) notice = '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>' + (mediaRequestState === "loaded" ? "Tape loaded; resuming job" : "Tape accepted; worker is rechecking it") + '</strong><span>No further tape selection is needed for this request. Keep the drive and loaded tape available while the same Bacula job resumes.</span></div></div>';
+    else if (waiting && readbackMedia) notice = '<div class="notice warning backup-run-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Load tape ' + esc(backupNextVolumeSequence(run)) + ' for readback</strong><span>The archive write is complete. Unload and remove the current tape, then insert the exact recorded tape shown next; TapeScale will read it without erasing or relabeling it.</span></div>' + (canAssign ? '<button class="button button-primary" type="button" data-action="assign-backup-media" data-id="' + esc(id) + '">Load tape for readback</button>' : "") + "</div>";
+    else if (waiting) notice = '<div class="notice warning backup-run-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>' + (nextMedia ? "Load tape " + esc(backupNextVolumeSequence(run)) : "Choose the first tape for this backup") + '</strong><span>' + (nextMedia ? "The archive filled its previous tape. Unload and remove it, then insert and confirm a different prepared scratch tape to continue the same backup." : "Confirm the loaded scratch tape and authorize its overwrite. Nothing has been written yet.") + '</span></div>' + (canAssign ? '<button class="button button-primary" type="button" data-action="assign-backup-media" data-id="' + esc(id) + '">' + (nextMedia ? "Load next tape" : "Continue with tape") + '</button>' : "") + "</div>";
+    else if (successful) notice = '<div class="notice success backup-run-notice"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Backup verified and cataloged for recovery</strong><span>Every tape in the archive was written, completely read back, and retained as one recovery point. Restore testing remains a separate assurance step.</span></div>' + (recoveryPointId ? '<div class="backup-complete-actions"><button class="button button-primary button-small" type="button" data-action="browse-backup-files" data-id="' + esc(recoveryPointId) + '">Browse backed-up files</button><button class="button button-small" type="button" data-action="select-recovery-point" data-id="' + esc(recoveryPointId) + '">Recovery options</button></div>' : "") + "</div>";
     else if (failed) notice = '<div class="notice danger backup-run-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>' + esc(backupRunStateLabel(run)) + '</strong><span>' + esc(failure) + "</span></div></div>";
     else if (["cancelled", "canceled"].includes(runState)) notice = '<div class="notice warning backup-run-notice"><span class="notice-icon" aria-hidden="true">×</span><div class="notice-copy"><strong>Backup cancelled</strong><span>' + esc(failure || "The attempt did not establish a recovery point. Previously valid backups remain unchanged.") + "</span></div></div>";
-    else notice = '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>' + esc(backupRunStateLabel(run)) + '</strong><span>Keep the snapshot, worker, drive, and selected tape available while this stage finishes.</span></div></div>';
+    else notice = '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>' + esc(backupRunStateLabel(run)) + '</strong><span>Keep the snapshot, worker, drive, and requested archive tapes available while this stage finishes.</span></div></div>';
     const cancel = canCancel ? '<button class="button button-danger button-small" type="button" data-action="cancel-backup-run" data-id="' + esc(id) + '">Cancel run</button>' : "";
-    const assignment = pick(run, "expected_cartridge_label", "cartridge_label")
-      ? '<span><strong>' + esc(label(pick(run, "expected_cartridge_label", "cartridge_label"))) + '</strong><small>' + esc(label(pick(run, "expected_stable_id", "drive_stable_id"))) + "</small></span>"
+    const volumes = backupRunVolumes(run);
+    const assignment = volumes.length
+      ? '<span><strong>' + esc(volumes.length + " tape" + (volumes.length === 1 ? "" : "s")) + '</strong><small class="backup-volume-summary">' + volumes.map((volume) => esc(volume.sequence + ". " + volume.label)).join(" · ") + "</small></span>"
       : '<span><strong>Not selected</strong><small>Choose a prepared scratch tape</small></span>';
     const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="retry-backup-run" data-id="' + esc(id) + '">Retry</button></div>' : "";
     const measuredProgress = progress == null ? "" : '<div class="progress backup-progress"><div class="progress-track"><div class="progress-value" style="width:' + progress + '%"></div></div><div class="progress-meta"><span>Measured progress</span><span>' + progress + "%</span></div></div>";
     const technical = '<details class="backup-technical"><summary><span><strong>Technical details</strong><small>Request identity, engine evidence, and complete activity history</small></span></summary><div class="backup-technical-body"><dl class="vault-facts"><dt>Request ID</dt><dd class="mono">' + esc(id) + '</dd><dt>Created</dt><dd>' + esc(date(pick(run, "created_at", "started_at"))) + '</dd><dt>Raw state</dt><dd>' + esc(runState) + '</dd>' + (backupFailureDetail(run) ? '<dt>Recorded failure</dt><dd>' + esc(backupFailureDetail(run)) + "</dd>" : "") + '</dl><section class="backup-detail-section"><div class="backup-section-head"><div><span>Engine evidence</span><h3>Recorded facts</h3></div></div>' + renderBackupEvidence(run) + '</section><section class="backup-detail-section"><div class="backup-section-head"><div><span>Complete history</span><h3>Activity</h3></div></div>' + renderBackupTimeline(run) + "</section>" + renderBackupArtifacts(run) + "</div></details>";
-    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>Started ' + esc(date(pick(run, "created_at", "started_at"))) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Tape</span>' + assignment + '</div><div><span>Backup</span><strong>Full</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header>' + renderBackupPhaseTrack(run) + '<div class="backup-run-actions">' + cancel + '<button class="button button-quiet button-small" type="button" data-action="refresh">Refresh status</button></div><div class="panel-body">' + detailFailure + notice + measuredProgress + '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>Backup result</h3></div></div>' + renderBackupOutcome(run) + "</section>" + technical + "</div></article>";
+    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>Started ' + esc(date(pick(run, "created_at", "started_at"))) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header>' + renderBackupPhaseTrack(run) + '<div class="backup-run-actions">' + cancel + '<button class="button button-quiet button-small" type="button" data-action="refresh">Refresh status</button></div><div class="panel-body">' + detailFailure + notice + measuredProgress + '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>Backup result</h3></div></div>' + renderBackupOutcome(run) + "</section>" + technical + "</div></article>";
   }
 
   function renderJobs() {
@@ -826,13 +944,13 @@
       return pageHead(heading, "Live status, next action, and verified result for this backup.", back + refreshButton()) + noticeFor("backupRuns") + '<section class="section backup-run-route">' + renderBackupRunDetail(selected && recordId(selected) === routeId ? selected : null) + "</section>";
     }
     const active = runs.filter(backupRunActive).length;
-    const waiting = runs.filter((run) => backupRunState(run) === "waiting_for_media").length;
+    const waiting = runs.filter(backupWaitingForOperator).length;
     const failed = runs.filter((run) => ["failed", "blocked", "interrupted"].includes(backupRunState(run))).length;
     const latestVerified = runs.find((run) => ["verified", "passed", "completed", "complete"].includes(backupRunState(run)));
     const create = '<button class="button button-primary" type="button" data-action="create-backup-profile">Choose snapshot</button>';
-    let html = pageHead("Backup Center", "Choose an existing ZFS snapshot, prepare one tape, and follow the backup through complete readback.", refreshButton() + create);
+    let html = pageHead("Backup Center", "Choose an existing ZFS snapshot, select compression, and follow a one- or multi-tape archive through complete readback.", refreshButton() + create);
     html += noticeFor("backupProfiles") + noticeFor("backupRuns");
-    html += '<div class="notice info backup-scope-notice"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>One exact snapshot per saved item</strong><span>This build copies an existing read-only ZFS snapshot; it does not create a fresh snapshot on each run yet. Full backup, one tape, and complete physical readback are enforced.</span></div></div>';
+    html += '<div class="notice info backup-scope-notice"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>One exact snapshot per saved item</strong><span>This build copies an existing read-only ZFS snapshot; it does not create a fresh snapshot on each run yet. Full backups may be compressed and span as many prepared tapes as the archive requires.</span></div></div>';
     html += '<section class="panel metric-strip backup-metrics"><div class="metric"><span>Saved snapshots</span><strong>' + profiles.length + '</strong></div><div class="metric"><span>Backups running</span><strong>' + active + '</strong></div><div class="metric"><span>Tape needed</span><strong>' + waiting + '</strong></div><div class="metric"><span>Latest protected</span><strong class="backup-metric-date">' + esc(latestVerified ? date(pick(latestVerified, "finished_at", "created_at")) : "None") + "</strong></div></section>";
     html += renderBackupProfiles();
     if (!runs.length) return html + empty("No backups yet", state.errors.backupRuns ? "Backup history could not be loaded." : "Choose a snapshot, then continue through tape selection to start the first backup.", create);
@@ -1641,8 +1759,13 @@
       if (kindDifference) return kindDifference;
       return String(pick(left, "name", "display_name") || "").localeCompare(String(pick(right, "name", "display_name") || ""), undefined, { numeric: true, sensitivity: "base" });
     });
+    const truncated = payload && payload.truncated === true;
+    const entryLimit = Number(pick(payload, "entry_limit")) || entries.length;
     const empty = '<div class="source-browser-empty"><span aria-hidden="true">□</span><strong>No retained entries in this directory</strong><small>The manifest reports an empty folder.</small></div>';
-    return '<section class="vault-dossier-section recovery-file-browser-shell" data-recovery-files="' + esc(pointId) + '"><div class="vault-section-head"><div><h3>Files & directories</h3><p>Catalog view from the content-addressed manifest.</p></div><button class="icon-button" type="button" data-action="close-recovery-files" data-id="' + esc(pointId) + '" aria-label="Close retained contents browser">&times;</button></div><div class="notice info recovery-files-boundary"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Browse-only recovery inventory</strong><span>This view does not read tape and does not change restore scope. The currently proven recovery action still restores the complete recovery point.</span></div></div><div class="backup-source-browser retained-browser"><div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(parentPath || "") + '" aria-label="Open parent retained directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Retained backup path">' + recoveryFileBreadcrumbs(pointId, currentPath) + '</nav></div><div class="source-browser-context"><div><span>Retained path</span><code>/' + esc(currentPath) + '</code></div><span class="source-browser-scope readonly"><span aria-hidden="true">◇</span> Manifest evidence</span></div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Action</span></div><div class="source-browser-entries" role="list" aria-label="Retained files and directories in ' + esc(currentPath || "backup root") + '">' + (entries.length ? entries.map((entry) => recoveryFileEntry(entry, currentPath, pointId)).join("") : empty) + '</div><p class="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + " retained entries loaded") + "</p></div></section>";
+    const partialWarning = truncated
+      ? '<div class="notice warning source-browser-partial"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Showing the first ' + esc(entryLimit) + ' retained entries in this folder</strong><span>Only this browse-only directory view is bounded. The retained manifest and tape archive are complete, and the backup itself was not limited to these rows.</span></div></div>'
+      : "";
+    return '<section class="vault-dossier-section recovery-file-browser-shell" data-recovery-files="' + esc(pointId) + '"><div class="vault-section-head"><div><h3>Files & directories</h3><p>Catalog view from the content-addressed manifest.</p></div><button class="icon-button" type="button" data-action="close-recovery-files" data-id="' + esc(pointId) + '" aria-label="Close retained contents browser">&times;</button></div><div class="notice info recovery-files-boundary"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Browse-only recovery inventory</strong><span>This view does not read tape and does not change restore scope. The currently proven recovery action still restores the complete recovery point.</span></div></div>' + partialWarning + '<div class="backup-source-browser retained-browser"><div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(parentPath || "") + '" aria-label="Open parent retained directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Retained backup path">' + recoveryFileBreadcrumbs(pointId, currentPath) + '</nav></div><div class="source-browser-context"><div><span>Retained path</span><code>/' + esc(currentPath) + '</code></div><span class="source-browser-scope readonly"><span aria-hidden="true">◇</span> Manifest evidence</span></div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Action</span></div><div class="source-browser-entries" role="list" aria-label="Retained files and directories in ' + esc(currentPath || "backup root") + '">' + (entries.length ? entries.map((entry) => recoveryFileEntry(entry, currentPath, pointId)).join("") : empty) + '</div><p class="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + (truncated ? "+ retained entries available; partial view loaded" : " retained entries loaded")) + "</p></div></section>";
   }
 
   const RESTORE_REHEARSAL_PHASES = [
@@ -3705,6 +3828,8 @@
       return String(pick(left, "name", "display_name") || "").localeCompare(String(pick(right, "name", "display_name") || ""), undefined, { numeric: true, sensitivity: "base" });
     });
     const payloadReadOnly = payload && (payload.read_only ?? payload.current_read_only ?? payload.readonly);
+    const truncated = payload && payload.truncated === true;
+    const entryLimit = Number(pick(payload, "entry_limit")) || entries.length;
     sourceBrowserPath = currentPath;
     sourceBrowserReadOnly = typeof payloadReadOnly === "boolean" ? payloadReadOnly : null;
     const snapshot = payload && (payload.is_snapshot === true || payload.snapshot === true) || sourceBrowserSnapshotPath(currentPath);
@@ -3722,12 +3847,15 @@
         ? '<span class="source-browser-scope readonly"><span aria-hidden="true">✓</span> Read-only source</span>'
         : '<span class="source-browser-scope caution"><span aria-hidden="true">i</span> Checked when saved</span>';
     const empty = '<div class="source-browser-empty"><span aria-hidden="true">□</span><strong>This directory is empty</strong><small>Choose a different folder or use this empty scope intentionally.</small></div>';
+    const partialWarning = truncated
+      ? '<div class="notice warning source-browser-partial"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Showing the first ' + esc(entryLimit) + ' entries in this folder</strong><span>This is a partial browser view. The folder is still selectable, you can type a known snapshot path in the field, and the backup itself has no TapeScale total file-count limit.</span></div></div>'
+      : "";
     const selectionBlocker = !currentPath
       ? "Open a folder below the source root first."
       : backupPlanSelection && !snapshot
         ? "Open a folder inside .zfs/snapshot/<snapshot-name> before selecting it."
         : "";
-    panel.innerHTML = '<div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="source-browser-navigate" data-path="' + esc(parentPath || "") + '" aria-label="Open parent directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Source path">' + sourceBrowserBreadcrumbs(currentPath) + '</nav><button class="icon-button" type="button" data-action="close-source-browser" aria-label="Close source browser">&times;</button></div><div class="source-browser-context"><div><span>Browsing</span><code>/source' + (currentPath ? "/" + esc(currentPath) : "") + '</code></div>' + scopeBadge + '</div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Open</span></div><div class="source-browser-entries" role="list" aria-label="Files and directories in ' + esc(currentPath || "source root") + '">' + (entries.length ? entries.map((entry) => sourceBrowserEntry(entry, currentPath)).join("") : empty) + '</div><div class="source-browser-footer"><div class="source-browser-selection"><span>Selected folder</span><strong>' + esc(currentPath || "Open a folder to select it") + '</strong><small>' + esc(sourceBrowserSelectable ? "Everything inside this folder will be included in the Full backup." : selectionBlocker) + '</small></div><button class="button button-primary" type="button" data-action="select-source-directory"' + (sourceBrowserSelectable ? "" : ' disabled title="' + esc(selectionBlocker) + '"') + '>Select this folder</button></div><p class="source-browser-live" id="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + " entries loaded") + "</p>";
+    panel.innerHTML = '<div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="source-browser-navigate" data-path="' + esc(parentPath || "") + '" aria-label="Open parent directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Source path">' + sourceBrowserBreadcrumbs(currentPath) + '</nav><button class="icon-button" type="button" data-action="close-source-browser" aria-label="Close source browser">&times;</button></div><div class="source-browser-context"><div><span>Browsing</span><code>/source' + (currentPath ? "/" + esc(currentPath) : "") + '</code></div>' + scopeBadge + '</div>' + partialWarning + '<div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Open</span></div><div class="source-browser-entries" role="list" aria-label="Files and directories in ' + esc(currentPath || "source root") + '">' + (entries.length ? entries.map((entry) => sourceBrowserEntry(entry, currentPath)).join("") : empty) + '</div><div class="source-browser-footer"><div class="source-browser-selection"><span>Selected folder</span><strong>' + esc(currentPath || "Open a folder to select it") + '</strong><small>' + esc(sourceBrowserSelectable ? "Everything inside this folder will be included in the Full backup." : selectionBlocker) + '</small></div><button class="button button-primary" type="button" data-action="select-source-directory"' + (sourceBrowserSelectable ? "" : ' disabled title="' + esc(selectionBlocker) + '"') + '>Select this folder</button></div><p class="source-browser-live" id="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + (truncated ? "+ entries available; partial view loaded" : " entries loaded")) + "</p>";
   }
 
   async function loadSourceBrowser(path, focusEntries) {
@@ -3809,7 +3937,9 @@
       '<section class="backup-source-browser" id="backup-source-browser" aria-label="Source file browser" hidden></section>',
       '<div class="form-field"><label for="backup-retention-days">Keep completed backups for</label><div class="input-suffix"><input class="input" id="backup-retention-days" name="retention_days" type="number" min="1" max="36500" value="28" required><span>days</span></div></div>',
       '<div class="form-field"><label for="backup-media-pool">Tape pool <small>(optional)</small></label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div>',
-      '<div class="form-field full"><div class="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · one tape · complete readback</strong><small>Next, TapeScale will help you choose and confirm a prepared tape. Automatic rolling snapshots are not enabled yet.</small></div></div></div>',
+      '<div class="form-field"><label for="backup-compression">Compression</label><select class="select" id="backup-compression" name="compression_mode"><option value="auto" selected>Automatic · fast GZIP</option><option value="gzip">GZIP · balanced</option><option value="lzo">LZO · fastest</option><option value="none">None</option></select><small>Automatic explicitly uses fast GZIP for a predictable on-tape format. Already-compressed files may not shrink.</small></div>',
+      '<div class="form-field"><label>Archive size</label><label class="check-option backup-span-option"><input type="checkbox" id="backup-media-spanning" name="spanning_enabled" checked> Continue onto additional prepared tapes when this archive fills a cartridge.</label></div>',
+      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · fast GZIP · spans tapes as needed</strong><small>Next, TapeScale shows the tapes prepared now, then requests each additional tape only if the running archive needs it. Automatic rolling snapshots are not enabled yet.</small></div></div></div>',
       '</div>',
       '<p class="notice danger" id="backup-profile-error" role="alert" aria-live="assertive" hidden></p>',
       '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Continue to tape</button></div>',
@@ -3821,7 +3951,16 @@
     sourceBrowserSelectable = false;
     sourceBrowserTarget = { inputId: "backup-source-subpath", panelId: "backup-source-browser", summaryId: "backup-source-selection", nameId: "backup-profile-name" };
     openModal("Choose snapshot to back up", body);
+    updateBackupProfileOptions(document.querySelector("#backup-profile-form"));
     document.querySelector("#backup-profile-name").focus();
+  }
+
+  function updateBackupProfileOptions(form) {
+    if (!form) return;
+    const compression = backupCompressionLabel({ compression_mode: String(form.elements.compression_mode && form.elements.compression_mode.value || "auto") });
+    const spanning = Boolean(form.elements.spanning_enabled && form.elements.spanning_enabled.checked);
+    const summary = form.querySelector("#backup-plan-summary strong");
+    if (summary) summary.textContent = "Full backup · " + compression + " · " + (spanning ? "spans tapes as needed" : "one tape maximum");
   }
 
   async function submitBackupProfile(form) {
@@ -3847,6 +3986,8 @@
           name: String(values.get("name") || "").trim(),
           source_subpath: source,
           media_pool_id: String(values.get("media_pool_id") || "") || null,
+          compression_mode: String(values.get("compression_mode") || "auto"),
+          spanning_enabled: values.get("spanning_enabled") === "on",
           schedule_timezone: form.dataset.timezone || "UTC",
           schedule_enabled: false,
           retention_days: Number(values.get("retention_days")),
@@ -3866,6 +4007,37 @@
       submit.disabled = false;
       submit.textContent = "Continue to tape";
     }
+  }
+
+  function backupCapacityPlan(readiness) {
+    const plan = objectValue(readiness, "capacity_plan", "capacity", "archive_estimate");
+    const logicalRaw = pick(plan, "logical_bytes", "source_bytes", "estimated_logical_bytes") ?? pick(readiness, "logical_bytes", "source_bytes");
+    const estimatedMediaRaw = pick(plan, "estimated_media_bytes", "encoded_bytes", "estimated_encoded_bytes");
+    const tapeCapacityRaw = pick(plan, "tape_capacity_bytes", "usable_bytes_per_tape", "cartridge_capacity_bytes");
+    const estimatedTapesRaw = pick(plan, "estimated_tapes", "minimum_tapes", "tapes_required");
+    const logicalBytes = logicalRaw === null ? Number.NaN : Number(logicalRaw);
+    const estimatedMediaBytes = estimatedMediaRaw === null ? Number.NaN : Number(estimatedMediaRaw);
+    const tapeCapacityBytes = tapeCapacityRaw === null ? Number.NaN : Number(tapeCapacityRaw);
+    const estimatedTapes = estimatedTapesRaw === null ? Number.NaN : Number(estimatedTapesRaw);
+    return {
+      logicalBytes: Number.isFinite(logicalBytes) && logicalBytes >= 0 ? logicalBytes : null,
+      estimatedMediaBytes: Number.isFinite(estimatedMediaBytes) && estimatedMediaBytes >= 0 ? estimatedMediaBytes : null,
+      tapeCapacityBytes: Number.isFinite(tapeCapacityBytes) && tapeCapacityBytes > 0 ? tapeCapacityBytes : null,
+      estimatedTapes: Number.isInteger(estimatedTapes) && estimatedTapes > 0 ? estimatedTapes : null
+    };
+  }
+
+  function renderBackupCapacityPlan(readiness, readyTapeCount, spanning) {
+    const plan = backupCapacityPlan(readiness);
+    const estimate = plan.estimatedTapes ? plan.estimatedTapes + " tape" + (plan.estimatedTapes === 1 ? "" : "s") : "Determined while writing";
+    const facts = [
+      ["Estimated tapes", estimate],
+      ["Prepared now", readyTapeCount + " tape" + (readyTapeCount === 1 ? "" : "s")],
+      ["Snapshot data", plan.logicalBytes === null ? "Measured during scan" : bytes(plan.logicalBytes)],
+      ["Estimated on tape", plan.estimatedMediaBytes === null ? "Depends on compression" : bytes(plan.estimatedMediaBytes)]
+    ];
+    const blocked = !spanning && plan.estimatedTapes && plan.estimatedTapes > 1;
+    return '<section class="backup-capacity-plan' + (blocked || !spanning ? " warning" : "") + '"><div class="backup-capacity-head"><span aria-hidden="true">' + (blocked || !spanning ? "!" : "▦") + '</span><div><strong>' + (blocked ? "This snapshot is unlikely to fit one tape" : spanning ? "Archive capacity plan" : "Single-tape archive plan") + '</strong><p>Estimates are planning guidance, not a guaranteed fit. Actual tape use depends on file mix, hardware compression, media condition, and engine overhead.</p></div></div><div class="backup-capacity-facts">' + facts.map(([name, value]) => '<div><span>' + esc(name) + '</span><strong>' + esc(value) + '</strong></div>').join("") + '</div>' + (spanning ? '<p class="backup-capacity-action">If another tape is needed, the run pauses safely and asks you to load and authorize the next prepared tape.</p>' : '<p class="backup-capacity-action">This saved plan cannot continue onto another tape. To remove that ceiling, create a new backup plan for this snapshot with media spanning enabled.</p>') + '</section>';
   }
 
   async function openStartBackup(profileId) {
@@ -3892,6 +4064,10 @@
     const drives = driveCandidates.map(backupCandidateDrive);
     const initialPair = readiness.recommended_candidate || (pairs.length === 1 ? pairs[0] : null);
     const readyTapeCount = new Set(pairs.map((candidate) => String(pick(candidate, "cartridge_id") || "")).filter(Boolean)).size;
+    const compression = backupCompressionLabel(profile);
+    const spanning = backupSpanningEnabled(profile);
+    const capacityPlan = backupCapacityPlan(readiness);
+    const estimatedTapes = capacityPlan.estimatedTapes ? capacityPlan.estimatedTapes + " estimated" : "As needed";
     const initialDrive = initialPair ? backupCandidateDrive(initialPair) : drives.length === 1 ? drives[0] : null;
     const initialMedia = initialPair ? backupCandidateMedia(initialPair) : null;
     const driveOptions = drives.map((drive) => '<option value="' + esc(recordId(drive)) + '"' + (initialDrive && recordId(initialDrive) === recordId(drive) ? " selected" : "") + '>' + esc(label(pick(drive, "model", "stable_id", "observed_path"))) + " · " + esc(label(pick(drive, "observed_path"))) + "</option>").join("");
@@ -3906,7 +4082,8 @@
       '<form id="start-backup-form" data-profile-id="' + esc(profileId) + '" data-readiness-key="' + esc(readinessKey) + '" data-required-pool-id="' + esc(requiredPoolId) + '" data-idempotency-key="' + esc(idempotencyKey) + '">',
       '<ol class="backup-start-steps" aria-label="Start backup steps"><li class="done"><span>✓</span><strong>Snapshot</strong></li><li class="active"><span>2</span><strong>Tape</strong></li><li><span>3</span><strong>Confirm & start</strong></li></ol>',
       '<div class="backup-boundary"><span aria-hidden="true">◆</span><div><strong>' + esc(backupProfileName(profile)) + '</strong><p><code>' + esc(label(source)) + '</code></p></div></div>',
-      '<div class="backup-start-facts"><div><span>Backup</span><strong>Full</strong></div><div><span>Tapes</span><strong>One</strong></div><div><span>Verification</span><strong>Complete readback</strong></div><div><span>Retention</span><strong>' + esc(count(pick(profile, "retention_days")) || 28) + ' days</strong></div></div>',
+      '<div class="backup-start-facts"><div><span>Backup</span><strong>Full</strong></div><div><span>Compression</span><strong>' + esc(compression) + '</strong></div><div><span>Estimated tapes</span><strong>' + esc(spanning ? estimatedTapes : "One maximum") + '</strong></div><div><span>Verification</span><strong>Complete readback</strong></div><div><span>Retention</span><strong>' + esc(count(pick(profile, "retention_days")) || 28) + ' days</strong></div></div>',
+      renderBackupCapacityPlan(readiness, readyTapeCount, spanning),
       readinessPanel,
       '<div class="form-grid backup-tape-choice"' + (blocked ? " hidden" : "") + '><div class="form-field full"><label for="start-backup-drive">Loaded tape drive</label><select class="select" id="start-backup-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select></div><div class="form-field full"><label for="start-backup-cartridge">Loaded scratch tape</label><select class="select" id="start-backup-cartridge" name="cartridge_id" required><option value="">Choose tape</option>' + mediaOptions + '</select></div></div>',
       '<p class="notice danger" id="start-backup-error" role="alert" aria-live="assertive" hidden></p>',
@@ -3961,6 +4138,8 @@
         headers: { Accept: "application/json", "Content-Type": "application/json" },
         body: JSON.stringify({
           idempotency_key: form.dataset.idempotencyKey || operationKey("manual-backup"),
+          compression_mode: backupCompressionMode(state.data.backupProfiles.find((profile) => recordId(profile) === profileId)),
+          spanning_enabled: backupSpanningEnabled(state.data.backupProfiles.find((profile) => recordId(profile) === profileId)),
           requested_by_label: "Web operator"
         })
       });
@@ -3979,7 +4158,7 @@
         return;
       }
       const retained = orderedBackupRuns().find((item) => recordId(item) === state.selectedBackupRunId) || run;
-      if (backupRunState(retained) === "waiting_for_media") {
+      if (backupRunState(retained) === "waiting_for_media" || backupNeedsNextMedia(retained)) {
         await openAssignBackupMedia(state.selectedBackupRunId, { driveId, cartridgeId, guided: true });
       } else {
         closeModal();
@@ -4000,25 +4179,39 @@
   }
 
   function backupMediaConfirmation(run, cartridgeLabel) {
-    return String(pick(run, "required_confirmation", "media_confirmation") || (cartridgeLabel ? "OVERWRITE " + cartridgeLabel + " FOR BACKUP " + recordId(run) : "Select a cartridge."));
+    const explicit = pick(run, "required_confirmation", "media_confirmation");
+    if (explicit) return String(explicit);
+    if (backupMediaIsReadback(run)) return "Select the exact archive tape to retrieve the server confirmation.";
+    return cartridgeLabel ? "OVERWRITE " + cartridgeLabel + " FOR BACKUP " + recordId(run) : "Select a cartridge.";
   }
 
   async function openAssignBackupMedia(runId, options) {
     const run = orderedBackupRuns().find((item) => recordId(item) === runId);
     if (!run) return;
+    let readbackMedia = backupMediaIsReadback(run);
+    let nextMedia = backupNeedsNextMedia(run);
+    let volumeSequence = backupNextVolumeSequence(run);
+    let modalTitle = readbackMedia ? "Load tape " + volumeSequence + " for readback" : nextMedia ? "Load tape " + volumeSequence : "Confirm first tape and start";
     const token = ++state.backupReadinessModalToken;
-    openModal("Confirm tape and start", '<div class="source-browser-loading" role="status"><span class="spinner" aria-hidden="true"></span><strong>Rechecking the loaded drive and tape…</strong><small>The retained backup request is still waiting; nothing has been written.</small></div>');
+    openModal(modalTitle, '<div class="source-browser-loading" role="status"><span class="spinner" aria-hidden="true"></span><strong>Rechecking the loaded drive and tape…</strong><small>' + (readbackMedia ? "The completed archive is paused safely until its exact next tape is loaded for readback." : nextMedia ? "The archive is paused safely at the media boundary." : "The retained backup request is still waiting; nothing has been written.") + '</small></div>');
     let readiness;
     try {
       readiness = await loadBackupMediaReadiness("run", runId);
     } catch (error) {
       if (token !== state.backupReadinessModalToken || modalLayer.hidden) return;
       const body = '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not check tape readiness</strong><span>' + esc(errorMessage(error)) + '</span></div></div><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button button-primary" type="button" data-action="refresh-backup-readiness" data-run-id="' + esc(runId) + '">Try again</button></div>';
-      openModal("Confirm tape and start", body);
+      openModal(modalTitle, body);
       return;
     }
     if (token !== state.backupReadinessModalToken || modalLayer.hidden) return;
-    if (readiness.state === "assigned") {
+    const mediaRequest = objectValue(readiness, "media_request");
+    const requestedSequence = Number(pick(mediaRequest, "volume_order", "volume_sequence", "media_sequence"));
+    if (Number.isInteger(requestedSequence) && requestedSequence > 0) volumeSequence = requestedSequence;
+    const mediaPhase = String(pick(mediaRequest, "phase") || "backup_write").toLowerCase();
+    readbackMedia = mediaPhase === "full_readback";
+    nextMedia = !readbackMedia && (nextMedia || mediaPhase === "next_media" || volumeSequence > 1);
+    modalTitle = readbackMedia ? "Load tape " + volumeSequence + " for readback" : nextMedia ? "Load tape " + volumeSequence : "Confirm first tape and start";
+    if (["assigned", "media_authorized", "media_loaded"].includes(readiness.state)) {
       closeModal();
       const target = "#jobs/" + encodeURIComponent(runId);
       if (location.hash !== target) location.hash = target;
@@ -4027,12 +4220,13 @@
     const readinessKey = backupReadinessKey("run", runId);
     const initial = options || {};
     const pairs = readiness.candidates;
+    const expectedLabel = String(pick(mediaRequest, "expected_label", "expected_cartridge_label", "cartridge_label") || "");
     const driveCandidates = pairs.filter((candidate, index) => pairs.findIndex((item) => String(pick(item, "drive_id")) === String(pick(candidate, "drive_id"))) === index);
     const readyDrives = driveCandidates.map(backupCandidateDrive);
     const selectedDrive = readyDrives.find((drive) => recordId(drive) === String(initial.driveId || "")) || (readyDrives.length === 1 ? readyDrives[0] : null);
     const eligibleCandidates = selectedDrive ? pairs.filter((candidate) => String(pick(candidate, "drive_id")) === recordId(selectedDrive)) : [];
     const eligibleMedia = eligibleCandidates.map(backupCandidateMedia);
-    const selectedMedia = eligibleMedia.find((item) => recordId(item) === String(initial.cartridgeId || "")) || (eligibleMedia.length === 1 ? eligibleMedia[0] : null);
+    const selectedMedia = eligibleMedia.find((item) => recordId(item) === String(initial.cartridgeId || "")) || eligibleMedia.find((item) => String(mediaName(item)) === expectedLabel) || (eligibleMedia.length === 1 ? eligibleMedia[0] : null);
     const driveOptions = readyDrives.map((drive) => {
       const stableId = String(pick(drive, "stable_id") || "");
       return '<option value="' + esc(recordId(drive)) + '" data-stable-id="' + esc(stableId) + '"' + (selectedDrive && recordId(selectedDrive) === recordId(drive) ? " selected" : "") + '>' + esc(label(pick(drive, "model", "stable_id"))) + " · " + esc(label(pick(drive, "observed_path"))) + "</option>";
@@ -4042,18 +4236,31 @@
     const remediation = backupReadinessRemediation(readiness);
     const primaryAction = backupReadinessAction(remediation, "run", runId);
     const blockedNotice = blocked ? '<div class="backup-readiness blocked"><span aria-hidden="true">!</span><div><strong>' + esc(remediation.heading) + '</strong><p>' + esc(backupServerReadinessMessage(readiness)) + '</p><div class="backup-readiness-actions">' + primaryAction + '<button class="button button-quiet button-small" type="button" data-action="refresh-backup-readiness" data-run-id="' + esc(runId) + '">Check again</button></div></div></div>' : "";
+    const archiveVolumes = backupRunVolumes(run);
+    const volumeAlreadyListed = archiveVolumes.some((volume) => volume.sequence === volumeSequence);
+    const volumePlan = archiveVolumes.length ? '<div class="backup-volume-plan"><span>' + (readbackMedia ? "Readback order" : "Archive so far") + '</span><ol>' + archiveVolumes.map((volume) => '<li' + (readbackMedia && volume.sequence === volumeSequence ? ' class="current" aria-current="step"' : "") + '><strong>Tape ' + esc(volume.sequence) + '</strong><code>' + esc(volume.label) + '</code></li>').join("") + (!readbackMedia && !volumeAlreadyListed ? '<li class="next"><strong>Tape ' + esc(volumeSequence) + '</strong><span>' + esc(expectedLabel || "Choose below") + '</span></li>' : "") + '</ol></div>' : "";
+    const steps = readbackMedia
+      ? '<ol class="backup-start-steps" aria-label="Readback tape steps"><li class="done"><span>✓</span><strong>Archive written</strong></li><li class="' + (blocked ? "active" : "done") + '"><span>' + (blocked ? "2" : "✓") + '</span><strong>Exact tape ' + esc(volumeSequence) + '</strong></li><li' + (blocked ? "" : ' class="active"') + '><span>3</span><strong>Confirm & read</strong></li></ol>'
+      : '<ol class="backup-start-steps" aria-label="Start backup steps"><li class="done"><span>✓</span><strong>Snapshot</strong></li><li class="' + (blocked ? "active" : "done") + '"><span>' + (blocked ? "2" : "✓") + '</span><strong>' + (nextMedia ? "Next tape" : "First tape") + '</strong></li><li' + (blocked ? "" : ' class="active"') + '><span>3</span><strong>' + (nextMedia ? "Confirm & continue" : "Confirm & start") + '</strong></li></ol>';
+    const boundary = readbackMedia
+      ? '<div class="backup-boundary info"><span aria-hidden="true">✓</span><div><strong>Load recorded archive tape ' + esc(volumeSequence) + '</strong><p>Unload and remove the current tape before inserting this one. ' + (expectedLabel ? "The required label is " + esc(expectedLabel) + ". " : "") + 'This is a read-only media handoff: TapeScale will not erase, relabel, or append to this tape.</p></div></div>'
+      : '<div class="backup-boundary danger"><span aria-hidden="true">!</span><div><strong>Tape ' + esc(volumeSequence) + ' will be erased</strong><p>' + (nextMedia ? "Unload and remove the previous archive tape before inserting this one. " : "") + (expectedLabel ? "The engine requested label " + esc(expectedLabel) + ". " : "") + (nextMedia ? "This tape becomes the next ordered volume in the existing archive. " : "This tape becomes the first volume in the archive. ") + 'TapeScale checks identity, label, protection, holds, reservation, and setup again before writing.</p></div></div>';
+    const mediaFields = readbackMedia
+      ? '<div class="form-grid"' + (blocked ? " hidden" : "") + '><div class="form-field full"><label for="backup-media-drive">Tape drive containing the archive tape</label><select class="select" id="backup-media-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select></div><div class="form-field full"><label for="backup-media-cartridge">Archive tape ' + esc(volumeSequence) + ' to read</label><select class="select" id="backup-media-cartridge" name="cartridge_id" required><option value="">Choose tape</option>' + mediaOptions + '</select><small>Standalone SAS drives cannot report the physical cartridge label. Match the recorded label to the tape you load; Bacula validates its on-tape volume label after rewind before reading backup data.</small></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="backup_authority_confirmed" required> I physically verified that archive tape ' + esc(volumeSequence) + ' is loaded in this drive and authorize read-only verification.</label></div><div class="form-field full"><label for="backup-media-confirmation">Type the exact load confirmation</label><input class="input input-mono" id="backup-media-confirmation" name="confirmation" autocomplete="off" spellcheck="false" aria-describedby="backup-media-confirmation-help" required><small id="backup-media-confirmation-help" aria-live="polite">Choose the required tape to reveal the server confirmation.</small></div></div>'
+      : '<div class="form-grid"' + (blocked ? " hidden" : "") + '><div class="form-field full"><label for="backup-media-drive">Loaded tape drive</label><select class="select" id="backup-media-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select></div><div class="form-field full"><label for="backup-media-cartridge">Tape ' + esc(volumeSequence) + ' to erase and use</label><select class="select" id="backup-media-cartridge" name="cartridge_id" required><option value="">Choose tape</option>' + mediaOptions + '</select><small>Standalone drives cannot report the physical cartridge label. Match the selected label to the tape you loaded. Previously written archive tapes cannot be selected again.</small></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="backup_authority_confirmed" required> I physically verified this labeled scratch tape is loaded in this drive, authorize erasing it as archive volume ' + esc(volumeSequence) + ', and understand this backup is not encrypted.</label></div><div class="form-field full"><label for="backup-media-confirmation">Type the exact erase confirmation</label><input class="input input-mono" id="backup-media-confirmation" name="confirmation" autocomplete="off" spellcheck="false" aria-describedby="backup-media-confirmation-help" required><small id="backup-media-confirmation-help" aria-live="polite">Choose a tape to reveal the exact phrase.</small></div></div>';
     const body = [
-      '<form id="backup-media-form" data-run-id="' + esc(runId) + '" data-readiness-key="' + esc(readinessKey) + '">',
-      '<ol class="backup-start-steps" aria-label="Start backup steps"><li class="done"><span>✓</span><strong>Snapshot</strong></li><li class="' + (blocked ? "active" : "done") + '"><span>' + (blocked ? "2" : "✓") + '</span><strong>Tape</strong></li><li' + (blocked ? "" : ' class="active"') + '><span>3</span><strong>Confirm & start</strong></li></ol>',
-      '<div class="backup-boundary danger"><span aria-hidden="true">!</span><div><strong>The selected tape will be erased</strong><p>TapeScale checks the drive identity, tape label, protection status, holds, reservation, and setup again before writing.</p></div></div>',
-      '<div class="notice warning backup-encryption-warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Not encrypted in this build</strong><span>Do not use this workflow for sensitive production data until encryption and independent key recovery are enabled.</span></div></div>',
+      '<form id="backup-media-form" data-run-id="' + esc(runId) + '" data-readiness-key="' + esc(readinessKey) + '" data-volume-sequence="' + esc(volumeSequence) + '" data-media-phase="' + esc(mediaPhase) + '">',
+      steps,
+      boundary,
+      volumePlan,
+      '<div class="notice warning backup-encryption-warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>This archive is not encrypted</strong><span>' + (readbackMedia ? "Readback does not change the tape, but its contents remain unencrypted." : "Do not use this workflow for sensitive production data until encryption and independent key recovery are enabled.") + '</span></div></div>',
       blockedNotice,
-      '<div class="form-grid"' + (blocked ? " hidden" : "") + '><div class="form-field full"><label for="backup-media-drive">Loaded tape drive</label><select class="select" id="backup-media-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select></div><div class="form-field full"><label for="backup-media-cartridge">Tape to erase and use</label><select class="select" id="backup-media-cartridge" name="cartridge_id" required><option value="">Choose tape</option>' + mediaOptions + '</select><small>Standalone drives cannot report the physical cartridge label. Match the selected label to the tape you loaded.</small></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="backup_authority_confirmed" required> I physically verified this labeled scratch tape is loaded in this drive, authorize erasing it, and understand this backup is not encrypted.</label></div><div class="form-field full"><label for="backup-media-confirmation">Type the exact erase confirmation</label><input class="input input-mono" id="backup-media-confirmation" name="confirmation" autocomplete="off" spellcheck="false" aria-describedby="backup-media-confirmation-help" required><small id="backup-media-confirmation-help" aria-live="polite">Choose a tape to reveal the exact phrase.</small></div></div>',
+      mediaFields,
       '<p class="notice danger" id="backup-media-error" role="alert" aria-live="assertive" hidden></p>',
-      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button button-danger" type="submit"' + (blocked ? " disabled" : "") + '>Erase tape and start backup</button></div>',
+      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button ' + (readbackMedia ? "button-primary" : "button-danger") + '" type="submit"' + (blocked ? " disabled" : "") + '>' + (readbackMedia ? "Confirm tape and continue readback" : nextMedia ? "Erase tape and continue archive" : "Erase tape and start backup") + '</button></div>',
       '</form>'
     ].join("");
-    openModal("Confirm tape and start", body);
+    openModal(modalTitle, body);
     updateBackupMediaForDrive(document.querySelector("#backup-media-form"));
   }
 
@@ -4097,6 +4304,10 @@
 
   async function submitBackupMedia(form) {
     const runId = form.dataset.runId;
+    const volumeSequence = Number(form.dataset.volumeSequence || 1);
+    const mediaPhase = String(form.dataset.mediaPhase || "backup_write");
+    const readbackMedia = mediaPhase === "full_readback";
+    const continuingArchive = !readbackMedia && volumeSequence > 1;
     const token = state.backupReadinessModalToken;
     const values = new FormData(form);
     const drive = form.querySelector('[name="drive_id"]');
@@ -4109,7 +4320,7 @@
     const errorBox = form.querySelector("#backup-media-error");
     let assignmentAttempted = false;
     if (!authorized || !cartridgeLabel) {
-      errorBox.textContent = "Confirm the loaded scratch tape and type the exact erase phrase shown above.";
+      errorBox.textContent = readbackMedia ? "Confirm the exact loaded archive tape and type the server-provided load phrase shown above." : "Confirm the loaded scratch tape and type the exact erase phrase shown above.";
       errorBox.hidden = false;
       return;
     }
@@ -4121,12 +4332,16 @@
       const cartridgeId = String(values.get("cartridge_id") || "");
       const readiness = await loadBackupMediaReadiness("run", runId);
       if (!backupModalSubmissionCurrent(form, token)) return;
+      const currentMediaRequest = objectValue(readiness, "media_request");
+      const currentPhase = String(pick(currentMediaRequest, "phase") || "backup_write").toLowerCase();
+      const currentSequence = Number(pick(currentMediaRequest, "volume_order", "volume_sequence", "media_sequence") || 1);
+      if (currentPhase !== mediaPhase || currentSequence !== volumeSequence) throw new Error("The requested tape changed while this form was open. Review the current media request before continuing.");
       const candidate = readiness.candidates.find((item) => String(pick(item, "drive_id")) === driveId && String(pick(item, "cartridge_id")) === cartridgeId);
       if (!candidate) throw new Error(backupServerReadinessMessage(readiness));
       const exactLabel = String(pick(candidate, "cartridge_label") || "");
       const expectedConfirmation = String(pick(candidate, "required_confirmation") || "");
-      if (!expectedConfirmation || exactLabel !== cartridgeLabel || String(values.get("confirmation") || "") !== expectedConfirmation) throw new Error("The tape selection changed. Review it and type the current exact erase phrase.");
-      submit.textContent = "Starting backup…";
+      if (!expectedConfirmation || exactLabel !== cartridgeLabel || String(values.get("confirmation") || "") !== expectedConfirmation) throw new Error(readbackMedia ? "The readback request changed. Review the exact tape and type the current server-provided load phrase." : "The tape selection changed. Review it and type the current exact erase phrase.");
+      submit.textContent = readbackMedia ? "Continuing readback…" : continuingArchive ? "Continuing archive…" : "Starting backup…";
       assignmentAttempted = true;
       await request(endpoints.backupRuns + "/" + encodeURIComponent(runId) + "/media", {
         method: "POST",
@@ -4135,10 +4350,11 @@
           drive_id: driveId,
           expected_stable_id: String(pick(candidate, "stable_id") || (driveOption && driveOption.dataset.stableId) || ""),
           cartridge_id: cartridgeId,
+          volume_sequence: volumeSequence,
           typed_cartridge_label: exactLabel,
           loaded_media_confirmed: authorized,
-          destructive_overwrite_confirmed: authorized,
-          encryption_deviation_confirmed: authorized,
+          destructive_overwrite_confirmed: !readbackMedia && authorized,
+          encryption_deviation_confirmed: !readbackMedia && authorized,
           confirmation: String(values.get("confirmation") || "")
         })
       });
@@ -4156,7 +4372,7 @@
         render();
       }
       scheduleBackupRunPoll();
-      toast(continueGuided ? "Backup started" : "Backup started in background", "TapeScale is scanning the snapshot and will verify the entire tape after writing it.");
+      toast(continueGuided ? (readbackMedia ? "Readback tape accepted" : continuingArchive ? "Archive continued" : "Backup started") : (readbackMedia ? "Readback tape accepted in background" : continuingArchive ? "Archive continued in background" : "Backup started in background"), readbackMedia ? "TapeScale accepted your physical-label attestation. Bacula will validate the on-tape volume label after rewind before reading backup data." : continuingArchive ? "TapeScale is writing the next ordered archive volume and will request another tape only if needed." : "TapeScale is scanning the snapshot and will verify every tape in the archive after writing it.");
     } catch (error) {
       if (!backupModalSubmissionCurrent(form, token)) {
         if (assignmentAttempted) toast("Backup start needs review", errorMessage(error));
@@ -4165,7 +4381,7 @@
       errorBox.textContent = errorMessage(error);
       errorBox.hidden = false;
       submit.disabled = false;
-      submit.textContent = "Erase tape and start backup";
+      submit.textContent = readbackMedia ? "Confirm tape and continue readback" : continuingArchive ? "Erase tape and continue archive" : "Erase tape and start backup";
     }
   }
 
@@ -5394,6 +5610,7 @@
     if (event.target.id === "backup-media-cartridge") updateBackupMediaConfirmation(event.target.form);
     if (event.target.id === "start-backup-drive") updateStartBackupTape(event.target.form);
     if (event.target.id === "start-backup-cartridge") updateStartBackupTape(event.target.form);
+    if (["backup-compression", "backup-media-spanning"].includes(event.target.id)) updateBackupProfileOptions(event.target.form);
     if (event.target.id === "backup-state-filter") {
       state.backupStateFilter = event.target.value;
       applyBackupFilters();
