@@ -1935,6 +1935,17 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     )
     .await
     .expect("rehearsal should enter restoring"));
+    let claimed_restore_volumes = store::restore_rehearsal_volumes(&pool, rehearsal_id)
+        .await
+        .expect("the normalized single-volume restore ledger should load");
+    assert_eq!(claimed_restore_volumes.len(), 1);
+    assert_eq!(claimed_restore_volumes[0].state, "loaded");
+    let ordered_restore_volumes = json!([{
+        "volume_order": claimed_restore_volumes[0].volume_order,
+        "cartridge_label": claimed_restore_volumes[0].expected_cartridge_label.clone(),
+        "volume_label": claimed_restore_volumes[0].expected_volume_label.clone(),
+        "engine_media_id": claimed_restore_volumes[0].expected_engine_media_id
+    }]);
     assert!(store::append_restore_rehearsal_event(
         &pool,
         &rehearsal_claim,
@@ -1962,6 +1973,8 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             "engine_media_id": 2001,
             "media_id": 2001,
             "volume": "INTEGRATION-SCRATCH-L9-000001",
+            "volume_count": 1,
+            "volumes": ordered_restore_volumes.clone(),
             "destination": rehearsal_destination.clone()
         }),
     )
@@ -1975,6 +1988,11 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     )
     .await
     .expect("restore completion evidence should append"));
+    assert!(
+        store::complete_restore_rehearsal_volume(&pool, &rehearsal_claim, 1)
+            .await
+            .expect("the single ordered restore volume should complete")
+    );
     assert!(store::transition_restore_rehearsal_phase(
         &pool,
         &rehearsal_claim,
@@ -2026,6 +2044,8 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             "complete": true,
             "matched": true,
             "read_only_media_operation": true,
+            "volume_count": 1,
+            "volumes": ordered_restore_volumes.clone(),
             "source_manifest_digest": source_manifest_digest.clone(),
             "restored_manifest_digest": source_manifest_digest.clone()
         }),
@@ -2058,6 +2078,8 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             "source_backup_job_id": 1001,
             "job": {"job_id":2002}
         },
+        "volume_count": 1,
+        "volumes": ordered_restore_volumes,
         "source_manifest_digest": source_manifest_digest.clone(),
         "restored_manifest_digest": source_manifest_digest.clone(),
         "restored_manifest_sha256": "f".repeat(64),
