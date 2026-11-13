@@ -2938,6 +2938,10 @@ async fn plan_restore(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let supported_origin_workflow = matches!(
+        aggregate.origin.workflow_kind.as_deref(),
+        Some("recovery_exercise" | "backup")
+    );
     let execution_supported = state.lab_file_roundtrip_enabled
         && preflight.ready()
         && mode == RestoreMode::FileArchive
@@ -2950,13 +2954,13 @@ async fn plan_restore(
         && aggregate.volumes.len() == 1
         && required_media_ids.len() == 1
         && aggregate.origin.data_run_id.is_some()
+        && supported_origin_workflow
         && aggregate.origin.run_state == "verified"
         && aggregate.origin.engine_name.as_deref() == Some("Bacula Community")
         && aggregate.origin.engine_version.as_deref() == Some("15.0.3")
         && aggregate.origin.adapter_version.as_deref() == Some("g0.2-lab-v1")
         && aggregate.recovery_point.format_version == "bacula-community-15.0.3-lab-v1"
         && all_chain_full_readback
-        && restore_test_passed
         && per_file_digests_available
         && !compatible_execution_drives.is_empty()
         && !aggregate.caps.dependencies_truncated
@@ -2965,11 +2969,11 @@ async fn plan_restore(
         && !aggregate.caps.artifacts_truncated
         && !aggregate.caps.values_truncated;
     let execution_detail = if execution_supported {
-        "This ready G0.2 point supports an attended, read-only physical-tape restore rehearsal into the isolated destination."
+        "This verified single-volume point supports an attended, read-only physical-tape restore into the isolated destination."
     } else if !preflight.ready() {
         "Resolve every restore-planning blocker and generate a fresh plan before execution can be considered."
     } else {
-        "This ready plan remains planning-only because its representation, dependency shape, retained format, or physical evidence is outside the narrow G0.2 rehearsal adapter."
+        "This ready plan remains planning-only because its representation, dependency shape, retained format, origin workflow, or physical evidence is outside the single-volume restore adapter."
     };
     let execution = json!({
         "kind": "attended_verified_point_recovery_rehearsal",
@@ -2977,6 +2981,7 @@ async fn plan_restore(
         "production_eligible": false,
         "recovery_point_id": recovery_point_id,
         "origin_data_run_id": aggregate.origin.data_run_id,
+        "origin_workflow_kind": aggregate.origin.workflow_kind.clone(),
         "required_media_ids": required_media_ids,
         "required_tape_ids": required_tape_ids,
         "destination_subpath": destination,
@@ -3155,7 +3160,7 @@ async fn restore_rehearsals(State(state): State<AppState>) -> Result<Json<Value>
     };
     Ok(Json(json!({
         "rehearsals": rehearsals,
-        "scope": "attended_verified_g0_2_physical_restore_rehearsal",
+        "scope": "attended_verified_single_volume_physical_restore",
         "production_eligible": false
     })))
 }
@@ -3183,7 +3188,7 @@ async fn restore_rehearsal(
             "artifacts_maximum": RESTORE_REHEARSAL_ARTIFACT_LIMIT,
             "artifacts_truncated": artifacts_truncated
         },
-        "scope": "attended_verified_g0_2_physical_restore_rehearsal",
+        "scope": "attended_verified_single_volume_physical_restore",
         "production_eligible": false
     })))
 }
@@ -3275,7 +3280,7 @@ async fn restore_rehearsal_evidence(
     let evidence = json!({
         "format": "tapescale.restore-rehearsal-evidence.v1",
         "canonicalization": "UTF-8 compact JSON with lexicographically ordered object keys",
-        "execution_claim": "attended G0.2 physical-tape restore rehearsal; not production qualification",
+        "execution_claim": "attended verified-point single-volume physical-tape Restore run; not production qualification",
         "bounds": {
             "maximum_serialized_bytes": RESTORE_REHEARSAL_EXPORT_BYTES,
             "events_maximum": RESTORE_REHEARSAL_EVENT_LIMIT,
@@ -3291,7 +3296,7 @@ async fn restore_rehearsal_evidence(
     let body = canonical_json(&evidence)?;
     if body.len() > RESTORE_REHEARSAL_EXPORT_BYTES {
         return Err(AppError::Blocked(format!(
-            "the bounded rehearsal evidence export is {} bytes, exceeding the {} byte response limit",
+            "the bounded Restore-run evidence export is {} bytes, exceeding the {} byte response limit",
             body.len(),
             RESTORE_REHEARSAL_EXPORT_BYTES
         )));
@@ -3302,7 +3307,7 @@ async fn restore_rehearsal_evidence(
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
         .header(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"tapescale-restore-rehearsal-{id}-evidence.json\""),
+            format!("attachment; filename=\"tapescale-restore-run-{id}-evidence.json\""),
         )
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::ETAG, format!("\"sha256-{digest}\""))

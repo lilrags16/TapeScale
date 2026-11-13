@@ -1587,6 +1587,265 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         .get("content_sha256")
         .is_none());
 
+    // A verified operational backup must be able to establish its first
+    // restore-test record. Requiring a prior restore test here would make that
+    // evidence impossible to create.
+    let restore_location_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO locations (id, name, kind)
+         VALUES ($1, 'Operational restore integration shelf', 'onsite')",
+    )
+    .bind(restore_location_id)
+    .execute(&pool)
+    .await
+    .expect("restore fixture location should persist");
+    sqlx::query(
+        "UPDATE cartridges SET confirmed_location_id = $1, updated_at = now() WHERE id = $2",
+    )
+    .bind(restore_location_id)
+    .bind(scratch.id)
+    .execute(&pool)
+    .await
+    .expect("verified backup media should have confirmed custody");
+    sqlx::query("UPDATE drives SET last_observed_at = now() WHERE id = $1")
+        .bind(drive.id)
+        .execute(&pool)
+        .await
+        .expect("restore fixture drive observation should remain fresh");
+
+    let restore_plan_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/restores/plan".to_owned(),
+        json!({
+            "recovery_point_id": recovery_point_id,
+            "mode": "file_archive",
+            "destination": "planned-restores/operational-single-volume",
+            "conflict_policy": "skip",
+            "destination_approved": true,
+            "is_new_destination": true,
+            "acl_semantics_supported": true,
+            "identity_mapping_complete": true,
+            "estimated_required_bytes": 1024,
+            "available_bytes": 1048576,
+            "required_free_reserve_bytes": 4096,
+            "automatic_publication_requested": false
+        }),
+    )
+    .await;
+    assert_eq!(restore_plan_response.status(), StatusCode::CREATED);
+    let restore_plan = response_json(restore_plan_response).await;
+    assert_eq!(restore_plan["plan"]["ready"], true);
+    assert_eq!(restore_plan["plan"]["execution_supported"], true);
+    assert_eq!(
+        restore_plan["plan"]["execution"]["origin_workflow_kind"],
+        "backup"
+    );
+    assert_eq!(
+        restore_plan["plan"]["verification_prerequisites"]["full_readback_passed"],
+        true
+    );
+    assert_eq!(
+        restore_plan["plan"]["verification_prerequisites"]["restore_test_passed"],
+        false
+    );
+    assert!(restore_plan["plan"]["warnings"]
+        .as_array()
+        .is_some_and(|warnings| warnings
+            .iter()
+            .any(|warning| warning["code"] == "restore_test_not_passed")));
+
+    let restore_plan_id = Uuid::parse_str(
+        restore_plan["plan"]["id"]
+            .as_str()
+            .expect("restore plan should have an id"),
+    )
+    .expect("restore plan id should parse");
+    let queue_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/restore-rehearsals".to_owned(),
+        json!({
+            "plan_id": restore_plan_id,
+            "preview_hash": restore_plan["plan"]["preview_hash"],
+            "drive_id": drive.id,
+            "confirmation": format!("RESTORE PLAN {restore_plan_id} TO ISOLATED DESTINATION"),
+            "tape_loaded_confirmed": true,
+            "isolated_destination_confirmed": true,
+            "attended_confirmed": true,
+            "actor": "Operational restore integration operator"
+        }),
+    )
+    .await;
+    let queue_status = queue_response.status();
+    let queued_restore = response_json(queue_response).await;
+    assert_eq!(
+        queue_status,
+        StatusCode::ACCEPTED,
+        "operational restore queue response: {queued_restore}"
+    );
+    let restore_rehearsal_id = Uuid::parse_str(
+        queued_restore["rehearsal"]["id"]
+            .as_str()
+            .expect("queued operational restore should have an id"),
+    )
+    .expect("restore rehearsal id should parse");
+
+    let restore_claim = store::claim_next_restore_rehearsal_run(&pool, Uuid::now_v7())
+        .await
+        .expect("operational restore rehearsal claim should query");
+    let store::ClaimRestoreRehearsalRunResult::Claimed(restore_claim) = restore_claim else {
+        panic!("verified operational single-volume restore should be claimable");
+    };
+    assert_eq!(restore_claim.run.id, restore_rehearsal_id);
+    assert!(store::transition_restore_rehearsal_phase(
+        &pool,
+        &restore_claim,
+        store::RestoreRehearsalPhase::Restoring,
+        json!({"detail": "operational integration restore started"}),
+    )
+    .await
+    .expect("operational restore should enter restoring"));
+    let restore_job_id = 9002_i64;
+    let restore_destination =
+        format!("/restore/planned-restores/operational-single-volume/{restore_rehearsal_id}");
+    assert!(store::append_restore_rehearsal_artifact(
+        &pool,
+        &restore_claim,
+        "engine_restore",
+        "/integration/operational-engine-restore.json",
+        &"c".repeat(64),
+        512,
+        json!({
+            "completed": true,
+            "finalized": true,
+            "read_only_media_operation": true,
+            "physical_media_readback": true,
+            "backup_job_id": 9001,
+            "restore_job_id": restore_job_id,
+            "engine_media_id": 91,
+            "media_id": 91,
+            "volume": engine_volume,
+            "destination": restore_destination
+        }),
+    )
+    .await
+    .expect("operational engine restore evidence should append"));
+    assert!(store::transition_restore_rehearsal_phase(
+        &pool,
+        &restore_claim,
+        store::RestoreRehearsalPhase::Comparing,
+        json!({"detail": "operational integration restore hashing complete"}),
+    )
+    .await
+    .expect("operational restore should enter comparing"));
+    let restored_artifact_sha256 = "d".repeat(64);
+    for (kind, storage_ref, sha256, metadata) in [
+        (
+            "restored_manifest",
+            "/integration/operational-restored-manifest.json",
+            restored_artifact_sha256.clone(),
+            json!({
+                "manifest_digest": source_manifest.digest_sha256,
+                "entry_count": source_manifest.entry_count,
+                "file_count": source_manifest.file_count,
+                "logical_bytes": source_manifest.logical_bytes
+            }),
+        ),
+        (
+            "comparison",
+            "/integration/operational-comparison.json",
+            "e".repeat(64),
+            json!({
+                "matched": true,
+                "expected_digest": source_manifest.digest_sha256,
+                "actual_digest": source_manifest.digest_sha256,
+                "differences": 0
+            }),
+        ),
+        (
+            "evidence_report",
+            "/integration/operational-restore-report.json",
+            "f".repeat(64),
+            json!({
+                "complete": true,
+                "matched": true,
+                "read_only_media_operation": true,
+                "source_manifest_digest": source_manifest.digest_sha256,
+                "restored_manifest_digest": source_manifest.digest_sha256
+            }),
+        ),
+    ] {
+        assert!(store::append_restore_rehearsal_artifact(
+            &pool,
+            &restore_claim,
+            kind,
+            storage_ref,
+            &sha256,
+            256,
+            metadata,
+        )
+        .await
+        .expect("operational restore artifact should append"));
+    }
+    let finalized_restore = store::finalize_restore_rehearsal_pass(
+        &pool,
+        &restore_claim,
+        json!({
+            "scope": "integration attended operational single-volume restore",
+            "production_eligible": false,
+            "media_operation": "read_only",
+            "source_backup_job_id": 9001,
+            "engine_operation_id": format!("bacula-job:{restore_job_id}"),
+            "restore_job_id": restore_job_id,
+            "restore_job": {"job_id": restore_job_id, "job_status": "T", "job_errors": 0},
+            "restore_catalog": {
+                "source_backup_job_id": 9001,
+                "job": {"job_id": restore_job_id}
+            },
+            "source_manifest_digest": source_manifest.digest_sha256,
+            "restored_manifest_digest": source_manifest.digest_sha256,
+            "restored_manifest_sha256": restored_artifact_sha256,
+            "comparison": {
+                "matched": true,
+                "expected_digest": source_manifest.digest_sha256,
+                "actual_digest": source_manifest.digest_sha256,
+                "differences": []
+            },
+            "restore_destination": restore_destination,
+            "cleanup": {"postcondition": "ready_at_bot", "position_uncertain": false},
+            "media_mutation_commands_dispatched": false
+        }),
+    )
+    .await
+    .expect("operational restore evidence should finalize");
+    let store::FinalizeRestoreRehearsalResult::Passed {
+        verification_record_id,
+    } = finalized_restore
+    else {
+        panic!("complete operational restore evidence should pass");
+    };
+    let (restore_scope, pass_result) = sqlx::query_as::<_, (Value, Value)>(
+        "SELECT verification.scope, rehearsal.result
+         FROM verification_records verification
+         JOIN restore_rehearsals rehearsal ON rehearsal.id = $2
+         WHERE verification.id = $1
+           AND verification.kind = 'restore_test' AND verification.outcome = 'passed'",
+    )
+    .bind(verification_record_id)
+    .bind(restore_rehearsal_id)
+    .fetch_one(&pool)
+    .await
+    .expect("operational restore-test verification should persist");
+    assert_eq!(
+        restore_scope["scope"],
+        "complete attended single-volume file recovery replay"
+    );
+    assert_eq!(
+        pass_result["execution_scope"],
+        "attended_single_volume_file_restore"
+    );
+
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)

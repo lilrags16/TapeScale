@@ -342,6 +342,7 @@ pub struct RecoveryOriginRecord {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub data_run_id: Option<Uuid>,
+    pub workflow_kind: Option<String>,
     pub profile_name: Option<String>,
     pub engine_name: Option<String>,
     pub engine_version: Option<String>,
@@ -1554,7 +1555,7 @@ pub async fn list_sources(pool: &PgPool) -> Result<Vec<SourceRecord>, sqlx::Erro
 const JOB_SELECT: &str = "SELECT j.id AS job_id, j.external_id, j.kind, j.priority,
             j.created_at AS job_created_at,
             COALESCE(p.name, data_profile.name,
-                     CASE WHEN rehearsal.id IS NOT NULL THEN 'Recovery rehearsal' END) AS policy_name,
+                     CASE WHEN rehearsal.id IS NOT NULL THEN 'Restore run' END) AS policy_name,
             CASE WHEN data_profile.id IS NOT NULL OR rehearsal.id IS NOT NULL
                  THEN 'file' ELSE p.representation END AS representation,
             COALESCE(s.dataset_name, rehearsal_source.dataset_name) AS dataset_name,
@@ -8455,7 +8456,8 @@ pub async fn get_recovery_point_aggregate(
                 j.kind AS job_kind, jr.id AS run_id, jr.state AS run_state,
                 jr.attempt, jr.correlation_id, jr.engine_operation_id,
                 jr.created_at AS run_created_at, jr.started_at, jr.finished_at,
-                data_run.id AS data_run_id, profile.name AS profile_name,
+                data_run.id AS data_run_id, data_run.workflow_kind,
+                profile.name AS profile_name,
                 data_run.engine_name, data_run.engine_version,
                 data_run.adapter_version, data_run.result AS data_run_result
          FROM job_runs jr
@@ -8628,6 +8630,7 @@ struct RestoreRehearsalOriginBinding {
     recovery_point_id: Uuid,
     origin_job_run_id: Uuid,
     original_data_run_id: Uuid,
+    workflow_kind: String,
     origin_drive_id: Uuid,
     source_snapshot_id: Uuid,
     representation: String,
@@ -8739,7 +8742,8 @@ async fn load_restore_rehearsal_origin(
 ) -> Result<Option<RestoreRehearsalOriginBinding>, sqlx::Error> {
     sqlx::query_as(
         "SELECT rp.id AS recovery_point_id, rp.run_id AS origin_job_run_id,
-                data_run.id AS original_data_run_id, data_run.drive_id AS origin_drive_id,
+                data_run.id AS original_data_run_id, data_run.workflow_kind,
+                data_run.drive_id AS origin_drive_id,
                 data_run.source_snapshot_id, rp.representation, rp.level,
                 rp.status AS recovery_status, rp.expires_at AS recovery_expires_at,
                 rp.indefinite AS recovery_indefinite, rp.key_lineage_id,
@@ -8790,6 +8794,47 @@ async fn load_restore_rehearsal_volume(
     .bind(recovery_point_id)
     .fetch_optional(&mut **transaction)
     .await
+}
+
+async fn restore_rehearsal_full_readback_passed(
+    transaction: &mut Transaction<'_, Postgres>,
+    recovery_point_id: Uuid,
+    drive_id: Uuid,
+    cartridge_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM verification_records
+             WHERE recovery_point_id = $1 AND kind = 'full_readback'
+               AND outcome = 'passed' AND finished_at IS NOT NULL
+               AND drive_id = $2 AND media_ids = ARRAY[$3]::uuid[]
+         )",
+    )
+    .bind(recovery_point_id)
+    .bind(drive_id)
+    .bind(cartridge_id)
+    .fetch_one(&mut **transaction)
+    .await
+}
+
+fn restore_rehearsal_manifest_binding_valid(origin: &RestoreRehearsalOriginBinding) -> bool {
+    let Some(source_manifest_digest) = origin.source_manifest_digest.as_deref() else {
+        return false;
+    };
+    if !valid_sha256(&origin.source_manifest_sha256) || !valid_sha256(source_manifest_digest) {
+        return false;
+    }
+    match origin.workflow_kind.as_str() {
+        // The legacy recovery exercise used the serialized artifact identity as
+        // the recovery-point manifest identity.
+        "recovery_exercise" => {
+            origin.manifest_digest.as_deref() == Some(origin.source_manifest_sha256.as_str())
+        }
+        // Operational backups retain the normalized file-manifest digest as
+        // the recovery-point identity and the artifact digest independently.
+        "backup" => origin.manifest_digest.as_deref() == Some(source_manifest_digest),
+        _ => false,
+    }
 }
 
 fn restore_plan_recovery_point_id(plan: &RestorePlanRecord) -> Option<Uuid> {
@@ -8997,7 +9042,7 @@ pub async fn queue_restore_rehearsal(
         )
     } else if !plan.key_lineage_ids.is_empty() {
         Some(
-            "encrypted or key-dependent recovery points are outside the G0.2 replay gate"
+            "encrypted or key-dependent recovery points are outside the attended replay gate"
                 .to_owned(),
         )
     } else if plan.required_media_ids.len() != 1 {
@@ -9046,6 +9091,13 @@ pub async fn queue_restore_rehearsal(
         .and_then(Value::as_i64);
     let qualification_passed =
         single_tape_qualification_passed(&mut transaction, &drive, volume.cartridge_id).await?;
+    let full_readback_passed = restore_rehearsal_full_readback_passed(
+        &mut transaction,
+        recovery_point_id,
+        drive.id,
+        volume.cartridge_id,
+    )
+    .await?;
     let readable = drive
         .generation
         .and_then(drive_generation)
@@ -9068,19 +9120,27 @@ pub async fn queue_restore_rehearsal(
             .is_none_or(|expires_at| expires_at <= Utc::now())
     {
         Some("the selected recovery point has expired and is not retained indefinitely".to_owned())
+    } else if !matches!(
+        origin.workflow_kind.as_str(),
+        "recovery_exercise" | "backup"
+    ) {
+        Some(
+            "the recovery point did not originate from a supported physical backup workflow"
+                .to_owned(),
+        )
     } else if origin.recovery_format_version != "bacula-community-15.0.3-lab-v1"
         || origin.format_version != "bacula-community-15.0.3-lab-v1"
         || origin.engine_name != "Bacula Community"
         || origin.engine_version != "15.0.3"
         || origin.adapter_version != "g0.2-lab-v1"
     {
-        Some("the recovery point is not bound to the pinned G0.2 Bacula format".to_owned())
+        Some("the recovery point is not bound to the supported pinned Bacula format".to_owned())
     } else if origin.origin_job_state != "verified"
         || origin.origin_data_state != "passed"
         || origin.production_eligible
         || !origin.encryption_deviation_confirmed
     {
-        Some("the originating G0.2 exercise is not a passed laboratory run".to_owned())
+        Some("the originating physical backup is not a passed, verified run".to_owned())
     } else if dependency_count != 0 || volume_count != 1 {
         Some("the recovery point is not a dependency-free single-volume capture".to_owned())
     } else if plan.required_media_ids.as_slice() != [volume.cartridge_id] {
@@ -9093,18 +9153,18 @@ pub async fn queue_restore_rehearsal(
     {
         Some("the retained Bacula backup JobId or media record binding is invalid".to_owned())
     } else if coverage_artifact_id != Some(origin.source_manifest_artifact_id)
-        || origin.manifest_digest.as_deref() != Some(origin.source_manifest_sha256.as_str())
-        || !valid_sha256(&origin.source_manifest_sha256)
-        || origin
-            .source_manifest_digest
-            .as_deref()
-            .is_none_or(|digest| !valid_sha256(digest))
+        || !restore_rehearsal_manifest_binding_valid(&origin)
         || origin.source_manifest_size_bytes <= 0
     {
         Some("the retained source-manifest identity is incomplete or inconsistent".to_owned())
+    } else if !full_readback_passed {
+        Some(
+            "the exact single-volume recovery point lacks a completed physical full-readback verification"
+                .to_owned(),
+        )
     } else if drive.id != origin.origin_drive_id {
         Some(
-            "this laboratory replay requires the exact drive used by the passed G0.2 run"
+            "this attended replay requires the exact drive used by the verified physical backup"
                 .to_owned(),
         )
     } else if let Some(reason) = drive_motion_blocker(&drive) {
@@ -9126,7 +9186,7 @@ pub async fn queue_restore_rehearsal(
     } else if engine_volume_name.is_none()
         || volume.on_tape_identity.as_deref() != engine_volume_name
     {
-        Some("the current on-tape identity disagrees with the passed G0.2 volume".to_owned())
+        Some("the current on-tape identity disagrees with the verified backup volume".to_owned())
     } else {
         None
     };
@@ -9312,7 +9372,8 @@ pub async fn queue_restore_rehearsal(
                 "assertion_only": true,
                 "safety_authority": false
             },
-            "scope": "attended G0.2 single-volume full-file recovery replay",
+            "origin_workflow_kind": origin.workflow_kind,
+            "scope": "attended single-volume full-file recovery replay",
             "production_eligible": false
         }),
         requested_by_label,
@@ -9532,6 +9593,21 @@ pub async fn claim_next_restore_rehearsal_run(
     let expected_reservation = format!("restore_rehearsal:{}", run.id);
     let qualification_passed =
         single_tape_qualification_passed(&mut transaction, &drive, run.cartridge_id).await?;
+    let full_readback_passed = restore_rehearsal_full_readback_passed(
+        &mut transaction,
+        run.recovery_point_id,
+        run.drive_id,
+        run.cartridge_id,
+    )
+    .await?;
+    let (dependency_count, volume_count) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT
+             (SELECT count(*) FROM recovery_dependencies WHERE recovery_point_id = $1),
+             (SELECT count(*) FROM volume_records WHERE recovery_point_id = $1)",
+    )
+    .bind(run.recovery_point_id)
+    .fetch_one(&mut *transaction)
+    .await?;
     let readable = drive
         .generation
         .and_then(drive_generation)
@@ -9594,6 +9670,10 @@ pub async fn claim_next_restore_rehearsal_run(
         Some("the approved destination or capacity assertions changed after queuing".to_owned())
     } else if origin.original_data_run_id != run.original_data_run_id
         || origin.origin_drive_id != run.drive_id
+        || !matches!(
+            origin.workflow_kind.as_str(),
+            "recovery_exercise" | "backup"
+        )
         || origin.representation != "file"
         || origin.level != "full"
         || origin.recovery_status != "verified"
@@ -9604,7 +9684,7 @@ pub async fn claim_next_restore_rehearsal_run(
         || !origin.encryption_deviation_confirmed
     {
         Some(
-            "the originating G0.2 full-file recovery evidence changed or is no longer valid"
+            "the originating full-file physical-backup evidence changed or is no longer valid"
                 .to_owned(),
         )
     } else if !origin.recovery_indefinite
@@ -9628,11 +9708,16 @@ pub async fn claim_next_restore_rehearsal_run(
         || origin.source_manifest_sha256 != run.source_manifest_sha256
         || origin.source_manifest_digest.as_deref() != Some(run.source_manifest_digest.as_str())
         || origin.source_manifest_size_bytes != run.source_manifest_size_bytes
-        || origin.manifest_digest.as_deref() != Some(run.source_manifest_sha256.as_str())
+        || !restore_rehearsal_manifest_binding_valid(&origin)
         || !valid_sha256(&run.source_manifest_sha256)
         || !valid_sha256(&run.source_manifest_digest)
     {
         Some("the retained source-manifest binding changed or is incomplete".to_owned())
+    } else if dependency_count != 0 || volume_count != 1 || !full_readback_passed {
+        Some(
+            "the recovery point no longer has one dependency-free, fully read-back physical volume"
+                .to_owned(),
+        )
     } else if backup_job_id != Some(run.backup_job_id)
         || engine_record != Some((run.expected_engine_media_id, run.backup_job_id))
         || volume.engine_record_id != run.expected_engine_record_id
@@ -10455,7 +10540,7 @@ pub async fn finalize_restore_rehearsal_pass(
     .bind(verification_record_id)
     .bind(claim.run.recovery_point_id)
     .bind(json!({
-        "scope": "complete attended G0.2 single-volume file recovery replay",
+        "scope": "complete attended single-volume file recovery replay",
         "source_manifest_digest": claim.run.source_manifest_digest,
         "destination_subpath": claim.run.destination_subpath
     }))
@@ -10474,7 +10559,7 @@ pub async fn finalize_restore_rehearsal_pass(
         "restore_job_id": restore_job_id_i64,
         "source_manifest_digest": claim.run.source_manifest_digest,
         "production_eligible": false,
-        "g0_gate": "still_open",
+        "execution_scope": "attended_single_volume_file_restore",
         "evidence": result
     });
     let updated = sqlx::query(

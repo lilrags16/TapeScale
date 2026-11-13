@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-1/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-1/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-2/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-2/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -135,6 +135,49 @@ test("bounded source and retained browsers disclose partial directory views", ()
   assert.match(retained, /Only this browse-only directory view is bounded/);
   assert.match(retained, /retained manifest and tape archive are complete/);
   assert.match(retained, /backup itself was not limited/);
+});
+
+test("the Recovery Vault offers an honest attended single-volume Restore run", () => {
+  const phases = section("  const RESTORE_REHEARSAL_PHASES = [", "  function restoreRehearsalDetailRecord(");
+  const history = section("  function renderRestoreRehearsal(", "  function renderRecoveryPointDossier(");
+  const dossier = section("  function renderRecoveryPointDossier(", "  function renderRestore(");
+  const mediaContract = section("  function restorePlanTapes(", "  function restorePlanDrives(");
+  const result = section("  function renderRestorePlanResult(", "  async function submitRestorePlan(");
+  const start = section("  function openRestoreRehearsal(", "  async function submitRestoreRehearsal(");
+
+  assert.match(phases, /name: "Restore files", detail: "Read the complete backup from one tape"/);
+  assert.match(phases, /name: "Verify files", detail: "Hash and compare restored content"/);
+  assert.match(phases, /name: "Complete", detail: "Retain restore evidence"/);
+  assert.doesNotMatch(phases, /Retain rehearsal evidence/);
+
+  assert.match(history, /<h3>Restore runs<\/h3>/);
+  assert.match(history, /supported verified Full recovery point on one cartridge/);
+  assert.match(history, /<h4>Restore run<\/h4>/);
+  assert.match(history, /Download restore evidence/);
+  assert.doesNotMatch(history, /Ready G0\.2 restore plans|Recovery rehearsals/);
+
+  assert.match(dossier, /supported verified Full recovery points from operational backups or the recovery exercise, held on exactly one cartridge/);
+  assert.match(dossier, /recovers the complete point into a new isolated destination/);
+  assert.match(dossier, /file selection and multi-tape restore are not available yet/);
+  assert.doesNotMatch(dossier, /supported G0\.2 point/);
+
+  assert.match(mediaContract, /planArray\(restorePlanExecution\(plan\), "required_tape_ids", "required_tapes", "tapes"\)/);
+  assert.match(result, /supported verified Full recovery point can advance to an attended Restore run/);
+  assert.match(result, /pick\(plan, "execution_supported"\) === true && tapes\.length === 1/);
+  assert.match(result, /Restore this complete recovery point/);
+  assert.match(result, /Start Restore run/);
+  assert.match(result, /File or directory selection and multi-tape restore are not available/);
+  assert.match(result, /single-tape, isolated-destination, and attended confirmation/);
+
+  assert.match(start, /if \(tapes\.length !== 1\)/);
+  assert.match(start, /pick\(restorePlanExecution\(plan\), "destination_subpath", "destination"\)/);
+  assert.match(start, /Multi-tape recovery points remain planning-only/);
+  assert.match(start, /restores the complete recovery point from exactly one retained cartridge/);
+  assert.match(start, /File or directory selection and multi-tape restore are not supported/);
+  assert.match(start, /local console has no application sign-in/);
+  assert.match(start, /new isolated recovery destination, not live data/);
+  assert.match(start, /openModal\("Start Restore run"/);
+  assert.doesNotMatch(start, /supported G0\.2 recovery point|Start recovery rehearsal/);
 });
 
 test("capacity planning is explicitly estimated and supports unknown archive size", () => {

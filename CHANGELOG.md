@@ -2,6 +2,21 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.2] - 2026-11-13
+
+### Restore workflow
+
+- Recovery Vault can now start an attended, read-only Restore run for a verified single-volume operational Full backup as well as a legacy G0.2 recovery point.
+- The first Restore run no longer requires a prior passing restore test; a passing run creates that independent `restore_test` verification after Bacula restores the complete JobId and TapeScale matches the authenticated manifest.
+- Restored-tree inventory now uses the bounded-memory external sorter and no longer inherits the G0.2 100,000-entry or 100 GiB policy ceiling.
+- Planning, queueing, worker claim, and finalization recheck the exact origin workflow, full-readback record, drive, cartridge, Bacula JobId/catalog, media identity, manifest, destination, lease, and preview hash.
+- Recovery Vault now presents this as a four-stage Restore run and clearly identifies its full-point, one-cartridge, isolated-destination boundary.
+
+### Alpha boundaries
+
+- Multi-volume, path-selective, encrypted, and clean-catalog restore remain unavailable. Authenticated manifest decoding retains a 256 MiB serialized-artifact safety bound.
+- This release remains for attended evaluation on a trusted isolated network and makes no production or broad physical-qualification claim.
+
 ## [0.1.0-alpha.1] - 2026-11-13
 
 First public alpha release.
@@ -31,4 +46,5 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.2]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.1

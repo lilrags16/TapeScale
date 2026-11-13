@@ -1,10 +1,10 @@
-//! Attended, read-only recovery rehearsal for an already verified G0.2 point.
+//! Attended, read-only recovery rehearsal for an already verified full-file point.
 //!
-//! This path deliberately does not generalize the Bacula laboratory adapter. It accepts only the
-//! exact full, single-volume job retained by a passed G0.2 exercise, recreates that exercise's
-//! fixed Bacula resources, restores the complete job into a fresh server-generated directory, and
-//! independently compares the result with the retained source manifest. It never labels, erases,
-//! writes, or otherwise prepares media.
+//! This path accepts the exact full, single-volume job retained by either a passed legacy G0.2
+//! exercise or a verified operational backup, recreates that run's fixed Bacula resources,
+//! restores the complete job into a fresh server-generated directory, and independently compares
+//! the result with the retained source manifest. It never labels, erases, writes, or otherwise
+//! prepares media.
 
 use std::{
     fs,
@@ -31,10 +31,9 @@ use crate::{
     bacula_runtime::{BaculaRuntime, BaculaRuntimeEvidence},
     config::Config,
     data_path::{
-        build_manifest_with_cancel, compare_manifests, create_isolated_restore_destination,
-        persist_json_artifact, persist_manifest, FileManifest, JsonArtifactSummary,
-        ManifestArtifactSummary, ManifestComparison, MAX_G02_LOGICAL_BYTES,
-        MAX_G02_MANIFEST_ENTRIES,
+        build_and_persist_manifest_with_cancel, compare_manifests,
+        create_isolated_restore_destination, persist_json_artifact, FileManifest,
+        JsonArtifactSummary, ManifestArtifactSummary, ManifestComparison,
     },
     device::{
         discover_sas_drives, execute_sas_motion, SasDiscoveryConfig, SasMotionOperation,
@@ -49,7 +48,7 @@ use crate::{
     store,
 };
 
-const MAX_RETAINED_MANIFEST_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_MANIFEST_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,7 +132,7 @@ pub async fn process_restore_rehearsal_runs(
     if !config.lab_file_roundtrip_enabled {
         let blocked = store::block_queued_restore_rehearsal_runs(
             pool,
-            "the attended G0.2 restore-rehearsal gate was disabled before worker execution",
+            "the attended Bacula restore-rehearsal gate was disabled before worker execution",
         )
         .await?;
         if blocked > 0 {
@@ -490,10 +489,11 @@ async fn perform_rehearsal(
             destination.path(),
             Path::new(&claim.run.source_mount_path),
         )?;
-        let restored_manifest = scan_manifest_with_lease(
+        let (restored_manifest, restored_artifact) = scan_manifest_with_lease(
             pool,
             claim,
             restored_source_root.clone(),
+            evidence_directory.to_owned(),
             deadline,
             cancellation,
         )
@@ -506,12 +506,6 @@ async fn perform_rehearsal(
             );
             error
         })?;
-        let restored_artifact = persist_manifest(
-            evidence_directory,
-            "restored-manifest",
-            &restored_manifest,
-        )
-        .map_err(|error| RehearsalFailure::failed(error.to_string()))?;
         append_manifest_artifact(
             pool,
             claim,
@@ -622,7 +616,7 @@ async fn complete_rehearsal(
                 return Ok(());
             }
             let report = json!({
-                "scope": "attended G0.2 verified-point full-file restore rehearsal",
+                "scope": "attended verified-point single-volume full-file restore rehearsal",
                 "production_eligible": false,
                 "media_operation": "read_only",
                 "recovery_point_id": claim.run.recovery_point_id,
@@ -793,7 +787,7 @@ fn validate_contract(
         || run.format_version != "bacula-community-15.0.3-lab-v1"
     {
         return Err(RehearsalFailure::blocked(
-            "the recovery point is not bound to the pinned G0.2 Bacula adapter and format",
+            "the recovery point is not bound to the supported pinned Bacula adapter and format",
         ));
     }
     let source = Path::new(&run.source_mount_path);
@@ -845,27 +839,27 @@ fn load_verified_source_manifest(
     let expected = expected_run_directory.join("source-manifest.json");
     if Path::new(&reference.storage_ref) != expected {
         return Err(RehearsalFailure::blocked(
-            "retained source-manifest reference did not match the original G0.2 evidence path",
+            "retained source-manifest reference did not match the originating run's evidence path",
         ));
     }
     let expected_size = u64::try_from(reference.size_bytes)
         .map_err(|_| RehearsalFailure::blocked("retained source-manifest size is invalid"))?;
-    if expected_size == 0 || expected_size > MAX_RETAINED_MANIFEST_BYTES {
+    if expected_size == 0 || expected_size > MAX_MANIFEST_ARTIFACT_BYTES {
         return Err(RehearsalFailure::blocked(format!(
             "retained source manifest exceeds the {} byte read bound",
-            MAX_RETAINED_MANIFEST_BYTES
+            MAX_MANIFEST_ARTIFACT_BYTES
         )));
     }
     let run_directory_metadata =
         fs::symlink_metadata(&expected_run_directory).map_err(|error| {
             RehearsalFailure::blocked(format!(
-                "original G0.2 evidence directory {} is unavailable: {error}",
+                "originating run evidence directory {} is unavailable: {error}",
                 expected_run_directory.display()
             ))
         })?;
     if !run_directory_metadata.is_dir() || run_directory_metadata.file_type().is_symlink() {
         return Err(RehearsalFailure::blocked(
-            "original G0.2 evidence directory is not a direct directory",
+            "originating run evidence directory is not a direct directory",
         ));
     }
     let metadata = fs::symlink_metadata(&expected).map_err(|error| {
@@ -884,12 +878,12 @@ fn load_verified_source_manifest(
     })?;
     let canonical_run_directory = expected_run_directory.canonicalize().map_err(|error| {
         RehearsalFailure::blocked(format!(
-            "could not resolve the original G0.2 evidence directory: {error}"
+            "could not resolve the originating run evidence directory: {error}"
         ))
     })?;
     if canonical_run_directory.parent() != Some(canonical_root.as_path()) {
         return Err(RehearsalFailure::blocked(
-            "original G0.2 evidence directory escaped the configured evidence root",
+            "originating run evidence directory escaped the configured evidence root",
         ));
     }
     let canonical_manifest = expected.canonicalize().map_err(|error| {
@@ -902,52 +896,15 @@ fn load_verified_source_manifest(
             != Some("source-manifest.json")
     {
         return Err(RehearsalFailure::blocked(
-            "retained source-manifest path escaped the original G0.2 evidence directory",
+            "retained source-manifest path escaped the originating run evidence directory",
         ));
     }
-    let descriptor = open(
+    let manifest = load_authenticated_manifest(
         &canonical_manifest,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| {
-        RehearsalFailure::blocked(format!(
-            "could not safely open the retained source manifest: {error}"
-        ))
-    })?;
-    let mut file = fs::File::from(descriptor);
-    let opened_metadata = file.metadata().map_err(|error| {
-        RehearsalFailure::blocked(format!(
-            "could not inspect the opened source manifest: {error}"
-        ))
-    })?;
-    if !opened_metadata.is_file() || opened_metadata.len() != expected_size {
-        return Err(RehearsalFailure::blocked(
-            "opened source-manifest file type or size no longer matches its catalog record",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(expected_size).unwrap_or(0));
-    file.by_ref()
-        .take(expected_size.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            RehearsalFailure::blocked(format!(
-                "could not read the retained source manifest: {error}"
-            ))
-        })?;
-    if u64::try_from(bytes.len()).ok() != Some(expected_size) {
-        return Err(RehearsalFailure::blocked(
-            "retained source-manifest length changed while it was read",
-        ));
-    }
-    let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
-    if actual_sha256 != reference.sha256 {
-        return Err(RehearsalFailure::blocked(format!(
-            "retained source-manifest artifact SHA-256 mismatch: expected {}, observed {actual_sha256}",
-            reference.sha256
-        )));
-    }
-    let manifest = parse_manifest_bytes(&bytes)?;
+        expected_size,
+        &reference.sha256,
+        "retained source",
+    )?;
     if manifest.digest_sha256 != reference.manifest_digest {
         return Err(RehearsalFailure::blocked(format!(
             "retained source-manifest digest mismatch: expected {}, observed {}",
@@ -958,18 +915,146 @@ fn load_verified_source_manifest(
     Ok(manifest)
 }
 
+fn load_verified_restored_manifest(
+    evidence_directory: &Path,
+    artifact: &ManifestArtifactSummary,
+) -> Result<FileManifest, RehearsalFailure> {
+    let expected = evidence_directory.join("restored-manifest.json");
+    if artifact.storage_path != expected {
+        return Err(RehearsalFailure::failed(
+            "restored-manifest reference escaped its restore-rehearsal evidence directory",
+        ));
+    }
+    let directory_metadata = fs::symlink_metadata(evidence_directory).map_err(|error| {
+        RehearsalFailure::failed(format!(
+            "restore-rehearsal evidence directory {} is unavailable: {error}",
+            evidence_directory.display()
+        ))
+    })?;
+    if !directory_metadata.is_dir() || directory_metadata.file_type().is_symlink() {
+        return Err(RehearsalFailure::failed(
+            "restore-rehearsal evidence directory is not a direct directory",
+        ));
+    }
+    let metadata = fs::symlink_metadata(&expected).map_err(|error| {
+        RehearsalFailure::failed(format!(
+            "restored manifest {} is unavailable: {error}",
+            expected.display()
+        ))
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() != artifact.size_bytes
+    {
+        return Err(RehearsalFailure::failed(
+            "restored-manifest file type or size no longer matches its freshly written evidence",
+        ));
+    }
+    let canonical_directory = evidence_directory.canonicalize().map_err(|error| {
+        RehearsalFailure::failed(format!(
+            "could not resolve the restore-rehearsal evidence directory: {error}"
+        ))
+    })?;
+    let canonical_manifest = expected.canonicalize().map_err(|error| {
+        RehearsalFailure::failed(format!("could not resolve the restored manifest: {error}"))
+    })?;
+    if canonical_manifest.parent() != Some(canonical_directory.as_path())
+        || canonical_manifest
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some("restored-manifest.json")
+    {
+        return Err(RehearsalFailure::failed(
+            "restored-manifest path escaped its restore-rehearsal evidence directory",
+        ));
+    }
+    let manifest = load_authenticated_manifest(
+        &canonical_manifest,
+        artifact.size_bytes,
+        &artifact.artifact_sha256,
+        "restored",
+    )
+    .map_err(|error| RehearsalFailure::failed(error.detail))?;
+    if manifest.digest_sha256 != artifact.manifest_digest
+        || manifest.entry_count != artifact.entry_count
+        || manifest.file_count != artifact.file_count
+        || manifest.logical_bytes != artifact.logical_bytes
+        || manifest.coverage != artifact.coverage
+    {
+        return Err(RehearsalFailure::failed(
+            "restored-manifest summary no longer matches its authenticated contents",
+        ));
+    }
+    validate_manifest_paths(&manifest).map_err(|error| RehearsalFailure::failed(error.detail))?;
+    Ok(manifest)
+}
+
+fn load_authenticated_manifest(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    description: &str,
+) -> Result<FileManifest, RehearsalFailure> {
+    if expected_size == 0 || expected_size > MAX_MANIFEST_ARTIFACT_BYTES {
+        return Err(RehearsalFailure::blocked(format!(
+            "{description} manifest exceeds the {MAX_MANIFEST_ARTIFACT_BYTES} byte read bound"
+        )));
+    }
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        RehearsalFailure::blocked(format!(
+            "could not safely open the {description} manifest: {error}"
+        ))
+    })?;
+    let mut file = fs::File::from(descriptor);
+    let opened_metadata = file.metadata().map_err(|error| {
+        RehearsalFailure::blocked(format!(
+            "could not inspect the opened {description} manifest: {error}"
+        ))
+    })?;
+    if !opened_metadata.is_file() || opened_metadata.len() != expected_size {
+        return Err(RehearsalFailure::blocked(format!(
+            "opened {description} manifest type or size no longer matches its evidence record"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(expected_size).unwrap_or(0));
+    file.by_ref()
+        .take(expected_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            RehearsalFailure::blocked(format!(
+                "could not read the {description} manifest: {error}"
+            ))
+        })?;
+    if u64::try_from(bytes.len()).ok() != Some(expected_size) {
+        return Err(RehearsalFailure::blocked(format!(
+            "{description} manifest length changed while it was read"
+        )));
+    }
+    let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if actual_sha256 != expected_sha256 {
+        return Err(RehearsalFailure::blocked(format!(
+            "{description} manifest artifact SHA-256 mismatch: expected {expected_sha256}, observed {actual_sha256}"
+        )));
+    }
+    parse_manifest_bytes(&bytes)
+}
+
 fn parse_manifest_bytes(bytes: &[u8]) -> Result<FileManifest, RehearsalFailure> {
     let manifest: FileManifest = serde_json::from_slice(bytes).map_err(|error| {
-        RehearsalFailure::blocked(format!("retained source manifest is invalid JSON: {error}"))
+        RehearsalFailure::blocked(format!("manifest evidence is invalid JSON: {error}"))
     })?;
     if manifest.format != "tapescale-file-manifest-v2" {
         return Err(RehearsalFailure::blocked(
-            "retained source manifest uses an unsupported format",
+            "manifest evidence uses an unsupported format",
         ));
     }
-    let entry_count = u64::try_from(manifest.entries.len()).map_err(|_| {
-        RehearsalFailure::blocked("retained source manifest entry count is out of range")
-    })?;
+    let entry_count = u64::try_from(manifest.entries.len())
+        .map_err(|_| RehearsalFailure::blocked("manifest evidence entry count is out of range"))?;
     let file_count = u64::try_from(
         manifest
             .entries
@@ -977,16 +1062,14 @@ fn parse_manifest_bytes(bytes: &[u8]) -> Result<FileManifest, RehearsalFailure> 
             .filter(|entry| matches!(entry.kind, crate::data_path::EntryKind::File))
             .count(),
     )
-    .map_err(|_| {
-        RehearsalFailure::blocked("retained source manifest file count is out of range")
-    })?;
+    .map_err(|_| RehearsalFailure::blocked("manifest evidence file count is out of range"))?;
     let logical_bytes = manifest
         .entries
         .iter()
         .filter_map(|entry| entry.size)
         .try_fold(0_u64, u64::checked_add)
         .ok_or_else(|| {
-            RehearsalFailure::blocked("retained source manifest logical byte count overflowed")
+            RehearsalFailure::blocked("manifest evidence logical byte count overflowed")
         })?;
     if manifest.entry_count != entry_count
         || manifest.file_count != file_count
@@ -994,18 +1077,18 @@ fn parse_manifest_bytes(bytes: &[u8]) -> Result<FileManifest, RehearsalFailure> 
         || manifest.coverage != crate::data_path::ManifestCoverage::default()
     {
         return Err(RehearsalFailure::blocked(
-            "retained source manifest counters or coverage declaration are invalid",
+            "manifest evidence counters or coverage declaration are invalid",
         ));
     }
     let entry_bytes = serde_json::to_vec(&manifest.entries).map_err(|error| {
         RehearsalFailure::blocked(format!(
-            "could not validate source manifest entries: {error}"
+            "could not validate manifest evidence entries: {error}"
         ))
     })?;
     let digest = format!("{:x}", Sha256::digest(entry_bytes));
     if digest != manifest.digest_sha256 {
         return Err(RehearsalFailure::blocked(
-            "retained source manifest entry digest is invalid",
+            "manifest evidence entry digest is invalid",
         ));
     }
     Ok(manifest)
@@ -1046,13 +1129,6 @@ fn destination_capacity_evidence(
 }
 
 fn validate_manifest_paths(manifest: &FileManifest) -> Result<(), RehearsalFailure> {
-    if manifest.entry_count > MAX_G02_MANIFEST_ENTRIES
-        || manifest.logical_bytes > MAX_G02_LOGICAL_BYTES
-    {
-        return Err(RehearsalFailure::blocked(
-            "retained source manifest exceeds the G0.2 entry or logical-byte bound",
-        ));
-    }
     let mut previous: Option<&str> = None;
     let mut root_seen = false;
     for entry in &manifest.entries {
@@ -1161,13 +1237,23 @@ async fn scan_manifest_with_lease(
     pool: &PgPool,
     claim: &store::ClaimedRestoreRehearsalRun,
     path: PathBuf,
+    evidence_directory: PathBuf,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<FileManifest, RehearsalFailure> {
+) -> Result<(FileManifest, ManifestArtifactSummary), RehearsalFailure> {
     let stop = Arc::new(AtomicBool::new(false));
     let scan_stop = Arc::clone(&stop);
-    let mut scan =
-        tokio::task::spawn_blocking(move || build_manifest_with_cancel(&path, scan_stop.as_ref()));
+    let mut scan = tokio::task::spawn_blocking(move || {
+        let artifact = build_and_persist_manifest_with_cancel(
+            &path,
+            &evidence_directory,
+            "restored-manifest",
+            scan_stop.as_ref(),
+        )
+        .map_err(|error| RehearsalFailure::failed(error.to_string()))?;
+        let manifest = load_verified_restored_manifest(&evidence_directory, &artifact)?;
+        Ok::<_, RehearsalFailure>((manifest, artifact))
+    });
     let mut heartbeat = tokio::time::interval(LEASE_HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
@@ -1175,8 +1261,7 @@ async fn scan_manifest_with_lease(
         tokio::select! {
             result = &mut scan => {
                 return result
-                    .map_err(|error| RehearsalFailure::failed(format!("manifest worker failed: {error}")))?
-                    .map_err(|error| RehearsalFailure::failed(error.to_string()));
+                    .map_err(|error| RehearsalFailure::failed(format!("streaming manifest worker failed: {error}")))?;
             }
             () = cancellation.cancelled() => {
                 break RehearsalFailure::interrupted(
@@ -1719,7 +1804,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::data_path::build_manifest;
+    use crate::data_path::{build_manifest, persist_manifest, MAX_G02_LOGICAL_BYTES};
 
     #[test]
     fn retained_manifest_requires_exact_path_size_and_artifact_digest() {
@@ -1749,6 +1834,88 @@ mod tests {
         let mut wrong_path = reference;
         wrong_path.storage_ref = evidence.path().join("other.json").display().to_string();
         assert!(load_verified_source_manifest(evidence.path(), &wrong_path).is_err());
+    }
+
+    #[test]
+    fn retained_manifest_accepts_the_operational_streaming_artifact() {
+        let evidence = tempdir().expect("evidence root");
+        let run_id = Uuid::now_v7();
+        let original = tempdir().expect("source");
+        fs::write(original.path().join("file.txt"), b"operational backup\n").expect("fixture");
+        let run_dir = evidence.path().join(run_id.to_string());
+        fs::create_dir(&run_dir).expect("run directory");
+        let artifact = build_and_persist_manifest_with_cancel(
+            original.path(),
+            &run_dir,
+            "source-manifest",
+            &AtomicBool::new(false),
+        )
+        .expect("streaming artifact");
+        let reference = ManifestReference {
+            original_data_run_id: run_id,
+            storage_ref: artifact.storage_path.display().to_string(),
+            sha256: artifact.artifact_sha256,
+            manifest_digest: artifact.manifest_digest.clone(),
+            size_bytes: i64::try_from(artifact.size_bytes).expect("small fixture"),
+        };
+
+        let loaded = load_verified_source_manifest(evidence.path(), &reference)
+            .expect("verified operational manifest");
+        assert_eq!(loaded.digest_sha256, artifact.manifest_digest);
+        assert_eq!(loaded.entry_count, artifact.entry_count);
+    }
+
+    #[test]
+    fn operational_manifest_is_not_rejected_by_the_legacy_logical_size_cap() {
+        let evidence = tempdir().expect("evidence root");
+        let run_id = Uuid::now_v7();
+        let original = tempdir().expect("source");
+        fs::write(original.path().join("large-sparse-record.bin"), b"fixture").expect("fixture");
+        let mut manifest = build_manifest(original.path()).expect("manifest");
+        let logical_bytes = MAX_G02_LOGICAL_BYTES + 1;
+        let file = manifest
+            .entries
+            .iter_mut()
+            .find(|entry| matches!(entry.kind, crate::data_path::EntryKind::File))
+            .expect("file entry");
+        file.size = Some(logical_bytes);
+        manifest.logical_bytes = logical_bytes;
+        manifest.digest_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&manifest.entries).expect("entry JSON"))
+        );
+        let run_dir = evidence.path().join(run_id.to_string());
+        fs::create_dir(&run_dir).expect("run directory");
+        let artifact = persist_manifest(&run_dir, "source-manifest", &manifest).expect("artifact");
+        let reference = ManifestReference {
+            original_data_run_id: run_id,
+            storage_ref: artifact.storage_path.display().to_string(),
+            sha256: artifact.artifact_sha256,
+            manifest_digest: manifest.digest_sha256.clone(),
+            size_bytes: i64::try_from(artifact.size_bytes).expect("small metadata fixture"),
+        };
+
+        let loaded = load_verified_source_manifest(evidence.path(), &reference)
+            .expect("operational manifest above legacy logical limit");
+        assert_eq!(loaded.logical_bytes, logical_bytes);
+        assert_eq!(loaded.digest_sha256, manifest.digest_sha256);
+    }
+
+    #[test]
+    fn restored_manifest_loader_requires_its_exact_evidence_directory() {
+        let evidence = tempdir().expect("restore evidence");
+        let source = tempdir().expect("source");
+        fs::write(source.path().join("file.txt"), b"restored evidence").expect("fixture");
+        let manifest = build_manifest(source.path()).expect("manifest");
+        let artifact =
+            persist_manifest(evidence.path(), "restored-manifest", &manifest).expect("artifact");
+
+        let loaded = load_verified_restored_manifest(evidence.path(), &artifact)
+            .expect("authenticated restored manifest");
+        assert_eq!(loaded.digest_sha256, manifest.digest_sha256);
+
+        let other = tempdir().expect("other evidence");
+        assert!(load_verified_restored_manifest(other.path(), &artifact).is_err());
     }
 
     #[test]
