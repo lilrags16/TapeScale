@@ -655,7 +655,7 @@ async fn create_backup_request(
            JOIN job_runs job_run ON job_run.id = request.job_run_id
           WHERE request.profile_id = $1
             AND job_run.state IN (
-                'queued', 'preparing', 'waiting_for_media', 'writing',
+                'queued', 'preparing', 'inventorying', 'waiting_for_media', 'writing',
                 'written', 'verifying', 'restoring', 'comparing'
             )
           ORDER BY request.created_at DESC LIMIT 1",

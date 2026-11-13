@@ -1959,6 +1959,10 @@ svg {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.backup-preparation-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
 .backup-live-rate-grid > div {
   min-width: 0;
   padding: 13px;
@@ -1985,6 +1989,13 @@ svg {
 .backup-live-rate-grid strong {
   margin-top: 4px;
   font: 750 18px var(--font-mono);
+}
+
+.backup-live-rate-grid small {
+  display: block;
+  margin-top: 4px;
+  color: var(--ink-soft);
+  font-size: 9px;
 }
 
 .backup-live-io > p {

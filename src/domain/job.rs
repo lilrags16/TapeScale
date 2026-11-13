@@ -4,6 +4,7 @@
 pub enum JobState {
     Queued,
     Preparing,
+    Inventorying,
     WaitingForMedia,
     Writing,
     Written,
@@ -16,9 +17,10 @@ pub enum JobState {
 }
 
 impl JobState {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Queued,
         Self::Preparing,
+        Self::Inventorying,
         Self::WaitingForMedia,
         Self::Writing,
         Self::Written,
@@ -60,12 +62,17 @@ pub fn transition_allowed(from: JobState, to: JobState) -> bool {
         (S::Queued, S::Preparing | S::Canceled)
             | (
                 S::Preparing,
-                S::WaitingForMedia
+                S::Inventorying
+                    | S::WaitingForMedia
                     | S::Writing
                     | S::Blocked
                     | S::Interrupted
                     | S::Failed
                     | S::Canceled
+            )
+            | (
+                S::Inventorying,
+                S::Writing | S::Blocked | S::Interrupted | S::Failed | S::Canceled
             )
             | (
                 S::WaitingForMedia,
@@ -108,6 +115,7 @@ mod tests {
         let path = [
             JobState::Queued,
             JobState::Preparing,
+            JobState::Inventorying,
             JobState::Writing,
             JobState::Written,
             JobState::Verifying,

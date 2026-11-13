@@ -1399,6 +1399,14 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         panic!("the exact qualified backup should be claimable");
     };
     assert_eq!(claimed.run.id, final_run.id);
+    assert!(store::transition_single_tape_data_phase(
+        &pool,
+        &claimed,
+        store::SingleTapeDataPhase::Inventorying,
+        json!({"detail": "integration source inventory"}),
+    )
+    .await
+    .expect("inventory phase should persist"));
     let manifest_source = tempfile::tempdir().expect("manifest source should exist");
     fs::write(
         manifest_source.path().join("payload.bin"),
@@ -1432,6 +1440,65 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     )
     .await
     .expect("source manifest artifact should persist"));
+    let preparation_sampled_at = Utc::now();
+    let preparation_sample = store::SingleTapePreparationProgress {
+        stage: store::SingleTapePreparationStage::SourceInventory,
+        step: "digesting_manifest",
+        started_at: preparation_sampled_at,
+        sampled_at: preparation_sampled_at,
+        elapsed_ms: 5_000,
+        sample_window_ms: Some(5_000),
+        stale_after_seconds: 20,
+        entries_discovered: source_manifest.entry_count,
+        files_discovered: source_manifest.file_count,
+        files_hashed: source_manifest.file_count,
+        logical_bytes_discovered: source_manifest.logical_bytes,
+        bytes_hashed: source_manifest.logical_bytes,
+        hash_bytes_per_second: Some(200),
+        basis: "sha256_source_bytes_read",
+    };
+    assert!(store::record_single_tape_data_preparation_progress(
+        &pool,
+        &claimed,
+        &preparation_sample,
+    )
+    .await
+    .expect("the fenced preparation sample should persist"));
+    let wrong_stage_sample = store::SingleTapePreparationProgress {
+        stage: store::SingleTapePreparationStage::SourceStabilityCheck,
+        ..preparation_sample.clone()
+    };
+    assert!(!store::record_single_tape_data_preparation_progress(
+        &pool,
+        &claimed,
+        &wrong_stage_sample,
+    )
+    .await
+    .expect("a preparation sample for the wrong durable phase should be rejected"));
+    assert!(
+        store::overview_counts(&pool)
+            .await
+            .expect("inventorying overview should query")
+            .active_jobs
+            >= 1
+    );
+    let inventory_view = api_request(
+        &replay_application,
+        Method::GET,
+        format!("/api/v1/backup-runs/{}", final_request.id),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(inventory_view.status(), StatusCode::OK);
+    let inventory_view = response_json(inventory_view).await;
+    assert_eq!(inventory_view["run"]["state"], "inventorying");
+    assert_eq!(
+        inventory_view["run"]["result"]["preparation_progress"]["bytes_hashed"],
+        1_024
+    );
+    assert!(inventory_view["run"]["result"]["preparation_progress"]
+        .get("path")
+        .is_none());
     assert!(store::transition_single_tape_data_phase(
         &pool,
         &claimed,
@@ -1440,6 +1507,15 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     )
     .await
     .expect("write phase should persist"));
+    let writing_view = api_request(
+        &replay_application,
+        Method::GET,
+        format!("/api/v1/backup-runs/{}", final_request.id),
+        Value::Null,
+    )
+    .await;
+    let writing_view = response_json(writing_view).await;
+    assert!(writing_view["run"]["result"]["preparation_progress"].is_null());
     let live_sampled_at = Utc::now();
     let live_sample = store::SingleTapeLiveIoSample {
         phase: store::SingleTapeLiveIoPhase::BackupWrite,

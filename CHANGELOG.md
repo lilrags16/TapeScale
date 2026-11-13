@@ -2,6 +2,22 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.8] - 2026-11-13
+
+### Visible backup preparation
+
+- Backup preflight and source inventory are now separate durable phases. A run no longer remains under the vague **Starting backup** label while TapeScale reads the entire snapshot.
+- The running-job view refreshes aggregate source progress every five seconds: SHA-256 bytes read, current read rate, files hashed, files and entries discovered, growing logical bytes, elapsed time, last update, and the current scan/sort/write/digest step.
+- The same truthful progress panel covers the post-readback source-stability pass. Stale rates are hidden while cumulative work remains visible, and the UI explicitly avoids a completion percentage until an authoritative total exists.
+- Live preparation samples are lease-fenced, bounded, path-free, and ephemeral. They never expose the current filename, create high-frequency audit events, or replace the retained final manifest evidence.
+
+### Faster large manifests
+
+- Streaming sort batches increased from 1,024 to at most 16,384 entries, sharply reducing temporary runs and merge passes. A separate 32 MiB resident-entry budget keeps unusually long paths and symlink targets within a predictable memory envelope.
+- Disposable sort runs and hard-link workspace mappings no longer force thousands of unnecessary filesystem syncs. The final retained manifest is still flushed and synced before it is published.
+- The source scanner reuses one 1 MiB hashing buffer across files instead of allocating and zeroing it for every file, and long sort/merge and final-digest work now honors cancellation.
+- Bacula catalog lock acquisition is bounded so a competing or stale initializer cannot leave preflight waiting indefinitely.
+
 ## [0.1.0-alpha.7] - 2026-11-13
 
 ### Live transfer telemetry
@@ -117,6 +133,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.8]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.8
 [0.1.0-alpha.7]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.7
 [0.1.0-alpha.6]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.6
 [0.1.0-alpha.5]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.5

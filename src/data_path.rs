@@ -12,7 +12,7 @@ use std::{
     os::fd::AsFd,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
 };
 
 use rustix::{
@@ -30,7 +30,109 @@ const MAX_DIFFERENCES: usize = 1_000;
 pub const MAX_G02_MANIFEST_ENTRIES: u64 = 100_000;
 pub const MAX_G02_LOGICAL_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 pub const MAX_RESTORE_SELECTION_PATHS: usize = 256;
-const STREAMING_MANIFEST_SORT_CHUNK_ENTRIES: usize = 1_024;
+const STREAMING_MANIFEST_SORT_CHUNK_ENTRIES: usize = 16_384;
+const STREAMING_MANIFEST_SORT_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+const MANIFEST_HASH_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Lock-free counters published by the streaming source scanner.
+///
+/// The worker samples these counters from its async lease-renewal loop while the blocking
+/// filesystem walk is running. Paths are intentionally never exposed: the live API reports only
+/// aggregate work, so operational progress cannot disclose source names.
+#[derive(Debug, Default)]
+pub struct ManifestBuildProgress {
+    step: AtomicU8,
+    entries_discovered: AtomicU64,
+    files_discovered: AtomicU64,
+    files_hashed: AtomicU64,
+    logical_bytes_discovered: AtomicU64,
+    bytes_hashed: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ManifestBuildStep {
+    #[default]
+    DiscoveringAndHashing = 0,
+    Sorting = 1,
+    WritingManifest = 2,
+    DigestingManifest = 3,
+}
+
+impl ManifestBuildStep {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DiscoveringAndHashing => "discovering_and_hashing",
+            Self::Sorting => "sorting",
+            Self::WritingManifest => "writing_manifest",
+            Self::DigestingManifest => "digesting_manifest",
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Sorting,
+            2 => Self::WritingManifest,
+            3 => Self::DigestingManifest,
+            _ => Self::DiscoveringAndHashing,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ManifestBuildProgressSnapshot {
+    pub step: ManifestBuildStep,
+    pub entries_discovered: u64,
+    pub files_discovered: u64,
+    pub files_hashed: u64,
+    pub logical_bytes_discovered: u64,
+    pub bytes_hashed: u64,
+}
+
+impl ManifestBuildProgress {
+    #[must_use]
+    pub fn snapshot(&self) -> ManifestBuildProgressSnapshot {
+        // Read work-completion counters first. Their release/acquire edge makes the discovery
+        // counters that preceded that work visible in the same snapshot.
+        let files_hashed = self.files_hashed.load(Ordering::Acquire);
+        let bytes_hashed = self.bytes_hashed.load(Ordering::Acquire);
+        ManifestBuildProgressSnapshot {
+            step: ManifestBuildStep::from_u8(self.step.load(Ordering::Acquire)),
+            entries_discovered: self.entries_discovered.load(Ordering::Acquire),
+            files_discovered: self.files_discovered.load(Ordering::Acquire),
+            files_hashed,
+            logical_bytes_discovered: self.logical_bytes_discovered.load(Ordering::Acquire),
+            bytes_hashed,
+        }
+    }
+
+    fn set_step(&self, step: ManifestBuildStep) {
+        self.step.store(step as u8, Ordering::Release);
+    }
+
+    fn discovered(&self, kind: EntryKind, size: u64) {
+        saturating_atomic_add(&self.entries_discovered, 1);
+        if kind == EntryKind::File {
+            saturating_atomic_add(&self.files_discovered, 1);
+            saturating_atomic_add(&self.logical_bytes_discovered, size);
+        }
+    }
+
+    fn hashed_bytes(&self, bytes: u64) {
+        saturating_atomic_add(&self.bytes_hashed, bytes);
+    }
+
+    fn file_hashed(&self) {
+        saturating_atomic_add(&self.files_hashed, 1);
+    }
+}
+
+fn saturating_atomic_add(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Release, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(amount))
+    });
+}
 
 #[derive(Debug, Error)]
 pub enum ManifestError {
@@ -477,6 +579,14 @@ pub fn build_manifest_with_cancel(
     root: &Path,
     cancellation: &AtomicBool,
 ) -> Result<FileManifest, ManifestError> {
+    build_manifest_with_cancel_and_progress(root, cancellation, None)
+}
+
+pub fn build_manifest_with_cancel_and_progress(
+    root: &Path,
+    cancellation: &AtomicBool,
+    progress: Option<&ManifestBuildProgress>,
+) -> Result<FileManifest, ManifestError> {
     let root = root.canonicalize().map_err(|source| ManifestError::Io {
         path: root.to_owned(),
         source,
@@ -494,6 +604,7 @@ pub fn build_manifest_with_cancel(
     let mut pending = vec![PathBuf::new()];
     let mut raw_entries = Vec::new();
     let mut logical_bytes_seen = 0_u64;
+    let mut hash_buffer = vec![0_u8; MANIFEST_HASH_BUFFER_BYTES];
     while let Some(relative) = pending.pop() {
         if cancellation.load(Ordering::Acquire) {
             return Err(ManifestError::Cancelled);
@@ -568,11 +679,19 @@ pub fn build_manifest_with_cancel(
             metadata,
             kind,
             cancellation,
+            progress,
+            &mut hash_buffer,
         )?);
     }
 
+    if let Some(progress) = progress {
+        progress.set_step(ManifestBuildStep::Sorting);
+    }
     raw_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let source_stability_digest_sha256 = exact_stability_digest(&raw_entries)?;
+    if let Some(progress) = progress {
+        progress.set_step(ManifestBuildStep::WritingManifest);
+    }
     let mut link_groups = BTreeMap::<(u64, u64), String>::new();
     let mut next_link_group = 1_u64;
     let mut entries = Vec::with_capacity(raw_entries.len());
@@ -606,6 +725,9 @@ pub fn build_manifest_with_cancel(
         .filter(|entry| entry.kind == EntryKind::File)
         .count() as u64;
     let logical_bytes = entries.iter().filter_map(|entry| entry.size).sum();
+    if let Some(progress) = progress {
+        progress.set_step(ManifestBuildStep::DigestingManifest);
+    }
     let digest_sha256 = manifest_digest(&entries)?;
     Ok(FileManifest {
         format: MANIFEST_FORMAT.to_owned(),
@@ -634,6 +756,26 @@ pub fn build_and_persist_manifest_with_cancel(
     artifact_name: &str,
     cancellation: &AtomicBool,
 ) -> Result<ManifestArtifactSummary, ManifestError> {
+    build_and_persist_manifest_with_cancel_and_progress(
+        root,
+        run_directory,
+        artifact_name,
+        cancellation,
+        None,
+    )
+}
+
+/// Streaming manifest builder with optional aggregate progress counters.
+///
+/// The original wrapper remains available for callers that do not publish live progress. Keeping
+/// the observer optional also ensures telemetry cannot change manifest bytes or failure behavior.
+pub fn build_and_persist_manifest_with_cancel_and_progress(
+    root: &Path,
+    run_directory: &Path,
+    artifact_name: &str,
+    cancellation: &AtomicBool,
+    progress: Option<&ManifestBuildProgress>,
+) -> Result<ManifestArtifactSummary, ManifestError> {
     validate_artifact_name(artifact_name)?;
     fs::create_dir_all(run_directory).map_err(|source| ManifestError::Io {
         path: run_directory.to_owned(),
@@ -645,15 +787,27 @@ pub fn build_and_persist_manifest_with_cancel(
     }
 
     let workspace = StreamingWorkspace::new(run_directory, artifact_name)?;
-    let mut sorter =
-        RawEntryExternalSorter::new(workspace.path(), STREAMING_MANIFEST_SORT_CHUNK_ENTRIES);
-    scan_raw_entries_to_sorter(root, cancellation, &mut sorter)?;
+    let mut sorter = RawEntryExternalSorter::new_with_cancellation(
+        workspace.path(),
+        STREAMING_MANIFEST_SORT_CHUNK_ENTRIES,
+        STREAMING_MANIFEST_SORT_CHUNK_BYTES,
+        cancellation,
+        progress,
+    );
+    scan_raw_entries_to_sorter(root, cancellation, &mut sorter, progress)?;
+    if let Some(progress) = progress {
+        progress.set_step(ManifestBuildStep::Sorting);
+    }
     let sorted_entries = sorter.finish()?;
+    if let Some(progress) = progress {
+        progress.set_step(ManifestBuildStep::WritingManifest);
+    }
     write_streaming_manifest_artifact(
         &sorted_entries,
         workspace.path(),
         &destination,
         cancellation,
+        progress,
     )
 }
 
@@ -1402,13 +1556,25 @@ struct RawEntry {
 }
 
 impl RawEntry {
+    fn estimated_resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.path.capacity())
+            .saturating_add(self.content_sha256.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.symlink_target.as_ref().map_or(0, String::capacity))
+    }
+
     fn capture(
         absolute: &Path,
         relative: &Path,
         before: Metadata,
         kind: EntryKind,
         cancellation: &AtomicBool,
+        progress: Option<&ManifestBuildProgress>,
+        hash_buffer: &mut [u8],
     ) -> Result<Self, ManifestError> {
+        if let Some(progress) = progress {
+            progress.discovered(kind, before.len());
+        }
         let path = display_relative(relative);
         let safe_path = if relative.as_os_str().is_empty() {
             None
@@ -1419,13 +1585,16 @@ impl RawEntry {
             )
         };
         let (size, content_sha256, hard_link_identity, sparse) = if kind == EntryKind::File {
-            let digest = hash_file(absolute, cancellation)?;
+            let digest = hash_file(absolute, cancellation, progress, hash_buffer)?;
             let after = fs::symlink_metadata(absolute).map_err(|source| ManifestError::Io {
                 path: absolute.to_owned(),
                 source,
             })?;
             if metadata_identity(&before) != metadata_identity(&after) {
                 return Err(ManifestError::ChangedDuringRead(path));
+            }
+            if let Some(progress) = progress {
+                progress.file_hashed();
             }
             (
                 Some(before.len()),
@@ -1502,35 +1671,93 @@ impl Drop for StreamingWorkspace {
     }
 }
 
-struct RawEntryExternalSorter {
+struct RawEntryExternalSorter<'a> {
     workspace: PathBuf,
     chunk_entries: usize,
+    chunk_bytes: usize,
+    cancellation: Option<&'a AtomicBool>,
+    progress: Option<&'a ManifestBuildProgress>,
     buffer: Vec<RawEntry>,
+    buffer_bytes: usize,
     levels: Vec<Option<PathBuf>>,
     sequence: u64,
     max_buffered_entries: usize,
+    max_buffered_bytes: usize,
 }
 
-impl RawEntryExternalSorter {
+impl<'a> RawEntryExternalSorter<'a> {
+    #[cfg(test)]
     fn new(workspace: &Path, chunk_entries: usize) -> Self {
+        Self::new_internal(workspace, chunk_entries, usize::MAX, None, None)
+    }
+
+    fn new_with_cancellation(
+        workspace: &Path,
+        chunk_entries: usize,
+        chunk_bytes: usize,
+        cancellation: &'a AtomicBool,
+        progress: Option<&'a ManifestBuildProgress>,
+    ) -> Self {
+        Self::new_internal(
+            workspace,
+            chunk_entries,
+            chunk_bytes,
+            Some(cancellation),
+            progress,
+        )
+    }
+
+    fn new_internal(
+        workspace: &Path,
+        chunk_entries: usize,
+        chunk_bytes: usize,
+        cancellation: Option<&'a AtomicBool>,
+        progress: Option<&'a ManifestBuildProgress>,
+    ) -> Self {
         debug_assert!(chunk_entries > 0);
+        debug_assert!(chunk_bytes > 0);
         Self {
             workspace: workspace.to_owned(),
             chunk_entries,
+            chunk_bytes,
+            cancellation,
+            progress,
             buffer: Vec::with_capacity(chunk_entries),
+            buffer_bytes: 0,
             levels: Vec::new(),
             sequence: 0,
             max_buffered_entries: 0,
+            max_buffered_bytes: 0,
         }
     }
 
     fn push(&mut self, entry: RawEntry) -> Result<(), ManifestError> {
+        let entry_bytes = entry.estimated_resident_bytes();
+        if !self.buffer.is_empty()
+            && (self.buffer.len() >= self.chunk_entries
+                || self.buffer_bytes.saturating_add(entry_bytes) > self.chunk_bytes)
+        {
+            self.flush_during_scan()?;
+        }
         self.buffer.push(entry);
+        self.buffer_bytes = self.buffer_bytes.saturating_add(entry_bytes);
         self.max_buffered_entries = self.max_buffered_entries.max(self.buffer.len());
-        if self.buffer.len() == self.chunk_entries {
-            self.flush_buffer()?;
+        self.max_buffered_bytes = self.max_buffered_bytes.max(self.buffer_bytes);
+        if self.buffer.len() >= self.chunk_entries || self.buffer_bytes >= self.chunk_bytes {
+            self.flush_during_scan()?;
         }
         Ok(())
+    }
+
+    fn flush_during_scan(&mut self) -> Result<(), ManifestError> {
+        if let Some(progress) = self.progress {
+            progress.set_step(ManifestBuildStep::Sorting);
+        }
+        let result = self.flush_buffer();
+        if let Some(progress) = self.progress {
+            progress.set_step(ManifestBuildStep::DiscoveringAndHashing);
+        }
+        result
     }
 
     fn finish(mut self) -> Result<PathBuf, ManifestError> {
@@ -1542,7 +1769,7 @@ impl RawEntryExternalSorter {
                 Some(left) => {
                     let destination =
                         next_sort_path(&self.workspace, &mut self.sequence, "final-merge")?;
-                    merge_raw_entry_files(&left, &path, &destination)?;
+                    merge_raw_entry_files(&left, &path, &destination, self.cancellation)?;
                     remove_streaming_file(&left)?;
                     remove_streaming_file(&path)?;
                     destination
@@ -1570,8 +1797,9 @@ impl RawEntryExternalSorter {
             ));
         }
         let path = next_sort_path(&self.workspace, &mut self.sequence, "run")?;
-        write_raw_entry_file(&path, &self.buffer)?;
+        write_raw_entry_file(&path, &self.buffer, self.cancellation)?;
         self.buffer.clear();
+        self.buffer_bytes = 0;
         self.insert_run(path, 0)
     }
 
@@ -1585,7 +1813,7 @@ impl RawEntryExternalSorter {
                 return Ok(());
             };
             let merged = next_sort_path(&self.workspace, &mut self.sequence, "merge")?;
-            merge_raw_entry_files(&existing, &path, &merged)?;
+            merge_raw_entry_files(&existing, &path, &merged, self.cancellation)?;
             remove_streaming_file(&existing)?;
             remove_streaming_file(&path)?;
             path = merged;
@@ -1608,7 +1836,11 @@ fn next_sort_path(
     Ok(workspace.join(format!("{kind}-{current:020}.jsonl")))
 }
 
-fn write_raw_entry_file(path: &Path, entries: &[RawEntry]) -> Result<(), ManifestError> {
+fn write_raw_entry_file(
+    path: &Path,
+    entries: &[RawEntry],
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), ManifestError> {
     let file = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -1619,6 +1851,9 @@ fn write_raw_entry_file(path: &Path, entries: &[RawEntry]) -> Result<(), Manifes
         })?;
     let mut writer = BufWriter::new(file);
     for entry in entries {
+        if cancellation.is_some_and(|cancellation| cancellation.load(Ordering::Acquire)) {
+            return Err(ManifestError::Cancelled);
+        }
         serde_json::to_writer(&mut writer, entry)?;
         writer
             .write_all(b"\n")
@@ -1627,23 +1862,20 @@ fn write_raw_entry_file(path: &Path, entries: &[RawEntry]) -> Result<(), Manifes
                 source,
             })?;
     }
+    // Sort runs live only in the per-attempt workspace. A crash discards and rebuilds that
+    // workspace, so forcing every intermediate run to stable storage adds no recovery value.
+    // The final retained manifest is still flushed and synced before publication.
     writer.flush().map_err(|source| ManifestError::Io {
         path: path.to_owned(),
         source,
-    })?;
-    writer
-        .get_ref()
-        .sync_all()
-        .map_err(|source| ManifestError::Io {
-            path: path.to_owned(),
-            source,
-        })
+    })
 }
 
 fn merge_raw_entry_files(
     left: &Path,
     right: &Path,
     destination: &Path,
+    cancellation: Option<&AtomicBool>,
 ) -> Result<(), ManifestError> {
     let mut left_reader = open_streaming_reader(left)?;
     let mut right_reader = open_streaming_reader(right)?;
@@ -1661,6 +1893,9 @@ fn merge_raw_entry_files(
     let mut left_entry = read_raw_entry(&mut left_reader, left, &mut left_line)?;
     let mut right_entry = read_raw_entry(&mut right_reader, right, &mut right_line)?;
     while left_entry.is_some() || right_entry.is_some() {
+        if cancellation.is_some_and(|cancellation| cancellation.load(Ordering::Acquire)) {
+            return Err(ManifestError::Cancelled);
+        }
         let take_left = match (&left_entry, &right_entry) {
             (Some(left), Some(right)) if left.path == right.path => {
                 return Err(ManifestError::Integrity(
@@ -1689,14 +1924,7 @@ fn merge_raw_entry_files(
     writer.flush().map_err(|source| ManifestError::Io {
         path: destination.to_owned(),
         source,
-    })?;
-    writer
-        .get_ref()
-        .sync_all()
-        .map_err(|source| ManifestError::Io {
-            path: destination.to_owned(),
-            source,
-        })
+    })
 }
 
 fn open_streaming_reader(path: &Path) -> Result<BufReader<File>, ManifestError> {
@@ -1749,7 +1977,8 @@ fn remove_streaming_file(path: &Path) -> Result<(), ManifestError> {
 fn scan_raw_entries_to_sorter(
     root: &Path,
     cancellation: &AtomicBool,
-    sorter: &mut RawEntryExternalSorter,
+    sorter: &mut RawEntryExternalSorter<'_>,
+    progress: Option<&ManifestBuildProgress>,
 ) -> Result<(), ManifestError> {
     let root = root.canonicalize().map_err(|source| ManifestError::Io {
         path: root.to_owned(),
@@ -1763,12 +1992,15 @@ fn scan_raw_entries_to_sorter(
         source,
     })?;
     let root_device = root_metadata.dev();
+    let mut hash_buffer = vec![0_u8; MANIFEST_HASH_BUFFER_BYTES];
     sorter.push(RawEntry::capture(
         &root,
         Path::new(""),
         root_metadata,
         EntryKind::Directory,
         cancellation,
+        progress,
+        &mut hash_buffer,
     )?)?;
     let root_directory = fs::read_dir(&root).map_err(|source| ManifestError::Io {
         path: root.clone(),
@@ -1810,6 +2042,8 @@ fn scan_raw_entries_to_sorter(
             metadata,
             kind,
             cancellation,
+            progress,
+            &mut hash_buffer,
         )?)?;
         if kind == EntryKind::Directory {
             let directory = fs::read_dir(&absolute).map_err(|source| ManifestError::Io {
@@ -1827,6 +2061,7 @@ fn write_streaming_manifest_artifact(
     workspace: &Path,
     destination: &Path,
     cancellation: &AtomicBool,
+    progress: Option<&ManifestBuildProgress>,
 ) -> Result<ManifestArtifactSummary, ManifestError> {
     let hard_links = workspace.join("hard-links");
     fs::create_dir(&hard_links).map_err(|source| ManifestError::Io {
@@ -1921,7 +2156,10 @@ fn write_streaming_manifest_artifact(
             source,
         })?;
     drop(writer);
-    let (artifact_sha256, size_bytes) = digest_file(&temporary)?;
+    if let Some(progress) = progress {
+        progress.set_step(ManifestBuildStep::DigestingManifest);
+    }
+    let (artifact_sha256, size_bytes) = digest_file(&temporary, cancellation)?;
     if let Err(source) = fs::hard_link(&temporary, destination) {
         return if source.kind() == io::ErrorKind::AlreadyExists {
             Err(ManifestError::ArtifactExists(destination.to_owned()))
@@ -1981,8 +2219,9 @@ fn hard_link_group(
         .open(&mapping)
     {
         Ok(mut file) => {
+            // The mapping is disposable workspace state and is consumed only by this process.
+            // A durable sync per hard link can dominate inventories with link-heavy trees.
             file.write_all(group.as_bytes())
-                .and_then(|()| file.sync_all())
                 .map_err(|source| ManifestError::Io {
                     path: mapping,
                     source,
@@ -2005,7 +2244,7 @@ fn hard_link_group(
     }
 }
 
-fn digest_file(path: &Path) -> Result<(String, u64), ManifestError> {
+fn digest_file(path: &Path, cancellation: &AtomicBool) -> Result<(String, u64), ManifestError> {
     let mut file = File::open(path).map_err(|source| ManifestError::Io {
         path: path.to_owned(),
         source,
@@ -2014,6 +2253,9 @@ fn digest_file(path: &Path) -> Result<(String, u64), ManifestError> {
     let mut size = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(ManifestError::Cancelled);
+        }
         let read = file.read(&mut buffer).map_err(|source| ManifestError::Io {
             path: path.to_owned(),
             source,
@@ -2039,18 +2281,22 @@ fn metadata_identity(metadata: &Metadata) -> (u64, u64, u64, i64, i64) {
     )
 }
 
-fn hash_file(path: &Path, cancellation: &AtomicBool) -> Result<String, ManifestError> {
+fn hash_file(
+    path: &Path,
+    cancellation: &AtomicBool,
+    progress: Option<&ManifestBuildProgress>,
+    buffer: &mut [u8],
+) -> Result<String, ManifestError> {
     let mut file = File::open(path).map_err(|source| ManifestError::Io {
         path: path.to_owned(),
         source,
     })?;
     let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         if cancellation.load(Ordering::Acquire) {
             return Err(ManifestError::Cancelled);
         }
-        let read = file.read(&mut buffer).map_err(|source| ManifestError::Io {
+        let read = file.read(buffer).map_err(|source| ManifestError::Io {
             path: path.to_owned(),
             source,
         })?;
@@ -2058,6 +2304,9 @@ fn hash_file(path: &Path, cancellation: &AtomicBool) -> Result<String, ManifestE
             break;
         }
         digest.update(&buffer[..read]);
+        if let Some(progress) = progress {
+            progress.hashed_bytes(read as u64);
+        }
     }
     Ok(format!("{:x}", digest.finalize()))
 }
@@ -2645,6 +2894,33 @@ mod tests {
     }
 
     #[test]
+    fn streaming_manifest_reports_aggregate_progress_without_paths() {
+        let source = tempdir().expect("source");
+        fs::create_dir(source.path().join("nested")).expect("directory");
+        fs::write(source.path().join("one"), b"1234").expect("first file");
+        fs::write(source.path().join("nested/two"), b"56789").expect("second file");
+        let evidence = tempdir().expect("evidence");
+        let progress = ManifestBuildProgress::default();
+
+        let artifact = build_and_persist_manifest_with_cancel_and_progress(
+            source.path(),
+            evidence.path(),
+            "progressed",
+            &AtomicBool::new(false),
+            Some(&progress),
+        )
+        .expect("streaming manifest");
+        let snapshot = progress.snapshot();
+
+        assert_eq!(snapshot.step, ManifestBuildStep::DigestingManifest);
+        assert_eq!(snapshot.entries_discovered, artifact.entry_count);
+        assert_eq!(snapshot.files_discovered, artifact.file_count);
+        assert_eq!(snapshot.files_hashed, artifact.file_count);
+        assert_eq!(snapshot.logical_bytes_discovered, artifact.logical_bytes);
+        assert_eq!(snapshot.bytes_hashed, artifact.logical_bytes);
+    }
+
+    #[test]
     fn external_sorter_bounds_the_entry_buffer_and_orders_runs() {
         let workspace = tempdir().expect("workspace");
         let mut sorter = RawEntryExternalSorter::new(workspace.path(), 3);
@@ -2667,6 +2943,46 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 100);
+    }
+
+    #[test]
+    fn external_sorter_bounds_resident_entry_bytes_for_long_paths() {
+        let workspace = tempdir().expect("workspace");
+        let entries = (0..25)
+            .rev()
+            .map(|index| {
+                synthetic_file_entry(format!("{}-{index:03}", "long-path-segment".repeat(256)), 0)
+            })
+            .collect::<Vec<_>>();
+        let largest_entry = entries
+            .iter()
+            .map(RawEntry::estimated_resident_bytes)
+            .max()
+            .expect("entries");
+        let byte_budget = largest_entry.checked_mul(3).expect("test byte budget");
+        let mut sorter = RawEntryExternalSorter::new_internal(
+            workspace.path(),
+            entries.len() + 1,
+            byte_budget,
+            None,
+            None,
+        );
+        for entry in entries {
+            sorter.push(entry).expect("spool entry");
+        }
+        assert!(sorter.max_buffered_bytes <= byte_budget);
+
+        let sorted = sorter.finish().expect("finish sort");
+        let mut reader = open_streaming_reader(&sorted).expect("open sorted run");
+        let mut line = String::new();
+        let mut count = 0;
+        while read_raw_entry(&mut reader, &sorted, &mut line)
+            .expect("entry")
+            .is_some()
+        {
+            count += 1;
+        }
+        assert_eq!(count, 25);
     }
 
     #[test]
@@ -2703,6 +3019,7 @@ mod tests {
             &workspace,
             &destination,
             &AtomicBool::new(false),
+            None,
         )
         .expect("large streaming manifest");
 

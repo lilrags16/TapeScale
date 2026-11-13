@@ -1057,6 +1057,36 @@ pub struct SingleTapeLiveIoSample {
     pub tape_basis: Option<&'static str>,
 }
 
+/// Latest aggregate source-manifest scan measurement for a fenced data run.
+///
+/// This is operational telemetry, not immutable recovery evidence. It deliberately contains no
+/// source path or current filename. `logical_bytes_discovered` grows as the tree is walked and is
+/// therefore not an authoritative total from which a completion percentage can be inferred.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SingleTapePreparationStage {
+    SourceInventory,
+    SourceStabilityCheck,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SingleTapePreparationProgress {
+    pub stage: SingleTapePreparationStage,
+    pub step: &'static str,
+    pub started_at: DateTime<Utc>,
+    pub sampled_at: DateTime<Utc>,
+    pub elapsed_ms: u64,
+    pub sample_window_ms: Option<u64>,
+    pub stale_after_seconds: u64,
+    pub entries_discovered: u64,
+    pub files_discovered: u64,
+    pub files_hashed: u64,
+    pub logical_bytes_discovered: u64,
+    pub bytes_hashed: u64,
+    pub hash_bytes_per_second: Option<u64>,
+    pub basis: &'static str,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClaimedSingleTapeDataRun {
     pub run: SingleTapeDataRunRecord,
@@ -1171,6 +1201,7 @@ pub enum ClaimSingleTapeDataRunResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SingleTapeDataPhase {
+    Inventorying,
     Writing,
     Written,
     Verifying,
@@ -1181,6 +1212,7 @@ pub enum SingleTapeDataPhase {
 impl SingleTapeDataPhase {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Inventorying => "inventorying",
             Self::Writing => "writing",
             Self::Written => "written",
             Self::Verifying => "verifying",
@@ -1191,7 +1223,8 @@ impl SingleTapeDataPhase {
 
     const fn allowed_previous(self) -> &'static [&'static str] {
         match self {
-            Self::Writing => &["preparing", "waiting_for_media"],
+            Self::Inventorying => &["preparing"],
+            Self::Writing => &["preparing", "inventorying", "waiting_for_media"],
             Self::Written => &["writing"],
             Self::Verifying => &["written"],
             Self::Restoring => &["verifying"],
@@ -1550,7 +1583,7 @@ pub async fn overview_counts(pool: &PgPool) -> Result<OverviewCounts, sqlx::Erro
         "SELECT
             (SELECT count(*) FROM sources WHERE enabled) AS protected_sources,
             (SELECT count(*) FROM job_runs
-             WHERE state IN ('queued','preparing','waiting_for_media','writing','written','verifying','restoring','comparing','blocked','interrupted')
+             WHERE state IN ('queued','preparing','inventorying','waiting_for_media','writing','written','verifying','restoring','comparing','blocked','interrupted')
                AND finished_at IS NULL) AS active_jobs,
             ((SELECT count(*) FROM job_runs
               WHERE state IN ('waiting_for_media','blocked','interrupted','failed')
@@ -5716,9 +5749,9 @@ pub async fn claim_next_single_tape_data_run(
             "drive_fencing_token": drive_fencing_token,
             "media_lease_id": media_lease_id,
             "media_fencing_token": media_fencing_token,
-            "phase": "inventorying",
+            "phase": "preparing",
             "workflow_kind": &run.workflow_kind,
-            "detail": "worker claimed the fenced operation and is hashing the immutable source"
+            "detail": "worker claimed the fenced operation and is validating the source, catalog, drive, and tape"
         }),
         "tapescale-worker",
     )
@@ -6608,7 +6641,67 @@ pub async fn record_single_tape_data_live_io(
     }
     let updated = sqlx::query(
         "UPDATE single_tape_data_runs
-            SET result = jsonb_set(result, '{live_io}', $1::jsonb, true)
+            SET result = jsonb_set(result - 'preparation_progress', '{live_io}', $1::jsonb, true)
+          WHERE id = $2 AND state = 'running'",
+    )
+    .bind(json!(sample))
+    .bind(claim.run.id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// Replace the bounded live source-scan snapshot for an actively fenced data run.
+///
+/// The sample is intentionally mutable and does not append an event every five seconds. Durable
+/// phase transitions retain the audit trail; final manifest evidence retains the completed facts.
+pub async fn record_single_tape_data_preparation_progress(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    sample: &SingleTapePreparationProgress,
+) -> Result<bool, sqlx::Error> {
+    if !(5..=300).contains(&sample.stale_after_seconds)
+        || sample.basis != "sha256_source_bytes_read"
+        || !matches!(
+            sample.step,
+            "discovering_and_hashing" | "sorting" | "writing_manifest" | "digesting_manifest"
+        )
+        || sample.files_hashed > sample.files_discovered
+        || sample.files_discovered > sample.entries_discovered
+        || sample.bytes_hashed > sample.logical_bytes_discovered
+        || sample.sampled_at < sample.started_at
+    {
+        return Ok(false);
+    }
+
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let current =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(claim.run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    let expected = match sample.stage {
+        SingleTapePreparationStage::SourceInventory => "inventorying",
+        SingleTapePreparationStage::SourceStabilityCheck => "verifying",
+    };
+    if current != expected {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE single_tape_data_runs
+            SET result = jsonb_set(
+                result - 'live_io', '{preparation_progress}', $1::jsonb, true
+            )
           WHERE id = $2 AND state = 'running'",
     )
     .bind(json!(sample))
@@ -6647,7 +6740,8 @@ pub async fn transition_single_tape_data_phase(
     // the mutable snapshot before publishing the next durable phase so an old write rate can
     // never appear as a current readback or restore rate.
     sqlx::query(
-        "UPDATE single_tape_data_runs SET result = result - 'live_io'
+        "UPDATE single_tape_data_runs
+            SET result = result - 'live_io' - 'preparation_progress'
          WHERE id = $1 AND state = 'running'",
     )
     .bind(claim.run.id)

@@ -37,11 +37,12 @@
   const RECOVERY_TERMINAL_STATES = new Set(["passed", "verified", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
   const BACKUP_PHASES = [
     { name: "Confirm first tape", detail: "Choose the first archive volume", aliases: ["waiting_for_media"] },
-    { name: "Starting", detail: "Waiting for the worker", aliases: ["queued", "media_assigned", "preparing"] },
-    { name: "Scan files", detail: "Read the snapshot", aliases: ["inventorying", "manifesting", "source_manifest"] },
+    { name: "Preflight", detail: "Validate source, catalog, drive, tape, and spool", aliases: ["queued", "media_assigned", "preparing"] },
+    { name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: ["inventorying", "manifesting", "source_manifest"] },
     { name: "Write archive", detail: "Copy across tapes as needed", aliases: ["writing", "media_write_started", "engine_dispatched", "waiting_for_next_media", "next_media", "media_required"] },
     { name: "Close archive", detail: "Finish the complete backup set", aliases: ["written", "finalizing"] },
     { name: "Read back", detail: "Verify every physical tape", aliases: ["verifying", "reading", "readback"] },
+    { name: "Finalize", detail: "Confirm the source snapshot and seal evidence", aliases: ["source_stability_check", "final_source_check"] },
     { name: "Protected", detail: "Retain recovery evidence", aliases: ["verified", "passed", "completed", "complete"] }
   ];
   const BACKUP_TERMINAL_STATES = new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
@@ -484,14 +485,16 @@
     if (backupRunState(run) === "waiting_for_media" && backupMediaRequestState(run) === "loaded") return "Resuming";
     if (backupRunState(run) === "waiting_for_media" && backupMediaIsReadback(run)) return "Tape needed for readback";
     if (backupRunState(run) === "waiting_for_media" && backupNeedsNextMedia(run)) return "Next tape needed";
+    const preparation = objectValue(objectValue(run, "result"), "preparation_progress");
+    if (pick(preparation, "stage") === "source_stability_check") return "Confirming source snapshot";
     const labels = {
       queued: "Waiting to start",
       waiting_for_media: "Tape needed",
       waiting_for_next_media: "Next tape needed",
       next_media: "Next tape needed",
       media_required: "Next tape needed",
-      preparing: "Starting backup",
-      inventorying: "Scanning files",
+      preparing: "Validating backup inputs",
+      inventorying: "Scanning and hashing files",
       writing: "Writing tape",
       written: "Write complete",
       finalizing: "Closing tape",
@@ -712,6 +715,10 @@
     return objectValue(objectValue(run, "result"), "live_io");
   }
 
+  function backupPreparationProgress(run) {
+    return objectValue(objectValue(run, "result"), "preparation_progress");
+  }
+
   function backupLiveIoStale(liveIo, nowMilliseconds) {
     const sampledAt = Date.parse(String(pick(liveIo, "sampled_at") || ""));
     if (!Number.isFinite(sampledAt)) return false;
@@ -743,9 +750,74 @@
     return labels[phase] || human(phase);
   }
 
+  function renderBackupPreparationProgress(run) {
+    if (BACKUP_TERMINAL_STATES.has(backupRunState(run))) return "";
+    const runState = backupRunState(run);
+    const progress = backupPreparationProgress(run);
+    const stage = String(pick(progress, "stage") || "");
+    const isPreparationState = ["preparing", "inventorying"].includes(runState);
+    if (!isPreparationState && !stage) return "";
+
+    const sampledAt = pick(progress, "sampled_at");
+    const sampledMilliseconds = sampledAt ? Date.parse(String(sampledAt)) : Number.NaN;
+    if (!stage || !Number.isFinite(sampledMilliseconds)) {
+      const preflight = runState === "preparing";
+      const heading = preflight ? "Validating backup inputs" : "Starting source inventory";
+      const detail = preflight
+        ? "Checking the immutable snapshot, Bacula catalog, drive, tape, and disk spool before the source scan begins. Tape writing has not started."
+        : "Waiting for the worker's first source-scan sample. Tape writing has not started.";
+      return '<section class="backup-live-io backup-preparation measuring" role="status"><div class="backup-live-io-head"><div><span>Backup preparation</span><h3>' + esc(heading) + '</h3></div><strong>' + (preflight ? "Preflight" : "Starting…") + '</strong></div><p>' + esc(detail) + "</p></section>";
+    }
+
+    const stale = backupLiveIoStale(progress);
+    const step = String(pick(progress, "step") || "discovering_and_hashing");
+    const stepLabels = {
+      discovering_and_hashing: stage === "source_stability_check" ? "Re-reading and hashing the source" : "Scanning and hashing the source",
+      sorting: "Sorting manifest entries",
+      writing_manifest: "Writing the recovery manifest",
+      digesting_manifest: "Sealing the recovery manifest"
+    };
+    const heading = stepLabels[step] || human(step);
+    const numeric = (key) => {
+      const value = pick(progress, key);
+      return value === null || value === undefined || value === "" ? Number.NaN : Number(value);
+    };
+    const readBytes = numeric("bytes_hashed");
+    const discoveredBytes = numeric("logical_bytes_discovered");
+    const filesHashed = numeric("files_hashed");
+    const filesDiscovered = numeric("files_discovered");
+    const entriesDiscovered = numeric("entries_discovered");
+    const elapsedMilliseconds = numeric("elapsed_ms");
+    const rate = numeric("hash_bytes_per_second");
+    const count = (value) => Number.isFinite(value) && value >= 0 ? Math.trunc(value).toLocaleString() : "Unavailable";
+    const amount = (value) => Number.isFinite(value) && value >= 0 ? bytes(value) : "Unavailable";
+    const elapsed = (() => {
+      if (!Number.isFinite(elapsedMilliseconds) || elapsedMilliseconds < 0) return "Unavailable";
+      const seconds = Math.floor(elapsedMilliseconds / 1000);
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const remainder = seconds % 60;
+      if (hours) return hours + "h " + minutes + "m";
+      if (minutes) return minutes + "m " + remainder + "s";
+      return remainder + "s";
+    })();
+    const rateLabel = stale
+      ? "Rate hidden until next update"
+      : step === "sorting"
+        ? "Hashing paused for manifest sort"
+        : step !== "discovering_and_hashing"
+        ? "Hash pass complete"
+        : Number.isFinite(rate) && rate >= 0 ? bytes(rate) + "/s" : "Measuring rate…";
+    const footer = stage === "source_stability_check"
+      ? "Tape readback is complete. TapeScale is confirming that the immutable source stayed unchanged before it commits the recovery point."
+      : "Tape writing has not started. The final source total is discovered while the tree is walked, so no completion percentage is estimated.";
+    return '<section class="backup-live-io backup-preparation' + (stale ? " stale" : "") + '" role="status"><div class="backup-live-io-head"><div><span>' + (stage === "source_stability_check" ? "Final source check" : "Source inventory") + '</span><h3>' + esc(heading) + '</h3></div><strong>' + (stale ? "Update delayed" : "Updated " + esc(date(sampledAt))) + '</strong></div><div class="backup-live-rate-grid backup-preparation-grid"><div><span>SHA-256 bytes read</span><strong>' + esc(amount(readBytes)) + '</strong><small>' + esc(rateLabel) + '</small></div><div><span>Files hashed</span><strong>' + esc(count(filesHashed)) + '</strong><small>' + esc(count(filesDiscovered)) + ' discovered</small></div><div><span>Source bytes found</span><strong>' + esc(amount(discoveredBytes)) + '</strong><small>Growing total</small></div><div><span>Elapsed</span><strong>' + esc(elapsed) + '</strong><small>' + esc(count(entriesDiscovered)) + ' entries found</small></div></div><p>' + esc(footer) + "</p></section>";
+  }
+
   function renderBackupLiveThroughput(run) {
     if (BACKUP_TERMINAL_STATES.has(backupRunState(run))) return "";
     const runState = backupRunState(run);
+    if (["preparing", "inventorying"].includes(runState) || pick(backupPreparationProgress(run), "stage")) return "";
     const waiting = ["waiting_for_media", "waiting_for_next_media", "next_media", "media_required"].includes(runState);
     if (waiting) {
       return '<section class="backup-live-io waiting" role="status"><div class="backup-live-io-head"><div><span>Live transfer</span><h3>Waiting for tape</h3></div><strong>Paused</strong></div><p>No disk or tape transfer is active while the job waits for the required cartridge.</p></section>';
@@ -808,6 +880,7 @@
   function backupPhaseIndex(run) {
     const runState = backupRunState(run);
     if (["verified", "passed", "completed", "complete"].includes(runState)) return BACKUP_PHASES.length - 1;
+    if (pick(backupPreparationProgress(run), "stage") === "source_stability_check") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("source_stability_check"));
     if (backupMediaIsReadback(run)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("readback"));
     if (backupNeedsNextMedia(run)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("next_media"));
     const explicit = Number(backupEvidenceValue(run, "phase_index"));
@@ -846,6 +919,7 @@
   function backupReadbackSummary(run) {
     const runState = backupRunState(run);
     if (["verified", "passed", "completed", "complete"].includes(runState)) return "Readback complete";
+    if (pick(backupPreparationProgress(run), "stage") === "source_stability_check") return "Readback complete; final source check";
     if (runState === "verifying") return "Readback in progress";
     if (BACKUP_TERMINAL_STATES.has(runState)) return "Readback not completed";
     return "Complete readback planned";
@@ -1050,6 +1124,8 @@
     else if (successful) notice = '<div class="notice success backup-run-notice"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Backup verified and cataloged for recovery</strong><span>Every tape in the archive was written, completely read back, and retained as one recovery point. Restore testing remains a separate assurance step.</span></div>' + (recoveryPointId ? '<div class="backup-complete-actions"><button class="button button-primary button-small" type="button" data-action="browse-backup-files" data-id="' + esc(recoveryPointId) + '">Browse backed-up files</button><button class="button button-small" type="button" data-action="select-recovery-point" data-id="' + esc(recoveryPointId) + '">Recovery options</button></div>' : "") + "</div>";
     else if (failed) notice = '<div class="notice danger backup-run-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>' + esc(backupRunStateLabel(run)) + '</strong><span>' + esc(failure) + "</span></div></div>";
     else if (["cancelled", "canceled"].includes(runState)) notice = '<div class="notice warning backup-run-notice"><span class="notice-icon" aria-hidden="true">×</span><div class="notice-copy"><strong>Backup cancelled</strong><span>' + esc(failure || "The attempt did not establish a recovery point. Previously valid backups remain unchanged.") + "</span></div></div>";
+    else if (runState === "preparing") notice = '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>Validating backup inputs</strong><span>The worker is checking the snapshot, catalog, drive, tape, and spool. It will publish live source-scan counters as soon as inventory begins.</span></div></div>';
+    else if (runState === "inventorying") notice = '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>Building the recovery manifest</strong><span>TapeScale is reading every source file to retain its SHA-256 identity before tape writing starts.</span></div></div>';
     else notice = '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>' + esc(backupRunStateLabel(run)) + '</strong><span>Keep the snapshot, worker, drive, and requested archive tapes available while this stage finishes.</span></div></div>';
     const cancel = canCancel ? '<button class="button button-danger button-small" type="button" data-action="cancel-backup-run" data-id="' + esc(id) + '">Cancel run</button>' : "";
     const volumes = backupRunVolumes(run);
@@ -1059,7 +1135,7 @@
     const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="retry-backup-run" data-id="' + esc(id) + '">Retry</button></div>' : "";
     const measuredProgress = progress == null ? "" : '<div class="progress backup-progress"><div class="progress-track"><div class="progress-value" style="width:' + progress + '%"></div></div><div class="progress-meta"><span>Measured progress</span><span>' + progress + "%</span></div></div>";
     const technical = '<details class="backup-technical"><summary><span><strong>Technical details</strong><small>Request identity, engine evidence, and complete activity history</small></span></summary><div class="backup-technical-body"><dl class="vault-facts"><dt>Request ID</dt><dd class="mono">' + esc(id) + '</dd><dt>Created</dt><dd>' + esc(date(pick(run, "created_at", "started_at"))) + '</dd><dt>Raw state</dt><dd>' + esc(runState) + '</dd>' + (backupFailureDetail(run) ? '<dt>Recorded failure</dt><dd>' + esc(backupFailureDetail(run)) + "</dd>" : "") + '</dl><section class="backup-detail-section"><div class="backup-section-head"><div><span>Engine evidence</span><h3>Recorded facts</h3></div></div>' + renderBackupEvidence(run) + '</section><section class="backup-detail-section"><div class="backup-section-head"><div><span>Complete history</span><h3>Activity</h3></div></div>' + renderBackupTimeline(run) + "</section>" + renderBackupArtifacts(run) + "</div></details>";
-    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>Started ' + esc(date(pick(run, "created_at", "started_at"))) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header>' + renderBackupPhaseTrack(run) + '<div class="backup-run-actions">' + cancel + '<button class="button button-quiet button-small" type="button" data-action="refresh">Refresh status</button></div><div class="panel-body">' + detailFailure + notice + renderBackupSpoolingCue(run) + renderBackupLiveThroughput(run) + measuredProgress + '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>Backup result</h3></div></div>' + renderBackupOutcome(run) + "</section>" + technical + "</div></article>";
+    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>Started ' + esc(date(pick(run, "created_at", "started_at"))) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header>' + renderBackupPhaseTrack(run) + '<div class="backup-run-actions">' + cancel + '<button class="button button-quiet button-small" type="button" data-action="refresh">Refresh status</button></div><div class="panel-body">' + detailFailure + notice + renderBackupSpoolingCue(run) + renderBackupPreparationProgress(run) + renderBackupLiveThroughput(run) + measuredProgress + '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>Backup result</h3></div></div>' + renderBackupOutcome(run) + "</section>" + technical + "</div></article>";
   }
 
   function renderJobs() {
@@ -2640,7 +2716,7 @@
     }
     const progress = Number.isFinite(progressValue) && progressValue >= 0 && progressValue <= 100 ? '<div class="progress recovery-progress"><div class="progress-track"><div class="progress-value" style="width:' + progressValue + '%"></div></div><div class="progress-meta"><span>Reported progress</span><span>' + progressValue + "%</span></div></div>" : "";
     const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="refresh">Retry</button></div>' : "";
-    return '<section class="panel recovery-exercise-panel section"><div class="recovery-exercise-head"><div><span class="lab-badge">G0.2 · full · single tape · no encryption</span><h2>' + esc(profileName) + '</h2><p>Run ' + esc(recordId(exercise)) + " · " + esc(date(pick(exercise, "started_at", "created_at"))) + '</p></div>' + status(stateValue) + "</div>" + renderRecoveryPhaseTrack(exercise) + '<div class="panel-body recovery-exercise-body">' + detailFailure + outcome + renderBackupLiveThroughput({ state: stateValue, result: objectValue(exercise, "result") }) + progress + '<section class="recovery-evidence"><h3>' + (terminal ? "Retained result" : "Evidence so far") + "</h3>" + renderRecoveryEvidence(exercise) + "</section></div></section>" + renderRecoveryEvents(exercise);
+    return '<section class="panel recovery-exercise-panel section"><div class="recovery-exercise-head"><div><span class="lab-badge">G0.2 · full · single tape · no encryption</span><h2>' + esc(profileName) + '</h2><p>Run ' + esc(recordId(exercise)) + " · " + esc(date(pick(exercise, "started_at", "created_at"))) + '</p></div>' + status(stateValue) + "</div>" + renderRecoveryPhaseTrack(exercise) + '<div class="panel-body recovery-exercise-body">' + detailFailure + outcome + renderBackupPreparationProgress({ state: stateValue, result: objectValue(exercise, "result") }) + renderBackupLiveThroughput({ state: stateValue, result: objectValue(exercise, "result") }) + progress + '<section class="recovery-evidence"><h3>' + (terminal ? "Retained result" : "Evidence so far") + "</h3>" + renderRecoveryEvidence(exercise) + "</section></div></section>" + renderRecoveryEvents(exercise);
   }
 
   function renderRecoveryLab() {

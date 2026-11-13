@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rustix::fs::statvfs;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -37,10 +37,12 @@ use crate::{
     bacula_runtime::{BaculaRuntime, BaculaRuntimeEvidence},
     config::Config,
     data_path::{
-        build_and_persist_manifest_with_cancel, build_manifest_with_cancel, compare_manifests,
+        build_and_persist_manifest_with_cancel_and_progress,
+        build_manifest_with_cancel_and_progress, compare_manifests,
         create_isolated_restore_destination, persist_json_artifact, persist_manifest,
         resolve_existing_zfs_snapshot_selection, source_manifests_stable, verify_read_only_mount,
-        FileManifest, JsonArtifactSummary, ManifestArtifactSummary, ManifestComparison,
+        FileManifest, JsonArtifactSummary, ManifestArtifactSummary, ManifestBuildProgress,
+        ManifestBuildProgressSnapshot, ManifestComparison,
     },
     device::{
         clear_sas_scratch_label, discover_sas_drives, execute_sas_motion,
@@ -89,12 +91,67 @@ struct ActiveManualMedia {
 }
 
 const LIVE_IO_STALE_AFTER_SECONDS: u64 = 20;
+const PREPARATION_PROGRESS_STALE_AFTER_SECONDS: u64 = 20;
 
 #[derive(Clone, Copy, Debug)]
 struct LiveIoObservation {
     observed_at: Instant,
     pipeline_bytes: u64,
     tape_counters: Option<SasTapeIoCounters>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ManifestProgressObservation {
+    observed_at: Instant,
+    snapshot: ManifestBuildProgressSnapshot,
+}
+
+#[derive(Debug, Default)]
+struct ManifestProgressSampler {
+    previous: Option<ManifestProgressObservation>,
+}
+
+impl ManifestProgressSampler {
+    fn observe(
+        &mut self,
+        stage: store::SingleTapePreparationStage,
+        progress: &ManifestBuildProgress,
+        started_at: DateTime<Utc>,
+        started: Instant,
+        observed_at: Instant,
+    ) -> store::SingleTapePreparationProgress {
+        let snapshot = progress.snapshot();
+        let previous = self.previous;
+        let elapsed =
+            previous.map(|sample| observed_at.saturating_duration_since(sample.observed_at));
+        let rate = previous.and_then(|sample| {
+            bytes_per_second(
+                sample.snapshot.bytes_hashed,
+                snapshot.bytes_hashed,
+                elapsed.expect("previous progress sample has an elapsed window"),
+            )
+        });
+        self.previous = Some(ManifestProgressObservation {
+            observed_at,
+            snapshot,
+        });
+        store::SingleTapePreparationProgress {
+            stage,
+            step: snapshot.step.as_str(),
+            started_at,
+            sampled_at: Utc::now(),
+            elapsed_ms: duration_millis_u64(observed_at.saturating_duration_since(started)),
+            sample_window_ms: elapsed.map(duration_millis_u64),
+            stale_after_seconds: PREPARATION_PROGRESS_STALE_AFTER_SECONDS,
+            entries_discovered: snapshot.entries_discovered,
+            files_discovered: snapshot.files_discovered,
+            files_hashed: snapshot.files_hashed,
+            logical_bytes_discovered: snapshot.logical_bytes_discovered,
+            bytes_hashed: snapshot.bytes_hashed,
+            hash_bytes_per_second: rate,
+            basis: "sha256_source_bytes_read",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -488,6 +545,19 @@ async fn perform_exercise(
             ));
         }
 
+        transition(
+            pool,
+            claim,
+            store::SingleTapeDataPhase::Inventorying,
+            json!({
+                "detail": "preflight passed; reading and hashing the immutable source to build its recovery manifest",
+                "digest": "sha256",
+                "progress_reporting": "aggregate_live_counters",
+                "tape_write_started": false
+            }),
+        )
+        .await?;
+
         let source_manifest = if claim.run.workflow_kind == "backup" {
             RetainedSourceManifest::Streaming(
                 scan_and_persist_manifest_with_lease(
@@ -496,7 +566,7 @@ async fn perform_exercise(
                     PathBuf::from(&claim.run.source_mount_path),
                     evidence_directory.to_owned(),
                     "source-manifest".to_owned(),
-                    deadline,
+                    store::SingleTapePreparationStage::SourceInventory,
                     cancellation,
                 )
                 .await?,
@@ -910,7 +980,7 @@ async fn perform_exercise(
                 PathBuf::from(&claim.run.source_mount_path),
                 evidence_directory.to_owned(),
                 "source-stability-after".to_owned(),
-                deadline,
+                store::SingleTapePreparationStage::SourceStabilityCheck,
                 cancellation,
             )
             .await?;
@@ -1580,17 +1650,41 @@ async fn scan_manifest_with_lease(
 ) -> Result<FileManifest, ExerciseFailure> {
     let stop = Arc::new(AtomicBool::new(false));
     let scan_stop = Arc::clone(&stop);
-    let mut scan =
-        tokio::task::spawn_blocking(move || build_manifest_with_cancel(&path, scan_stop.as_ref()));
+    let progress = Arc::new(ManifestBuildProgress::default());
+    let scan_progress = Arc::clone(&progress);
+    let started_at = Utc::now();
+    let started = Instant::now();
+    let stage = store::SingleTapePreparationStage::SourceInventory;
+    let mut sampler = ManifestProgressSampler::default();
+    let mut scan = tokio::task::spawn_blocking(move || {
+        build_manifest_with_cancel_and_progress(
+            &path,
+            scan_stop.as_ref(),
+            Some(scan_progress.as_ref()),
+        )
+    });
+    publish_preparation_progress(
+        pool,
+        claim,
+        &sampler.observe(stage, &progress, started_at, started, Instant::now()),
+    )
+    .await;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
     let failure = loop {
         tokio::select! {
             result = &mut scan => {
-                return result
+                let completed = result
                     .map_err(|error| ExerciseFailure::failed(format!("manifest worker failed: {error}")))?
                     .map_err(|error| ExerciseFailure::blocked(error.to_string()));
+                publish_preparation_progress(
+                    pool,
+                    claim,
+                    &sampler.observe(stage, &progress, started_at, started, Instant::now()),
+                )
+                .await;
+                return completed;
             }
             () = cancellation.cancelled() => {
                 break ExerciseFailure::interrupted(
@@ -1604,7 +1698,14 @@ async fn scan_manifest_with_lease(
             }
             _ = heartbeat.tick() => {
                 match renew_claim(pool, claim, "during file inventory").await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        publish_preparation_progress(
+                            pool,
+                            claim,
+                            &sampler.observe(stage, &progress, started_at, started, Instant::now()),
+                        )
+                        .await;
+                    }
                     Err(error) => break error,
                 }
             }
@@ -1621,28 +1722,47 @@ async fn scan_and_persist_manifest_with_lease(
     path: PathBuf,
     run_directory: PathBuf,
     artifact_name: String,
-    _deadline: Instant,
+    stage: store::SingleTapePreparationStage,
     cancellation: &CancellationToken,
 ) -> Result<ManifestArtifactSummary, ExerciseFailure> {
     let stop = Arc::new(AtomicBool::new(false));
     let scan_stop = Arc::clone(&stop);
+    let progress = Arc::new(ManifestBuildProgress::default());
+    let scan_progress = Arc::clone(&progress);
+    let started_at = Utc::now();
+    let started = Instant::now();
+    let mut sampler = ManifestProgressSampler::default();
     let mut scan = tokio::task::spawn_blocking(move || {
-        build_and_persist_manifest_with_cancel(
+        build_and_persist_manifest_with_cancel_and_progress(
             &path,
             &run_directory,
             &artifact_name,
             scan_stop.as_ref(),
+            Some(scan_progress.as_ref()),
         )
     });
+    publish_preparation_progress(
+        pool,
+        claim,
+        &sampler.observe(stage, &progress, started_at, started, Instant::now()),
+    )
+    .await;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
     let failure = loop {
         tokio::select! {
             result = &mut scan => {
-                return result
+                let completed = result
                     .map_err(|error| ExerciseFailure::failed(format!("streaming manifest worker failed: {error}")))?
                     .map_err(|error| ExerciseFailure::blocked(error.to_string()));
+                publish_preparation_progress(
+                    pool,
+                    claim,
+                    &sampler.observe(stage, &progress, started_at, started, Instant::now()),
+                )
+                .await;
+                return completed;
             }
             () = cancellation.cancelled() => {
                 break ExerciseFailure::interrupted(
@@ -1651,7 +1771,14 @@ async fn scan_and_persist_manifest_with_lease(
             }
             _ = heartbeat.tick() => {
                 match renew_claim(pool, claim, "during streaming file inventory").await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        publish_preparation_progress(
+                            pool,
+                            claim,
+                            &sampler.observe(stage, &progress, started_at, started, Instant::now()),
+                        )
+                        .await;
+                    }
                     Err(error) => break error,
                 }
             }
@@ -1660,6 +1787,27 @@ async fn scan_and_persist_manifest_with_lease(
     stop.store(true, Ordering::Release);
     let _ = scan.await;
     Err(failure)
+}
+
+async fn publish_preparation_progress(
+    pool: &PgPool,
+    claim: &store::ClaimedSingleTapeDataRun,
+    sample: &store::SingleTapePreparationProgress,
+) {
+    match store::record_single_tape_data_preparation_progress(pool, claim, sample).await {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            backup_run_id = %claim.run.id,
+            stage = ?sample.stage,
+            "live source-scan progress sample was rejected"
+        ),
+        Err(error) => warn!(
+            backup_run_id = %claim.run.id,
+            stage = ?sample.stage,
+            %error,
+            "could not persist live source-scan progress; backup work continues"
+        ),
+    }
 }
 
 async fn wait_for_console(

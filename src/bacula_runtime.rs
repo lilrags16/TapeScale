@@ -317,6 +317,17 @@ async fn ensure_catalog_schema(
             "could not begin catalog initialization lock: {error}"
         ))
     })?;
+    // A stale or competing initializer must not leave an attended backup looking frozen in
+    // preflight indefinitely. These bounds apply only to this transaction; the packaged schema
+    // installer retains its separate 180-second process timeout.
+    sqlx::query("SET LOCAL lock_timeout = '30s'")
+        .execute(&mut *schema_lock)
+        .await
+        .map_err(|error| BaculaRuntimeError::CatalogInitialization(error.to_string()))?;
+    sqlx::query("SET LOCAL statement_timeout = '35s'")
+        .execute(&mut *schema_lock)
+        .await
+        .map_err(|error| BaculaRuntimeError::CatalogInitialization(error.to_string()))?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(CATALOG_SCHEMA_LOCK_ID)
         .execute(&mut *schema_lock)
