@@ -131,6 +131,40 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     assert!(created.worm);
     assert!(!created.has_content);
     assert_eq!(created.active_holds, 0);
+    let registered_actions = store::list_required_actions(&pool)
+        .await
+        .expect("registered-media actions should query");
+    assert!(registered_actions
+        .iter()
+        .all(|action| action.id != format!("media:{}", created.id)));
+    assert_eq!(
+        store::overview_counts(&pool)
+            .await
+            .expect("registered-media action count should query")
+            .required_actions,
+        0,
+        "a registered blank cartridge has no identity to reconcile yet"
+    );
+
+    sqlx::query("UPDATE cartridges SET identity_status = 'mismatch' WHERE id = $1")
+        .bind(created.id)
+        .execute(&pool)
+        .await
+        .expect("identity-mismatch fixture should persist");
+    assert!(store::list_required_actions(&pool)
+        .await
+        .expect("identity-mismatch actions should query")
+        .iter()
+        .any(|action| {
+            action.id == format!("media:{}", created.id)
+                && action.title == "Resolve cartridge identity mismatch"
+                && action.state == "blocked"
+        }));
+    sqlx::query("UPDATE cartridges SET identity_status = 'unknown' WHERE id = $1")
+        .bind(created.id)
+        .execute(&pool)
+        .await
+        .expect("registered cartridge identity fixture should restore");
 
     let reloaded = store::list_media(&pool)
         .await
@@ -709,6 +743,15 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     )
     .await
     .expect("restored qualification pass should persist"));
+    let prepared_scratch_actions = store::list_required_actions(&pool)
+        .await
+        .expect("prepared-scratch actions should query");
+    assert!(prepared_scratch_actions
+        .iter()
+        .all(|action| action.id != format!("media:{}", scratch.id)));
+    assert!(prepared_scratch_actions
+        .iter()
+        .all(|action| action.id != format!("media:{}", created.id)));
     let reservation =
         sqlx::query_scalar::<_, Option<String>>("SELECT reserved_by FROM cartridges WHERE id = $1")
             .bind(scratch.id)
@@ -3120,10 +3163,9 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     let media_actions = store::list_required_actions(&pool)
         .await
         .expect("media required actions should query");
-    assert!(media_actions.iter().any(|action| {
-        action.id == format!("media:{}", created.id)
-            && action.route == format!("tapes/{}", created.id)
-    }));
+    assert!(media_actions
+        .iter()
+        .all(|action| action.id != format!("media:{}", created.id)));
     assert_eq!(
         store::overview_counts(&pool)
             .await
@@ -3342,6 +3384,15 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     assert!(interrupted_position_uncertain);
     assert!(!interrupted_drive_reconciled);
     assert!(interrupted_drive_position_uncertain);
+    assert!(store::list_required_actions(&pool)
+        .await
+        .expect("write-unverified actions should query")
+        .iter()
+        .any(|action| {
+            action.id == format!("media:{}", quarantine_media.id)
+                && action.title == "Review cartridge condition"
+                && action.state == "blocked"
+        }));
     let fenced_events = store::single_tape_data_events(&pool, fenced_claim.run.id)
         .await
         .expect("fenced events should reload");

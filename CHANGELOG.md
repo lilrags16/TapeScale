@@ -2,6 +2,15 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.6] - 2026-11-13
+
+### Truthful cartridge status
+
+- The Media Control Center no longer presents the conservative destructive-reuse gate as every cartridge's operational status. Registered media, prepared scratch tapes, verified archives, protected media, reservations, and genuine review states now have distinct headlines.
+- Prepared scratch media explicitly explains that its Bacula on-tape identity is intentionally pending until the first verified backup. The strict reuse gate remains unchanged and is displayed separately as a destructive-reuse assessment.
+- Blank registered and successfully qualified scratch cartridges no longer create impossible “Reconcile cartridge identity” actions. Foreign or mismatched identity, unsafe health, recorded content with unknown identity, and missing custody for finalized content remain actionable.
+- Static asset revision keys advance with the release so TrueNAS browsers load the corrected cartridge UI immediately after redeployment.
+
 ## [0.1.0-alpha.5] - 2026-11-13
 
 ### Long-running backup lease reliability
@@ -99,6 +108,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.6]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.6
 [0.1.0-alpha.5]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.3

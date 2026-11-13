@@ -1525,10 +1525,15 @@ pub async fn overview_counts(pool: &PgPool) -> Result<OverviewCounts, sqlx::Erro
              (SELECT count(*) FROM movement_tasks
               WHERE state IN ('ready','departed','partially_confirmed','overdue','blocked')) +
              (SELECT count(*) FROM cartridges cartridge
-              WHERE cartridge.identity_status <> 'reconciled'
+              WHERE cartridge.identity_status IN ('mismatch', 'foreign')
                  OR cartridge.health_status IN (
-                    'qualification_interrupted', 'write_unverified', 'quarantined', 'failed'
+                    'qualification_interrupted', 'qualification_failed',
+                    'write_unverified', 'quarantined', 'failed'
                  )
+                 OR (cartridge.identity_status = 'unknown' AND EXISTS (
+                    SELECT 1 FROM volume_records volume
+                    WHERE volume.cartridge_id = cartridge.id
+                 ))
                  OR (cartridge.confirmed_location_id IS NULL AND EXISTS (
                     SELECT 1 FROM volume_records volume
                     WHERE volume.cartridge_id = cartridge.id AND volume.finalized
@@ -1592,28 +1597,30 @@ pub async fn list_required_actions(
                         WHEN cartridge.identity_status = 'foreign'
                             THEN 'Review foreign cartridge'
                         WHEN cartridge.health_status IN (
-                            'qualification_interrupted', 'write_unverified',
+                            'qualification_interrupted', 'qualification_failed', 'write_unverified',
                             'quarantined', 'failed'
-                        ) THEN 'Review quarantined cartridge'
+                        ) THEN 'Review cartridge condition'
                         WHEN cartridge.identity_status = 'unknown'
-                            THEN 'Reconcile cartridge identity'
+                            THEN 'Review cartridge identity'
                         ELSE 'Confirm protected cartridge location'
                     END,
                     concat_ws(' · ',
                         cartridge.internal_label,
                         CASE
-                            WHEN cartridge.identity_status <> 'reconciled'
+                            WHEN cartridge.identity_status IN ('mismatch', 'foreign')
                                 THEN 'identity ' || cartridge.identity_status
                             WHEN cartridge.health_status IN (
-                                'qualification_interrupted', 'write_unverified',
+                                'qualification_interrupted', 'qualification_failed', 'write_unverified',
                                 'quarantined', 'failed'
                             ) THEN 'health ' || cartridge.health_status
+                            WHEN cartridge.identity_status = 'unknown'
+                                THEN 'identity unknown for recorded content'
                             ELSE 'finalized content has no confirmed location'
                         END),
                     CASE
                         WHEN cartridge.identity_status IN ('mismatch', 'foreign')
                           OR cartridge.health_status IN (
-                            'qualification_interrupted', 'write_unverified',
+                            'qualification_interrupted', 'qualification_failed', 'write_unverified',
                             'quarantined', 'failed'
                           ) THEN 'blocked'
                         ELSE 'attention'
@@ -1622,10 +1629,15 @@ pub async fn list_required_actions(
                     'tapes/' || cartridge.id::text,
                     cartridge.updated_at
              FROM cartridges cartridge
-             WHERE cartridge.identity_status <> 'reconciled'
+             WHERE cartridge.identity_status IN ('mismatch', 'foreign')
                 OR cartridge.health_status IN (
-                    'qualification_interrupted', 'write_unverified', 'quarantined', 'failed'
+                    'qualification_interrupted', 'qualification_failed',
+                    'write_unverified', 'quarantined', 'failed'
                 )
+                OR (cartridge.identity_status = 'unknown' AND EXISTS (
+                    SELECT 1 FROM volume_records volume
+                    WHERE volume.cartridge_id = cartridge.id
+                ))
                 OR (cartridge.confirmed_location_id IS NULL AND EXISTS (
                     SELECT 1 FROM volume_records volume
                     WHERE volume.cartridge_id = cartridge.id AND volume.finalized

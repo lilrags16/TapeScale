@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-3/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-3/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-6/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-6/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -42,6 +42,39 @@ test("operational chrome uses recovery exercise and manual motion language", () 
   assert.doesNotMatch(app, /Lab tape motion|lab-only motion|"Lab motion"/);
   assert.match(app, /G0\.2 laboratory path—not a production backup policy/);
   assert.match(app, /G0\.2 · full · single tape · no encryption/);
+});
+
+test("cartridge headlines do not confuse the destructive reuse gate with operational state", () => {
+  const helpers = section("  function mediaReuseState(", "  function mediaPoolId(");
+  const testPick = (object, ...keys) => {
+    if (!object || typeof object !== "object") return null;
+    for (const key of keys) if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+    return null;
+  };
+  const testCount = (value) => Array.isArray(value) ? value.length : Number(value) || 0;
+  const [operationalState, reuseAssessment, attentionRequired] = Function(
+    "pick", "count",
+    '"use strict";\n' + helpers + "\nreturn [mediaOperationalState, mediaReuseAssessment, mediaAttentionRequired];"
+  )(testPick, testCount);
+
+  const registered = { reuse_state: "needs_reconciliation", identity_status: "unknown", health_status: "unknown", has_content: false };
+  const prepared = { ...registered, health_status: "qualified_scratch" };
+  const verified = { ...registered, identity_status: "reconciled", health_status: "written_verified", has_content: true, confirmed_location_id: "location-1" };
+
+  assert.equal(operationalState(registered), "registered");
+  assert.equal(operationalState(prepared), "prepared_scratch");
+  assert.equal(operationalState(verified), "verified_archive");
+  assert.equal(operationalState({ ...verified, reuse_state: "protected", retained_recovery_points: 1 }), "protected");
+  assert.equal(operationalState({ ...prepared, health_status: "write_unverified" }), "needs_attention");
+  assert.equal(operationalState({ ...registered, identity_status: "mismatch" }), "identity_conflict");
+  assert.equal(operationalState({ ...verified, catalog_reconciled: false }), "catalog_review");
+  assert.equal(operationalState({ ...verified, identity_status: "unknown" }), "identity_review");
+  assert.equal(operationalState({ ...verified, confirmed_location_id: null }), "custody_review");
+  assert.equal(attentionRequired(prepared), false);
+  assert.equal(attentionRequired({ ...verified, confirmed_location_id: null }), true);
+  assert.equal(reuseAssessment(prepared), "Reuse evidence incomplete");
+  assert.match(app, /Prepared scratch identity is intentionally pending/);
+  assert.match(app, /Destructive reuse gate/);
 });
 
 test("the start flow requires a currently eligible drive and tape", () => {

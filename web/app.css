@@ -1203,7 +1203,10 @@ svg {
 .status.ready,
 .status.protected,
 .status.snapshot-ready,
-.status.snapshot-saved {
+.status.snapshot-saved,
+.status.prepared-scratch,
+.status.verified-archive,
+.status.reconciled {
   color: var(--teal-strong);
   background: var(--teal-soft);
 }
@@ -1222,7 +1225,10 @@ svg {
 }
 
 .status.tape-needed,
-.status.needs-attention {
+.status.needs-attention,
+.status.catalog-review,
+.status.identity-review,
+.status.custody-review {
   color: #8a4f0d;
   background: var(--amber-soft);
 }
@@ -1238,7 +1244,8 @@ svg {
 .status.info,
 .status.queued,
 .status.running,
-.status.preparing {
+.status.preparing,
+.status.registered {
   color: var(--blue);
   background: var(--blue-soft);
 }
@@ -1254,7 +1261,8 @@ svg {
 }
 
 .status.offsite,
-.status.planned {
+.status.planned,
+.status.contains-data {
   color: var(--violet);
   background: var(--violet-soft);
 }
@@ -8194,7 +8202,8 @@ button.source-browser-name:hover strong {
 
 .status.physically-blocked,
 .status.foreign,
-.status.mismatch {
+.status.mismatch,
+.status.identity-conflict {
   color: #94362f;
   background: var(--red-soft);
 }

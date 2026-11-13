@@ -1028,13 +1028,52 @@
     }
   }
 
+  function mediaReuseState(item) {
+    return String(pick(item, "reuse_state") || "").toLowerCase();
+  }
+
+  function mediaReuseAssessment(item) {
+    switch (mediaReuseState(item)) {
+      case "physically_blocked": return "Overwrite physically blocked";
+      case "reserved": return "Reserved by active work";
+      case "needs_reconciliation": return "Reuse evidence incomplete";
+      case "protected": return "Blocked by protection";
+      case "drive_evaluation_required": return "Exact-drive check required";
+      default: return "Not evaluated";
+    }
+  }
+
+  function mediaConfirmedLocationKnown(item) {
+    const nested = item && typeof item === "object" && item.confirmed_location && typeof item.confirmed_location === "object"
+      ? item.confirmed_location
+      : item && typeof item === "object" && item.location && typeof item.location === "object" ? item.location : null;
+    return Boolean(pick(item, "confirmed_location_id", "location_id") || pick(nested, "id", "uuid"));
+  }
+
   function mediaOperationalState(item) {
-    const explicit = pick(item, "reuse_state", "operational_state", "state", "health_status", "status");
+    const explicit = pick(item, "operational_state");
     if (explicit) return String(explicit).toLowerCase();
+    const health = String(pick(item, "health_status", "health") || "unknown").toLowerCase();
+    const identity = String(pick(item, "identity_status") || "unknown").toLowerCase();
+    const reuse = mediaReuseState(item);
+    if (pick(item, "reserved_by") || reuse === "reserved") return "reserved";
     if (count(pick(item, "active_holds", "hold_count")) > 0) return "held";
-    if (mediaRecoveryPointCount(item) > 0) return "protected";
-    if (pick(item, "has_content") === true) return "needs_evaluation";
-    return "available";
+    if (health === "write_in_progress") return "writing";
+    if (["qualification_interrupted", "qualification_failed", "write_unverified", "quarantined", "failed"].includes(health)) return "needs_attention";
+    if (["foreign", "mismatch"].includes(identity)) return "identity_conflict";
+    if (pick(item, "catalog_reconciled") === false || pick(item, "dependency_graph_truncated") === true) return "catalog_review";
+    if (pick(item, "has_content") === true && identity === "unknown") return "identity_review";
+    if (pick(item, "has_content") === true && !mediaConfirmedLocationKnown(item)) return "custody_review";
+    if (reuse === "protected" || mediaRecoveryPointCount(item) > 0 || count(pick(item, "indefinite_archive_claims", "indefinite_claims")) > 0) return "protected";
+    if (health === "qualified_scratch") return "prepared_scratch";
+    if (["written_verified", "verified"].includes(health)) return "verified_archive";
+    if (pick(item, "has_content") === true) return "contains_data";
+    if (identity === "reconciled") return "reconciled";
+    return "registered";
+  }
+
+  function mediaAttentionRequired(item) {
+    return ["held", "needs_attention", "identity_conflict", "catalog_review", "identity_review", "custody_review"].includes(mediaOperationalState(item));
   }
 
   function mediaRecoveryPointCount(item) {
@@ -1071,8 +1110,8 @@
 
   function orderedMedia() {
     return state.data.media.slice().sort((left, right) => {
-      const leftAttention = ["held", "physically_blocked", "blocked"].includes(mediaOperationalState(left)) ? 0 : 1;
-      const rightAttention = ["held", "physically_blocked", "blocked"].includes(mediaOperationalState(right)) ? 0 : 1;
+      const leftAttention = mediaAttentionRequired(left) ? 0 : 1;
+      const rightAttention = mediaAttentionRequired(right) ? 0 : 1;
       return leftAttention - rightAttention || String(mediaName(left) || "").localeCompare(String(mediaName(right) || ""));
     });
   }
@@ -1127,6 +1166,7 @@
       recordId(item), mediaName(item), pick(item, "barcode", "serial_number"),
       pick(item, "media_generation", "generation"), pick(item, "media_format", "format"),
       mediaPoolName(item), mediaLocationName(item), mediaOperationalState(item),
+      mediaReuseState(item), mediaReuseAssessment(item),
       pick(item, "identity_status"), pick(item, "health_status", "health"), pick(item, "on_tape_identity"),
       pick(item, "catalog_reconciled"), pick(item, "dependency_graph_truncated"),
       pick(item, "latest_verification_outcome", "verification_outcome") || pick(latestVerification, "outcome", "status")
@@ -1356,6 +1396,7 @@
     const generation = pick(cartridge, "media_generation", "generation");
     const latestVerification = objectValue(cartridge, "latest_verification");
     const catalogReconciled = pick(cartridge, "catalog_reconciled", "catalogReconciled");
+    const reuseAssessment = mediaReuseAssessment(cartridge);
     const latestVerificationAt = pick(cartridge, "latest_verification_at") || pick(latestVerification, "occurred_at", "finished_at", "completed_at", "created_at");
     const latestVerificationOutcome = pick(cartridge, "latest_verification_outcome") || pick(latestVerification, "outcome", "status");
     const latestVerificationText = latestVerificationAt
@@ -1365,6 +1406,9 @@
     const truncationWarning = truncatedSections.length
       ? '<div class="notice warning media-truncation-warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>This is a bounded dossier</strong><span>Additional records exist in: ' + esc(truncatedSections.join(", ")) + ". Those sections are partial; do not infer that an omitted hold, dependency, verification, or event is absent.</span></div></div>"
       : "";
+    const preparedScratchContext = stateValue === "prepared_scratch" && String(pick(cartridge, "identity_status") || "unknown").toLowerCase() === "unknown" && !pick(cartridge, "on_tape_identity")
+      ? '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Prepared scratch identity is intentionally pending</strong><span>Tape setup proved the physical drive-and-cartridge pair. Bacula on-tape identity is created by the first verified backup, and TapeScale rechecks the exact pair before writing.</span></div></div>'
+      : "";
     const hero = '<header class="media-dossier-hero"><div class="media-dossier-identity"><span class="media-hero-tape" aria-hidden="true"><i></i><i></i></span><div><span class="media-section-kicker">Cartridge dossier · state v' + version + '</span><div class="media-dossier-title"><h2>' + esc(label(mediaName(cartridge))) + "</h2>" + status(human(stateValue)) + '</div><p>' + esc(label(pick(cartridge, "barcode"))) + " · " + esc(generation ? "LTO-" + generation : pick(cartridge, "media_format", "format")) + " · " + esc(locationName) + '</p></div></div><div class="media-dossier-actions"><button class="button button-quiet" type="button" data-action="assign-media-pool" data-id="' + esc(id) + '">Assign pool</button><button class="button button-quiet" type="button" data-action="add-media-hold" data-id="' + esc(id) + '">Add hold</button><button class="button button-primary" type="button" data-action="open-media-reuse" data-id="' + esc(id) + '">Evaluate reuse</button></div></header>';
     const ribbon = '<div class="media-protection-ribbon"><span><strong>' + activeHolds + '</strong> active hold' + (activeHolds === 1 ? "" : "s") + '</span><span><strong>' + protectedRecoveryPoints + '</strong> protected recovery point' + (protectedRecoveryPoints === 1 ? "" : "s") + '</span><span><strong>' + recordedVolumes + '</strong> recorded volume' + (recordedVolumes === 1 ? "" : "s") + '</span><span><strong>' + (pick(parts.protection, "indefinite") === true || pick(parts.pool, "indefinite_retention") === true ? "Indefinite" : "Policy") + '</strong> retention</span></div>';
     const facts = mediaDetailFact("Internal label", mediaName(cartridge), true) +
@@ -1372,6 +1416,7 @@
       mediaDetailFact("On-tape identity", pick(cartridge, "on_tape_identity") || "Not observed", true) +
       mediaDetailFact("Identity status", human(pick(cartridge, "identity_status") || "unknown")) +
       mediaDetailFact("Health", human(pick(cartridge, "health_status", "health") || "unknown")) +
+      mediaDetailFact("Destructive reuse gate", reuseAssessment) +
       mediaDetailFact("Catalog reconciled", catalogReconciled == null ? "Not reported" : catalogReconciled ? "Yes" : "No") +
       mediaDetailFact("Dependency graph", pick(cartridge, "dependency_graph_truncated") == null ? "Not reported" : pick(cartridge, "dependency_graph_truncated") === true ? "Truncated — review required" : "Complete within catalog") +
       mediaDetailFact("Reserved by", pick(cartridge, "reserved_by") || "Not reserved") +
@@ -1386,7 +1431,7 @@
       mediaDetailFact("Latest verification", latestVerificationText) +
       mediaDetailFact("State version", "v" + version, true);
     const identitySection = '<section class="media-dossier-section"><div class="media-section-head"><div><span class="media-section-kicker">Registered identity</span><h3>Identity, location, and retention</h3></div></div><div class="media-facts-grid">' + facts + "</div></section>";
-    return '<article class="panel media-dossier">' + hero + ribbon + truncationWarning + identitySection + renderMediaReuseEvaluation(id) + renderMediaHolds(id, parts) + renderMediaProtection(parts) + renderMediaVerification(parts) + renderMediaHistory(parts) + "</article>";
+    return '<article class="panel media-dossier">' + hero + ribbon + preparedScratchContext + truncationWarning + identitySection + renderMediaReuseEvaluation(id) + renderMediaHolds(id, parts) + renderMediaProtection(parts) + renderMediaVerification(parts) + renderMediaHistory(parts) + "</article>";
   }
 
   function renderMedia() {
@@ -1399,7 +1444,7 @@
     if (!inventory.length) return html + renderMediaPools() + empty("No cartridges", state.errors.media ? "Cartridge inventory could not be loaded." : "Register a cartridge to begin building the operational inventory.", add);
     const protectedCount = inventory.filter((item) => pick(item, "dependency_graph_truncated") === true || mediaRecoveryPointCount(item) > 0 || count(pick(item, "indefinite_archive_claims", "indefinite_claims")) > 0 || mediaOperationalState(item) === "protected").length;
     const heldCount = inventory.reduce((total, item) => total + count(pick(item, "active_holds", "hold_count")), 0);
-    const attentionCount = inventory.filter((item) => count(pick(item, "active_holds", "hold_count")) > 0 || ["held", "blocked", "physically_blocked", "needs_reconciliation", "foreign", "mismatch"].includes(mediaOperationalState(item))).length;
+    const attentionCount = inventory.filter(mediaAttentionRequired).length;
     html += '<section class="panel metric-strip media-metrics"><div class="metric"><span>Total cartridges</span><strong>' + inventory.length + '</strong></div><div class="metric"><span>Recovery protected</span><strong>' + protectedCount + '</strong></div><div class="metric"><span>Active holds</span><strong>' + heldCount + '</strong></div><div class="metric"><span>Needs attention</span><strong>' + attentionCount + "</strong></div></section>";
     html += renderMediaPools();
     html += '<div class="media-control-layout section">' + renderMediaCatalog(inventory, selected && recordId(selected)) + renderMediaDetail(selected) + "</div>";
