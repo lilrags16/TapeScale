@@ -2050,6 +2050,36 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     )
     .await
     .expect("rehearsal should enter restoring"));
+    let restore_live_sample = store::SingleTapeLiveIoSample {
+        phase: store::SingleTapeLiveIoPhase::Restore,
+        sampled_at: Utc::now(),
+        sample_window_ms: Some(5_000),
+        stale_after_seconds: 20,
+        engine_job_id: 2_002,
+        files_processed: 3,
+        logical_bytes_processed: 4_096,
+        pipeline_bytes_per_second: Some(800),
+        tape_read_bytes_per_second: Some(1_024),
+        tape_write_bytes_per_second: Some(0),
+        tape_read_counter_available: true,
+        tape_write_counter_available: true,
+        tape_counters_available: true,
+        pipeline_basis: "bacula_job_bytes_delta",
+        tape_basis: Some("linux_scsi_tape_sysfs_counter_delta"),
+    };
+    assert!(
+        store::record_restore_rehearsal_live_io(&pool, &rehearsal_claim, &restore_live_sample,)
+            .await
+            .expect("fenced Restore telemetry should persist")
+    );
+    let live_result =
+        sqlx::query_scalar::<_, Value>("SELECT result FROM restore_rehearsals WHERE id = $1")
+            .bind(rehearsal_id)
+            .fetch_one(&pool)
+            .await
+            .expect("Restore telemetry should be queryable");
+    assert_eq!(live_result["live_io"]["phase"], "restore");
+    assert_eq!(live_result["live_io"]["tape_read_bytes_per_second"], 1_024);
     let claimed_restore_volumes = store::restore_rehearsal_volumes(&pool, rehearsal_id)
         .await
         .expect("the normalized single-volume restore ledger should load");
@@ -2117,6 +2147,13 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     )
     .await
     .expect("rehearsal should enter comparing"));
+    let transitioned_result =
+        sqlx::query_scalar::<_, Value>("SELECT result FROM restore_rehearsals WHERE id = $1")
+            .bind(rehearsal_id)
+            .fetch_one(&pool)
+            .await
+            .expect("transitioned Restore result should be queryable");
+    assert!(transitioned_result["live_io"].is_null());
     assert!(store::append_restore_rehearsal_artifact(
         &pool,
         &rehearsal_claim,

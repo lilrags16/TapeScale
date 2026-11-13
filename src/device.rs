@@ -82,6 +82,18 @@ pub struct SasDriveObservation {
     pub observed_at: DateTime<Utc>,
 }
 
+/// Cumulative byte counters reported by Linux's SCSI tape driver.
+///
+/// These values are optional because not every supported kernel exposes the
+/// statistics files.  Callers calculate rates from two monotonic samples; a
+/// missing or malformed counter must remain unavailable rather than being
+/// represented as zero.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SasTapeIoCounters {
+    pub read_bytes: Option<u64>,
+    pub write_bytes: Option<u64>,
+}
+
 impl SasDriveObservation {
     #[must_use]
     pub fn health(&self) -> Value {
@@ -165,6 +177,46 @@ pub enum SasMotionError {
     DeviceBinding { device: PathBuf, reason: String },
     #[error(transparent)]
     Tool(#[from] ToolError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SasTapeIoCounterError {
+    #[error("tape statistics are not available for unconfigured device {device}")]
+    DeviceNotConfigured { device: PathBuf },
+    #[error("tape device binding is unsafe for {device}: {reason}")]
+    DeviceBinding { device: PathBuf, reason: String },
+}
+
+/// Read cumulative kernel I/O counters for an exact configured tape device.
+///
+/// Linux publishes SCSI tape statistics on the rewinding `stN` class entry
+/// even when TapeScale operates through the non-rewinding `/dev/nstN` node.
+/// Reading these files does not open the tape device, issue a command, or
+/// change tape position.  Unsupported, missing, or malformed individual
+/// counters are returned as `None`.
+pub fn read_sas_tape_io_counters(
+    config: &SasDiscoveryConfig,
+    device: &Path,
+) -> Result<SasTapeIoCounters, SasTapeIoCounterError> {
+    if validate_tape_path(device).is_err()
+        || !config
+            .devices
+            .iter()
+            .any(|configured| configured.as_path() == device)
+    {
+        return Err(SasTapeIoCounterError::DeviceNotConfigured {
+            device: device.to_owned(),
+        });
+    }
+    verify_device_binding(config, device).map_err(|reason| {
+        SasTapeIoCounterError::DeviceBinding {
+            device: device.to_owned(),
+            reason,
+        }
+    })?;
+    let stats = tape_stats_path(&config.sysfs_root, device)
+        .expect("validated non-rewinding tape paths always map to a stats directory");
+    Ok(read_tape_io_counters(&stats))
 }
 
 /// Execute one allowlisted motion command against an exact configured non-rewinding device.
@@ -527,6 +579,30 @@ fn read_sysfs_identity(sysfs_root: &Path, device_name: &str) -> SysfsIdentity {
     }
 }
 
+fn tape_stats_path(sysfs_root: &Path, device: &Path) -> Option<PathBuf> {
+    let device_name = device.file_name()?.to_str()?;
+    let unit = device_name.strip_prefix("nst")?;
+    if unit.is_empty() || !unit.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(
+        sysfs_root
+            .join("class")
+            .join("scsi_tape")
+            .join(format!("st{unit}"))
+            .join("stats"),
+    )
+}
+
+fn read_tape_io_counters(stats: &Path) -> SasTapeIoCounters {
+    SasTapeIoCounters {
+        read_bytes: read_trimmed(stats.join("read_byte_cnt"))
+            .and_then(|value| parse_sysfs_u64(&value)),
+        write_bytes: read_trimmed(stats.join("write_byte_cnt"))
+            .and_then(|value| parse_sysfs_u64(&value)),
+    }
+}
+
 fn parse_sysfs_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" => Some(true),
@@ -832,6 +908,62 @@ mod tests {
         ] {
             assert!(parse_device_list(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn non_rewinding_device_maps_to_rewinding_kernel_stats() {
+        assert_eq!(
+            tape_stats_path(Path::new("/sys"), Path::new("/dev/nst12")),
+            Some(PathBuf::from("/sys/class/scsi_tape/st12/stats"))
+        );
+        assert!(tape_stats_path(Path::new("/sys"), Path::new("/dev/st12")).is_none());
+        assert!(tape_stats_path(Path::new("/sys"), Path::new("/dev/nstx")).is_none());
+    }
+
+    #[test]
+    fn tape_io_counters_read_valid_kernel_values() {
+        let root = tempfile::tempdir().expect("temporary stats directory");
+        fs::write(root.path().join("read_byte_cnt"), "123456\n").expect("read counter");
+        fs::write(root.path().join("write_byte_cnt"), "0x1e240\n").expect("write counter");
+
+        assert_eq!(
+            read_tape_io_counters(root.path()),
+            SasTapeIoCounters {
+                read_bytes: Some(123_456),
+                write_bytes: Some(123_456),
+            }
+        );
+    }
+
+    #[test]
+    fn tape_io_counters_leave_missing_or_malformed_values_unavailable() {
+        let missing = tempfile::tempdir().expect("temporary missing stats directory");
+        assert_eq!(
+            read_tape_io_counters(missing.path()),
+            SasTapeIoCounters::default()
+        );
+
+        let malformed = tempfile::tempdir().expect("temporary malformed stats directory");
+        fs::write(malformed.path().join("read_byte_cnt"), "not-a-counter\n")
+            .expect("malformed read counter");
+        fs::write(malformed.path().join("write_byte_cnt"), "987654\n")
+            .expect("valid write counter");
+        assert_eq!(
+            read_tape_io_counters(malformed.path()),
+            SasTapeIoCounters {
+                read_bytes: None,
+                write_bytes: Some(987_654),
+            }
+        );
+    }
+
+    #[test]
+    fn tape_io_counter_probe_rejects_unconfigured_devices_before_sysfs_access() {
+        let config = motion_config(&[], "/usr/bin/mt-st");
+        assert!(matches!(
+            read_sas_tape_io_counters(&config, Path::new("/dev/nst0")),
+            Err(SasTapeIoCounterError::DeviceNotConfigured { .. })
+        ));
     }
 
     #[test]

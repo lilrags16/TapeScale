@@ -1,6 +1,6 @@
 [package]
 name = "tapescale"
-version = "0.1.0-alpha.6"
+version = "0.1.0-alpha.7"
 edition = "2021"
 rust-version = "1.89.0"
 description = "Safety-first LTO backup control plane for TrueNAS"

@@ -1893,6 +1893,113 @@ svg {
   margin: 15px 0 19px;
 }
 
+.backup-live-io {
+  margin: 15px 0 19px;
+  overflow: hidden;
+  border: 1px solid #a9cfc7;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.backup-live-io.stale,
+.backup-live-io.waiting {
+  border-color: #e3bd89;
+  background: var(--amber-soft);
+}
+
+.backup-live-io.measuring {
+  background: var(--teal-soft);
+}
+
+.backup-live-io-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--line);
+}
+
+.backup-live-io:not(:has(.backup-live-rate-grid)) .backup-live-io-head {
+  border-bottom: 0;
+}
+
+.backup-live-io-head span,
+.backup-live-io-head h3 {
+  display: block;
+  margin: 0;
+}
+
+.backup-live-io-head span {
+  color: var(--ink-faint);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.backup-live-io-head h3 {
+  margin-top: 2px;
+  font-size: 15px;
+}
+
+.backup-live-io-head > strong {
+  color: var(--teal-strong);
+  font: 700 10px var(--font-mono);
+  text-align: right;
+}
+
+.backup-live-io.stale .backup-live-io-head > strong,
+.backup-live-io.waiting .backup-live-io-head > strong {
+  color: #855716;
+}
+
+.backup-live-rate-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.backup-live-rate-grid > div {
+  min-width: 0;
+  padding: 13px;
+  border-left: 1px solid var(--line);
+}
+
+.backup-live-rate-grid > div:first-child {
+  border-left: 0;
+}
+
+.backup-live-rate-grid span,
+.backup-live-rate-grid strong {
+  display: block;
+}
+
+.backup-live-rate-grid span {
+  color: var(--ink-faint);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.backup-live-rate-grid strong {
+  margin-top: 4px;
+  font: 750 18px var(--font-mono);
+}
+
+.backup-live-io > p {
+  margin: 0;
+  padding: 9px 13px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.backup-live-io:not(:has(.backup-live-rate-grid)) > p {
+  border-top: 0;
+  padding-top: 0;
+}
+
 .backup-detail-section {
   padding: 18px 0;
   border-top: 1px solid var(--line);
@@ -6889,6 +6996,23 @@ button.source-browser-name:hover strong {
   .backup-evidence-grid,
   .backup-start-facts {
     grid-template-columns: 1fr;
+  }
+
+  .backup-live-io-head {
+    align-items: flex-start;
+  }
+
+  .backup-live-rate-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .backup-live-rate-grid > div {
+    border-top: 1px solid var(--line);
+    border-left: 0;
+  }
+
+  .backup-live-rate-grid > div:first-child {
+    border-top: 0;
   }
 
   .backup-capacity-facts {

@@ -2,6 +2,15 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.7] - 2026-11-13
+
+### Live transfer telemetry
+
+- Running Backup, recovery-exercise, and Restore views now refresh a prominent live transfer panel while the worker is active.
+- Tape write and read rates come from the Linux SCSI tape driver's cumulative byte counters for the exact configured and identity-checked drive. Logical Bacula job progress remains separately labeled and is never presented as disk or physical tape I/O.
+- Each direction reports its own availability. A measured idle interval displays `0 B/s`; missing counters display **Unavailable**; the first sample displays **Measuring**; and stale samples are hidden instead of being repeated as current rates.
+- Live snapshots remain lease-fenced, replace only ephemeral run state, and are cleared at every physical phase transition. They do not create high-frequency audit events or survive as terminal evidence.
+
 ## [0.1.0-alpha.6] - 2026-11-13
 
 ### Truthful cartridge status
@@ -108,6 +117,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.7]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.7
 [0.1.0-alpha.6]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.6
 [0.1.0-alpha.5]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.4

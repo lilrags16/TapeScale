@@ -8,7 +8,7 @@ COPY migrations ./migrations
 RUN cargo build --locked --release --bins
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
-ARG TAPESCALE_VERSION=0.1.0-alpha.6
+ARG TAPESCALE_VERSION=0.1.0-alpha.7
 ARG TAPESCALE_REVISION=unknown
 ARG DEBIAN_SNAPSHOT=20250730T000000Z
 LABEL org.opencontainers.image.title="TapeScale" \

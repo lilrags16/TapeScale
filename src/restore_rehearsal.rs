@@ -19,6 +19,7 @@ use std::{
 };
 
 use anyhow::Result;
+use chrono::Utc;
 use rustix::fs::{open, statvfs, Mode, OFlags};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -43,8 +44,8 @@ use crate::{
         ManifestSelectionKind, ResolvedManifestSelection,
     },
     device::{
-        discover_sas_drives, execute_sas_motion, SasDiscoveryConfig, SasMotionOperation,
-        SasProbeResult,
+        discover_sas_drives, execute_sas_motion, read_sas_tape_io_counters, SasDiscoveryConfig,
+        SasMotionOperation, SasProbeResult, SasTapeIoCounters,
     },
     domain::path::{resolve_link_target, validate_archive_path},
     engine::bacula::{
@@ -57,6 +58,7 @@ use crate::{
 };
 
 const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+const LIVE_IO_STALE_AFTER_SECONDS: u64 = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FailureClass {
@@ -131,6 +133,114 @@ struct ManifestReference {
     sha256: String,
     manifest_digest: String,
     size_bytes: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RestoreLiveIoObservation {
+    observed_at: Instant,
+    pipeline_bytes: u64,
+    tape_counters: Option<SasTapeIoCounters>,
+}
+
+#[derive(Debug, Default)]
+struct RestoreLiveIoSampler {
+    previous: Option<RestoreLiveIoObservation>,
+}
+
+impl RestoreLiveIoSampler {
+    fn observe(
+        &mut self,
+        evidence: &BaculaJobEvidence,
+        tape_counters: Option<SasTapeIoCounters>,
+        observed_at: Instant,
+    ) -> store::SingleTapeLiveIoSample {
+        let previous = self.previous;
+        let elapsed =
+            previous.map(|sample| observed_at.saturating_duration_since(sample.observed_at));
+        let sample_window_ms = elapsed.map(restore_duration_millis_u64);
+        let pipeline_bytes_per_second = previous.and_then(|sample| {
+            elapsed.and_then(|window| {
+                restore_bytes_per_second(sample.pipeline_bytes, evidence.bytes, window)
+            })
+        });
+        let tape_read_bytes_per_second = previous.and_then(|sample| {
+            elapsed.and_then(|window| {
+                restore_counter_rate(
+                    sample
+                        .tape_counters
+                        .and_then(|counters| counters.read_bytes),
+                    tape_counters.and_then(|counters| counters.read_bytes),
+                    window,
+                )
+            })
+        });
+        let tape_write_bytes_per_second = previous.and_then(|sample| {
+            elapsed.and_then(|window| {
+                restore_counter_rate(
+                    sample
+                        .tape_counters
+                        .and_then(|counters| counters.write_bytes),
+                    tape_counters.and_then(|counters| counters.write_bytes),
+                    window,
+                )
+            })
+        });
+        let tape_read_counter_available =
+            tape_counters.is_some_and(|counters| counters.read_bytes.is_some());
+        let tape_write_counter_available =
+            tape_counters.is_some_and(|counters| counters.write_bytes.is_some());
+        let tape_counters_available = tape_read_counter_available || tape_write_counter_available;
+        self.previous = Some(RestoreLiveIoObservation {
+            observed_at,
+            pipeline_bytes: evidence.bytes,
+            tape_counters,
+        });
+        store::SingleTapeLiveIoSample {
+            phase: store::SingleTapeLiveIoPhase::Restore,
+            sampled_at: Utc::now(),
+            sample_window_ms,
+            stale_after_seconds: LIVE_IO_STALE_AFTER_SECONDS,
+            engine_job_id: evidence.job_id.get(),
+            files_processed: evidence.files,
+            logical_bytes_processed: evidence.bytes,
+            pipeline_bytes_per_second,
+            tape_read_bytes_per_second,
+            tape_write_bytes_per_second,
+            tape_read_counter_available,
+            tape_write_counter_available,
+            tape_counters_available,
+            pipeline_basis: "bacula_job_bytes_delta",
+            tape_basis: tape_counters_available.then_some("linux_scsi_tape_sysfs_counter_delta"),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.previous = None;
+    }
+}
+
+fn restore_duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn restore_counter_rate(
+    previous: Option<u64>,
+    current: Option<u64>,
+    elapsed: Duration,
+) -> Option<u64> {
+    restore_bytes_per_second(previous?, current?, elapsed)
+}
+
+fn restore_bytes_per_second(previous: u64, current: u64, elapsed: Duration) -> Option<u64> {
+    let elapsed_nanos = elapsed.as_nanos();
+    if elapsed_nanos == 0 {
+        return None;
+    }
+    let delta = current.checked_sub(previous)?;
+    let rate = u128::from(delta)
+        .saturating_mul(1_000_000_000)
+        .checked_div(elapsed_nanos)?;
+    Some(u64::try_from(rate).unwrap_or(u64::MAX))
 }
 
 pub async fn process_restore_rehearsal_runs(
@@ -1881,6 +1991,8 @@ async fn wait_for_job(
     let mut active_media = Some(ActiveRestoreMedia::initial());
     let mut operator_wait_started: Option<Instant> = None;
     let mut next_volume_order = 2_i32;
+    let mut live_io = RestoreLiveIoSampler::default();
+    let mut tape_counter_error_reported = false;
     loop {
         if cancellation.is_cancelled() {
             let cancellation_result = cancel_and_observe(adapter, job_id).await;
@@ -1937,6 +2049,49 @@ async fn wait_for_job(
         // an earlier handoff consume the retry budget for a later volume.
         if !is_restore_media_wait(evidence.state) {
             consecutive_media_proof_failures = 0;
+        }
+
+        if is_restore_media_wait(evidence.state) {
+            // Operator time between cartridges is not a transfer interval. The
+            // durable handoff removes the old snapshot, and the first sample
+            // after resume establishes a fresh baseline without inventing a
+            // low rate across the attended wait.
+            live_io.reset();
+        } else if !evidence.is_terminal() {
+            let tape_counters =
+                match read_sas_tape_io_counters(sas_config, Path::new(&claim.run.expected_path)) {
+                    Ok(counters) => Some(counters),
+                    Err(error) => {
+                        if !tape_counter_error_reported {
+                            warn!(
+                                restore_rehearsal_id = %claim.run.id,
+                                device = %claim.run.expected_path,
+                                %error,
+                                "live physical tape throughput is unavailable for Restore"
+                            );
+                            tape_counter_error_reported = true;
+                        }
+                        None
+                    }
+                };
+            let sample = live_io.observe(&evidence, tape_counters, Instant::now());
+            match store::record_restore_rehearsal_live_io(pool, claim, &sample).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                    return Err(RehearsalFailure::interrupted(format!(
+                        "the fenced Restore run rejected live Bacula telemetry; {cancellation_result}"
+                    )));
+                }
+                Err(error) => {
+                    warn!(
+                        restore_rehearsal_id = %claim.run.id,
+                        engine_job_id = %job_id,
+                        %error,
+                        "could not persist the latest Restore transfer measurement"
+                    );
+                }
+            }
         }
 
         if evidence.is_terminal() {
@@ -2762,6 +2917,79 @@ mod tests {
         build_manifest, persist_manifest, resolve_manifest_selection, ManifestSelectionRequest,
         MAX_G02_LOGICAL_BYTES,
     };
+
+    #[test]
+    fn restore_live_io_uses_real_deltas_and_resets_across_attended_media_waits() {
+        let started = Instant::now();
+        let mut sampler = RestoreLiveIoSampler::default();
+        let mut evidence = BaculaJobEvidence {
+            job_id: BaculaJobId::new(73).expect("positive JobId"),
+            resource_name: None,
+            unique_name: None,
+            raw_status: 'R',
+            state: BaculaJobState::Running,
+            files: 10,
+            bytes: 1_000,
+            errors: 0,
+            start_time: None,
+            end_time: None,
+        };
+        let first = sampler.observe(
+            &evidence,
+            Some(SasTapeIoCounters {
+                read_bytes: Some(10_000),
+                write_bytes: None,
+            }),
+            started,
+        );
+        assert_eq!(first.phase, store::SingleTapeLiveIoPhase::Restore);
+        assert_eq!(first.pipeline_bytes_per_second, None);
+        assert_eq!(first.tape_read_bytes_per_second, None);
+        assert!(first.tape_read_counter_available);
+        assert!(!first.tape_write_counter_available);
+
+        evidence.files = 20;
+        evidence.bytes = 2_500;
+        let measured = sampler.observe(
+            &evidence,
+            Some(SasTapeIoCounters {
+                read_bytes: Some(14_000),
+                write_bytes: None,
+            }),
+            started + Duration::from_secs(5),
+        );
+        assert_eq!(measured.sample_window_ms, Some(5_000));
+        assert_eq!(measured.pipeline_bytes_per_second, Some(300));
+        assert_eq!(measured.tape_read_bytes_per_second, Some(800));
+        assert_eq!(measured.tape_write_bytes_per_second, None);
+
+        sampler.reset();
+        evidence.bytes = 3_000;
+        let resumed = sampler.observe(
+            &evidence,
+            Some(SasTapeIoCounters {
+                read_bytes: Some(15_000),
+                write_bytes: None,
+            }),
+            started + Duration::from_secs(600),
+        );
+        assert_eq!(resumed.sample_window_ms, None);
+        assert_eq!(resumed.pipeline_bytes_per_second, None);
+        assert_eq!(resumed.tape_read_bytes_per_second, None);
+    }
+
+    #[test]
+    fn restore_live_io_never_invents_a_rate_for_reset_or_zero_duration() {
+        assert_eq!(
+            restore_bytes_per_second(10, 9, Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(restore_bytes_per_second(0, 1, Duration::ZERO), None);
+        assert_eq!(
+            restore_counter_rate(None, Some(1), Duration::from_secs(1)),
+            None
+        );
+    }
 
     #[test]
     fn selected_manifest_roots_become_only_typed_absolute_catalog_paths() {

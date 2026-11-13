@@ -1024,6 +1024,39 @@ pub struct SingleTapeDataEventRecord {
     pub occurred_at: DateTime<Utc>,
 }
 
+/// Latest live transfer measurement for one fenced physical-data run.
+///
+/// This is mutable operational telemetry rather than append-only audit evidence. The worker
+/// replaces one bounded snapshot while the run is active so five-second sampling cannot grow the
+/// event ledger without bound. Rates are integer bytes per second; `None` means the source could
+/// not be measured for that window, while `Some(0)` is a measured idle interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SingleTapeLiveIoPhase {
+    BackupWrite,
+    FullReadback,
+    Restore,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SingleTapeLiveIoSample {
+    pub phase: SingleTapeLiveIoPhase,
+    pub sampled_at: DateTime<Utc>,
+    pub sample_window_ms: Option<u64>,
+    pub stale_after_seconds: u64,
+    pub engine_job_id: u64,
+    pub files_processed: u64,
+    pub logical_bytes_processed: u64,
+    pub pipeline_bytes_per_second: Option<u64>,
+    pub tape_read_bytes_per_second: Option<u64>,
+    pub tape_write_bytes_per_second: Option<u64>,
+    pub tape_read_counter_available: bool,
+    pub tape_write_counter_available: bool,
+    pub tape_counters_available: bool,
+    pub pipeline_basis: &'static str,
+    pub tape_basis: Option<&'static str>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClaimedSingleTapeDataRun {
     pub run: SingleTapeDataRunRecord,
@@ -6546,6 +6579,50 @@ pub async fn renew_single_tape_data_run_leases(
     Ok(true)
 }
 
+/// Replace the latest live I/O snapshot for an actively fenced physical-data run.
+///
+/// Live samples deliberately do not create audit events. The terminal result replaces this
+/// ephemeral value, while phase transitions and safety evidence remain append-only elsewhere.
+pub async fn record_single_tape_data_live_io(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    sample: &SingleTapeLiveIoSample,
+) -> Result<bool, sqlx::Error> {
+    if sample.engine_job_id == 0
+        || !(5..=300).contains(&sample.stale_after_seconds)
+        || sample.pipeline_basis != "bacula_job_bytes_delta"
+        || sample
+            .tape_basis
+            .is_some_and(|basis| basis != "linux_scsi_tape_sysfs_counter_delta")
+        || sample.tape_counters_available
+            != (sample.tape_read_counter_available || sample.tape_write_counter_available)
+        || (sample.tape_counters_available != sample.tape_basis.is_some())
+    {
+        return Ok(false);
+    }
+
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE single_tape_data_runs
+            SET result = jsonb_set(result, '{live_io}', $1::jsonb, true)
+          WHERE id = $2 AND state = 'running'",
+    )
+    .bind(json!(sample))
+    .bind(claim.run.id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    transaction.commit().await?;
+    Ok(true)
+}
+
 pub async fn transition_single_tape_data_phase(
     pool: &PgPool,
     claim: &ClaimedSingleTapeDataRun,
@@ -6566,6 +6643,16 @@ pub async fn transition_single_tape_data_phase(
         transaction.rollback().await?;
         return Ok(false);
     }
+    // A rate belongs only to the exact engine phase and sampling window that produced it. Drop
+    // the mutable snapshot before publishing the next durable phase so an old write rate can
+    // never appear as a current readback or restore rate.
+    sqlx::query(
+        "UPDATE single_tape_data_runs SET result = result - 'live_io'
+         WHERE id = $1 AND state = 'running'",
+    )
+    .bind(claim.run.id)
+    .execute(&mut *transaction)
+    .await?;
     sqlx::query("UPDATE job_runs SET state = $1 WHERE id = $2")
         .bind(phase.as_str())
         .bind(claim.run.job_run_id)
@@ -10502,6 +10589,52 @@ pub async fn renew_restore_rehearsal_run_leases(
     Ok(true)
 }
 
+/// Replace the latest live I/O snapshot for an actively fenced Restore run.
+///
+/// This operational sample is deliberately excluded from the append-only event and audit
+/// ledgers. Phase and terminal transitions remove or replace it so a rate is never retained as
+/// recovery evidence or displayed outside the engine operation that produced it.
+pub async fn record_restore_rehearsal_live_io(
+    pool: &PgPool,
+    claim: &ClaimedRestoreRehearsalRun,
+    sample: &SingleTapeLiveIoSample,
+) -> Result<bool, sqlx::Error> {
+    if sample.phase != SingleTapeLiveIoPhase::Restore
+        || sample.engine_job_id == 0
+        || !(5..=300).contains(&sample.stale_after_seconds)
+        || sample.pipeline_basis != "bacula_job_bytes_delta"
+        || sample
+            .tape_basis
+            .is_some_and(|basis| basis != "linux_scsi_tape_sysfs_counter_delta")
+        || sample.tape_counters_available
+            != (sample.tape_read_counter_available || sample.tape_write_counter_available)
+        || (sample.tape_counters_available != sample.tape_basis.is_some())
+    {
+        return Ok(false);
+    }
+
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_restore_rehearsal_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE restore_rehearsals
+            SET result = jsonb_set(result, '{live_io}', $1::jsonb, true)
+          WHERE id = $2 AND state = 'running' AND phase = 'restoring'",
+    )
+    .bind(json!(sample))
+    .bind(claim.run.id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    transaction.commit().await?;
+    Ok(true)
+}
+
 pub async fn ensure_restore_rehearsal_media_request(
     pool: &PgPool,
     claim: &ClaimedRestoreRehearsalRun,
@@ -10616,7 +10749,8 @@ pub async fn ensure_restore_rehearsal_media_request(
     .execute(&mut *transaction)
     .await?;
     let rehearsal_updated = sqlx::query(
-        "UPDATE restore_rehearsals SET phase = 'waiting_for_media'
+        "UPDATE restore_rehearsals
+         SET phase = 'waiting_for_media', result = result - 'live_io'
          WHERE id = $1 AND state = 'running' AND phase = 'restoring'",
     )
     .bind(claim.run.id)
@@ -11459,7 +11593,7 @@ pub async fn transition_restore_rehearsal_phase(
         return Ok(false);
     }
     sqlx::query(
-        "UPDATE restore_rehearsals SET phase = $1
+        "UPDATE restore_rehearsals SET phase = $1, result = result - 'live_io'
          WHERE id = $2 AND state = 'running'",
     )
     .bind(phase.as_str())

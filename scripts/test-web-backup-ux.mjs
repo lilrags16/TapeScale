@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-6/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-6/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-7/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-7/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -352,7 +352,88 @@ test("writing progress explains bounded disk spooling without inventing a percen
   assert.doesNotMatch(cue, /pause normally|switches between filling and writing/);
   assert.match(cue, /This buffer does not limit the total archive size/);
   assert.doesNotMatch(cue, /%|percent|percentage/i);
-  assert.match(detail, /notice \+ renderBackupSpoolingCue\(run\) \+ measuredProgress/);
+  assert.match(detail, /notice \+ renderBackupSpoolingCue\(run\) \+ renderBackupLiveThroughput\(run\) \+ measuredProgress/);
+});
+
+test("running backup throughput is live, directional, and honest about stale or missing samples", () => {
+  const helpers = section("  function backupLiveIo(", "  function renderBackupSpoolingCue(");
+  const values = Function(
+    "objectValue", "pick", "backupRunState", "BACKUP_TERMINAL_STATES", "human", "date", "bytes", "esc",
+    '"use strict";\n' + helpers + "\nreturn [backupLiveIoStale, renderBackupLiveThroughput];"
+  )(
+    (object, key) => object && object[key] && typeof object[key] === "object" && !Array.isArray(object[key]) ? object[key] : {},
+    (object, ...keys) => {
+      if (!object || typeof object !== "object") return null;
+      for (const key of keys) if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+      return null;
+    },
+    (run) => run.state,
+    new Set(["verified", "failed", "blocked", "interrupted", "cancelled"]),
+    (value) => String(value).replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()),
+    (value) => String(value),
+    (value) => {
+      const amount = Number(value);
+      if (amount === 0) return "0 B";
+      return (amount / 1048576).toFixed(1) + " MiB";
+    },
+    (value) => String(value)
+  );
+  const [stale, render] = values;
+  const now = Date.now();
+  const freshSample = {
+    sampled_at: new Date(now).toISOString(),
+    sample_window_ms: 5000,
+    phase: "tape_write",
+    pipeline_bytes_per_second: 1048576,
+    tape_write_bytes_per_second: 0,
+    tape_read_bytes_per_second: null,
+    tape_read_counter_available: true,
+    tape_write_counter_available: true,
+    tape_counters_available: true,
+    stale_after_seconds: 20,
+    pipeline_basis: "bacula_job_bytes_delta",
+    tape_basis: "linux_scsi_tape_sysfs_counter_delta"
+  };
+
+  assert.equal(stale(freshSample, now), false);
+  const live = render({ state: "writing", result: { live_io: freshSample } });
+  assert.match(live, /Streaming to tape/);
+  assert.match(live, /Logical backup pipeline/);
+  assert.match(live, /1\.0 MiB\/s/);
+  assert.match(live, /Tape write/);
+  assert.match(live, /0 B\/s/);
+  assert.match(live, /Tape read/);
+  assert.match(live, /Measuring…/);
+  assert.match(live, /Rolling 5 second sample/);
+  assert.match(live, /Logical progress: Bacula Job Bytes Delta/);
+  assert.match(live, /Linux Scsi Tape Sysfs Counter Delta/);
+
+  const unavailable = render({ state: "writing", result: { live_io: { ...freshSample, tape_read_counter_available: false, tape_write_counter_available: false, tape_counters_available: false } } });
+  assert.equal((unavailable.match(/Unavailable/g) || []).length, 2);
+
+  const partial = render({ state: "writing", result: { live_io: { ...freshSample, tape_read_counter_available: false } } });
+  assert.match(partial, /Tape write<\/span><strong>0 B\/s/);
+  assert.match(partial, /Tape read<\/span><strong>Unavailable/);
+
+  const oldSample = { ...freshSample, sampled_at: "2000-01-01T00:00:00Z", pipeline_bytes_per_second: 999999999 };
+  assert.equal(stale(oldSample, now), true);
+  const delayed = render({ state: "writing", result: { live_io: oldSample } });
+  assert.match(delayed, /Transfer sample is stale/);
+  assert.match(delayed, /Rates are hidden/);
+  assert.doesNotMatch(delayed, /953\.7 MiB\/s/);
+
+  assert.match(render({ state: "inventorying", result: {} }), /Measuring transfer speed/);
+  assert.match(render({ state: "waiting_for_media", result: { live_io: freshSample } }), /Waiting for tape/);
+  assert.doesNotMatch(render({ state: "waiting_for_media", result: { live_io: freshSample } }), /1\.0 MiB\/s/);
+  assert.equal(render({ state: "verified", result: { live_io: freshSample } }), "");
+
+  const evidence = section("  function renderBackupEvidence(", "  function renderBackupOutcome(");
+  assert.match(evidence, /\["Recorded average", throughput == null \? null/);
+  assert.doesNotMatch(evidence, /\["Throughput",/);
+  assert.match(css, /\.backup-live-rate-grid/);
+  assert.match(css, /\.backup-live-io\.stale/);
+  assert.match(app, /outcome \+ liveTransfer \+ renderRestoreVolumeSequence/);
+  assert.match(app, /outcome \+ renderBackupLiveThroughput\(\{ state: stateValue/);
 });
 
 test("final authorization is explicit without asking for the cartridge label twice", () => {

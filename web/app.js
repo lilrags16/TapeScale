@@ -708,6 +708,92 @@
     return null;
   }
 
+  function backupLiveIo(run) {
+    return objectValue(objectValue(run, "result"), "live_io");
+  }
+
+  function backupLiveIoStale(liveIo, nowMilliseconds) {
+    const sampledAt = Date.parse(String(pick(liveIo, "sampled_at") || ""));
+    if (!Number.isFinite(sampledAt)) return false;
+    const sampleWindow = Number(pick(liveIo, "sample_window_ms"));
+    const reportedStaleAfterSeconds = Number(pick(liveIo, "stale_after_seconds"));
+    const staleAfter = Number.isFinite(reportedStaleAfterSeconds) && reportedStaleAfterSeconds >= 5 && reportedStaleAfterSeconds <= 300
+      ? reportedStaleAfterSeconds * 1000
+      : Math.max(12000, Number.isFinite(sampleWindow) && sampleWindow > 0 ? sampleWindow * 3 : 0);
+    const now = Number.isFinite(nowMilliseconds) ? nowMilliseconds : Date.now();
+    return sampledAt > now + 5000 || now - sampledAt > staleAfter;
+  }
+
+  function backupLivePhaseLabel(value) {
+    const labels = {
+      inventory: "Scanning source storage",
+      inventorying: "Scanning source storage",
+      source_inventory: "Scanning source storage",
+      spooling: "Buffering on disk",
+      backup_write: "Streaming to tape",
+      tape_write: "Streaming to tape",
+      writing: "Streaming to tape",
+      tape_read: "Reading tape",
+      tape_readback: "Reading tape for verification",
+      full_readback: "Reading tape for verification",
+      verifying: "Reading tape for verification",
+      restore: "Writing restored data to disk"
+    };
+    const phase = String(value || "measuring").toLowerCase();
+    return labels[phase] || human(phase);
+  }
+
+  function renderBackupLiveThroughput(run) {
+    if (BACKUP_TERMINAL_STATES.has(backupRunState(run))) return "";
+    const runState = backupRunState(run);
+    const waiting = ["waiting_for_media", "waiting_for_next_media", "next_media", "media_required"].includes(runState);
+    if (waiting) {
+      return '<section class="backup-live-io waiting" role="status"><div class="backup-live-io-head"><div><span>Live transfer</span><h3>Waiting for tape</h3></div><strong>Paused</strong></div><p>No disk or tape transfer is active while the job waits for the required cartridge.</p></section>';
+    }
+
+    const liveIo = backupLiveIo(run);
+    const sampledAt = liveIo && pick(liveIo, "sampled_at");
+    const sampledMilliseconds = sampledAt ? Date.parse(String(sampledAt)) : Number.NaN;
+    const stale = liveIo && Number.isFinite(sampledMilliseconds) && backupLiveIoStale(liveIo);
+    if (!liveIo || !Number.isFinite(sampledMilliseconds) || stale) {
+      const heading = stale ? "Transfer sample is stale" : "Measuring transfer speed";
+      const detail = stale
+        ? "The last worker sample is no longer current. Rates are hidden until a fresh measurement arrives. Last sample: " + date(sampledAt) + "."
+        : "Waiting for the worker's first timestamped measurement. No rate is estimated from elapsed time or total bytes.";
+      return '<section class="backup-live-io ' + (stale ? "stale" : "measuring") + '" role="status"><div class="backup-live-io-head"><div><span>Live transfer</span><h3>' + esc(heading) + '</h3></div><strong>' + (stale ? "Update delayed" : "Measuring…") + '</strong></div><p>' + esc(detail) + "</p></section>";
+    }
+
+    const sampleWindow = Number(pick(liveIo, "sample_window_ms"));
+    const windowLabel = Number.isFinite(sampleWindow) && sampleWindow > 0 ? "Rolling " + (sampleWindow / 1000).toFixed(sampleWindow % 1000 === 0 ? 0 : 1) + " second sample" : "Current worker sample";
+    const tapeCountersAvailable = pick(liveIo, "tape_counters_available");
+    const tapeReadCounterAvailable = pick(liveIo, "tape_read_counter_available");
+    const tapeWriteCounterAvailable = pick(liveIo, "tape_write_counter_available");
+    const tapeReadAvailable = tapeReadCounterAvailable == null ? tapeCountersAvailable : tapeReadCounterAvailable;
+    const tapeWriteAvailable = tapeWriteCounterAvailable == null ? tapeCountersAvailable : tapeWriteCounterAvailable;
+    const pipelineBasis = pick(liveIo, "pipeline_basis");
+    const tapeBasis = pick(liveIo, "tape_basis", "tape_counters_basis", "basis");
+    const livePhase = String(pick(liveIo, "phase") || runState).toLowerCase();
+    const pipelineLabel = ["backup_write", "tape_write", "writing", "spooling"].includes(livePhase)
+      ? "Logical backup pipeline"
+      : ["full_readback", "tape_read", "tape_readback", "verifying"].includes(livePhase)
+        ? "Logical verify pipeline"
+        : livePhase === "restore" ? "Logical restore pipeline" : "Logical data pipeline";
+    const rate = (value, available) => {
+      if (available === false) return "Unavailable";
+      if (value === null || value === undefined || value === "") return "Measuring…";
+      const numeric = Number(value);
+      return Number.isFinite(numeric) && numeric >= 0 ? bytes(numeric) + "/s" : "Unavailable";
+    };
+    const pipelineRate = pick(liveIo, "pipeline_bytes_per_second");
+    const tapeWriteRate = pick(liveIo, "tape_write_bytes_per_second");
+    const tapeReadRate = pick(liveIo, "tape_read_bytes_per_second");
+    const basis = [
+      pipelineBasis ? "Logical progress: " + human(pipelineBasis) : null,
+      tapeBasis ? "Physical tape I/O: " + human(tapeBasis) : tapeCountersAvailable === false ? "Physical tape counters unavailable on this host or drive" : "Physical tape counters measuring"
+    ].filter(Boolean).join(" · ");
+    return '<section class="backup-live-io" role="status"><div class="backup-live-io-head"><div><span>Live transfer</span><h3>' + esc(backupLivePhaseLabel(livePhase)) + '</h3></div><strong>Updated ' + esc(date(sampledAt)) + '</strong></div><div class="backup-live-rate-grid"><div><span>' + esc(pipelineLabel) + '</span><strong>' + esc(rate(pipelineRate, true)) + '</strong></div><div><span>Tape write</span><strong>' + esc(rate(tapeWriteRate, tapeWriteAvailable)) + '</strong></div><div><span>Tape read</span><strong>' + esc(rate(tapeReadRate, tapeReadAvailable)) + '</strong></div></div><p>' + esc(windowLabel + " · " + basis) + "</p></section>";
+  }
+
   function renderBackupSpoolingCue(run) {
     if (backupRunState(run) !== "writing") return "";
     const spooling = backupEvidenceValue(run, "data_spooling");
@@ -861,7 +947,7 @@
       ["Source entries", backupEvidenceValue(run, "source_entry_count", "entry_count", "file_count")],
       ["Logical bytes", logical == null ? null : bytes(logical)],
       ["Encoded bytes", encoded == null ? null : bytes(encoded)],
-      ["Throughput", throughput == null ? null : bytes(throughput) + "/s"],
+      ["Recorded average", throughput == null ? null : bytes(throughput) + "/s"],
       ["Source manifest", backupEvidenceValue(run, "source_manifest_sha256", "source_manifest_digest", "manifest_sha256")],
       ["Bacula JobId", backupEvidenceValue(run, "backup_job_id", "engine_job_id", "bacula_job_id", "engine_operation_id")],
       ["Compression", backupCompressionLabel(run)],
@@ -973,7 +1059,7 @@
     const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="retry-backup-run" data-id="' + esc(id) + '">Retry</button></div>' : "";
     const measuredProgress = progress == null ? "" : '<div class="progress backup-progress"><div class="progress-track"><div class="progress-value" style="width:' + progress + '%"></div></div><div class="progress-meta"><span>Measured progress</span><span>' + progress + "%</span></div></div>";
     const technical = '<details class="backup-technical"><summary><span><strong>Technical details</strong><small>Request identity, engine evidence, and complete activity history</small></span></summary><div class="backup-technical-body"><dl class="vault-facts"><dt>Request ID</dt><dd class="mono">' + esc(id) + '</dd><dt>Created</dt><dd>' + esc(date(pick(run, "created_at", "started_at"))) + '</dd><dt>Raw state</dt><dd>' + esc(runState) + '</dd>' + (backupFailureDetail(run) ? '<dt>Recorded failure</dt><dd>' + esc(backupFailureDetail(run)) + "</dd>" : "") + '</dl><section class="backup-detail-section"><div class="backup-section-head"><div><span>Engine evidence</span><h3>Recorded facts</h3></div></div>' + renderBackupEvidence(run) + '</section><section class="backup-detail-section"><div class="backup-section-head"><div><span>Complete history</span><h3>Activity</h3></div></div>' + renderBackupTimeline(run) + "</section>" + renderBackupArtifacts(run) + "</div></details>";
-    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>Started ' + esc(date(pick(run, "created_at", "started_at"))) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header>' + renderBackupPhaseTrack(run) + '<div class="backup-run-actions">' + cancel + '<button class="button button-quiet button-small" type="button" data-action="refresh">Refresh status</button></div><div class="panel-body">' + detailFailure + notice + renderBackupSpoolingCue(run) + measuredProgress + '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>Backup result</h3></div></div>' + renderBackupOutcome(run) + "</section>" + technical + "</div></article>";
+    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>Started ' + esc(date(pick(run, "created_at", "started_at"))) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header>' + renderBackupPhaseTrack(run) + '<div class="backup-run-actions">' + cancel + '<button class="button button-quiet button-small" type="button" data-action="refresh">Refresh status</button></div><div class="panel-body">' + detailFailure + notice + renderBackupSpoolingCue(run) + renderBackupLiveThroughput(run) + measuredProgress + '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>Backup result</h3></div></div>' + renderBackupOutcome(run) + "</section>" + technical + "</div></article>";
   }
 
   function renderJobs() {
@@ -2181,7 +2267,8 @@
     if (["passed", "verified", "completed", "complete"].includes(runState)) outcome = '<div class="notice success"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Restore run passed</strong><span>Bacula restored ' + (selectedScope ? "the planned selected content" : "the complete retained recovery point") + ' from physical tape and TapeScale independently matched the restored manifest evidence.</span></div></div>';
     if (["failed", "blocked", "interrupted", "cancelled", "canceled"].includes(runState)) outcome = '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Restore run ' + esc(runState) + '</strong><span>' + esc(resultDetail || "Inspect the durable activity below for the terminal evidence.") + "</span></div></div>";
     const cancel = active ? '<button class="button button-danger button-small" type="button" data-action="open-cancel-restore-rehearsal" data-id="' + esc(id) + '">Request safe cancel</button>' : "";
-    return '<article class="restore-rehearsal-run"><header><div><span class="vault-kicker">Attended ' + (multiVolume ? "multi-tape" : "single-tape") + " · " + (selectedScope ? "selected-path" : "complete-point") + ' restore</span><h4>Restore run</h4><code>' + esc(id) + '</code></div><div class="restore-rehearsal-actions">' + status(runState) + '<button class="button button-quiet button-small" type="button" data-action="download-restore-rehearsal-evidence" data-id="' + esc(id) + '">Download restore evidence</button>' + cancel + '</div></header>' + renderRestoreRehearsalTrack(rehearsal) + '<div class="restore-rehearsal-body">' + (error ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not refresh run evidence</strong><span>' + esc(errorMessage(error)) + '</span></div></div>' : "") + outcome + renderRestoreVolumeSequence(rehearsal) + '<dl class="restore-result-facts">' + facts.map(([name, value]) => '<dt>' + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-rehearsal-evidence-grid"><section><h5>Restore activity</h5>' + renderRestoreRehearsalTimeline(rehearsal) + '</section><section><h5>Restore evidence</h5>' + renderRestoreRehearsalArtifacts(rehearsal) + "</section></div></div></article>";
+    const liveTransfer = renderBackupLiveThroughput({ state: waiting ? "waiting_for_media" : runState, result });
+    return '<article class="restore-rehearsal-run"><header><div><span class="vault-kicker">Attended ' + (multiVolume ? "multi-tape" : "single-tape") + " · " + (selectedScope ? "selected-path" : "complete-point") + ' restore</span><h4>Restore run</h4><code>' + esc(id) + '</code></div><div class="restore-rehearsal-actions">' + status(runState) + '<button class="button button-quiet button-small" type="button" data-action="download-restore-rehearsal-evidence" data-id="' + esc(id) + '">Download restore evidence</button>' + cancel + '</div></header>' + renderRestoreRehearsalTrack(rehearsal) + '<div class="restore-rehearsal-body">' + (error ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not refresh run evidence</strong><span>' + esc(errorMessage(error)) + '</span></div></div>' : "") + outcome + liveTransfer + renderRestoreVolumeSequence(rehearsal) + '<dl class="restore-result-facts">' + facts.map(([name, value]) => '<dt>' + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-rehearsal-evidence-grid"><section><h5>Restore activity</h5>' + renderRestoreRehearsalTimeline(rehearsal) + '</section><section><h5>Restore evidence</h5>' + renderRestoreRehearsalArtifacts(rehearsal) + "</section></div></div></article>";
   }
 
   function renderRestoreRehearsals(pointId) {
@@ -2553,7 +2640,7 @@
     }
     const progress = Number.isFinite(progressValue) && progressValue >= 0 && progressValue <= 100 ? '<div class="progress recovery-progress"><div class="progress-track"><div class="progress-value" style="width:' + progressValue + '%"></div></div><div class="progress-meta"><span>Reported progress</span><span>' + progressValue + "%</span></div></div>" : "";
     const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="refresh">Retry</button></div>' : "";
-    return '<section class="panel recovery-exercise-panel section"><div class="recovery-exercise-head"><div><span class="lab-badge">G0.2 · full · single tape · no encryption</span><h2>' + esc(profileName) + '</h2><p>Run ' + esc(recordId(exercise)) + " · " + esc(date(pick(exercise, "started_at", "created_at"))) + '</p></div>' + status(stateValue) + "</div>" + renderRecoveryPhaseTrack(exercise) + '<div class="panel-body recovery-exercise-body">' + detailFailure + outcome + progress + '<section class="recovery-evidence"><h3>' + (terminal ? "Retained result" : "Evidence so far") + "</h3>" + renderRecoveryEvidence(exercise) + "</section></div></section>" + renderRecoveryEvents(exercise);
+    return '<section class="panel recovery-exercise-panel section"><div class="recovery-exercise-head"><div><span class="lab-badge">G0.2 · full · single tape · no encryption</span><h2>' + esc(profileName) + '</h2><p>Run ' + esc(recordId(exercise)) + " · " + esc(date(pick(exercise, "started_at", "created_at"))) + '</p></div>' + status(stateValue) + "</div>" + renderRecoveryPhaseTrack(exercise) + '<div class="panel-body recovery-exercise-body">' + detailFailure + outcome + renderBackupLiveThroughput({ state: stateValue, result: objectValue(exercise, "result") }) + progress + '<section class="recovery-evidence"><h3>' + (terminal ? "Retained result" : "Evidence so far") + "</h3>" + renderRecoveryEvidence(exercise) + "</section></div></section>" + renderRecoveryEvents(exercise);
   }
 
   function renderRecoveryLab() {

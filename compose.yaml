@@ -4,9 +4,9 @@ x-tapescale-common: &tapescale-common
   build:
     context: .
     args:
-      TAPESCALE_VERSION: ${TAPESCALE_VERSION:-0.1.0-alpha.6}
+      TAPESCALE_VERSION: ${TAPESCALE_VERSION:-0.1.0-alpha.7}
       TAPESCALE_REVISION: ${TAPESCALE_REVISION:-development}
-  image: tapescale:${TAPESCALE_VERSION:-0.1.0-alpha.6}
+  image: tapescale:${TAPESCALE_VERSION:-0.1.0-alpha.7}
   restart: unless-stopped
   read_only: true
   cap_drop: [ALL]
