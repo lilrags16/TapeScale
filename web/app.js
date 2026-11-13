@@ -6,6 +6,8 @@
     system: "/system",
     overview: "/overview",
     jobs: "/jobs",
+    backupProfiles: "/backup-profiles",
+    backupRuns: "/backup-runs",
     media: "/media",
     mediaPools: "/media-pools",
     drives: "/drives",
@@ -32,6 +34,16 @@
     { name: "Proven", detail: "Retain recovery evidence", aliases: ["passed", "verified", "completed", "complete"] }
   ];
   const RECOVERY_TERMINAL_STATES = new Set(["passed", "verified", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
+  const BACKUP_PHASES = [
+    { name: "Queued", detail: "Durable request accepted", aliases: ["queued"] },
+    { name: "Media", detail: "Bind exact drive and tape", aliases: ["waiting_for_media", "media_assigned", "preparing"] },
+    { name: "Inventory", detail: "Hash the read-only source", aliases: ["inventorying", "manifesting", "source_manifest"] },
+    { name: "Write", detail: "Stream the full backup", aliases: ["writing", "media_write_started", "engine_dispatched"] },
+    { name: "Finalize", detail: "Close and catalog the tape", aliases: ["written", "finalizing"] },
+    { name: "Verify", detail: "Read back physical media", aliases: ["verifying", "reading", "readback"] },
+    { name: "Protected", detail: "Retain recovery evidence", aliases: ["verified", "passed", "completed", "complete"] }
+  ];
+  const BACKUP_TERMINAL_STATES = new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
   const state = {
     route: "overview",
     loading: true,
@@ -41,6 +53,9 @@
       system: null,
       overview: { summary: { protected_sources: 0, active_jobs: 0, required_actions: 0 }, sources: [], actions: [], actions_total: 0, actions_returned: 0, actions_truncated: false },
       jobs: [],
+      backupProfiles: [],
+      backupRuns: [],
+      backupRunDetails: {},
       media: [],
       mediaPools: [],
       mediaDetails: {},
@@ -68,6 +83,11 @@
     qualificationPollTimer: null,
     recoveryExercisePollTimer: null,
     restoreRehearsalPollTimer: null,
+    backupRunPollTimer: null,
+    selectedBackupRunId: null,
+    backupRunDetailLoading: new Set(),
+    backupQuery: "",
+    backupStateFilter: "all",
     selectedRecoveryExerciseId: null,
     selectedRecoveryPointId: null,
     selectedRestoreRehearsalId: null,
@@ -132,7 +152,7 @@
   }
 
   function human(value) {
-    return String(value).replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+    return String(value).replace(/([a-z0-9])([A-Z])/g, "$1 $2").replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
   }
 
   function date(value) {
@@ -181,6 +201,8 @@
       });
     }
     if (key === "jobs") return list(payload, "jobs");
+    if (key === "backupProfiles") return list(payload, "profiles");
+    if (key === "backupRuns") return list(payload, "runs");
     if (key === "media") return list(payload, "media");
     if (key === "mediaPools") {
       const pools = list(payload, "pools");
@@ -278,6 +300,10 @@
       const media = selectedMedia();
       if (media && recordId(media)) await loadMediaDetail(recordId(media), !initial);
     }
+    if (state.route === "jobs") {
+      const run = selectedBackupRun();
+      if (run && recordId(run)) await loadBackupRunDetail(recordId(run), !initial);
+    }
     state.loading = false;
     state.refreshing = false;
     updateChrome();
@@ -285,6 +311,7 @@
     scheduleQualificationPoll();
     scheduleRecoveryExercisePoll();
     scheduleRestoreRehearsalPoll();
+    scheduleBackupRunPoll();
   }
 
   function setBadge(id, value) {
@@ -318,7 +345,7 @@
     const preflightState = String(pick(checks, "status") || "").toLowerCase();
     if (preflightDot) preflightDot.className = "health-dot" + (/fail|block|error/.test(preflightState) ? " failed" : /warn|attention|pending/.test(preflightState) ? " warning" : "");
     const summary = state.data.overview.summary || {};
-    setBadge("#nav-job-count", state.data.jobs.length);
+    setBadge("#nav-job-count", state.data.backupRuns.filter(backupRunActive).length);
     setBadge("#nav-move-count", state.data.movements.filter((movement) => !movementTerminal(movement)).length);
     setBadge("#nav-recovery-count", state.data.recoveryExercises.filter(recoveryExerciseActive).length);
     const actionCount = Math.max(count(pick(summary, "required_actions")), state.data.overview.actions.length);
@@ -405,15 +432,321 @@
     return html + "</div></section></div>";
   }
 
-  function renderJobs() {
-    const jobs = state.data.jobs;
-    let html = pageHead("Jobs", "Protection jobs returned by TapeScale.", refreshButton()) + noticeFor("jobs");
-    if (!jobs.length) return html + empty("No jobs", state.errors.jobs ? "Jobs could not be loaded." : "No protection jobs have been configured.");
-    const rows = jobs.map((job) => {
-      const id = recordId(job);
-      return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="jobs" data-id="' + esc(id) + '"><td class="primary-cell"><strong>' + esc(label(pick(job, "external_id", "name", "label", "job_id"))) + '</strong><small>' + esc(label(pick(job, "kind", "job_id"))) + "</small></td>" + cell(pick(job, "dataset_name", "source", "dataset", "path")) + "<td>" + status(pick(job, "state", "status")) + "</td>" + cell(pick(job, "policy_name", "schedule")) + cell(date(pick(job, "started_at", "finished_at", "job_created_at", "last_run", "updated_at"))) + "</tr>";
+  function backupRunState(run) {
+    return String(pick(run, "state", "status") || "queued").toLowerCase();
+  }
+
+  function backupRunActive(run) {
+    return !BACKUP_TERMINAL_STATES.has(backupRunState(run));
+  }
+
+  function backupRunRouteId() {
+    const parts = location.hash.slice(1).split("/");
+    if (parts[0] !== "jobs" || !parts[1]) return null;
+    try {
+      return decodeURIComponent(parts.slice(1).join("/"));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function backupRunRecord(run) {
+    if (!run) return null;
+    const detail = state.data.backupRunDetails[recordId(run)];
+    const detailedRun = detail && (detail.run || detail.backup_run || detail.request || (recordId(detail) === recordId(run) ? detail : null));
+    return detailedRun && typeof detailedRun === "object" ? Object.assign({}, detailedRun, run) : run;
+  }
+
+  function orderedBackupRuns() {
+    return state.data.backupRuns.map(backupRunRecord).sort((left, right) => {
+      const timeDifference = new Date(pick(right, "created_at", "started_at") || 0) - new Date(pick(left, "created_at", "started_at") || 0);
+      return timeDifference || recordId(right).localeCompare(recordId(left));
     });
-    return html + table(["Job", "Source", "Status", "Schedule", "Last activity"], rows);
+  }
+
+  function selectedBackupRun() {
+    const runs = orderedBackupRuns();
+    const requested = backupRunRouteId() || state.selectedBackupRunId;
+    const selected = requested && runs.find((run) => recordId(run) === requested);
+    const run = selected || runs.find(backupRunActive) || runs[0] || null;
+    if (run) state.selectedBackupRunId = recordId(run);
+    return run;
+  }
+
+  async function loadBackupRunDetail(id, force) {
+    if (!id || state.backupRunDetailLoading.has(id) || (!force && state.data.backupRunDetails[id])) return;
+    const errorKey = "backupRun:" + id;
+    state.backupRunDetailLoading.add(id);
+    delete state.errors[errorKey];
+    try {
+      const detail = await request(endpoints.backupRuns + "/" + encodeURIComponent(id));
+      state.data.backupRunDetails[id] = detail && typeof detail === "object" ? detail : {};
+      const detailedRun = detail && (detail.run || detail.backup_run || detail.request || (recordId(detail) === id ? detail : null));
+      if (detailedRun) rememberBackupRun(detailedRun);
+      delete state.errors[errorKey];
+    } catch (error) {
+      state.errors[errorKey] = error;
+    } finally {
+      state.backupRunDetailLoading.delete(id);
+    }
+    if (state.route === "jobs" && recordId(selectedBackupRun()) === id) render();
+  }
+
+  async function selectBackupRun(id) {
+    if (!id) return;
+    state.selectedBackupRunId = id;
+    const target = "#jobs/" + encodeURIComponent(id);
+    if (location.hash !== target) location.hash = target;
+    else render();
+    await loadBackupRunDetail(id);
+  }
+
+  function rememberBackupProfile(profile) {
+    if (!profile || typeof profile !== "object" || !recordId(profile)) return;
+    state.data.backupProfiles = [profile].concat(state.data.backupProfiles.filter((item) => recordId(item) !== recordId(profile)));
+    state.received.add("backupProfiles");
+    delete state.errors.backupProfiles;
+  }
+
+  function rememberBackupRun(run) {
+    if (!run || typeof run !== "object" || !recordId(run)) return;
+    state.data.backupRuns = [run].concat(state.data.backupRuns.filter((item) => recordId(item) !== recordId(run)));
+    state.received.add("backupRuns");
+    delete state.errors.backupRuns;
+  }
+
+  function backupProfileForRun(run) {
+    const id = String(pick(run, "profile_id", "backup_profile_id") || "");
+    return state.data.backupProfiles.find((profile) => recordId(profile) === id) || null;
+  }
+
+  function backupProfileName(profile) {
+    return String(pick(profile, "name", "profile_name") || "Unnamed backup plan");
+  }
+
+  function backupRunProfileName(run) {
+    return String(pick(run, "profile_name", "name") || (backupProfileForRun(run) && backupProfileName(backupProfileForRun(run))) || "Backup run");
+  }
+
+  function backupRunDetail(run) {
+    return run ? state.data.backupRunDetails[recordId(run)] || null : null;
+  }
+
+  function backupRunEvents(run) {
+    const detail = backupRunDetail(run);
+    return detail ? list(detail, "events") : [];
+  }
+
+  function backupRunArtifacts(run) {
+    const detail = backupRunDetail(run);
+    return detail ? list(detail, "artifacts") : [];
+  }
+
+  function backupEvidenceValue(run, ...keys) {
+    const result = objectValue(run, "result");
+    const resultEvidence = objectValue(result, "evidence");
+    const sources = [run, result, resultEvidence];
+    for (const source of sources) {
+      const value = pick(source, ...keys);
+      if (value !== null) return value;
+    }
+    for (const event of backupRunEvents(run).slice().reverse()) {
+      const value = pick(objectValue(event, "evidence"), ...keys);
+      if (value !== null) return value;
+    }
+    for (const artifact of backupRunArtifacts(run).slice().reverse()) {
+      const value = pick(objectValue(artifact, "metadata"), ...keys) || pick(artifact, ...keys);
+      if (value !== null) return value;
+    }
+    return null;
+  }
+
+  function backupPhaseIndex(run) {
+    const runState = backupRunState(run);
+    if (["verified", "passed", "completed", "complete"].includes(runState)) return BACKUP_PHASES.length - 1;
+    const explicit = Number(backupEvidenceValue(run, "phase_index"));
+    if (Number.isInteger(explicit) && explicit >= 0 && explicit < BACKUP_PHASES.length) return explicit;
+    const evidencePhase = String(backupEvidenceValue(run, "phase", "event_type") || runState).toLowerCase();
+    const fromEvidence = BACKUP_PHASES.findIndex((phase) => phase.aliases.includes(evidencePhase));
+    if (fromEvidence >= 0) return fromEvidence;
+    const events = backupRunEvents(run).slice().reverse();
+    for (const event of events) {
+      const eventName = String(pick(event, "event_type", "to_state", "phase") || "").toLowerCase();
+      const eventIndex = BACKUP_PHASES.findIndex((phase) => phase.aliases.includes(eventName));
+      if (eventIndex >= 0) return eventIndex;
+    }
+    return 0;
+  }
+
+  function renderBackupPhaseTrack(run) {
+    const current = backupPhaseIndex(run);
+    const completed = ["verified", "passed", "completed", "complete"].includes(backupRunState(run));
+    const failed = BACKUP_TERMINAL_STATES.has(backupRunState(run)) && !completed;
+    return '<div class="phase-track backup-phase-track" aria-label="Backup phases">' + BACKUP_PHASES.map((phase, index) => {
+      const phaseClass = completed || index < current ? " done" : index === current ? failed ? " failed" : " current" : "";
+      const marker = completed || index < current ? "✓" : index + 1;
+      return '<div class="phase' + phaseClass + '"' + (index === current && !completed ? ' aria-current="step"' : "") + '><span class="phase-marker">' + esc(marker) + '</span><strong>' + esc(phase.name) + '</strong><small>' + esc(phase.detail) + "</small></div>";
+    }).join("") + "</div>";
+  }
+
+  function backupProgressPercent(run) {
+    const explicit = Number(backupEvidenceValue(run, "progress_percent", "percent_complete"));
+    if (Number.isFinite(explicit) && explicit >= 0 && explicit <= 100) return explicit;
+    if (["verified", "passed", "completed", "complete"].includes(backupRunState(run))) return 100;
+    return Math.round((backupPhaseIndex(run) / (BACKUP_PHASES.length - 1)) * 100);
+  }
+
+  function backupFailureDetail(run) {
+    const failure = pick(run, "failure_detail", "failure_class", "detail", "message") || backupEvidenceValue(run, "failure_detail", "detail", "message", "reason");
+    return failure && typeof failure === "object" ? JSON.stringify(failure) : failure ? String(failure) : null;
+  }
+
+  function backupRunMatches(run) {
+    const runState = backupRunState(run);
+    if (state.backupStateFilter !== "all" && runState !== state.backupStateFilter) return false;
+    const query = state.backupQuery.trim().toLowerCase();
+    if (!query) return true;
+    return [
+      recordId(run), backupRunProfileName(run), pick(run, "source_subpath", "source_path", "logical_root"),
+      pick(run, "expected_cartridge_label", "cartridge_label"), pick(run, "expected_stable_id", "drive_stable_id"),
+      runState, pick(run, "recovery_point_id")
+    ].filter(Boolean).join(" ").toLowerCase().includes(query);
+  }
+
+  function applyBackupFilters() {
+    const tableBody = document.querySelector("#backup-run-rows");
+    if (!tableBody) return;
+    let visible = 0;
+    tableBody.querySelectorAll("tr[data-backup-run]").forEach((row) => {
+      const queryMatches = !state.backupQuery.trim() || String(row.dataset.search || "").includes(state.backupQuery.trim().toLowerCase());
+      const stateMatches = state.backupStateFilter === "all" || row.dataset.state === state.backupStateFilter;
+      row.hidden = !(queryMatches && stateMatches);
+      if (!row.hidden) visible += 1;
+    });
+    const countNode = document.querySelector("#backup-filter-count");
+    if (countNode) countNode.textContent = visible + " of " + state.data.backupRuns.length + " runs";
+    const emptyNode = document.querySelector("#backup-filter-empty");
+    if (emptyNode) emptyNode.hidden = visible !== 0;
+  }
+
+  function renderBackupProfiles() {
+    const profiles = state.data.backupProfiles;
+    const cards = profiles.map((profile) => {
+      const id = recordId(profile);
+      const latest = orderedBackupRuns().find((run) => String(pick(run, "profile_id", "backup_profile_id") || "") === id);
+      const source = pick(profile, "source_subpath", "source_path", "logical_root") || "Source not reported";
+      const schedule = pick(profile, "schedule_enabled") === true ? "Saturday 02:00 · " + label(pick(profile, "schedule_timezone")) : "Manual only";
+      const retention = count(pick(profile, "retention_days")) || 28;
+      const pool = pick(profile, "media_pool_name") || "any eligible scratch pool";
+      return '<article class="backup-profile-card"><div class="backup-profile-mark" aria-hidden="true">B</div><div class="backup-profile-copy"><span><strong>' + esc(backupProfileName(profile)) + '</strong>' + status(human(pick(profile, "enabled") === false ? "disabled" : "ready")) + '</span><code>' + esc(source) + '</code><small>Full · full readback · ' + retention + " days · " + esc(pool) + " · " + esc(schedule) + '</small></div><div class="backup-profile-actions"><span>' + (latest ? esc(human(backupRunState(latest))) + " · " + esc(date(pick(latest, "created_at", "started_at"))) : "Never run") + '</span><button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(id) + '"' + (pick(profile, "enabled") === false ? " disabled" : "") + '>Run now</button></div></article>';
+    }).join("");
+    return '<section class="panel backup-profiles"><div class="panel-head"><div><h2>Backup plans</h2><p>Approved source scope and repeatable full-backup intent.</p></div><button class="button button-small" type="button" data-action="create-backup-profile">Create plan</button></div><div class="backup-profile-list">' + (cards || '<div class="media-inline-empty">No backup plans yet. Create one for an explicit path inside the mounted source root.</div>') + "</div></section>";
+  }
+
+  function renderBackupRunTable(runs) {
+    const rows = runs.map((run) => {
+      const id = recordId(run);
+      const source = pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root");
+      const tape = pick(run, "expected_cartridge_label", "cartridge_label") || (backupRunState(run) === "waiting_for_media" ? "Assignment required" : "Not assigned");
+      const logical = backupEvidenceValue(run, "logical_bytes", "source_bytes");
+      const searchable = [id, backupRunProfileName(run), source, tape, backupRunState(run)].filter(Boolean).join(" ").toLowerCase();
+      return '<tr class="row-action" tabindex="0" data-action="select-backup-run" data-backup-run data-id="' + esc(id) + '" data-state="' + esc(backupRunState(run)) + '" data-search="' + esc(searchable) + '"' + (backupRunMatches(run) ? "" : " hidden") + '><td class="primary-cell" data-label="Run"><strong>' + esc(backupRunProfileName(run)) + '</strong><small class="mono">' + esc(id) + '</small></td><td data-label="Source">' + esc(label(source)) + '</td><td data-label="Level">Full</td><td data-label="Status">' + status(human(backupRunState(run))) + '<small class="backup-table-progress">' + backupProgressPercent(run) + '%</small></td><td data-label="Tape">' + esc(tape) + '</td><td data-label="Logical">' + esc(logical == null ? "Pending" : bytes(logical)) + '</td><td data-label="Activity">' + esc(date(pick(run, "finished_at", "started_at", "created_at"))) + "</td></tr>";
+    }).join("");
+    const filterOptions = ["queued", "waiting_for_media", "preparing", "inventorying", "writing", "written", "verifying", "verified", "failed", "blocked", "interrupted", "cancelled"].map((value) => '<option value="' + value + '"' + (state.backupStateFilter === value ? " selected" : "") + '>' + esc(human(value)) + "</option>").join("");
+    const visible = runs.filter(backupRunMatches).length;
+    return '<section class="panel backup-run-table">' +
+      '<div class="table-toolbar"><div class="toolbar-start">' +
+      '<label class="search-field"><span class="sr-only">Search backup runs</span><input id="backup-search" type="search" placeholder="Search plan, source, tape, or run" value="' + esc(state.backupQuery) + '"></label>' +
+      '<select class="select compact" id="backup-state-filter" aria-label="Filter backup runs by state"><option value="all">All states</option>' + filterOptions + "</select>" +
+      '</div><div class="toolbar-end"><span id="backup-filter-count">' + visible + " of " + runs.length + " runs</span></div></div>" +
+      '<div class="table-scroll"><table class="data-table responsive-table"><thead><tr><th>Run</th><th>Source</th><th>Level</th><th>Status</th><th>Tape</th><th>Logical</th><th>Activity</th></tr></thead><tbody id="backup-run-rows">' + rows + "</tbody></table>" +
+      '<div class="media-filter-empty" id="backup-filter-empty"' + (visible ? " hidden" : "") + ">No runs match the current filters.</div></div></section>";
+  }
+
+  function renderBackupEvidence(run) {
+    const logical = backupEvidenceValue(run, "logical_bytes", "source_bytes");
+    const encoded = backupEvidenceValue(run, "encoded_bytes", "media_bytes", "bytes_written");
+    const throughput = backupEvidenceValue(run, "throughput_bytes_per_second", "bytes_per_second");
+    const values = [
+      ["Source entries", backupEvidenceValue(run, "source_entry_count", "entry_count", "file_count")],
+      ["Logical bytes", logical == null ? null : bytes(logical)],
+      ["Encoded bytes", encoded == null ? null : bytes(encoded)],
+      ["Throughput", throughput == null ? null : bytes(throughput) + "/s"],
+      ["Source manifest", backupEvidenceValue(run, "source_manifest_sha256", "source_manifest_digest", "manifest_sha256")],
+      ["Bacula JobId", backupEvidenceValue(run, "backup_job_id", "engine_job_id", "bacula_job_id", "engine_operation_id")],
+      ["Volume", backupEvidenceValue(run, "engine_volume_name", "volume_name", "expected_cartridge_label") || pick(run, "expected_cartridge_label")],
+      ["Recovery point", backupEvidenceValue(run, "recovery_point_id") || pick(run, "recovery_point_id")]
+    ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "");
+    if (!values.length) return '<p class="recovery-evidence-pending">Evidence will appear as the source inventory, tape write, and readback complete.</p>';
+    return '<div class="backup-evidence-grid">' + values.map(([name, value]) => '<div><span>' + esc(name) + '</span><strong' + (/manifest/i.test(name) ? ' class="digest-value"' : "") + '>' + esc(value) + "</strong></div>").join("") + "</div>";
+  }
+
+  function renderBackupTimeline(run) {
+    const events = backupRunEvents(run);
+    if (!events.length) return '<div class="media-inline-empty">No append-only activity has been returned yet.</div>';
+    return '<ol class="timeline backup-timeline">' + events.map((event) => {
+      const evidence = objectValue(event, "evidence");
+      const detail = pick(evidence, "detail", "message", "reason", "cartridge_label") || pick(event, "reason", "detail") || "Evidence recorded";
+      return '<li class="timeline-item"><time class="timeline-time">' + esc(date(pick(event, "occurred_at", "created_at"))) + '</time><span class="timeline-marker" aria-hidden="true"></span><div class="timeline-copy"><strong>' + esc(human(pick(event, "event_type", "to_state", "phase") || "event")) + '</strong><span>' + esc(detail) + "</span></div></li>";
+    }).join("") + "</ol>";
+  }
+
+  function renderBackupArtifacts(run) {
+    const artifacts = backupRunArtifacts(run);
+    if (!artifacts.length) return "";
+    return '<section class="backup-detail-section"><div class="backup-section-head"><div><span>Retained evidence</span><h3>Artifacts</h3></div></div><ul class="detail-list recovery-artifact-list">' + artifacts.map((artifact) => {
+      const digest = pick(artifact, "sha256", "digest_sha256", "digest");
+      const size = pick(artifact, "size_bytes");
+      return '<li><span><strong>' + esc(human(pick(artifact, "artifact_kind", "kind") || "artifact")) + '</strong><small>' + esc(size == null ? label(pick(artifact, "storage_ref", "path")) : bytes(size)) + '</small></span><strong class="digest-value">' + esc(label(digest)) + "</strong></li>";
+    }).join("") + "</ul></section>";
+  }
+
+  function renderBackupRunDetail(run) {
+    if (!run) return '<section class="panel backup-run-detail backup-run-detail-empty"><span aria-hidden="true">▶</span><h2>No backup run selected</h2><p>Create a plan and start a full backup to begin the durable workflow.</p></section>';
+    const id = recordId(run);
+    const runState = backupRunState(run);
+    const progress = backupProgressPercent(run);
+    const detailError = state.errors["backupRun:" + id];
+    const waiting = runState === "waiting_for_media";
+    const allowedActions = objectValue(run, "allowed_actions");
+    const canAssign = waiting && pick(allowedActions, "assign_media") !== false;
+    const canCancel = backupRunActive(run) && pick(allowedActions, "cancel") !== false;
+    const successful = ["verified", "passed", "completed", "complete"].includes(runState);
+    const failed = BACKUP_TERMINAL_STATES.has(runState) && !successful && !["cancelled", "canceled"].includes(runState);
+    const failure = backupFailureDetail(run);
+    const recoveryPointId = String(backupEvidenceValue(run, "recovery_point_id") || pick(run, "recovery_point_id") || "");
+    let notice = "";
+    if (waiting) notice = '<div class="notice warning backup-run-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Physical media assignment required</strong><span>Select the exact trusted drive and eligible scratch cartridge. Nothing has been written yet.</span></div>' + (canAssign ? '<button class="button button-primary" type="button" data-action="assign-backup-media" data-id="' + esc(id) + '">Assign media</button>' : "") + "</div>";
+    else if (successful) notice = '<div class="notice success backup-run-notice"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Full backup verified</strong><span>The physical write, full readback, catalog relationship, and retained recovery evidence completed.</span></div>' + (recoveryPointId ? '<button class="button button-small" type="button" data-action="select-recovery-point" data-id="' + esc(recoveryPointId) + '">Open recovery point</button>' : "") + "</div>";
+    else if (failed) notice = '<div class="notice danger backup-run-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Backup ' + esc(human(runState)) + '</strong><span>' + esc(failure || "Review the durable timeline for the exact failed phase and retained evidence.") + "</span></div></div>";
+    else if (["cancelled", "canceled"].includes(runState)) notice = '<div class="notice warning backup-run-notice"><span class="notice-icon" aria-hidden="true">×</span><div class="notice-copy"><strong>Backup cancelled</strong><span>' + esc(failure || "The attempt did not establish a recovery point. Previously valid backups remain unchanged.") + "</span></div></div>";
+    else notice = '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>' + esc(human(runState)) + '</strong><span>' + esc(failure || "Keep the worker, read-only source snapshot, drive, and assigned cartridge available.") + "</span></div></div>";
+    const cancel = canCancel ? '<button class="button button-danger button-small" type="button" data-action="cancel-backup-run" data-id="' + esc(id) + '">Cancel run</button>' : "";
+    const assignment = pick(run, "expected_cartridge_label", "cartridge_label")
+      ? '<span><strong>' + esc(label(pick(run, "expected_cartridge_label", "cartridge_label"))) + '</strong><small>' + esc(label(pick(run, "expected_stable_id", "drive_stable_id"))) + "</small></span>"
+      : '<span><strong>Not assigned</strong><small>Waiting for exact media authority</small></span>';
+    const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="retry-backup-run" data-id="' + esc(id) + '">Retry</button></div>' : "";
+    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="lab-badge">Full · file · single volume · unencrypted</span>' + status(human(runState)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>Run <span class="mono">' + esc(id) + "</span> · " + esc(date(pick(run, "created_at", "started_at"))) + '</p></div><div class="job-summary"><div><span>Source</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Media</span>' + assignment + '</div><div><span>Level</span><strong>Full</strong></div><div><span>Verification</span><strong>Full readback</strong></div></div></header>' + renderBackupPhaseTrack(run) + '<div class="backup-run-actions">' + cancel + '<button class="button button-quiet button-small" type="button" data-action="refresh">Refresh</button></div><div class="panel-body">' + detailFailure + notice + '<div class="progress backup-progress"><div class="progress-track"><div class="progress-value" style="width:' + progress + '%"></div></div><div class="progress-meta"><span>Durable phase progress</span><span>' + progress + '%</span></div></div><section class="backup-detail-section"><div class="backup-section-head"><div><span>Run evidence</span><h3>Protection facts</h3></div></div>' + renderBackupEvidence(run) + '</section><section class="backup-detail-section"><div class="backup-section-head"><div><span>Append-only history</span><h3>Activity</h3></div></div>' + renderBackupTimeline(run) + "</section>" + renderBackupArtifacts(run) + "</div></article>";
+  }
+
+  function renderJobs() {
+    const profiles = state.data.backupProfiles;
+    const runs = orderedBackupRuns();
+    const selected = selectedBackupRun();
+    const active = runs.filter(backupRunActive).length;
+    const waiting = runs.filter((run) => backupRunState(run) === "waiting_for_media").length;
+    const failed = runs.filter((run) => ["failed", "blocked", "interrupted"].includes(backupRunState(run))).length;
+    const latestVerified = runs.find((run) => ["verified", "passed", "completed", "complete"].includes(backupRunState(run)));
+    const create = '<button class="button button-primary" type="button" data-action="create-backup-profile">Create backup plan</button>';
+    let html = pageHead("Backup Center", "Configure and operate durable, full single-tape backups from mounted read-only source snapshots.", refreshButton() + create);
+    html += noticeFor("backupProfiles") + noticeFor("backupRuns");
+    html += '<div class="notice warning backup-scope-notice"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Current operational boundary</strong><span>This build supports manual and weekly scheduled full, file-mode, single-volume, unencrypted backups from an operator-attested read-only source. Incrementals, spanning, native ZFS, and encryption remain blocked rather than simulated.</span></div></div>';
+    html += '<section class="panel metric-strip backup-metrics"><div class="metric"><span>Backup plans</span><strong>' + profiles.length + '</strong></div><div class="metric"><span>Active runs</span><strong>' + active + '</strong></div><div class="metric"><span>Waiting for media</span><strong>' + waiting + '</strong></div><div class="metric"><span>Latest verified</span><strong class="backup-metric-date">' + esc(latestVerified ? date(pick(latestVerified, "finished_at", "created_at")) : "None") + "</strong></div></section>";
+    html += renderBackupProfiles();
+    if (!runs.length) return html + empty("No backup runs", state.errors.backupRuns ? "Backup runs could not be loaded." : "Create a plan, then choose Run now to queue a durable backup request.", create);
+    html += '<section class="section"><div class="section-head"><div><h2>Run history</h2><p>Current work and every retained terminal attempt.</p></div><span class="status ' + (failed ? "failed" : active ? "running" : "ready") + '">' + (failed ? failed + " need review" : active ? active + " active" : "No active work") + "</span></div>" + renderBackupRunTable(runs) + "</section>";
+    html += '<section class="section">' + renderBackupRunDetail(selected) + "</section>";
+    return html;
   }
 
   function mediaName(item) {
@@ -1963,7 +2296,7 @@
       settings: renderSettings
     };
     main.innerHTML = renderers[state.route]();
-    document.title = human(state.route) + " · TapeScale";
+    document.title = (state.route === "jobs" ? "Backup Center" : human(state.route)) + " · TapeScale";
   }
 
   function findRecord(kind, id) {
@@ -2972,6 +3305,290 @@
     }, 3500);
   }
 
+  function backupDriveBlocker(drive) {
+    const health = objectValue(drive, "health");
+    if (drive.reconciled !== true) return "Trust the exact drive identity first.";
+    if (!pick(drive, "observed_path") || pick(drive, "observed_path") !== pick(drive, "expected_path")) return "The observed tape path does not match the trusted path.";
+    if (health.present !== true || health.accessible !== true) return "The configured tape device is not accessible.";
+    if (health.identity_verified !== true || health.identity_conflict === true) return "The stable SCSI identity is not safe.";
+    if (health.motion_position_uncertain === true || health.immediate_mode !== false || count(health.in_flight) !== 0) return "Tape I/O state must be reconciled before assignment.";
+    if (health.medium_loaded !== true || health.ready !== true) return "Load the designated cartridge and wait for the drive to report ready.";
+    return null;
+  }
+
+  function backupMediaBlocker(item, drive) {
+    if (item.worm === true) return "WORM media cannot be used by this overwrite workflow.";
+    if (count(pick(item, "active_holds", "hold_count")) > 0) return "The cartridge has an active hold.";
+    if (pick(item, "reserved_by")) return "The cartridge is reserved by another workflow.";
+    if (pick(item, "has_content") === true || mediaRecoveryPointCount(item) > 0) return "The cartridge contains retained protection and is not scratch media.";
+    if (["foreign", "mismatch"].includes(String(pick(item, "identity_status") || ""))) return "The cartridge identity is foreign or mismatched.";
+    if (["failed", "quarantined", "write_unverified"].includes(String(pick(item, "health_status") || ""))) return "The cartridge requires reconciliation or qualification.";
+    if (drive && !state.data.qualificationRuns.some((run) => recoveryQualificationMatches(run, drive, item))) return "This exact drive and cartridge have not passed current Bacula btape qualification.";
+    return null;
+  }
+
+  function openBackupProfile() {
+    const timezone = (() => {
+      try {
+        return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+      } catch (_) {
+        return "UTC";
+      }
+    })();
+    const poolOptions = ['<option value="">No fixed pool</option>'].concat(state.data.mediaPools.filter((pool) => pick(pool, "purpose") !== "cleaning").map((pool) => '<option value="' + esc(recordId(pool)) + '">' + esc(label(pick(pool, "name"))) + " · " + esc(human(pick(pool, "purpose") || "routine")) + "</option>"));
+    const body = '<form id="backup-profile-form"><div class="backup-boundary"><span aria-hidden="true">B</span><div><strong>Full single-tape protection plan</strong><p>The source is resolved beneath the configured read-only mount. Weekly dispatch can queue a durable media request; incrementals, spanning, native ZFS, and encryption remain blocked.</p></div></div><div class="form-grid"><div class="form-field full"><label for="backup-profile-name">Plan name</label><input class="input" id="backup-profile-name" name="name" maxlength="128" required placeholder="Sports archive full backup"></div><div class="form-field full"><label for="backup-source-subpath">Source subpath</label><input class="input input-mono" id="backup-source-subpath" name="source_subpath" maxlength="512" required placeholder="Archive/Brandon Sports"><small>Relative path inside the mounted source root. Absolute paths, parent traversal, and symlink escape are rejected by the API.</small></div><div class="form-field"><label for="backup-media-pool">Preferred media pool</label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div><div class="form-field"><label for="backup-retention-days">Retention days</label><input class="input" id="backup-retention-days" name="retention_days" type="number" min="1" max="36500" value="28" required></div><div class="form-field"><label for="backup-timezone">Site timezone</label><input class="input" id="backup-timezone" name="schedule_timezone" maxlength="128" value="' + esc(timezone) + '" required></div><div class="form-field"><label>Run level</label><input class="input" value="Full only" disabled></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="schedule_enabled"> Queue a full backup every Saturday at 02:00 in this timezone.</label><small>Scheduled runs wait durably for attended media assignment. They never select or overwrite tape automatically.</small></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="source_snapshot_attested_read_only" required> I attest this path resolves to an immutable, read-only snapshot for every run.</label></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="limitations_acknowledged" required> I understand this current gate is single-volume, unencrypted, and full-readback verified.</label></div><div class="form-field full"><label for="backup-profile-operator">Operator</label><input class="input" id="backup-profile-operator" name="requested_by_label" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="backup-profile-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Create backup plan</button></div></form>';
+    openModal("Create backup plan", body);
+    document.querySelector("#backup-profile-name").focus();
+  }
+
+  async function submitBackupProfile(form) {
+    const values = new FormData(form);
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#backup-profile-error");
+    submit.disabled = true;
+    submit.textContent = "Creating plan…";
+    errorBox.hidden = true;
+    try {
+      const response = await request(endpoints.backupProfiles, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: String(values.get("name") || "").trim(),
+          source_subpath: String(values.get("source_subpath") || "").trim(),
+          media_pool_id: String(values.get("media_pool_id") || "") || null,
+          schedule_timezone: String(values.get("schedule_timezone") || "UTC").trim(),
+          full_schedule: "0 2 * * 6",
+          schedule_enabled: values.get("schedule_enabled") === "on",
+          retention_days: Number(values.get("retention_days")),
+          representation: "file",
+          requested_level: "full",
+          verification_mode: "full_readback",
+          encryption_enabled: false,
+          spanning_enabled: false,
+          source_snapshot_attested_read_only: values.get("source_snapshot_attested_read_only") === "on",
+          immutable_snapshot_confirmed: values.get("source_snapshot_attested_read_only") === "on",
+          limitations_acknowledged: values.get("limitations_acknowledged") === "on",
+          requested_by_label: String(values.get("requested_by_label") || "").trim(),
+          actor_label: String(values.get("requested_by_label") || "").trim()
+        })
+      });
+      const profile = response && (response.profile || response);
+      rememberBackupProfile(profile);
+      closeModal();
+      await loadOne("backupProfiles");
+      updateChrome();
+      render();
+      toast("Backup plan created", "The plan is ready for an attended full run. No tape has been written.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Create backup plan";
+    }
+  }
+
+  function openStartBackup(profileId) {
+    const profile = state.data.backupProfiles.find((item) => recordId(item) === profileId);
+    if (!profile) return;
+    const source = pick(profile, "source_subpath", "source_path", "logical_root");
+    const idempotencyKey = operationKey("manual-backup");
+    const body = '<form id="start-backup-form" data-profile-id="' + esc(profileId) + '" data-idempotency-key="' + esc(idempotencyKey) + '"><div class="backup-boundary warning"><span aria-hidden="true">▶</span><div><strong>Queue a durable full backup</strong><p>' + esc(backupProfileName(profile)) + " will inventory " + esc(label(source)) + '. The run waits for explicit drive and scratch-media assignment before any tape write.</p></div></div><div class="backup-start-facts"><div><span>Representation</span><strong>File</strong></div><div><span>Level</span><strong>Full</strong></div><div><span>Volumes</span><strong>Exactly one</strong></div><div><span>Verification</span><strong>Full readback</strong></div></div><div class="form-grid"><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="source_snapshot_attested_read_only" required> The configured source currently resolves to the approved immutable read-only snapshot.</label></div><div class="form-field full"><label for="backup-start-operator">Operator</label><input class="input" id="backup-start-operator" name="requested_by_label" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="start-backup-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Queue full backup</button></div></form>';
+    openModal("Run " + backupProfileName(profile), body);
+  }
+
+  async function submitStartBackup(form) {
+    const profileId = form.dataset.profileId;
+    const values = new FormData(form);
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#start-backup-error");
+    submit.disabled = true;
+    submit.textContent = "Queueing…";
+    errorBox.hidden = true;
+    try {
+      const response = await request(endpoints.backupProfiles + "/" + encodeURIComponent(profileId) + "/runs", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          idempotency_key: form.dataset.idempotencyKey || operationKey("manual-backup"),
+          requested_by_label: String(values.get("requested_by_label") || "").trim(),
+          actor_label: String(values.get("requested_by_label") || "").trim(),
+          source_snapshot_attested_read_only: values.get("source_snapshot_attested_read_only") === "on"
+        })
+      });
+      const run = response && (response.run || response.backup_run || response.request || response);
+      rememberBackupRun(run);
+      state.selectedBackupRunId = recordId(run);
+      closeModal();
+      await Promise.all([loadOne("backupRuns"), loadOne("jobs"), loadOne("overview")]);
+      if (location.hash !== "#jobs/" + encodeURIComponent(state.selectedBackupRunId)) location.hash = "#jobs/" + encodeURIComponent(state.selectedBackupRunId);
+      await loadBackupRunDetail(state.selectedBackupRunId, true);
+      updateChrome();
+      render();
+      scheduleBackupRunPoll();
+      toast("Full backup queued", "Assign the exact loaded drive and scratch cartridge to begin the physical write.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Queue full backup";
+    }
+  }
+
+  function backupMediaConfirmation(run, cartridgeLabel) {
+    return String(pick(run, "required_confirmation", "media_confirmation") || (cartridgeLabel ? "OVERWRITE " + cartridgeLabel + " FOR BACKUP " + recordId(run) : "Select a cartridge."));
+  }
+
+  function openAssignBackupMedia(runId) {
+    const run = orderedBackupRuns().find((item) => recordId(item) === runId);
+    if (!run) return;
+    const driveOptions = state.data.drives.map((drive) => {
+      const blocker = backupDriveBlocker(drive);
+      const stableId = String(pick(drive, "stable_id") || "");
+      return '<option value="' + esc(recordId(drive)) + '" data-stable-id="' + esc(stableId) + '"' + (blocker ? " disabled" : "") + '>' + esc(label(stableId)) + " · " + esc(label(pick(drive, "observed_path"))) + (blocker ? " · " + esc(blocker) : " · ready") + "</option>";
+    }).join("");
+    const mediaOptions = state.data.media.map((item) => {
+      const blocker = backupMediaBlocker(item);
+      return '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '"' + (blocker ? " disabled" : "") + '>' + esc(label(mediaName(item))) + " · " + esc(label(pick(item, "media_format", "media_generation"))) + (blocker ? " · " + esc(blocker) : " · eligible scratch") + "</option>";
+    }).join("");
+    const hasDrive = state.data.drives.some((drive) => backupDriveBlocker(drive) === null);
+    const hasMedia = state.data.media.some((item) => backupMediaBlocker(item) === null);
+    const hasQualifiedPair = state.data.drives.some((drive) => backupDriveBlocker(drive) === null && state.data.media.some((item) => backupMediaBlocker(item, drive) === null));
+    const blocked = !hasDrive || !hasMedia || !hasQualifiedPair;
+    const body = '<form id="backup-media-form" data-run-id="' + esc(runId) + '"><div class="backup-boundary danger"><span aria-hidden="true">!</span><div><strong>This assignment authorizes a destructive tape write</strong><p>TapeScale will revalidate the exact drive, cartridge, qualification, holds, retention, identity, and lease before writing. Never select retained media.</p></div></div><div class="form-grid"><div class="form-field full"><label for="backup-media-drive">Loaded tape drive</label><select class="select" id="backup-media-drive" name="drive_id" required><option value="">Select the ready drive</option>' + driveOptions + '</select></div><div class="form-field full"><label for="backup-media-cartridge">Scratch cartridge</label><select class="select" id="backup-media-cartridge" name="cartridge_id" required><option value="">Select a drive to validate its exact qualified media</option>' + mediaOptions + '</select></div><div class="form-field full"><label for="backup-typed-cartridge">Type the exact cartridge label</label><input class="input input-mono" id="backup-typed-cartridge" name="typed_cartridge_label" autocomplete="off" spellcheck="false" required></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="loaded_media_confirmed" required> I physically confirmed the selected cartridge is loaded in the selected drive.</label></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="destructive_overwrite_confirmed" required> I authorize erasing and overwriting this designated scratch cartridge.</label></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="encryption_deviation_confirmed" required> I accept that this test-gate backup is unencrypted and must not contain sensitive production data.</label></div><div class="form-field full"><label for="backup-media-confirmation">Type the destructive confirmation phrase</label><input class="input input-mono" id="backup-media-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small id="backup-media-confirmation-help">Select a cartridge to reveal the exact phrase.</small></div></div>' + (blocked ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Assignment prerequisites are incomplete</strong><span>' + (!hasDrive ? "No reconciled, accessible, ready drive is available. " : "") + (!hasMedia ? "No unheld, unreserved, empty scratch cartridge is eligible. " : "") + (!hasQualifiedPair ? "No current exact drive-and-cartridge btape qualification is available." : "") + '</span></div></div>' : "") + '<p class="notice danger" id="backup-media-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-danger" type="submit"' + (blocked ? " disabled" : "") + '>Assign and authorize write</button></div></form>';
+    openModal("Assign physical media", body);
+  }
+
+  function updateBackupMediaForDrive(form) {
+    if (!form) return;
+    const driveSelect = form.querySelector('[name="drive_id"]');
+    const cartridgeSelect = form.querySelector('[name="cartridge_id"]');
+    const submit = form.querySelector('[type="submit"]');
+    if (!driveSelect || !cartridgeSelect) return;
+    const drive = state.data.drives.find((item) => recordId(item) === driveSelect.value);
+    const previous = cartridgeSelect.value;
+    cartridgeSelect.innerHTML = '<option value="">Select the loaded scratch cartridge</option>' + state.data.media.map((item) => {
+      const blocker = backupMediaBlocker(item, drive);
+      return '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '"' + (blocker ? " disabled" : "") + (recordId(item) === previous ? " selected" : "") + '>' + esc(label(mediaName(item))) + " · " + esc(label(pick(item, "media_format", "media_generation"))) + (blocker ? " · " + esc(blocker) : " · qualified scratch") + "</option>";
+    }).join("");
+    const eligible = Boolean(drive) && backupDriveBlocker(drive) === null && state.data.media.some((item) => backupMediaBlocker(item, drive) === null);
+    cartridgeSelect.disabled = !drive || !eligible;
+    if (submit) submit.disabled = !eligible;
+    updateBackupMediaConfirmation(form);
+  }
+
+  function updateBackupMediaConfirmation(form) {
+    if (!form) return;
+    const run = orderedBackupRuns().find((item) => recordId(item) === form.dataset.runId);
+    const cartridge = form.querySelector('[name="cartridge_id"]');
+    const option = cartridge && cartridge.options[cartridge.selectedIndex];
+    const cartridgeLabel = option && option.dataset.label;
+    const phrase = backupMediaConfirmation(run, cartridgeLabel);
+    const help = form.querySelector("#backup-media-confirmation-help");
+    if (help) help.textContent = cartridgeLabel ? "Required: " + phrase : phrase;
+    form.dataset.confirmation = cartridgeLabel ? phrase : "";
+  }
+
+  async function submitBackupMedia(form) {
+    const runId = form.dataset.runId;
+    const values = new FormData(form);
+    const drive = form.querySelector('[name="drive_id"]');
+    const driveOption = drive.options[drive.selectedIndex];
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#backup-media-error");
+    submit.disabled = true;
+    submit.textContent = "Authorizing…";
+    errorBox.hidden = true;
+    try {
+      await request(endpoints.backupRuns + "/" + encodeURIComponent(runId) + "/media", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          drive_id: String(values.get("drive_id") || ""),
+          expected_stable_id: String(driveOption && driveOption.dataset.stableId || ""),
+          cartridge_id: String(values.get("cartridge_id") || ""),
+          typed_cartridge_label: String(values.get("typed_cartridge_label") || "").trim(),
+          loaded_media_confirmed: values.get("loaded_media_confirmed") === "on",
+          destructive_overwrite_confirmed: values.get("destructive_overwrite_confirmed") === "on",
+          encryption_deviation_confirmed: values.get("encryption_deviation_confirmed") === "on",
+          confirmation: String(values.get("confirmation") || "")
+        })
+      });
+      closeModal();
+      await Promise.all([loadOne("backupRuns"), loadOne("jobs"), loadOne("drives"), loadOne("media")]);
+      await loadBackupRunDetail(runId, true);
+      updateChrome();
+      render();
+      scheduleBackupRunPoll();
+      toast("Media assigned", "The worker will revalidate every physical safety invariant before beginning the write.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Assign and authorize write";
+    }
+  }
+
+  function openCancelBackupRun(runId) {
+    const run = orderedBackupRuns().find((item) => recordId(item) === runId);
+    if (!run || !backupRunActive(run)) return;
+    const body = '<form id="cancel-backup-form" data-run-id="' + esc(runId) + '"><div class="backup-boundary warning"><span aria-hidden="true">×</span><div><strong>Request safe cancellation</strong><p>TapeScale will preserve previous valid backups, retain honest partial-write evidence, and perform required tape cleanup. Cancellation may wait for a safe engine boundary.</p></div></div><div class="form-grid"><div class="form-field full"><label for="backup-cancel-reason">Reason</label><textarea class="textarea" id="backup-cancel-reason" name="reason" maxlength="1000" required placeholder="Why this backup should stop"></textarea></div><div class="form-field full"><label for="backup-cancel-operator">Operator</label><input class="input" id="backup-cancel-operator" name="requested_by_label" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="backup-cancel-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Keep running</button><button class="button button-danger" type="submit">Request cancellation</button></div></form>';
+    openModal("Cancel backup run", body);
+    document.querySelector("#backup-cancel-reason").focus();
+  }
+
+  async function submitCancelBackup(form) {
+    const runId = form.dataset.runId;
+    const values = new FormData(form);
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#backup-cancel-error");
+    submit.disabled = true;
+    submit.textContent = "Requesting…";
+    errorBox.hidden = true;
+    try {
+      await request(endpoints.backupRuns + "/" + encodeURIComponent(runId) + "/cancel", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          reason: String(values.get("reason") || "").trim(),
+          requested_by_label: String(values.get("requested_by_label") || "").trim(),
+          actor_label: String(values.get("requested_by_label") || "").trim()
+        })
+      });
+      closeModal();
+      await loadOne("backupRuns");
+      await loadBackupRunDetail(runId, true);
+      updateChrome();
+      render();
+      scheduleBackupRunPoll();
+      toast("Cancellation requested", "The durable run record will show the safe terminal result.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Request cancellation";
+    }
+  }
+
+  function scheduleBackupRunPoll() {
+    if (state.backupRunPollTimer) window.clearTimeout(state.backupRunPollTimer);
+    const active = state.data.backupRuns.filter(backupRunActive);
+    if (!active.length) {
+      state.backupRunPollTimer = null;
+      return;
+    }
+    state.backupRunPollTimer = window.setTimeout(async () => {
+      const previouslyActive = new Set(active.map(recordId));
+      await Promise.all([loadOne("backupRuns"), loadOne("jobs"), loadOne("overview"), loadOne("drives"), loadOne("media"), loadOne("recoveryPoints")]);
+      const selected = selectedBackupRun();
+      if (selected) await loadBackupRunDetail(recordId(selected), true);
+      const completed = state.data.backupRuns.find((run) => previouslyActive.has(recordId(run)) && !backupRunActive(run));
+      if (completed) toast("Backup " + human(backupRunState(completed)), backupFailureDetail(completed) || "The durable result and retained evidence are ready.");
+      updateChrome();
+      render();
+      scheduleBackupRunPoll();
+    }, 3500);
+  }
+
   function openAddMedia() {
     const options = ['<option value="">Select a generation</option>'];
     for (let generation = 1; generation <= 10; generation += 1) options.push('<option value="' + generation + '">LTO-' + generation + "</option>");
@@ -3478,6 +4095,12 @@
     if (action === "open-nav") shell.classList.add("nav-open");
     if (action === "close-nav") shell.classList.remove("nav-open");
     if (action === "refresh") loadAll(false);
+    if (action === "create-backup-profile") openBackupProfile();
+    if (action === "start-backup") openStartBackup(target.dataset.profileId);
+    if (action === "select-backup-run") selectBackupRun(target.dataset.id);
+    if (action === "retry-backup-run") loadBackupRunDetail(target.dataset.id, true);
+    if (action === "assign-backup-media") openAssignBackupMedia(target.dataset.id);
+    if (action === "cancel-backup-run") openCancelBackupRun(target.dataset.id);
     if (action === "add-media") openAddMedia();
     if (action === "create-media-pool") openMediaPoolForm();
     if (action === "select-media") selectMedia(target.dataset.id);
@@ -3523,6 +4146,22 @@
   });
 
   document.addEventListener("submit", (event) => {
+    if (event.target.id === "backup-profile-form") {
+      event.preventDefault();
+      submitBackupProfile(event.target);
+    }
+    if (event.target.id === "start-backup-form") {
+      event.preventDefault();
+      submitStartBackup(event.target);
+    }
+    if (event.target.id === "backup-media-form") {
+      event.preventDefault();
+      submitBackupMedia(event.target);
+    }
+    if (event.target.id === "cancel-backup-form") {
+      event.preventDefault();
+      submitCancelBackup(event.target);
+    }
     if (event.target.id === "recovery-profile-form") {
       event.preventDefault();
       submitRecoveryProfile(event.target);
@@ -3594,6 +4233,10 @@
   });
 
   document.addEventListener("input", (event) => {
+    if (event.target.id === "backup-search") {
+      state.backupQuery = event.target.value;
+      applyBackupFilters();
+    }
     if (event.target.id === "vault-search") {
       state.recoveryPointQuery = event.target.value;
       applyRecoveryPointFilters();
@@ -3605,6 +4248,12 @@
   });
 
   document.addEventListener("change", (event) => {
+    if (event.target.id === "backup-media-drive") updateBackupMediaForDrive(event.target.form);
+    if (event.target.id === "backup-media-cartridge") updateBackupMediaConfirmation(event.target.form);
+    if (event.target.id === "backup-state-filter") {
+      state.backupStateFilter = event.target.value;
+      applyBackupFilters();
+    }
     if (event.target.id === "qualification-cartridge") updateQualificationConfirmation(event.target);
     if (event.target.id === "media-hold-kind") updateMediaHoldExpiry(event.target.form);
     if (event.target.id === "recovery-run-drive") updateRecoveryRunMediaOptions(event.target.form);
@@ -3676,7 +4325,7 @@
       closeDrawer();
       shell.classList.remove("nav-open");
     }
-    if ((event.key === "Enter" || event.key === " ") && event.target.matches("tr[data-action='open-record'], tr[data-action='select-recovery-exercise'], tr[data-action='select-recovery-point']")) event.target.click();
+    if ((event.key === "Enter" || event.key === " ") && event.target.matches("tr[data-action='open-record'], tr[data-action='select-backup-run'], tr[data-action='select-recovery-exercise'], tr[data-action='select-recovery-point']")) event.target.click();
   });
 
   modalLayer.addEventListener("click", (event) => {
@@ -3720,6 +4369,11 @@
       const media = selectedMedia();
       const id = recordId(media);
       if (id && !state.data.mediaDetails[id]) loadMediaDetail(id);
+    }
+    if (state.route === "jobs") {
+      const run = selectedBackupRun();
+      const id = recordId(run);
+      if (id && !state.data.backupRunDetails[id]) loadBackupRunDetail(id);
     }
   });
 
