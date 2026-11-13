@@ -21,6 +21,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::{
+    backup_ops,
     custody_ops::{self, CustodyActor, CustodyOpsError},
     data_path::{isolated_restore_destination, resolve_existing_selection, verify_read_only_mount},
     device::SasMotionOperation,
@@ -82,6 +83,16 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/jobs", get(jobs))
         .route("/api/v1/jobs/{id}", get(job))
+        .route(
+            "/api/v1/backup-profiles",
+            get(backup_profiles).post(create_backup_profile),
+        )
+        .route("/api/v1/backup-profiles/{id}", get(backup_profile))
+        .route("/api/v1/backup-profiles/{id}/runs", post(create_backup_run))
+        .route("/api/v1/backup-runs", get(backup_runs))
+        .route("/api/v1/backup-runs/{id}", get(backup_run))
+        .route("/api/v1/backup-runs/{id}/media", post(assign_backup_media))
+        .route("/api/v1/backup-runs/{id}/cancel", post(cancel_backup_run))
         .route("/api/v1/media", get(media).post(create_media))
         .route(
             "/api/v1/media-pools",
@@ -276,6 +287,563 @@ async fn job(
         None => Vec::new(),
     };
     Ok(Json(json!({"job":job,"transitions":transitions})))
+}
+
+async fn backup_profiles(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let profiles = match state.pool.as_ref() {
+        Some(pool) => backup_ops::list_backup_profiles(pool)
+            .await
+            .map_err(map_backup_ops_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(json!({
+        "profiles": profiles,
+        "execution_scope": "attended_full_file_single_volume",
+        "production_eligible": false
+    })))
+}
+
+async fn backup_profile(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let id = parse_uuid_path(&id, "backup profile")?;
+    let profile = backup_ops::get_backup_profile(pool, id)
+        .await
+        .map_err(map_backup_ops_error)?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(json!({"profile": profile})))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBackupProfileRequest {
+    name: String,
+    source_subpath: String,
+    #[serde(default = "default_backup_timezone")]
+    schedule_timezone: String,
+    #[serde(default)]
+    schedule_enabled: bool,
+    #[serde(default = "default_backup_retention_days")]
+    retention_days: i32,
+    #[serde(default)]
+    media_pool_id: Option<Uuid>,
+    source_snapshot_attested_read_only: bool,
+    limitations_acknowledged: bool,
+    #[serde(default)]
+    requested_by_label: Option<String>,
+}
+
+fn default_backup_timezone() -> String {
+    "UTC".to_owned()
+}
+
+const fn default_backup_retention_days() -> i32 {
+    28
+}
+
+fn backup_actor_label(value: Option<&str>) -> Result<String, AppError> {
+    let value = value.unwrap_or("Web operator").trim();
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(AppError::Invalid(
+            "requested_by_label must contain 1 to 256 printable bytes".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+async fn create_backup_profile(
+    State(state): State<AppState>,
+    Json(request): Json<CreateBackupProfileRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    require_file_roundtrip(&state)?;
+    let pool = require_pool(&state)?;
+    if !request.source_snapshot_attested_read_only || !request.limitations_acknowledged {
+        return Err(AppError::Invalid(
+            "source_snapshot_attested_read_only and limitations_acknowledged must both be true"
+                .to_owned(),
+        ));
+    }
+    let name = request.name.trim();
+    if name.is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) {
+        return Err(AppError::Invalid(
+            "name must contain 1 to 128 printable characters".to_owned(),
+        ));
+    }
+    request
+        .schedule_timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| AppError::Invalid("schedule_timezone is invalid".to_owned()))?;
+    if !(1..=36_500).contains(&request.retention_days) {
+        return Err(AppError::Invalid(
+            "retention_days must be between 1 and 36500".to_owned(),
+        ));
+    }
+    let actor_label = backup_actor_label(request.requested_by_label.as_deref())?;
+    if let Some(media_pool_id) = request.media_pool_id {
+        let purpose =
+            sqlx::query_scalar::<_, String>("SELECT purpose FROM media_pools WHERE id = $1")
+                .bind(media_pool_id)
+                .fetch_optional(pool)
+                .await?
+                .ok_or(AppError::NotFound)?;
+        if purpose == "cleaning" {
+            return Err(AppError::Invalid(
+                "a cleaning-media pool cannot be a backup target".to_owned(),
+            ));
+        }
+    }
+    let source_subpath = normalized_relative_path(&request.source_subpath, "source_subpath")?;
+    let source_mount = resolve_existing_selection(&state.source_root, &source_subpath)
+        .map_err(|error| AppError::Blocked(error.to_string()))?;
+    verify_read_only_mount(&source_mount).map_err(|error| AppError::Blocked(error.to_string()))?;
+    let restore_subpath = "backup-rehearsals".to_owned();
+    let restore_probe =
+        isolated_restore_destination(&state.restore_root, &restore_subpath, Uuid::nil())
+            .map_err(|error| AppError::Blocked(error.to_string()))?;
+    let restore_root = restore_probe
+        .parent()
+        .ok_or_else(|| AppError::Invalid("configured restore root is invalid".to_owned()))?;
+    let source_profile = store::NewSingleTapeDataProfile {
+        name: name.to_owned(),
+        source_subpath,
+        restore_subpath,
+        source_mount_path: utf8_path(&source_mount, "resolved source path")?,
+        restore_root_path: utf8_path(restore_root, "resolved restore path")?,
+        immutable_snapshot_confirmed: true,
+    };
+    let source_profile = match store::create_single_tape_data_profile(pool, &source_profile).await?
+    {
+        store::CreateSingleTapeDataProfileResult::Created(profile) => profile,
+        store::CreateSingleTapeDataProfileResult::NotFound => return Err(AppError::NotFound),
+        store::CreateSingleTapeDataProfileResult::Blocked(reason) => {
+            return Err(AppError::Blocked(reason))
+        }
+    };
+    let profile = backup_ops::create_backup_profile(
+        pool,
+        &backup_ops::NewBackupProfile {
+            source_profile_id: source_profile.id,
+            media_pool_id: request.media_pool_id,
+            schedule_timezone: request.schedule_timezone,
+            full_schedule: backup_ops::DEFAULT_FULL_SCHEDULE.to_owned(),
+            schedule_enabled: request.schedule_enabled,
+            retention_days: request.retention_days,
+            representation: "file".to_owned(),
+            requested_level: "full".to_owned(),
+            verification_mode: "full_readback".to_owned(),
+            encryption_enabled: false,
+            spanning_enabled: false,
+            actor_label,
+        },
+    )
+    .await
+    .map_err(map_backup_ops_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "profile": profile,
+            "source_mount": "read_only_verified",
+            "durability": "postgresql",
+            "audit": "appended",
+            "production_eligible": false
+        })),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBackupRunRequest {
+    source_snapshot_attested_read_only: bool,
+    #[serde(default)]
+    requested_by_label: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+async fn create_backup_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<CreateBackupRunRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    require_file_roundtrip(&state)?;
+    let pool = require_pool(&state)?;
+    let profile_id = parse_uuid_path(&id, "backup profile")?;
+    if !request.source_snapshot_attested_read_only {
+        return Err(AppError::Invalid(
+            "source_snapshot_attested_read_only must be true".to_owned(),
+        ));
+    }
+    let actor = backup_actor_label(request.requested_by_label.as_deref())?;
+    let idempotency_key = request
+        .idempotency_key
+        .unwrap_or_else(|| format!("manual:{}", Uuid::now_v7()));
+    let disposition =
+        backup_ops::create_manual_backup_request(pool, profile_id, &idempotency_key, &actor)
+            .await
+            .map_err(map_backup_ops_error)?;
+    let created = matches!(
+        disposition,
+        backup_ops::CreateBackupRequestResult::Created(_)
+    );
+    let response_state = disposition.record().state.clone();
+    let run = build_backup_run_view(pool, disposition.record()).await?;
+    Ok((
+        if created {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::OK
+        },
+        Json(json!({
+            "run": run,
+            "durability": "postgresql",
+            "state": response_state,
+            "production_eligible": false
+        })),
+    ))
+}
+
+async fn backup_runs(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let Some(pool) = state.pool.as_ref() else {
+        return Ok(Json(json!({"runs": []})));
+    };
+    let records = backup_ops::list_backup_requests(pool, None, 250)
+        .await
+        .map_err(map_backup_ops_error)?;
+    let mut runs = Vec::with_capacity(records.len());
+    for record in &records {
+        runs.push(build_backup_run_view(pool, record).await?);
+    }
+    Ok(Json(json!({
+        "runs": runs,
+        "execution_scope": "attended_full_file_single_volume",
+        "production_eligible": false
+    })))
+}
+
+async fn backup_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let request_id = parse_uuid_path(&id, "backup run")?;
+    let request = backup_ops::get_backup_request(pool, request_id)
+        .await
+        .map_err(map_backup_ops_error)?
+        .ok_or(AppError::NotFound)?;
+    let request_events = backup_ops::backup_request_events(pool, request_id)
+        .await
+        .map_err(map_backup_ops_error)?;
+    let mut events = serde_json::to_value(request_events)
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut artifacts = Vec::new();
+    if let Some(data_run_id) = request.assigned_data_run_id {
+        let data_events = store::single_tape_data_events(pool, data_run_id).await?;
+        for event in data_events {
+            events.push(json!({
+                "id": format!("data:{}", event.id),
+                "event_type": event.event_type,
+                "evidence": bounded_restore_evidence_value(&event.evidence),
+                "correlation_id": event.correlation_id,
+                "occurred_at": event.occurred_at
+            }));
+        }
+        for artifact in store::single_tape_data_artifacts(pool, data_run_id).await? {
+            artifacts.push(json!({
+                "id": artifact.id,
+                "artifact_kind": artifact.artifact_kind,
+                "sha256": artifact.sha256,
+                "size_bytes": artifact.size_bytes,
+                "metadata": bounded_restore_evidence_value(&artifact.metadata),
+                "created_at": artifact.created_at
+            }));
+        }
+    }
+    events.sort_by_key(|event| {
+        event
+            .get("occurred_at")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    });
+    let run = build_backup_run_view(pool, &request).await?;
+    Ok(Json(json!({
+        "run": run,
+        "events": events,
+        "artifacts": artifacts,
+        "production_eligible": false
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AssignBackupMediaRequest {
+    drive_id: Uuid,
+    expected_stable_id: String,
+    cartridge_id: Uuid,
+    typed_cartridge_label: String,
+    loaded_media_confirmed: bool,
+    destructive_overwrite_confirmed: bool,
+    encryption_deviation_confirmed: bool,
+    confirmation: String,
+}
+
+async fn assign_backup_media(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<AssignBackupMediaRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    require_file_roundtrip(&state)?;
+    let pool = require_pool(&state)?;
+    let request_id = parse_uuid_path(&id, "backup run")?;
+    let backup_request = backup_ops::get_backup_request(pool, request_id)
+        .await
+        .map_err(map_backup_ops_error)?
+        .ok_or(AppError::NotFound)?;
+    let profile = backup_ops::get_backup_profile(pool, backup_request.profile_id)
+        .await
+        .map_err(map_backup_ops_error)?
+        .ok_or(AppError::NotFound)?;
+    if !request.loaded_media_confirmed
+        || !request.destructive_overwrite_confirmed
+        || !request.encryption_deviation_confirmed
+    {
+        return Err(AppError::Invalid(
+            "loaded_media_confirmed, destructive_overwrite_confirmed, and encryption_deviation_confirmed must all be true"
+                .to_owned(),
+        ));
+    }
+    let stable_id = request.expected_stable_id.trim();
+    let cartridge_label = request.typed_cartridge_label.trim();
+    if stable_id.is_empty()
+        || stable_id.len() > 512
+        || stable_id.chars().any(char::is_control)
+        || cartridge_label.is_empty()
+        || cartridge_label.len() > 128
+        || cartridge_label.chars().any(char::is_control)
+    {
+        return Err(AppError::Invalid(
+            "expected_stable_id and typed_cartridge_label must be bounded printable values"
+                .to_owned(),
+        ));
+    }
+    let expected_confirmation = format!("OVERWRITE {cartridge_label} FOR BACKUP {request_id}");
+    if request.confirmation != expected_confirmation {
+        return Err(AppError::Invalid(format!(
+            "confirmation must exactly equal {expected_confirmation}"
+        )));
+    }
+    if let Some(data_run_id) = backup_request.assigned_data_run_id {
+        let data_run = store::get_single_tape_data_run(pool, data_run_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict(
+                    "the retained backup assignment no longer resolves to its data run".to_owned(),
+                )
+            })?;
+        let exact_replay = data_run.profile_id == backup_request.profile_id
+            && data_run.job_run_id == backup_request.job_run_id
+            && data_run.workflow_kind == "backup"
+            && data_run.drive_id == request.drive_id
+            && data_run.expected_stable_id == stable_id
+            && data_run.cartridge_id == request.cartridge_id
+            && data_run.expected_cartridge_label == cartridge_label
+            && data_run.scratch_media_confirmed == request.loaded_media_confirmed
+            && data_run.destructive_overwrite_confirmed == request.destructive_overwrite_confirmed
+            && data_run.encryption_deviation_confirmed == request.encryption_deviation_confirmed;
+        if !exact_replay {
+            return Err(AppError::Conflict(
+                "the backup request already has a different exact media assignment".to_owned(),
+            ));
+        }
+        let run = build_backup_run_view(pool, &backup_request).await?;
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "run": run,
+                "data_run_id": data_run.id,
+                "durability": "postgresql",
+                "audit": "existing",
+                "idempotent_replay": true,
+                "destructive": true,
+                "production_eligible": false
+            })),
+        ));
+    }
+    match store::attach_single_tape_backup_run(
+        pool,
+        backup_request.profile_id,
+        request_id,
+        backup_request.job_run_id,
+        &backup_request.trigger_kind,
+        backup_request.scheduled_occurrence.as_deref(),
+        profile.retention_days,
+        request.drive_id,
+        stable_id,
+        request.cartridge_id,
+        cartridge_label,
+        request.loaded_media_confirmed,
+        request.destructive_overwrite_confirmed,
+        request.encryption_deviation_confirmed,
+    )
+    .await?
+    {
+        store::QueueSingleTapeDataRunResult::Queued(data_run) => {
+            let updated = backup_ops::get_backup_request(pool, request_id)
+                .await
+                .map_err(map_backup_ops_error)?
+                .ok_or(AppError::NotFound)?;
+            let run = build_backup_run_view(pool, &updated).await?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "run": run,
+                    "data_run_id": data_run.id,
+                    "durability": "postgresql",
+                    "audit": "appended",
+                    "destructive": true,
+                    "production_eligible": false
+                })),
+            ))
+        }
+        store::QueueSingleTapeDataRunResult::NotFound => Err(AppError::NotFound),
+        store::QueueSingleTapeDataRunResult::Blocked(reason) => Err(AppError::Blocked(reason)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelBackupRunRequest {
+    reason: String,
+    #[serde(default)]
+    requested_by_label: Option<String>,
+}
+
+async fn cancel_backup_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<CancelBackupRunRequest>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let request_id = parse_uuid_path(&id, "backup run")?;
+    let reason = request.reason.trim();
+    if reason.is_empty() || reason.chars().count() > 1000 || reason.chars().any(char::is_control) {
+        return Err(AppError::Invalid(
+            "reason must contain 1 to 1000 printable characters".to_owned(),
+        ));
+    }
+    let actor = backup_actor_label(request.requested_by_label.as_deref())?;
+    let current = backup_ops::get_backup_request(pool, request_id)
+        .await
+        .map_err(map_backup_ops_error)?
+        .ok_or(AppError::NotFound)?;
+    let mut idempotent_replay = false;
+    if let Some(data_run_id) = current.assigned_data_run_id {
+        match store::cancel_single_tape_data_run(pool, data_run_id, &actor, reason).await? {
+            store::CancelSingleTapeDataRunResult::Cancelled(_)
+            | store::CancelSingleTapeDataRunResult::CancellationRequested(_) => {}
+            store::CancelSingleTapeDataRunResult::NotFound => return Err(AppError::NotFound),
+            store::CancelSingleTapeDataRunResult::Terminal(run) if run.state == "cancelled" => {
+                idempotent_replay = true;
+            }
+            store::CancelSingleTapeDataRunResult::Terminal(_) => {
+                return Err(AppError::Conflict(
+                    "the backup run is already terminal".to_owned(),
+                ))
+            }
+        }
+    } else {
+        let disposition =
+            backup_ops::cancel_waiting_backup_request(pool, request_id, &actor, reason)
+                .await
+                .map_err(map_backup_ops_error)?;
+        idempotent_replay = matches!(
+            disposition,
+            backup_ops::CancelBackupRequestResult::AlreadyCancelled(_)
+        );
+    }
+    let updated = backup_ops::get_backup_request(pool, request_id)
+        .await
+        .map_err(map_backup_ops_error)?
+        .ok_or(AppError::NotFound)?;
+    let run = build_backup_run_view(pool, &updated).await?;
+    Ok(Json(json!({
+        "run": run,
+        "reason": reason,
+        "durability": "postgresql",
+        "audit": if idempotent_replay { "existing" } else { "appended" },
+        "idempotent_replay": idempotent_replay
+    })))
+}
+
+async fn build_backup_run_view(
+    pool: &PgPool,
+    request: &backup_ops::BackupRequestRecord,
+) -> Result<Value, AppError> {
+    let profile = backup_ops::get_backup_profile(pool, request.profile_id)
+        .await
+        .map_err(map_backup_ops_error)?;
+    let mut value =
+        serde_json::to_value(request).map_err(|error| AppError::Internal(error.to_string()))?;
+    let object = value
+        .as_object_mut()
+        .expect("serialized backup request is an object");
+    if let Some(profile) = profile {
+        object.insert("source_subpath".to_owned(), json!(profile.source_subpath));
+        object.insert("logical_root".to_owned(), json!(profile.logical_root));
+        object.insert("retention_days".to_owned(), json!(profile.retention_days));
+        object.insert(
+            "schedule_enabled".to_owned(),
+            json!(profile.schedule_enabled),
+        );
+        object.insert(
+            "schedule_timezone".to_owned(),
+            json!(profile.schedule_timezone),
+        );
+        object.insert("media_pool_id".to_owned(), json!(profile.media_pool_id));
+        object.insert("media_pool_name".to_owned(), json!(profile.media_pool_name));
+    }
+    if let Some(data_run_id) = request.assigned_data_run_id {
+        if let Some(data_run) = store::get_single_tape_data_run(pool, data_run_id).await? {
+            let sanitized = bounded_restore_evidence_value(
+                &serde_json::to_value(&data_run)
+                    .map_err(|error| AppError::Internal(error.to_string()))?,
+            );
+            if let Some(data) = sanitized.as_object() {
+                for key in [
+                    "expected_stable_id",
+                    "expected_path",
+                    "expected_vendor",
+                    "expected_model",
+                    "expected_serial",
+                    "expected_wwn",
+                    "expected_firmware",
+                    "expected_cartridge_label",
+                    "expected_media_generation",
+                    "expected_media_format",
+                    "media_write_started",
+                    "media_write_started_at",
+                    "cancel_requested_at",
+                    "cancel_requested_by_label",
+                    "result",
+                ] {
+                    if let Some(item) = data.get(key) {
+                        object.insert(key.to_owned(), item.clone());
+                    }
+                }
+                object.insert("data_run".to_owned(), sanitized);
+            }
+        }
+    }
+    object.insert(
+        "allowed_actions".to_owned(),
+        json!({
+            "assign_media": request.state == "waiting_for_media" && request.assigned_data_run_id.is_none(),
+            "cancel": !matches!(request.state.as_str(), "verified" | "failed" | "cancelled" | "completed")
+        }),
+    );
+    object.insert("production_eligible".to_owned(), Value::Bool(false));
+    Ok(value)
 }
 
 async fn media(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -2212,7 +2780,7 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
             "checked_at":chrono::Utc::now(),
             "checks":[
                 preflight_check("database", "Database", "blocked", "PostgreSQL is not configured"),
-                preflight_check("engine", "Tape backup engine", "blocked", "Backup jobs still use the simulator; Bacula btape is qualification-only")
+                preflight_check("engine", "Tape backup engine", "blocked", "PostgreSQL is required before the attended Bacula backup path can retain requests and evidence")
             ],
             "inventory":empty_inventory()
         })));
@@ -2265,7 +2833,7 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
             preflight_check("media_inventory", "Media inventory", media_status,
                 if inventory.cartridges > 0 {"Cartridges are registered; on-tape identity still governs safe use"} else {"No cartridges are registered"}),
             preflight_check("engine", "Tape backup engine", engine_status,
-                if state.lab_file_roundtrip_enabled {"Pinned Bacula 15.0.3 is enabled only for attended G0.2 single-tape recovery exercises; general backup scheduling remains blocked"} else {"General backup jobs use the simulator and the G0.2 Bacula data path is disabled"})
+                if state.lab_file_roundtrip_enabled {"Pinned Bacula 15.0.3 is enabled for attended single-volume Full backups and recovery exercises; this test slice is not production-qualified"} else {"The attended Bacula backup and recovery data path is disabled"})
         ],
         "inventory":inventory
     })))
@@ -2501,6 +3069,15 @@ fn media_inventory_view(record: &media_ops::MediaInventorySummary) -> Value {
         object.insert("overwrite_blockers".to_owned(), json!([blocker]));
     }
     value
+}
+
+fn map_backup_ops_error(error: backup_ops::BackupOpsError) -> AppError {
+    match error {
+        backup_ops::BackupOpsError::Invalid(message) => AppError::Invalid(message),
+        backup_ops::BackupOpsError::NotFound => AppError::NotFound,
+        backup_ops::BackupOpsError::Conflict(message) => AppError::Conflict(message),
+        backup_ops::BackupOpsError::Database(error) => AppError::Database(error),
+    }
 }
 
 fn map_media_ops_error(error: media_ops::MediaOpsError) -> AppError {

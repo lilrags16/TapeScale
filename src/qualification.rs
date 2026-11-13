@@ -383,8 +383,8 @@ pub fn report() -> Value {
         "engine": {
             "candidate": format!("{BACULA_CANDIDATE} {BACULA_CANDIDATE_VERSION}"),
             "selection": "G0 laboratory candidate; not selected for production",
-            "adapter": "Simulator for general backup jobs; pinned Bacula 15.0.3 is available only through attended btape qualification and G0.2 single-tape recovery exercises",
-            "format": "Bacula format is exercised only by a passed G0.2 run; production format selection remains open"
+            "adapter": "Simulator for the legacy generic job engine; pinned Bacula 15.0.3 is available through attended btape qualification, single-volume Full backups, and G0.2 recovery exercises",
+            "format": "Bacula format is exercised by attended Full backups and G0.2 recovery runs; production format selection remains open"
         },
         "claims": {
             "software_tests": "Automated domain and service tests",

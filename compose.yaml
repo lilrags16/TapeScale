@@ -110,7 +110,6 @@ services:
     entrypoint: [/usr/local/bin/tapescale-scheduler]
     environment:
       <<: *tapescale-environment
-      TAPESCALE_SITE_TIMEZONE: ${TAPESCALE_SITE_TIMEZONE:-UTC}
       TAPESCALE_WORKER_POLL_SECS: ${TAPESCALE_SCHEDULER_POLL_SECS:-30}
     healthcheck:
       disable: true

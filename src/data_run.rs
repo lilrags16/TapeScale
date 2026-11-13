@@ -1,4 +1,4 @@
-//! G0.2 attended single-cartridge physical recovery exercise.
+//! Attended single-cartridge Bacula backup and physical recovery execution.
 
 use std::{
     path::{Path, PathBuf},
@@ -46,6 +46,7 @@ enum FailureClass {
     Blocked,
     Failed,
     Interrupted,
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -75,21 +76,28 @@ impl ExerciseFailure {
             detail: detail.into(),
         }
     }
+
+    fn cancelled(detail: impl Into<String>) -> Self {
+        Self {
+            class: FailureClass::Cancelled,
+            detail: detail.into(),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct CompletedExercise {
     source_manifest: FileManifest,
-    restored_manifest: FileManifest,
-    comparison: ManifestComparison,
+    restored_manifest: Option<FileManifest>,
+    comparison: Option<ManifestComparison>,
     backup: BaculaJobEvidence,
     backup_catalog: BaculaBackupCatalogEvidence,
     verify: BaculaJobEvidence,
     verify_catalog: BaculaVerifyCatalogEvidence,
-    restore: BaculaJobEvidence,
-    restore_catalog: BaculaRestoreCatalogEvidence,
+    restore: Option<BaculaJobEvidence>,
+    restore_catalog: Option<BaculaRestoreCatalogEvidence>,
     engine_volume_name: String,
-    restore_destination: PathBuf,
+    restore_destination: Option<PathBuf>,
 }
 
 pub async fn process_single_tape_data_runs(
@@ -103,19 +111,19 @@ pub async fn process_single_tape_data_runs(
     if expired > 0 {
         warn!(
             expired_runs = expired,
-            "expired physical recovery exercises require drive reconciliation"
+            "expired physical tape operations require drive reconciliation"
         );
     }
     if !config.lab_file_roundtrip_enabled {
         let blocked = store::block_queued_single_tape_data_runs(
             pool,
-            "the G0.2 laboratory file roundtrip was disabled before worker execution",
+            "the attended Bacula file data path was disabled before worker execution",
         )
         .await?;
         if blocked > 0 {
             warn!(
                 blocked_runs = blocked,
-                "queued recovery exercises were blocked"
+                "queued physical tape data operations were blocked"
             );
         }
         return Ok(());
@@ -128,7 +136,7 @@ pub async fn process_single_tape_data_runs(
             execute_claimed(pool, sas_config, config, &claim, cancellation).await?;
         }
         store::ClaimSingleTapeDataRunResult::Blocked { id, reason } => {
-            warn!(recovery_exercise_id = %id, %reason, "recovery exercise was blocked during worker revalidation");
+            warn!(physical_data_run_id = %id, %reason, "physical tape data operation was blocked during worker revalidation");
         }
         store::ClaimSingleTapeDataRunResult::Empty => {}
     }
@@ -153,7 +161,7 @@ async fn execute_claimed(
             claim,
             store::SingleTapeDataTerminalState::Blocked,
             json!({
-                "detail": "the exact configured drive identity was not observed immediately before the physical recovery exercise",
+                "detail": "the exact configured drive identity was not observed immediately before the physical tape operation",
                 "command_dispatched": false,
                 "position_uncertain": false
             }),
@@ -214,7 +222,7 @@ fn validate_paths(
 ) -> Result<(), ExerciseFailure> {
     if config.source_root != Path::new("/source") || config.restore_root != Path::new("/restore") {
         return Err(ExerciseFailure::blocked(
-            "the pinned Bacula G0.2 adapter requires TAPESCALE_SOURCE_ROOT=/source and TAPESCALE_RESTORE_ROOT=/restore",
+            "the pinned Bacula adapter requires TAPESCALE_SOURCE_ROOT=/source and TAPESCALE_RESTORE_ROOT=/restore",
         ));
     }
     let source = Path::new(&claim.run.source_mount_path);
@@ -320,6 +328,7 @@ async fn perform_exercise(
 
         let volume = engine_volume_label(&claim.run.expected_cartridge_label, claim.run.id)?;
         let bacula_pool = BaculaPoolName::for_run(claim.run.id);
+        renew_claim(pool, claim, "before entering the irreversible media-write boundary").await?;
         if !store::mark_single_tape_media_write_started(pool, claim, volume.as_str())
             .await
             .map_err(|error| ExerciseFailure::interrupted(error.to_string()))?
@@ -487,7 +496,11 @@ async fn perform_exercise(
             "catalog": backup_catalog,
             "finalized": true,
             "single_volume": backup_catalog.segments.iter().all(|segment| segment.media_id == backup_catalog.volume.media_id),
-            "encryption": "disabled_by_explicit_g0_2_lab_deviation"
+            "encryption": if claim.run.workflow_kind == "backup" {
+                "disabled_by_explicit_test_slice_deviation"
+            } else {
+                "disabled_by_explicit_g0_2_lab_deviation"
+            }
         });
         let engine_artifact = persist_json_artifact(
             evidence_directory,
@@ -559,6 +572,34 @@ async fn perform_exercise(
         .map_err(|error| {
             ExerciseFailure::failed(format!("Bacula Data verify catalog proof failed: {error}"))
         })?;
+        if claim.run.workflow_kind == "backup" {
+            let source_after = scan_manifest_with_lease(
+                pool,
+                claim,
+                PathBuf::from(&claim.run.source_mount_path),
+                deadline,
+                cancellation,
+            )
+            .await?;
+            if !source_manifests_stable(&source_manifest, &source_after) {
+                return Err(ExerciseFailure::failed(
+                    "the supposedly immutable source changed during backup; no recovery point can be committed",
+                ));
+            }
+            return Ok(CompletedExercise {
+                source_manifest,
+                restored_manifest: None,
+                comparison: None,
+                backup,
+                backup_catalog,
+                verify,
+                verify_catalog,
+                restore: None,
+                restore_catalog: None,
+                engine_volume_name: volume.as_str().to_owned(),
+                restore_destination: None,
+            });
+        }
         transition(
             pool,
             claim,
@@ -708,16 +749,16 @@ async fn perform_exercise(
 
         Ok(CompletedExercise {
             source_manifest,
-            restored_manifest,
-            comparison,
+            restored_manifest: Some(restored_manifest),
+            comparison: Some(comparison),
             backup,
             backup_catalog,
             verify,
             verify_catalog,
-            restore,
-            restore_catalog,
+            restore: Some(restore),
+            restore_catalog: Some(restore_catalog),
             engine_volume_name: volume.as_str().to_owned(),
-            restore_destination: destination.path().to_owned(),
+            restore_destination: Some(destination.path().to_owned()),
         })
     }
     .await;
@@ -748,6 +789,37 @@ async fn complete_exercise(
 ) -> Result<()> {
     match operation {
         Ok(completed) if cleanup.0 => {
+            if claim.run.workflow_kind == "backup" {
+                return complete_backup(
+                    pool,
+                    claim,
+                    completed,
+                    runtime_evidence,
+                    cleanup.1,
+                    evidence_directory,
+                )
+                .await;
+            }
+            let restored_manifest = completed
+                .restored_manifest
+                .as_ref()
+                .expect("recovery exercise completion includes a restored manifest");
+            let comparison = completed
+                .comparison
+                .as_ref()
+                .expect("recovery exercise completion includes a comparison");
+            let restore = completed
+                .restore
+                .as_ref()
+                .expect("recovery exercise completion includes a restore job");
+            let restore_catalog = completed
+                .restore_catalog
+                .as_ref()
+                .expect("recovery exercise completion includes restore catalog evidence");
+            let restore_destination = completed
+                .restore_destination
+                .as_ref()
+                .expect("recovery exercise completion includes a restore destination");
             let first_segment = completed
                 .backup_catalog
                 .segments
@@ -766,12 +838,12 @@ async fn complete_exercise(
                 "backup_catalog": completed.backup_catalog,
                 "data_verify_job": completed.verify,
                 "data_verify_catalog": completed.verify_catalog,
-                "restore_job": completed.restore,
-                "restore_catalog": completed.restore_catalog,
+                "restore_job": restore,
+                "restore_catalog": restore_catalog,
                 "source_manifest_digest": completed.source_manifest.digest_sha256,
-                "restored_manifest_digest": completed.restored_manifest.digest_sha256,
-                "comparison": completed.comparison,
-                "restore_destination": completed.restore_destination,
+                "restored_manifest_digest": restored_manifest.digest_sha256,
+                "comparison": comparison,
+                "restore_destination": restore_destination,
                 "runtime": runtime_evidence,
                 "cleanup": cleanup.1,
                 "encryption": "disabled_by_explicit_g0_2_lab_deviation"
@@ -823,11 +895,11 @@ async fn complete_exercise(
                     }),
                     restore_test_evidence: json!({
                         "matched": true,
-                        "job": completed.restore,
-                        "catalog": completed.restore_catalog,
+                        "job": restore,
+                        "catalog": restore_catalog,
                         "source_manifest_digest": completed.source_manifest.digest_sha256,
-                        "restored_manifest_digest": completed.restored_manifest.digest_sha256,
-                        "restore_destination": completed.restore_destination
+                        "restored_manifest_digest": restored_manifest.digest_sha256,
+                        "restore_destination": restore_destination
                     }),
                     result: report,
                 };
@@ -888,7 +960,11 @@ async fn complete_exercise(
                 claim,
                 store::SingleTapeDataTerminalState::Failed,
                 json!({
-                    "detail": "backup, physical readback, restore, and comparison passed, but the required cleanup rewind/postcondition failed",
+                    "detail": if claim.run.workflow_kind == "backup" {
+                        "backup and physical readback passed, but the required cleanup rewind/postcondition failed"
+                    } else {
+                        "backup, physical readback, restore, and comparison passed, but the required cleanup rewind/postcondition failed"
+                    },
                     "position_uncertain": true,
                     "media_write_started": true,
                     "cleanup": cleanup.1,
@@ -903,6 +979,7 @@ async fn complete_exercise(
                     store::SingleTapeDataTerminalState::Blocked
                 }
                 FailureClass::Interrupted => store::SingleTapeDataTerminalState::Interrupted,
+                FailureClass::Cancelled => store::SingleTapeDataTerminalState::Cancelled,
                 FailureClass::Blocked | FailureClass::Failed => {
                     store::SingleTapeDataTerminalState::Failed
                 }
@@ -935,6 +1012,164 @@ async fn complete_exercise(
         }
     }
     Ok(())
+}
+
+async fn complete_backup(
+    pool: &PgPool,
+    claim: &store::ClaimedSingleTapeDataRun,
+    completed: CompletedExercise,
+    runtime_evidence: Option<BaculaRuntimeEvidence>,
+    cleanup_evidence: Value,
+    evidence_directory: &Path,
+) -> Result<()> {
+    let first_segment = completed
+        .backup_catalog
+        .segments
+        .first()
+        .expect("catalog validation requires JobMedia evidence");
+    let last_segment = completed
+        .backup_catalog
+        .segments
+        .last()
+        .expect("catalog validation requires JobMedia evidence");
+    let report = json!({
+        "scope": "attended single-volume full-file backup with complete physical-media readback",
+        "qualification": "test_slice",
+        "production_eligible": false,
+        "limitations": ["single_volume", "full_only", "unencrypted", "operator_attested_snapshot"],
+        "engine": {"name":"Bacula Community","version":"15.0.3"},
+        "backup_job": &completed.backup,
+        "backup_catalog": &completed.backup_catalog,
+        "data_verify_job": &completed.verify,
+        "data_verify_catalog": &completed.verify_catalog,
+        "source_manifest_digest": &completed.source_manifest.digest_sha256,
+        "runtime": runtime_evidence,
+        "cleanup": cleanup_evidence,
+        "encryption": "disabled_by_explicit_test_slice_deviation",
+        "restore_test": "not_run_separate_rehearsal_required"
+    });
+    let report_artifact =
+        match persist_json_artifact(evidence_directory, "evidence-report", &report) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                return finish_or_quarantine(
+                    pool,
+                    claim,
+                    store::SingleTapeDataTerminalState::Failed,
+                    json!({
+                        "detail": format!("could not retain the backup evidence report: {error}"),
+                        "position_uncertain": false,
+                        "media_write_started": true,
+                        "verified_recovery_point_created": false
+                    }),
+                )
+                .await;
+            }
+        };
+    if let Err(error) = append_json_artifact(
+        pool,
+        claim,
+        "evidence_report",
+        &report_artifact,
+        json!({
+            "candidate_evidence": true,
+            "complete": false,
+            "pending_atomic_finalization": true,
+            "workflow_kind": "backup",
+            "production_eligible": false
+        }),
+    )
+    .await
+    {
+        return finish_or_quarantine(
+            pool,
+            claim,
+            store::SingleTapeDataTerminalState::Failed,
+            json!({
+                "detail": format!("could not retain the backup evidence artifact: {}", error.detail),
+                "position_uncertain": false,
+                "media_write_started": true,
+                "verified_recovery_point_created": false
+            }),
+        )
+        .await;
+    }
+    let pass = store::SingleTapePassEvidence {
+        engine_operation_id: format!("bacula-job:{}", completed.backup.job_id),
+        engine_volume_name: completed.engine_volume_name,
+        engine_record_id: format!(
+            "bacula-media:{}:job:{}",
+            completed.backup_catalog.volume.media_id, completed.backup.job_id
+        ),
+        first_record: format!(
+            "file={}:block={}",
+            first_segment.start_file, first_segment.start_block
+        ),
+        last_record: Some(format!(
+            "file={}:block={}",
+            last_segment.end_file, last_segment.end_block
+        )),
+        logical_bytes: completed.source_manifest.logical_bytes,
+        encoded_bytes: completed.backup_catalog.volume.volume_bytes,
+        file_count: completed.source_manifest.file_count,
+        coverage: serde_json::to_value(&completed.source_manifest.coverage)
+            .map_err(|error| anyhow::anyhow!(error))?,
+        full_readback_evidence: json!({
+            "physical_media_readback": true,
+            "level": "Data",
+            "job": completed.verify,
+            "catalog": completed.verify_catalog,
+            "backup_catalog": completed.backup_catalog
+        }),
+        restore_test_evidence: json!({
+            "outcome": "not_run",
+            "independent_claim": true
+        }),
+        result: report,
+    };
+    match store::finalize_single_tape_backup_pass(pool, claim, &pass).await? {
+        store::FinalizeSingleTapeDataResult::Passed {
+            recovery_point_id,
+            volume_record_id,
+        } => {
+            info!(
+                backup_run_id = %claim.run.id,
+                %recovery_point_id,
+                %volume_record_id,
+                "attended full backup passed physical readback and created a verified recovery point"
+            );
+            Ok(())
+        }
+        store::FinalizeSingleTapeDataResult::Rejected(reason) => {
+            let cancellation_requested =
+                store::single_tape_data_cancel_requested(pool, claim.run.id).await?;
+            finish_or_quarantine(
+                pool,
+                claim,
+                if cancellation_requested {
+                    store::SingleTapeDataTerminalState::Cancelled
+                } else {
+                    store::SingleTapeDataTerminalState::Failed
+                },
+                json!({
+                    "detail": if cancellation_requested {
+                        format!("backup cancellation was honored before atomic finalization: {reason}")
+                    } else {
+                        format!("final backup evidence was rejected: {reason}")
+                    },
+                    "position_uncertain": false,
+                    "media_write_started": true,
+                    "verified_recovery_point_created": false
+                }),
+            )
+            .await
+        }
+        store::FinalizeSingleTapeDataResult::FencedOut => {
+            let detail = "atomic backup finalization was fenced out after physical media work; drive and cartridge require reconciliation";
+            let _ = store::quarantine_fenced_single_tape_write(pool, claim, detail).await;
+            Err(anyhow::anyhow!(detail))
+        }
+    }
 }
 
 async fn finish_or_quarantine(
@@ -971,7 +1206,7 @@ async fn scan_manifest_with_lease(
     let scan_stop = Arc::clone(&stop);
     let mut scan =
         tokio::task::spawn_blocking(move || build_manifest_with_cancel(&path, scan_stop.as_ref()));
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
     let failure = loop {
@@ -992,14 +1227,9 @@ async fn scan_manifest_with_lease(
                 );
             }
             _ = heartbeat.tick() => {
-                match store::renew_single_tape_data_run_leases(pool, claim).await {
-                    Ok(true) => {}
-                    Ok(false) => break ExerciseFailure::interrupted(
-                        "the fenced drive or cartridge lease expired during file inventory",
-                    ),
-                    Err(error) => break ExerciseFailure::interrupted(format!(
-                        "the drive/cartridge lease heartbeat failed during file inventory: {error}"
-                    )),
+                match renew_claim(pool, claim, "during file inventory").await {
+                    Ok(()) => {}
+                    Err(error) => break error,
                 }
             }
         }
@@ -1060,15 +1290,12 @@ async fn wait_for_job(
         if Instant::now() >= deadline {
             let cancellation_result = cancel_and_observe(adapter, job_id).await;
             return Err(ExerciseFailure::interrupted(format!(
-                "Bacula {operation} JobId {job_id} exceeded the recovery-exercise deadline; {cancellation_result}"
+                "Bacula {operation} JobId {job_id} exceeded the physical-data deadline; {cancellation_result}"
             )));
         }
         if let Err(error) = renew_claim(pool, claim, &format!("during Bacula {operation}")).await {
             let cancellation_result = cancel_and_observe(adapter, job_id).await;
-            return Err(ExerciseFailure::interrupted(format!(
-                "{}; {}",
-                error.detail, cancellation_result
-            )));
+            return Err(engine_wait_failure(error, &cancellation_result));
         }
         let evidence = match adapter.job_evidence(job_id).await {
             Ok(evidence) => {
@@ -1101,6 +1328,15 @@ async fn wait_for_job(
             };
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+fn engine_wait_failure(error: ExerciseFailure, cancellation_result: &str) -> ExerciseFailure {
+    let detail = format!("{}; {cancellation_result}", error.detail);
+    if error.class == FailureClass::Cancelled {
+        ExerciseFailure::cancelled(detail)
+    } else {
+        ExerciseFailure::interrupted(detail)
     }
 }
 
@@ -1179,6 +1415,19 @@ async fn renew_claim(
     claim: &store::ClaimedSingleTapeDataRun,
     context: &str,
 ) -> Result<(), ExerciseFailure> {
+    match store::single_tape_data_cancel_requested(pool, claim.run.id).await {
+        Ok(true) => {
+            return Err(ExerciseFailure::cancelled(format!(
+                "operator cancellation was requested {context}"
+            )))
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return Err(ExerciseFailure::interrupted(format!(
+                "could not check durable cancellation state {context}: {error}"
+            )))
+        }
+    }
     match store::renew_single_tape_data_run_leases(pool, claim).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(ExerciseFailure::interrupted(format!(
@@ -1338,6 +1587,14 @@ async fn transition(
     phase: store::SingleTapeDataPhase,
     evidence: Value,
 ) -> Result<(), ExerciseFailure> {
+    if store::single_tape_data_cancel_requested(pool, claim.run.id)
+        .await
+        .map_err(|error| ExerciseFailure::interrupted(error.to_string()))?
+    {
+        return Err(ExerciseFailure::cancelled(
+            "operator cancellation was requested before the next phase",
+        ));
+    }
     if store::transition_single_tape_data_phase(pool, claim, phase, evidence)
         .await
         .map_err(|error| ExerciseFailure::interrupted(error.to_string()))?
@@ -1345,7 +1602,7 @@ async fn transition(
         Ok(())
     } else {
         Err(ExerciseFailure::interrupted(
-            "the fenced claim rejected a recovery-exercise phase transition",
+            "the fenced claim rejected a physical-data phase transition",
         ))
     }
 }
@@ -1486,7 +1743,7 @@ fn observation_blocker(
         || observation.wwn != run.expected_wwn
         || observation.firmware != run.expected_firmware
     {
-        return Some("drive model, serial, WWN, or firmware changed before the exercise");
+        return Some("drive model, serial, WWN, or firmware changed before the operation");
     }
     if observation.medium_loaded != Some(true) || observation.ready != Some(true) {
         return Some("no ready cartridge is loaded");
@@ -1502,12 +1759,12 @@ async fn finish(
 ) -> Result<bool> {
     if !store::finish_single_tape_data_run(pool, claim, terminal, result.clone()).await? {
         warn!(
-            recovery_exercise_id = %claim.run.id,
-            "recovery-exercise completion was rejected by its fencing token"
+            physical_data_run_id = %claim.run.id,
+            "physical-data completion was rejected by its fencing token"
         );
     } else {
         warn!(
-            recovery_exercise_id = %claim.run.id,
+            physical_data_run_id = %claim.run.id,
             terminal_state = ?terminal,
             detail = %concise_text(
                 result
@@ -1516,7 +1773,7 @@ async fn finish(
                     .unwrap_or("terminal evidence recorded"),
                 512
             ),
-            "physical recovery exercise reached a durable terminal state"
+            "physical tape data operation reached a durable terminal state"
         );
         return Ok(true);
     }
@@ -1560,5 +1817,24 @@ mod tests {
     fn label_validation_accepts_success() {
         let output = b"3000 OK label. VolBytes=283 Volume=TEST001 Device=TS-LTO-Drive";
         assert!(validate_console_output("label", output, b"").is_ok());
+    }
+
+    #[test]
+    fn engine_wait_preserves_operator_cancellation_class() {
+        let failure = engine_wait_failure(
+            ExerciseFailure::cancelled("operator cancellation was requested during Bacula verify"),
+            "cancel command accepted",
+        );
+        assert_eq!(failure.class, FailureClass::Cancelled);
+        assert!(failure.detail.contains("cancel command accepted"));
+    }
+
+    #[test]
+    fn engine_wait_keeps_lease_failure_interrupted() {
+        let failure = engine_wait_failure(
+            ExerciseFailure::interrupted("the fenced lease expired during Bacula backup"),
+            "cancel command accepted",
+        );
+        assert_eq!(failure.class, FailureClass::Interrupted);
     }
 }

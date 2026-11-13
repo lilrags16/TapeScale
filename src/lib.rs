@@ -5,6 +5,7 @@
 //! hardware qualification claim.
 
 pub mod api;
+pub mod backup_ops;
 pub mod bacula_catalog;
 pub mod bacula_runtime;
 pub mod config;

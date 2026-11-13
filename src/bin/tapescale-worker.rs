@@ -186,7 +186,7 @@ async fn main() -> Result<()> {
             source_root = %config.source_root.display(),
             restore_root = %config.restore_root.display(),
             timeout_seconds = config.data_run_timeout.as_secs(),
-            "G0.2 laboratory single-tape full-file write, physical readback, and restore comparison is enabled; it is not production-qualified"
+            "attended Bacula single-tape Full backup, physical readback, and recovery-exercise execution is enabled; it is not production-qualified"
         );
     }
     let btape_config = BtapeQualificationConfig {
@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
     if engine_identity.qualification != QualificationStatus::PhysicallyQualified {
         warn!(
             qualification = ?engine_identity.qualification,
-            "ordinary backup jobs remain blocked by the unqualified simulator; the attended btape qualification harness uses its separate lab gate"
+            "the legacy generic job engine remains an unqualified simulator; attended Full backups use the separately gated pinned Bacula data path"
         );
     }
     let worker_id = Uuid::now_v7();

@@ -1,11 +1,10 @@
 use anyhow::Result;
 use chrono::Utc;
-use chrono_tz::Tz;
 use clap::Parser;
 use tapescale::{
+    backup_ops,
     config::Config,
     custody_ops::{self, CustodyActor, ReconcileOverdueRequest},
-    domain::schedule::next_default_occurrence,
     store,
 };
 use tracing::info;
@@ -33,12 +32,8 @@ async fn main() -> Result<()> {
         None if config.demo_mode => None,
         None => anyhow::bail!("DATABASE_URL is required outside simulation mode"),
     };
-    let timezone: Tz = std::env::var("TAPESCALE_SITE_TIMEZONE")
-        .unwrap_or_else(|_| "UTC".to_owned())
-        .parse()?;
-
     loop {
-        evaluate_once(pool.as_ref(), timezone).await?;
+        evaluate_once(pool.as_ref(), config.lab_file_roundtrip_enabled).await?;
         if arguments.once {
             break;
         }
@@ -54,17 +49,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn evaluate_once(pool: Option<&sqlx::PgPool>, timezone: Tz) -> Result<()> {
-    let next = next_default_occurrence(Utc::now(), timezone);
-    let (enabled_policies, newly_overdue_movements) = if let Some(pool) = pool {
-        let enabled =
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM protection_policies WHERE enabled")
-                .fetch_one(pool)
-                .await?;
+async fn evaluate_once(pool: Option<&sqlx::PgPool>, attended_backup_enabled: bool) -> Result<()> {
+    let as_of = Utc::now();
+    let (backup_queue, newly_overdue_movements) = if let Some(pool) = pool {
+        // The queue operation owns per-policy timezones, occurrence idempotency, and policy
+        // revalidation. The first operational data path is intentionally weekly-Full only;
+        // incremental schedules remain persisted but cannot be dispatched by this worker.
+        let backup_queue = if attended_backup_enabled {
+            Some(backup_ops::enqueue_due_backup_requests(pool, as_of).await?)
+        } else {
+            None
+        };
         let overdue = custody_ops::reconcile_overdue_movements(
             pool,
             ReconcileOverdueRequest {
-                as_of: Utc::now(),
+                as_of,
                 actor: CustodyActor {
                     user_id: None,
                     label: "tapescale-scheduler".to_owned(),
@@ -75,17 +74,17 @@ async fn evaluate_once(pool: Option<&sqlx::PgPool>, timezone: Tz) -> Result<()> 
         .await?
         .newly_overdue_task_ids
         .len();
-        (enabled, overdue)
+        (backup_queue, overdue)
     } else {
-        (0, 0)
+        (None, 0)
     };
     info!(
-        enabled_policies,
+        backup_queue = ?backup_queue,
         newly_overdue_movements,
-        occurrence_id = %next.id,
-        kind = ?next.kind,
-        scheduled_for = %next.scheduled_for,
-        shifted_for_dst_gap = next.shifted_for_dst_gap,
+        evaluation_as_of = %as_of,
+        attended_backup_enabled,
+        operational_backup_kind = "full",
+        incremental_execution = "blocked",
         "schedule evaluation complete"
     );
     Ok(())
