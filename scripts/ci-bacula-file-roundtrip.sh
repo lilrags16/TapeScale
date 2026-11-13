@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Exercise the exact Bacula 15.0.3 catalog contract without tape hardware. The
 # Storage Daemon still uses TapeScale's LTO media type and resource names, but
-# its Device Type is File so CI can prove backup, Data verify, and restore rows.
+# its Device Type is File so CI can prove backup, Data verify, initial restore,
+# then a second restore after daemon restart with the source unavailable.
 
 : "${DATABASE_URL:?DATABASE_URL is required}"
 : "${BACULA_CATALOG_HOST:?BACULA_CATALOG_HOST is required}"
@@ -34,6 +35,7 @@ readonly runtime_root="/run/bacula"
 readonly source_root="/source"
 readonly restore_root="/restore"
 readonly restore_destination="${restore_root}/${run_token}"
+readonly rehearsal_destination="${restore_root}/${run_token}-rehearsal"
 readonly log_root="$(mktemp -d /tmp/tapescale-bacula-roundtrip.XXXXXX)"
 
 sd_pid=""
@@ -365,32 +367,70 @@ wait_for_job() {
   return 1
 }
 
+stop_runtime() {
+  local daemon_pid
+  local running
+  for daemon_pid in "$director_pid" "$fd_pid" "$sd_pid"; do
+    if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+      kill -TERM "$daemon_pid" 2>/dev/null || true
+    fi
+  done
+  for _attempt in $(seq 1 150); do
+    running=false
+    for daemon_pid in "$director_pid" "$fd_pid" "$sd_pid"; do
+      if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+        running=true
+      fi
+    done
+    if [[ "$running" == false ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+  for daemon_pid in "$director_pid" "$fd_pid" "$sd_pid"; do
+    if [[ -n "$daemon_pid" ]]; then
+      if kill -0 "$daemon_pid" 2>/dev/null; then
+        kill -KILL "$daemon_pid" 2>/dev/null || true
+      fi
+      wait "$daemon_pid" || true
+    fi
+  done
+  director_pid=""
+  fd_pid=""
+  sd_pid=""
+}
+
+start_runtime() {
+  local suffix=$1
+  bacula-sd -f -P -c "$config_root/bacula-sd.conf" >"$log_root/storage-${suffix}.log" 2>&1 &
+  sd_pid=$!
+  bacula-fd -f -P -c "$config_root/bacula-fd.conf" >"$log_root/file-${suffix}.log" 2>&1 &
+  fd_pid=$!
+  bacula-dir -f -P -c "$config_root/bacula-dir.conf" >"$log_root/director-${suffix}.log" 2>&1 &
+  director_pid=$!
+
+  local director_ready=false
+  for _attempt in $(seq 1 30); do
+    if director_status="$(run_console 'status director' 2>&1)" \
+      && grep -Fq '1000 OK:' <<<"$director_status"; then
+      director_ready=true
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$director_ready" != true ]]; then
+    echo "Bacula Director did not accept the restricted console within 30 seconds" >&2
+    return 1
+  fi
+}
+
 /usr/local/bin/tapescale-worker --prepare-bacula-catalog
 
 bacula-sd -t -c "$config_root/bacula-sd.conf"
 bacula-fd -t -c "$config_root/bacula-fd.conf"
 bacula-dir -t -c "$config_root/bacula-dir.conf"
 
-bacula-sd -f -P -c "$config_root/bacula-sd.conf" >"$log_root/storage.log" 2>&1 &
-sd_pid=$!
-bacula-fd -f -P -c "$config_root/bacula-fd.conf" >"$log_root/file.log" 2>&1 &
-fd_pid=$!
-bacula-dir -f -P -c "$config_root/bacula-dir.conf" >"$log_root/director.log" 2>&1 &
-director_pid=$!
-
-director_ready=false
-for _attempt in $(seq 1 30); do
-  if director_status="$(run_console 'status director' 2>&1)" \
-    && grep -Fq '1000 OK:' <<<"$director_status"; then
-    director_ready=true
-    break
-  fi
-  sleep 1
-done
-if [[ "$director_ready" != true ]]; then
-  echo "Bacula Director did not accept the restricted console within 30 seconds" >&2
-  exit 1
-fi
+start_runtime initial
 
 label_output="$(run_console "label storage=TS-LTO pool=${pool_name} volume=${volume_name} yes")"
 if ! grep -Fq 'successfully created' <<<"$label_output"; then
@@ -441,4 +481,27 @@ test "$restore_shape" = "TS-Restore|R|F|T|0|0|<missing>|TS-LTO|0"
   --catalog-run-id "$run_id" \
   --catalog-volume "$volume_name"
 
-echo "Bacula file-backed catalog roundtrip passed: backup=${backup_job_id} verify=${verify_job_id} restore=${restore_job_id}"
+# A verified point must remain restorable after the engine processes restart and
+# without consulting the original source. This is the deterministic software
+# equivalent of the attended Recovery Vault rehearsal; physical SAS/LTO proof
+# remains a separate hardware acceptance result.
+stop_runtime
+mv "$source_root" "${source_root}.unavailable"
+install -d -m 0750 "$source_root"
+test ! -e "$source_root/fixture.txt"
+start_runtime rehearsal
+
+rehearsal_output="$(run_console "restore jobid=${backup_job_id} restorejob=TS-Restore restoreclient=tapescale-fd where=\"${rehearsal_destination}\" all done yes")"
+rehearsal_job_id="$(extract_job_id "$rehearsal_output")"
+wait_for_job "$rehearsal_job_id" "Restarted-runtime restore rehearsal"
+cmp "${source_root}.unavailable/fixture.txt" "$rehearsal_destination/source/fixture.txt"
+
+/usr/local/bin/tapescale-worker \
+  --validate-bacula-roundtrip-catalog \
+  --catalog-backup-job-id "$backup_job_id" \
+  --catalog-verify-job-id "$verify_job_id" \
+  --catalog-restore-job-id "$rehearsal_job_id" \
+  --catalog-run-id "$run_id" \
+  --catalog-volume "$volume_name"
+
+echo "Bacula file-backed recovery path passed: backup=${backup_job_id} verify=${verify_job_id} initial_restore=${restore_job_id} restarted_restore=${rehearsal_job_id}"

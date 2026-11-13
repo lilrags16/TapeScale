@@ -64,7 +64,7 @@ jobs:
           --entrypoint /usr/local/bin/tapescale-worker
           tapescale:ci
           --validate-bacula-schema
-      - name: Exercise fresh Bacula backup, Data verify, restore, and catalog proof
+      - name: Exercise backup, Data verify, and restarted source-independent restores
         run: |
           set -euo pipefail
           catalog_network="tapescale-ci-catalog-${GITHUB_RUN_ID}"

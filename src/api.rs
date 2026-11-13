@@ -1944,12 +1944,19 @@ async fn queue_restore_rehearsal(
     require_file_roundtrip(&state)?;
     let pool = require_pool(&state)?;
     let actor = request.validate()?;
+    let attestations = store::RestoreRehearsalAttestations {
+        confirmation: request.confirmation.clone(),
+        tape_loaded_confirmed: request.tape_loaded_confirmed,
+        isolated_destination_confirmed: request.isolated_destination_confirmed,
+        attended_confirmed: request.attended_confirmed,
+    };
     match store::queue_restore_rehearsal(
         pool,
         request.plan_id,
         request.preview_hash.trim(),
         request.drive_id,
         &actor,
+        &attestations,
     )
     .await?
     {
@@ -2165,6 +2172,8 @@ fn sanitize_restore_evidence_value(value: &Value, depth: usize, truncated: &mut 
             for (key, item) in values.iter().take(MAX_MEMBERS) {
                 let normalized = key.to_ascii_lowercase();
                 if normalized.contains("storage_ref")
+                    || normalized.ends_with("_lease_id")
+                    || normalized.ends_with("_fencing_token")
                     || matches!(
                         normalized.as_str(),
                         "source_mount_path"
@@ -2941,6 +2950,12 @@ mod tests {
                 "daemon_logs": ["/var/lib/tapescale/private/director.log"]
             },
             "source_mount_path": "/source/private-snapshot",
+            "lease": {
+                "drive_lease_id": Uuid::now_v7(),
+                "drive_fencing_token": 42,
+                "media_lease_id": Uuid::now_v7(),
+                "media_fencing_token": 43
+            },
             "artifact": {
                 "storage_ref": "/var/lib/tapescale/evidence/private.json",
                 "sha256": "b".repeat(64)
@@ -2950,6 +2965,10 @@ mod tests {
         }));
         assert!(sanitized["runtime"].get("daemon_logs").is_none());
         assert!(sanitized.get("source_mount_path").is_none());
+        assert!(sanitized["lease"].get("drive_lease_id").is_none());
+        assert!(sanitized["lease"].get("drive_fencing_token").is_none());
+        assert!(sanitized["lease"].get("media_lease_id").is_none());
+        assert!(sanitized["lease"].get("media_fencing_token").is_none());
         assert!(sanitized["artifact"].get("storage_ref").is_none());
         assert_eq!(sanitized["restore_destination"], "planned-restores/run-1");
         assert!(sanitized["oversized"]

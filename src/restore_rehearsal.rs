@@ -1834,10 +1834,9 @@ mod tests {
         )
         .expect("redirect");
 
-        assert!(verified_restored_source_path(
-            destination.path(),
-            Path::new("/source/archive")
-        )
-        .is_err());
+        assert!(
+            verified_restored_source_path(destination.path(), Path::new("/source/archive"))
+                .is_err()
+        );
     }
 }
