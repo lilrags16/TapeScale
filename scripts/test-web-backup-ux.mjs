@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-2/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-2/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-3/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-3/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -137,47 +137,88 @@ test("bounded source and retained browsers disclose partial directory views", ()
   assert.match(retained, /backup itself was not limited/);
 });
 
-test("the Recovery Vault offers an honest attended single-volume Restore run", () => {
+test("the Recovery Vault offers attended one- and multi-tape Restore runs only under the server contract", () => {
   const phases = section("  const RESTORE_REHEARSAL_PHASES = [", "  function restoreRehearsalDetailRecord(");
+  const detailContract = section("  function restoreRehearsalVolumes(", "  function restoreRehearsalPhase(");
   const history = section("  function renderRestoreRehearsal(", "  function renderRecoveryPointDossier(");
   const dossier = section("  function renderRecoveryPointDossier(", "  function renderRestore(");
+  const planDialog = section("  function openRestorePlan(", "  function optionalFormNumber(");
   const mediaContract = section("  function restorePlanTapes(", "  function restorePlanDrives(");
   const result = section("  function renderRestorePlanResult(", "  async function submitRestorePlan(");
   const start = section("  function openRestoreRehearsal(", "  async function submitRestoreRehearsal(");
+  const handoff = section("  function restoreMediaReadinessValue(", "  function openCancelRestoreRehearsal(");
 
-  assert.match(phases, /name: "Restore files", detail: "Read the complete backup from one tape"/);
+  assert.match(phases, /name: "Restore files", detail: "Read the complete backup across its ordered tapes"/);
+  assert.match(phases, /"waiting_for_media", "media_required"/);
   assert.match(phases, /name: "Verify files", detail: "Hash and compare restored content"/);
   assert.match(phases, /name: "Complete", detail: "Retain restore evidence"/);
   assert.doesNotMatch(phases, /Retain rehearsal evidence/);
 
+  assert.match(detailContract, /arrayValue\(detail, "volumes", "required_volumes"\)/);
+  assert.match(app, /"expected_cartridge_label", "expected_volume_label", "internal_label"/);
+  assert.match(detailContract, /sort\(\(left, right\) => left\.sequence - right\.sequence\)/);
+  assert.match(detailContract, /"media_request", "current_media_request"/);
+  assert.match(detailContract, /pick\(detail, "media_handoff"\)/);
+  assert.match(detailContract, /required.*waiting_for_media/s);
+  assert.match(detailContract, /Exact ordered restore media/);
+  assert.match(detailContract, /Required next/);
+
   assert.match(history, /<h3>Restore runs<\/h3>/);
-  assert.match(history, /supported verified Full recovery point on one cartridge/);
+  assert.match(history, /supported verified Full recovery point can run an attended one- or multi-tape restore/);
   assert.match(history, /<h4>Restore run<\/h4>/);
+  assert.match(history, /Attended .*multi-tape.*single-tape/);
+  assert.match(history, /Load tape .* of/);
+  assert.match(history, /durably paused at a read-only media boundary/);
+  assert.match(history, /data-action="open-restore-media-handoff"/);
+  assert.match(history, /data-action="open-cancel-restore-rehearsal"/);
   assert.match(history, /Download restore evidence/);
   assert.doesNotMatch(history, /Ready G0\.2 restore plans|Recovery rehearsals/);
 
-  assert.match(dossier, /supported verified Full recovery points from operational backups or the recovery exercise, held on exactly one cartridge/);
-  assert.match(dossier, /recovers the complete point into a new isolated destination/);
-  assert.match(dossier, /file selection and multi-tape restore are not available yet/);
-  assert.doesNotMatch(dossier, /supported G0\.2 point/);
+  assert.match(dossier, /recovers the complete point across its exact ordered tape set into a new isolated destination/);
+  assert.match(dossier, /File or directory selection, encrypted recovery points, and clean-catalog recovery are not available yet/);
+  assert.match(planDialog, /server-returned ordered tape set/);
 
   assert.match(mediaContract, /planArray\(restorePlanExecution\(plan\), "required_tape_ids", "required_tapes", "tapes"\)/);
-  assert.match(result, /supported verified Full recovery point can advance to an attended Restore run/);
-  assert.match(result, /pick\(plan, "execution_supported"\) === true && tapes\.length === 1/);
+  assert.match(mediaContract, /pick\(execution, "multi_volume"\) === true/);
+  assert.match(mediaContract, /declaredCount === tapes\.length/);
+  assert.match(mediaContract, /tapes\.length === 1 \|\| restorePlanMultiVolumeSupported\(plan\)/);
+  assert.match(result, /executionSupported = ready && executionOffered && volumeContractReady/);
+  assert.match(result, /matching attended execution contract for this ordered media set/);
   assert.match(result, /Restore this complete recovery point/);
   assert.match(result, /Start Restore run/);
-  assert.match(result, /File or directory selection and multi-tape restore are not available/);
-  assert.match(result, /single-tape, isolated-destination, and attended confirmation/);
+  assert.match(result, /pause durably at each media boundary and name the exact next cartridge/);
+  assert.match(result, /Full-point-only and does not support file selection, encrypted recovery points, or clean-catalog recovery/);
+  assert.match(result, /Every later tape requires its own exact attended handoff/);
 
-  assert.match(start, /if \(tapes\.length !== 1\)/);
+  assert.match(start, /if \(!restorePlanVolumeContractReady\(plan\)\)/);
+  assert.doesNotMatch(start, /if \(tapes\.length !== 1\)/);
   assert.match(start, /pick\(restorePlanExecution\(plan\), "destination_subpath", "destination"\)/);
-  assert.match(start, /Multi-tape recovery points remain planning-only/);
-  assert.match(start, /restores the complete recovery point from exactly one retained cartridge/);
-  assert.match(start, /File or directory selection and multi-tape restore are not supported/);
+  assert.match(start, /restores the complete recovery point across .* exact ordered cartridges/);
+  assert.match(start, /Load only tape 1 now/);
+  assert.match(start, /Later tapes use separate exact handoffs/);
+  assert.match(start, /File or directory selection, encrypted recovery points, and clean-catalog recovery are not supported/);
   assert.match(start, /local console has no application sign-in/);
   assert.match(start, /new isolated recovery destination, not live data/);
   assert.match(start, /openModal\("Start Restore run"/);
   assert.doesNotMatch(start, /supported G0\.2 recovery point|Start recovery rehearsal/);
+
+  assert.match(handoff, /\/media-readiness/);
+  assert.match(handoff, /pick\(readiness, "ready"\) !== true/);
+  assert.match(handoff, /Incomplete durable tape request/);
+  assert.match(handoff, /Unload and remove the previous tape, then insert this exact recorded cartridge/);
+  assert.match(handoff, /name="loaded_media_confirmed" required/);
+  assert.match(handoff, /name="attended_confirmed" required/);
+  assert.match(handoff, /Finish later/);
+  assert.match(handoff, /const readiness = await loadRestoreMediaReadiness\(runId\)/);
+  assert.match(handoff, /The exact restore tape request changed while this form was open/);
+  assert.match(handoff, /endpoints\.restoreRehearsals \+ "\/" \+ encodeURIComponent\(runId\) \+ "\/media"/);
+  for (const field of ["request_id", "drive_id", "expected_stable_id", "cartridge_id", "typed_cartridge_label", "volume_order", "loaded_media_confirmed", "attended_confirmed", "confirmation"]) {
+    assert.match(handoff, new RegExp(field + ":"), `media handoff must send ${field}`);
+  }
+  assert.match(app, /action === "open-restore-media-handoff"/);
+  assert.match(app, /event\.target\.id === "restore-media-handoff-form"/);
+  assert.match(css, /\.restore-media-handoff/);
+  assert.match(css, /\.restore-volume-plan li\.done/);
 });
 
 test("capacity planning is explicitly estimated and supports unknown archive size", () => {
@@ -190,6 +231,22 @@ test("capacity planning is explicitly estimated and supports unknown archive siz
   assert.match(capacity, /create a new backup plan for this snapshot with media spanning enabled/);
   assert.doesNotMatch(app, /will estimate the tape count/);
   assert.doesNotMatch(capacity, /will fit/);
+});
+
+test("writing progress explains bounded disk spooling without inventing a percentage", () => {
+  const cue = section("  function renderBackupSpoolingCue(", "  function backupPhaseIndex(");
+  const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
+
+  assert.match(cue, /backupRunState\(run\) !== "writing"/);
+  assert.match(cue, /backupEvidenceValue\(run, "data_spooling"\)/);
+  assert.match(cue, /"effective_maximum_bytes", "maximum_bytes"/);
+  assert.match(cue, /Buffering on disk, then streaming to tape/);
+  assert.match(cue, /drive may remain idle while the buffer initially fills/);
+  assert.match(cue, /once despooling begins, it should stream continuously for that buffered segment/);
+  assert.doesNotMatch(cue, /pause normally|switches between filling and writing/);
+  assert.match(cue, /This buffer does not limit the total archive size/);
+  assert.doesNotMatch(cue, /%|percent|percentage/i);
+  assert.match(detail, /notice \+ renderBackupSpoolingCue\(run\) \+ measuredProgress/);
 });
 
 test("final authorization is explicit without asking for the cartridge label twice", () => {

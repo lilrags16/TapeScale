@@ -2,6 +2,11 @@ use std::{env, fs, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration}
 
 use anyhow::{Context, Result};
 
+use crate::engine::bacula::{DATA_SPOOL_DIRECTORY, DEFAULT_DATA_SPOOL_MAX_BYTES};
+
+const DEFAULT_DATA_SPOOL_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DEFAULT_DATA_SPOOL_MIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -21,6 +26,10 @@ pub struct Config {
     pub restore_root: PathBuf,
     pub evidence_root: PathBuf,
     pub data_run_timeout: Duration,
+    pub bacula_spool_dir: PathBuf,
+    pub bacula_spool_max_bytes: u64,
+    pub bacula_spool_reserve_bytes: u64,
+    pub bacula_spool_min_bytes: u64,
 }
 
 impl Config {
@@ -53,6 +62,19 @@ impl Config {
         ));
         let data_run_timeout =
             Duration::from_secs(parse("TAPESCALE_DATA_RUN_TIMEOUT_SECS", 43_200)?);
+        let bacula_spool_dir = PathBuf::from(DATA_SPOOL_DIRECTORY);
+        let bacula_spool_max_bytes = parse(
+            "TAPESCALE_BACULA_SPOOL_MAX_BYTES",
+            DEFAULT_DATA_SPOOL_MAX_BYTES,
+        )?;
+        let bacula_spool_reserve_bytes = parse(
+            "TAPESCALE_BACULA_SPOOL_RESERVE_BYTES",
+            DEFAULT_DATA_SPOOL_RESERVE_BYTES,
+        )?;
+        let bacula_spool_min_bytes = parse(
+            "TAPESCALE_BACULA_SPOOL_MIN_BYTES",
+            DEFAULT_DATA_SPOOL_MIN_BYTES,
+        )?;
 
         anyhow::ensure!(
             qualification_timeout >= Duration::from_secs(60),
@@ -94,6 +116,26 @@ impl Config {
                 && data_run_timeout <= Duration::from_secs(86_400),
             "TAPESCALE_DATA_RUN_TIMEOUT_SECS must be between 300 and 86400"
         );
+        anyhow::ensure!(
+            bacula_spool_dir.is_absolute(),
+            "the pinned Bacula spool directory must be an absolute path"
+        );
+        anyhow::ensure!(
+            !bacula_spool_dir.starts_with(&source_root)
+                && !source_root.starts_with(&bacula_spool_dir)
+                && !bacula_spool_dir.starts_with(&restore_root)
+                && !restore_root.starts_with(&bacula_spool_dir)
+                && !bacula_spool_dir.starts_with(&evidence_root)
+                && !evidence_root.starts_with(&bacula_spool_dir)
+                && !bacula_spool_dir.starts_with(&bacula_state_dir)
+                && !bacula_state_dir.starts_with(&bacula_spool_dir),
+            "the Bacula spool must be isolated from source, restore, evidence, and engine-state trees"
+        );
+        anyhow::ensure!(
+            bacula_spool_min_bytes > 0
+                && bacula_spool_max_bytes >= bacula_spool_min_bytes,
+            "TAPESCALE_BACULA_SPOOL_MAX_BYTES must be at least TAPESCALE_BACULA_SPOOL_MIN_BYTES, and both must be non-zero"
+        );
 
         Ok(Self {
             bind,
@@ -113,6 +155,10 @@ impl Config {
             restore_root,
             evidence_root,
             data_run_timeout,
+            bacula_spool_dir,
+            bacula_spool_max_bytes,
+            bacula_spool_reserve_bytes,
+            bacula_spool_min_bytes,
         })
     }
 }

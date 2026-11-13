@@ -1,10 +1,11 @@
 //! Attended, read-only recovery rehearsal for an already verified full-file point.
 //!
-//! This path accepts the exact full, single-volume job retained by either a passed legacy G0.2
-//! exercise or a verified operational backup, recreates that run's fixed Bacula resources,
-//! restores the complete job into a fresh server-generated directory, and independently compares
-//! the result with the retained source manifest. It never labels, erases, writes, or otherwise
-//! prepares media.
+//! This path accepts the exact full job retained by either a passed legacy G0.2 exercise or a
+//! verified operational backup, recreates that run's fixed Bacula resources, and restores the
+//! complete job into a fresh server-generated directory. Spanning jobs use an attended, ordered,
+//! read-only media handoff for every retained volume. The result is independently compared with
+//! the retained source manifest. This path never labels, erases, writes, or otherwise prepares
+//! media.
 
 use std::{
     fs,
@@ -19,6 +20,7 @@ use std::{
 
 use anyhow::Result;
 use rustix::fs::{open, statvfs, Mode, OFlags};
+use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -27,7 +29,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
-    bacula_catalog::{validate_backup_job, validate_restore_job, BaculaRestoreCatalogEvidence},
+    bacula_catalog::{
+        validate_backup_job_on_volumes, validate_restore_job, BaculaBackupCatalogEvidence,
+        BaculaRestoreCatalogEvidence,
+    },
     bacula_runtime::{BaculaRuntime, BaculaRuntimeEvidence},
     config::Config,
     data_path::{
@@ -41,14 +46,13 @@ use crate::{
     },
     domain::path::{resolve_link_target, validate_archive_path},
     engine::bacula::{
-        BaculaAdapter, BaculaCommands, BaculaJobEvidence, BaculaJobId, BaculaJobResource,
-        BaculaPaths, BaculaPoolName, BaculaRestoreSubpath, CorrelatedJobDispatch,
-        DirectBconsoleExecutor, VolumeLabel,
+        BaculaAdapter, BaculaCommands, BaculaCompression, BaculaDataOptions, BaculaJobEvidence,
+        BaculaJobId, BaculaJobResource, BaculaJobState, BaculaPaths, BaculaPoolName,
+        BaculaRestoreSubpath, CorrelatedJobDispatch, DirectBconsoleExecutor, VolumeLabel,
     },
     store,
 };
 
-const MAX_MANIFEST_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +108,15 @@ struct CompletedRehearsal {
     restore: BaculaJobEvidence,
     restore_catalog: BaculaRestoreCatalogEvidence,
     restore_destination: PathBuf,
+    volumes: Vec<RestoreVolumeEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct RestoreVolumeEvidence {
+    volume_order: i32,
+    cartridge_label: String,
+    volume_label: String,
+    engine_media_id: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -299,30 +312,34 @@ async fn perform_rehearsal(
         }
         renew_claim(pool, claim, "before Bacula catalog preflight").await?;
 
-        if claim.run.expected_volume_label != claim.run.expected_on_tape_identity {
-            return Err(RehearsalFailure::blocked(
-                "the retained Bacula volume label and on-tape identity disagree",
-            ));
-        }
         let backup_job_id = positive_bacula_job_id(claim.run.backup_job_id)?;
-        let volume = VolumeLabel::parse(claim.run.expected_volume_label.clone())
-            .map_err(|error| RehearsalFailure::blocked(error.to_string()))?;
-        let bacula_pool = BaculaPoolName::for_run(claim.run.original_data_run_id);
-        let backup_catalog = validate_backup_job(pool, backup_job_id, &volume, &bacula_pool)
+        let restore_volumes = store::restore_rehearsal_volumes(pool, claim.run.id)
             .await
             .map_err(|error| {
+                RehearsalFailure::blocked(format!(
+                    "could not load the retained ordered restore volumes: {error}"
+                ))
+            })?;
+        let authorized_volumes = validate_restore_volume_ledger(claim, &restore_volumes)?;
+        let volume = authorized_volumes
+            .first()
+            .expect("the restore-volume ledger validator requires a first volume")
+            .clone();
+        let bacula_pool = BaculaPoolName::for_run(claim.run.original_data_run_id);
+        let backup_catalog = validate_backup_job_on_volumes(
+            pool,
+            backup_job_id,
+            &authorized_volumes,
+            &bacula_pool,
+        )
+        .await
+        .map_err(|error| {
                 RehearsalFailure::blocked(format!(
                     "the retained Bacula backup/catalog binding is no longer valid: {error}"
                 ))
             })?;
-        let expected_engine_media_id = u64::try_from(claim.run.expected_engine_media_id)
-            .map_err(|_| RehearsalFailure::blocked("the retained engine media id is invalid"))?;
-        if backup_catalog.volume.media_id != expected_engine_media_id {
-            return Err(RehearsalFailure::blocked(format!(
-                "Bacula media id changed: expected {expected_engine_media_id}, observed {}",
-                backup_catalog.volume.media_id
-            )));
-        }
+        let ordered_volume_evidence =
+            validate_restore_catalog_volumes(&restore_volumes, &backup_catalog, backup_job_id)?;
 
         let source_relative = Path::new(&claim.run.source_mount_path)
             .strip_prefix(&config.source_root)
@@ -335,12 +352,18 @@ async fn perform_rehearsal(
         let database_url = config.database_url.as_deref().ok_or_else(|| {
             RehearsalFailure::blocked("DATABASE_URL is required for the Bacula catalog")
         })?;
+        let data_options = if restore_volumes.len() > 1 {
+            BaculaDataOptions::spanning(BaculaCompression::None)
+        } else {
+            BaculaDataOptions::single_volume(BaculaCompression::None)
+        };
         runtime = Some(
-            BaculaRuntime::start(
+            BaculaRuntime::start_with_data_options(
                 pool,
                 database_url,
                 claim.run.original_data_run_id,
                 paths,
+                data_options,
                 evidence_directory,
                 cancellation,
             )
@@ -400,6 +423,8 @@ async fn perform_rehearsal(
                 "backup_job_id": backup_job_id,
                 "engine_media_id": backup_catalog.volume.media_id,
                 "volume": volume.as_str(),
+                "volume_count": ordered_volume_evidence.len(),
+                "volumes": ordered_volume_evidence,
                 "source_manifest_artifact_sha256": claim.run.source_manifest_sha256,
                 "source_manifest_digest": source_manifest.digest_sha256,
                 "restore_destination": destination.path(),
@@ -424,13 +449,40 @@ async fn perform_rehearsal(
         record_engine_dispatch(pool, claim, &restore_dispatch, &adapter).await?;
         let restore = wait_for_job(
             pool,
+            sas_config,
             claim,
             &adapter,
-            restore_dispatch.job_id,
+            RestoreJobMediaContext {
+                job_id: restore_dispatch.job_id,
+                ordered_volumes: &authorized_volumes,
+                pool: &bacula_pool,
+            },
             deadline,
             cancellation,
         )
         .await?;
+        let final_backup_catalog = validate_backup_job_on_volumes(
+            pool,
+            backup_job_id,
+            &authorized_volumes,
+            &bacula_pool,
+        )
+        .await
+        .map_err(|error| {
+            RehearsalFailure::failed(format!(
+                "Bacula backup/catalog binding changed during restore: {error}"
+            ))
+        })?;
+        let final_volume_evidence = validate_restore_catalog_volumes(
+            &restore_volumes,
+            &final_backup_catalog,
+            backup_job_id,
+        )?;
+        if final_volume_evidence != ordered_volume_evidence {
+            return Err(RehearsalFailure::failed(
+                "ordered Bacula volume evidence changed during restore",
+            ));
+        }
         let restore_catalog = validate_restore_job(pool, restore.job_id, backup_job_id)
             .await
             .map_err(|error| {
@@ -441,10 +493,12 @@ async fn perform_rehearsal(
             "engine_version": "15.0.3",
             "read_only_media_operation": true,
             "source_backup_job_id": backup_job_id,
-            "source_backup_catalog": backup_catalog,
+            "source_backup_catalog": final_backup_catalog,
             "restore_job": restore,
             "restore_catalog": restore_catalog,
             "volume": volume.as_str(),
+            "volume_count": ordered_volume_evidence.len(),
+            "volumes": ordered_volume_evidence,
             "restore_destination": destination.path()
         });
         let engine_artifact = persist_json_artifact(
@@ -468,6 +522,8 @@ async fn perform_rehearsal(
                 "engine_media_id": backup_catalog.volume.media_id,
                 "media_id": backup_catalog.volume.media_id,
                 "volume": volume.as_str(),
+                "volume_count": ordered_volume_evidence.len(),
+                "volumes": ordered_volume_evidence,
                 "destination": destination.path()
             }),
         )
@@ -559,6 +615,7 @@ async fn perform_rehearsal(
             restore,
             restore_catalog,
             restore_destination: destination.path().to_owned(),
+            volumes: ordered_volume_evidence,
         })
     }
     .await;
@@ -616,7 +673,11 @@ async fn complete_rehearsal(
                 return Ok(());
             }
             let report = json!({
-                "scope": "attended verified-point single-volume full-file restore rehearsal",
+                "scope": if completed.volumes.len() > 1 {
+                    "attended verified-point multi-volume full-file restore rehearsal"
+                } else {
+                    "attended verified-point single-volume full-file restore rehearsal"
+                },
                 "production_eligible": false,
                 "media_operation": "read_only",
                 "recovery_point_id": claim.run.recovery_point_id,
@@ -626,6 +687,8 @@ async fn complete_rehearsal(
                 "restore_job_id": completed.restore.job_id.get(),
                 "restore_job": completed.restore,
                 "restore_catalog": completed.restore_catalog,
+                "volume_count": completed.volumes.len(),
+                "volumes": completed.volumes,
                 "source_manifest_digest": completed.source_manifest.digest_sha256,
                 "restored_manifest_digest": completed.restored_manifest.digest_sha256,
                 "restored_manifest_sha256": completed.restored_manifest_artifact_sha256,
@@ -650,6 +713,8 @@ async fn complete_rehearsal(
                         "pending_atomic_finalization": true,
                         "matched": true,
                         "read_only_media_operation": true,
+                        "volume_count": completed.volumes.len(),
+                        "volumes": completed.volumes,
                         "source_manifest_digest": completed.source_manifest.digest_sha256,
                         "restored_manifest_digest": completed.restored_manifest.digest_sha256
                     }),
@@ -772,6 +837,108 @@ async fn complete_rehearsal(
     Ok(())
 }
 
+fn validate_restore_volume_ledger(
+    claim: &store::ClaimedRestoreRehearsalRun,
+    volumes: &[store::RestoreRehearsalVolumeRecord],
+) -> Result<Vec<VolumeLabel>, RehearsalFailure> {
+    let expected_count = usize::try_from(claim.run.volume_count)
+        .map_err(|_| RehearsalFailure::blocked("restore volume count is invalid"))?;
+    if volumes.is_empty() || volumes.len() != expected_count {
+        return Err(RehearsalFailure::blocked(format!(
+            "restore volume ledger contains {} rows but the fenced run requires {expected_count}",
+            volumes.len()
+        )));
+    }
+
+    let mut labels = Vec::with_capacity(volumes.len());
+    for (index, volume) in volumes.iter().enumerate() {
+        let expected_order = i32::try_from(index + 1)
+            .map_err(|_| RehearsalFailure::blocked("restore volume order overflowed"))?;
+        if volume.restore_rehearsal_id != claim.run.id || volume.volume_order != expected_order {
+            return Err(RehearsalFailure::blocked(
+                "restore volume ledger is not a contiguous ordered set for this run",
+            ));
+        }
+        if !volume.active || volume.expected_volume_label != volume.expected_on_tape_identity {
+            return Err(RehearsalFailure::blocked(format!(
+                "restore volume {} is inactive or its Bacula and on-tape identities disagree",
+                volume.volume_order
+            )));
+        }
+        if volume.volume_order == 1 {
+            if volume.cartridge_id != claim.run.cartridge_id
+                || volume.expected_volume_label != claim.run.expected_volume_label
+                || volume.expected_on_tape_identity != claim.run.expected_on_tape_identity
+                || volume.expected_engine_media_id != claim.run.expected_engine_media_id
+                || volume.expected_engine_record_id != claim.run.expected_engine_record_id
+                || volume.state != "loaded"
+                || volume.media_lease_id != Some(claim.media_lease_id)
+                || volume.media_fencing_token != Some(claim.media_fencing_token)
+            {
+                return Err(RehearsalFailure::blocked(
+                    "the first restore volume no longer matches the fenced loaded-media binding",
+                ));
+            }
+        } else if volume.state != "reserved"
+            || volume.media_lease_id.is_some()
+            || volume.media_fencing_token.is_some()
+        {
+            return Err(RehearsalFailure::blocked(format!(
+                "restore volume {} was not an untouched reserved continuation volume",
+                volume.volume_order
+            )));
+        }
+        labels.push(
+            VolumeLabel::parse(volume.expected_volume_label.clone())
+                .map_err(|error| RehearsalFailure::blocked(error.to_string()))?,
+        );
+    }
+    Ok(labels)
+}
+
+fn validate_restore_catalog_volumes(
+    expected: &[store::RestoreRehearsalVolumeRecord],
+    catalog: &BaculaBackupCatalogEvidence,
+    backup_job_id: BaculaJobId,
+) -> Result<Vec<RestoreVolumeEvidence>, RehearsalFailure> {
+    if catalog.volumes.len() != expected.len() {
+        return Err(RehearsalFailure::blocked(format!(
+            "Bacula backup uses {} volumes but the retained restore ledger requires {}",
+            catalog.volumes.len(),
+            expected.len()
+        )));
+    }
+    let mut evidence = Vec::with_capacity(expected.len());
+    for (expected, observed) in expected.iter().zip(&catalog.volumes) {
+        let expected_media_id = u64::try_from(expected.expected_engine_media_id).map_err(|_| {
+            RehearsalFailure::blocked(format!(
+                "restore volume {} has an invalid retained Bacula MediaId",
+                expected.volume_order
+            ))
+        })?;
+        let expected_record = format!(
+            "bacula-media:{expected_media_id}:job:{}",
+            backup_job_id.get()
+        );
+        if observed.volume_name != expected.expected_volume_label
+            || observed.media_id != expected_media_id
+            || expected.expected_engine_record_id != expected_record
+        {
+            return Err(RehearsalFailure::blocked(format!(
+                "Bacula catalog binding changed for retained restore volume {}",
+                expected.volume_order
+            )));
+        }
+        evidence.push(RestoreVolumeEvidence {
+            volume_order: expected.volume_order,
+            cartridge_label: expected.expected_cartridge_label.clone(),
+            volume_label: expected.expected_volume_label.clone(),
+            engine_media_id: expected_media_id,
+        });
+    }
+    Ok(evidence)
+}
+
 fn validate_contract(
     config: &Config,
     run: &store::RestoreRehearsalRunRecord,
@@ -844,10 +1011,10 @@ fn load_verified_source_manifest(
     }
     let expected_size = u64::try_from(reference.size_bytes)
         .map_err(|_| RehearsalFailure::blocked("retained source-manifest size is invalid"))?;
-    if expected_size == 0 || expected_size > MAX_MANIFEST_ARTIFACT_BYTES {
+    if expected_size == 0 || expected_size > store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES {
         return Err(RehearsalFailure::blocked(format!(
             "retained source manifest exceeds the {} byte read bound",
-            MAX_MANIFEST_ARTIFACT_BYTES
+            store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES
         )));
     }
     let run_directory_metadata =
@@ -995,9 +1162,10 @@ fn load_authenticated_manifest(
     expected_sha256: &str,
     description: &str,
 ) -> Result<FileManifest, RehearsalFailure> {
-    if expected_size == 0 || expected_size > MAX_MANIFEST_ARTIFACT_BYTES {
+    if expected_size == 0 || expected_size > store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES {
         return Err(RehearsalFailure::blocked(format!(
-            "{description} manifest exceeds the {MAX_MANIFEST_ARTIFACT_BYTES} byte read bound"
+            "{description} manifest exceeds the {} byte read bound",
+            store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES
         )));
     }
     let descriptor = open(
@@ -1325,15 +1493,121 @@ async fn wait_for_console(
     )))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveRestoreMedia {
+    request_id: Option<Uuid>,
+    volume_order: i32,
+    automatic_remount_attempted: bool,
+}
+
+impl ActiveRestoreMedia {
+    const fn initial() -> Self {
+        Self {
+            request_id: None,
+            volume_order: 1,
+            automatic_remount_attempted: false,
+        }
+    }
+
+    fn next_volume_order(self) -> Result<i32, RehearsalFailure> {
+        self.volume_order
+            .checked_add(1)
+            .ok_or_else(|| RehearsalFailure::failed("restore volume order overflowed"))
+    }
+
+    /// Claim the one automatic mount retry permitted for this exact active
+    /// volume. Repeated mount dispatch can make a rejected or wrong cartridge
+    /// cycle indefinitely, so another request must fail closed and return the
+    /// drive to attended reconciliation.
+    fn claim_automatic_remount(&mut self) -> bool {
+        if self.automatic_remount_attempted {
+            false
+        } else {
+            self.automatic_remount_attempted = true;
+            true
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestoreMediaWaitDecision {
+    RemountCurrent,
+    AdvanceTo(i32),
+}
+
+/// Decide a restore handoff only from Bacula's exact requested VolumeName.
+/// JobStatus and counters are deliberately insufficient: a normal remount,
+/// startup, or rejected wrong tape can all produce the same state transitions.
+fn restore_media_wait_decision(
+    active: ActiveRestoreMedia,
+    ordered_volumes: &[VolumeLabel],
+    requested_volume: &VolumeLabel,
+) -> Result<RestoreMediaWaitDecision, RehearsalFailure> {
+    let current_index = usize::try_from(active.volume_order.saturating_sub(1))
+        .map_err(|_| RehearsalFailure::failed("active restore volume order is invalid"))?;
+    let current = ordered_volumes.get(current_index).ok_or_else(|| {
+        RehearsalFailure::failed(format!(
+            "active restore volume {} is outside the authorized ordered set",
+            active.volume_order
+        ))
+    })?;
+    if requested_volume == current {
+        return Ok(RestoreMediaWaitDecision::RemountCurrent);
+    }
+
+    let next_volume_order = active.next_volume_order()?;
+    let next_index = current_index
+        .checked_add(1)
+        .ok_or_else(|| RehearsalFailure::failed("restore volume sequence index overflowed"))?;
+    let Some(next) = ordered_volumes.get(next_index) else {
+        return Err(RehearsalFailure::failed(format!(
+            "Bacula requested unexpected volume {} after the final authorized restore volume",
+            requested_volume.as_str()
+        )));
+    };
+    if requested_volume != next {
+        return Err(RehearsalFailure::failed(format!(
+            "Bacula requested volume {}, but ordered volume {next_volume_order} is {}",
+            requested_volume.as_str(),
+            next.as_str()
+        )));
+    }
+    Ok(RestoreMediaWaitDecision::AdvanceTo(next_volume_order))
+}
+
+const fn is_restore_media_wait(state: BaculaJobState) -> bool {
+    matches!(
+        state,
+        BaculaJobState::WaitingForMount | BaculaJobState::WaitingForMedia
+    )
+}
+
+#[derive(Clone, Copy)]
+struct RestoreJobMediaContext<'a> {
+    job_id: BaculaJobId,
+    ordered_volumes: &'a [VolumeLabel],
+    pool: &'a BaculaPoolName,
+}
+
 async fn wait_for_job(
     pool: &PgPool,
+    sas_config: &SasDiscoveryConfig,
     claim: &store::ClaimedRestoreRehearsalRun,
     adapter: &BaculaAdapter<DirectBconsoleExecutor>,
-    job_id: BaculaJobId,
+    media: RestoreJobMediaContext<'_>,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<BaculaJobEvidence, RehearsalFailure> {
+    let job_id = media.job_id;
+    let mut deadline = deadline;
     let mut consecutive_poll_failures = 0_u8;
+    let mut consecutive_media_proof_failures = 0_u8;
+    // The claim transaction has already fenced and marked volume one loaded.
+    // Seeding it here prevents Bacula's first pre-progress `M` from incorrectly
+    // requesting volume one again; that state only remounts the current tape.
+    let mut active_media = Some(ActiveRestoreMedia::initial());
+    let mut operator_wait_started: Option<Instant> = None;
+    let mut next_volume_order = 2_i32;
     loop {
         if cancellation.is_cancelled() {
             let cancellation_result = cancel_and_observe(adapter, job_id).await;
@@ -1347,7 +1621,10 @@ async fn wait_for_job(
                 "operator requested cancellation of Bacula restore JobId {job_id}; {cancellation_result}"
             )));
         }
-        if Instant::now() >= deadline {
+        // A pending attended media request is operator time rather than tape
+        // I/O time. Cancellation and lease heartbeats remain live, but the
+        // restore deadline resumes only after the exact next tape is loaded.
+        if active_media.is_some() && Instant::now() >= deadline {
             let cancellation_result = cancel_and_observe(adapter, job_id).await;
             return Err(RehearsalFailure::interrupted(format!(
                 "Bacula restore JobId {job_id} exceeded the restore-rehearsal deadline; {cancellation_result}"
@@ -1380,18 +1657,410 @@ async fn wait_for_job(
                 continue;
             }
         };
+
+        // A proof failure is meaningful only within one continuous Bacula
+        // media-wait episode. Ordinary running states separate episodes and
+        // must not let transient Director/SD propagation disagreements from
+        // an earlier handoff consume the retry budget for a later volume.
+        if !is_restore_media_wait(evidence.state) {
+            consecutive_media_proof_failures = 0;
+        }
+
         if evidence.is_terminal() {
-            return if evidence.is_strict_success() {
-                Ok(evidence)
-            } else {
-                Err(RehearsalFailure::failed(format!(
+            if !evidence.is_strict_success() {
+                return Err(RehearsalFailure::failed(format!(
                     "Bacula restore JobId {job_id} ended as {:?} with {} errors",
                     evidence.state, evidence.errors
-                )))
+                )));
+            }
+            let Some(completed) = active_media.take() else {
+                return Err(RehearsalFailure::failed(
+                    "Bacula restore completed while waiting for an unfulfilled continuation tape",
+                ));
             };
+            complete_active_restore_media(pool, claim, completed).await?;
+            if store::open_restore_rehearsal_media_request(pool, claim.run.id)
+                .await
+                .map_err(|error| {
+                    RehearsalFailure::interrupted(format!(
+                        "could not inspect final restore-media request state: {error}"
+                    ))
+                })?
+                .is_some()
+            {
+                return Err(RehearsalFailure::failed(
+                    "Bacula restore completed while a durable media request remained open",
+                ));
+            }
+            let volumes = store::restore_rehearsal_volumes(pool, claim.run.id)
+                .await
+                .map_err(|error| {
+                    RehearsalFailure::interrupted(format!(
+                        "could not validate final restore-volume state: {error}"
+                    ))
+                })?;
+            if volumes.len() != usize::try_from(claim.run.volume_count).unwrap_or(usize::MAX)
+                || volumes
+                    .iter()
+                    .any(|volume| volume.state != "completed" || !volume.active)
+            {
+                return Err(RehearsalFailure::failed(
+                    "Bacula restore completed before every ordered retained volume was durably read",
+                ));
+            }
+            return Ok(evidence);
+        }
+
+        if is_restore_media_wait(evidence.state) {
+            if let Some(active) = active_media {
+                let requested_volume = match adapter.requested_volume(job_id, media.pool).await {
+                    Ok(volume) => {
+                        consecutive_media_proof_failures = 0;
+                        volume
+                    }
+                    Err(error) => {
+                        consecutive_media_proof_failures += 1;
+                        if consecutive_media_proof_failures >= 3 {
+                            let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                            return Err(RehearsalFailure::failed(format!(
+                                "Bacula entered a media wait without one exact correlated requested VolumeName after {consecutive_media_proof_failures} attempts; refusing to advance ordered restore media: {error}; {cancellation_result}"
+                            )));
+                        }
+                        // Director catalog status and Storage-Daemon DCR status
+                        // are sampled separately. Tolerate a short propagation
+                        // disagreement without changing any durable media state.
+                        tokio::time::sleep(Duration::from_secs(
+                            2_u64.pow(u32::from(consecutive_media_proof_failures)),
+                        ))
+                        .await;
+                        continue;
+                    }
+                };
+                let decision = match restore_media_wait_decision(
+                    active,
+                    media.ordered_volumes,
+                    &requested_volume,
+                ) {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                        return Err(RehearsalFailure::failed(format!(
+                            "{}; {cancellation_result}",
+                            error.detail
+                        )));
+                    }
+                };
+                match decision {
+                    RestoreMediaWaitDecision::AdvanceTo(order) => {
+                        let completed = active_media
+                            .take()
+                            .expect("the exact requested-next proof established active media");
+                        next_volume_order = order;
+                        complete_active_restore_media(pool, claim, completed).await?;
+                    }
+                    RestoreMediaWaitDecision::RemountCurrent => {
+                        let automatic_remount_available = active_media
+                            .as_mut()
+                            .is_some_and(ActiveRestoreMedia::claim_automatic_remount);
+                        if !automatic_remount_available {
+                            let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                            return Err(RehearsalFailure::failed(format!(
+                                "Bacula requested restore volume {} again after one automatic remount; refusing repeated tape motion. Verify the physical cartridge and drive state before starting a new restore; {cancellation_result}",
+                                requested_volume.as_str()
+                            )));
+                        }
+                        // Bacula is still asking for the current exact volume.
+                        // Permit one read-only automatic mount, but never
+                        // advance the ordered durable request or repeatedly
+                        // cycle a rejected physical cartridge.
+                        let mount =
+                            adapter
+                                .dispatch(&BaculaCommands::mount())
+                                .await
+                                .map_err(|error| {
+                                    RehearsalFailure::failed(format!(
+                                    "Bacula could not remount the current restore volume: {error}"
+                                ))
+                                })?;
+                        validate_console_output(
+                            "remount current restore volume",
+                            &mount.stdout,
+                            &mount.stderr,
+                        )?;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }
+            }
+
+            let prepared_media = prepare_restore_media(
+                pool,
+                sas_config,
+                claim,
+                adapter,
+                next_volume_order,
+                cancellation,
+            )
+            .await?;
+            if let Some(prepared_media) = prepared_media {
+                if let Some(started) = operator_wait_started.take() {
+                    let operator_wait = Instant::now().saturating_duration_since(started);
+                    deadline = deadline.checked_add(operator_wait).ok_or_else(|| {
+                        RehearsalFailure::interrupted(
+                            "the restore deadline overflowed while accounting for an attended media wait",
+                        )
+                    })?;
+                }
+                active_media = Some(prepared_media);
+            } else {
+                operator_wait_started.get_or_insert_with(Instant::now);
+                active_media = None;
+            }
+            // A pending request is attended operator time, not stalled tape
+            // I/O. Cancellation and the lease heartbeat remain authoritative.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+async fn complete_active_restore_media(
+    pool: &PgPool,
+    claim: &store::ClaimedRestoreRehearsalRun,
+    active: ActiveRestoreMedia,
+) -> Result<(), RehearsalFailure> {
+    let completed = if let Some(request_id) = active.request_id {
+        store::complete_restore_rehearsal_media_request(pool, claim, request_id).await
+    } else {
+        store::complete_restore_rehearsal_volume(pool, claim, active.volume_order).await
+    };
+    match completed {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(RehearsalFailure::interrupted(format!(
+            "the fenced restore could not durably complete volume {}",
+            active.volume_order
+        ))),
+        Err(error) => Err(RehearsalFailure::interrupted(format!(
+            "could not durably complete restore volume {}: {error}",
+            active.volume_order
+        ))),
+    }
+}
+
+async fn prepare_restore_media(
+    pool: &PgPool,
+    sas_config: &SasDiscoveryConfig,
+    claim: &store::ClaimedRestoreRehearsalRun,
+    adapter: &BaculaAdapter<DirectBconsoleExecutor>,
+    next_volume_order: i32,
+    cancellation: &CancellationToken,
+) -> Result<Option<ActiveRestoreMedia>, RehearsalFailure> {
+    let existing = store::open_restore_rehearsal_media_request(pool, claim.run.id)
+        .await
+        .map_err(|error| {
+            RehearsalFailure::interrupted(format!(
+                "could not inspect the durable restore-media request: {error}"
+            ))
+        })?;
+    let request = if let Some(existing) = existing {
+        if existing.state == "loaded" {
+            return Err(RehearsalFailure::interrupted(
+                "the worker lost in-memory state after a restore tape was loaded; refusing to guess whether Bacula consumed it",
+            ));
+        }
+        if existing.volume_order != next_volume_order {
+            return Err(RehearsalFailure::failed(format!(
+                "the durable restore request is for volume {}, but Bacula requires volume {next_volume_order}",
+                existing.volume_order
+            )));
+        }
+        existing
+    } else {
+        let release = adapter
+            .dispatch(&BaculaCommands::release())
+            .await
+            .map_err(|error| {
+                RehearsalFailure::failed(format!(
+                    "Bacula could not release the current restore tape before a manual change: {error}"
+                ))
+            })?;
+        validate_console_output(
+            "release current restore volume",
+            &release.stdout,
+            &release.stderr,
+        )?;
+        match store::ensure_restore_rehearsal_media_request(pool, claim, next_volume_order)
+            .await
+            .map_err(|error| {
+                RehearsalFailure::interrupted(format!(
+                    "could not retain Bacula's restore-media request: {error}"
+                ))
+            })? {
+            store::RestoreRehearsalMediaRequestResult::Ready(request) => *request,
+            store::RestoreRehearsalMediaRequestResult::FencedOut => {
+                return Err(RehearsalFailure::interrupted(
+                    "the restore was fenced out while requesting its next tape",
+                ));
+            }
+            store::RestoreRehearsalMediaRequestResult::Blocked(reason) => {
+                return Err(media_handoff_blocked_failure(pool, claim, reason).await);
+            }
+        }
+    };
+
+    let (authorized_request, authorized_volume) =
+        match store::authorized_restore_rehearsal_media_request(pool, claim)
+            .await
+            .map_err(|error| {
+                RehearsalFailure::interrupted(format!(
+                    "could not inspect authorized restore media: {error}"
+                ))
+            })? {
+            store::AuthorizedRestoreRehearsalMediaRequestResult::Waiting => return Ok(None),
+            store::AuthorizedRestoreRehearsalMediaRequestResult::Authorized { request, volume } => {
+                (*request, *volume)
+            }
+            store::AuthorizedRestoreRehearsalMediaRequestResult::LoadedAfterRestart { .. } => {
+                return Err(RehearsalFailure::interrupted(
+                    "a restore tape was durably loaded without matching worker state; drive position requires reconciliation",
+                ));
+            }
+            store::AuthorizedRestoreRehearsalMediaRequestResult::FencedOut => {
+                return Err(RehearsalFailure::interrupted(
+                    "the restore was fenced out while inspecting its next tape",
+                ));
+            }
+            store::AuthorizedRestoreRehearsalMediaRequestResult::Blocked(reason) => {
+                return Err(media_handoff_blocked_failure(pool, claim, reason).await);
+            }
+        };
+    if authorized_request.id != request.id
+        || authorized_request.volume_order != next_volume_order
+        || authorized_volume.volume_order != next_volume_order
+        || authorized_request.expected_cartridge_id != authorized_volume.cartridge_id
+        || authorized_request.authorized_cartridge_id != Some(authorized_volume.cartridge_id)
+        || authorized_request.expected_engine_volume_name != authorized_volume.expected_volume_label
+    {
+        return Err(RehearsalFailure::failed(
+            "the authorized restore tape does not match Bacula's exact ordered media request",
+        ));
+    }
+
+    let loaded =
+        match store::load_authorized_restore_rehearsal_media(pool, claim, authorized_request.id)
+            .await
+            .map_err(|error| {
+                RehearsalFailure::interrupted(format!(
+                    "could not durably accept the loaded restore tape: {error}"
+                ))
+            })? {
+            store::LoadRestoreRehearsalMediaResult::Loaded(loaded) => *loaded,
+            store::LoadRestoreRehearsalMediaResult::FencedOut => {
+                return Err(RehearsalFailure::interrupted(
+                    "the restore was fenced out while loading its next tape",
+                ));
+            }
+            store::LoadRestoreRehearsalMediaResult::Blocked(reason) => {
+                return Err(media_handoff_blocked_failure(pool, claim, reason).await);
+            }
+        };
+    if loaded.request.id != authorized_request.id
+        || loaded.volume.id != authorized_volume.id
+        || loaded.volume.volume_order != next_volume_order
+        || loaded.volume.media_lease_id != Some(loaded.media_lease_id)
+        || loaded.volume.media_fencing_token != Some(loaded.media_fencing_token)
+    {
+        return Err(RehearsalFailure::interrupted(
+            "the loaded restore tape does not match its new fenced media lease",
+        ));
+    }
+
+    // The durable load commits the exact next cartridge and its new media
+    // fencing token. Re-probe only after that boundary so no physical motion
+    // can rely on a stale observation made before the lease was acquired.
+    let observations = discover_and_persist(pool, sas_config)
+        .await
+        .map_err(|error| {
+            RehearsalFailure::interrupted(format!(
+                "could not revalidate the loaded drive after the restore-media lease was acquired: {error}"
+            ))
+        })?;
+    let observation = matching_observation(
+        &observations,
+        &claim.run.expected_path,
+        &claim.run.expected_stable_id,
+    )
+    .ok_or_else(|| {
+        RehearsalFailure::blocked(
+            "the exact assigned tape drive disappeared after the restore-media lease was acquired",
+        )
+    })?;
+    if let Some(reason) = observation_blocker(observation, &claim.run) {
+        return Err(RehearsalFailure::blocked(format!(
+            "the fenced restore tape is not ready: {reason}"
+        )));
+    }
+
+    execute_sas_motion(
+        sas_config,
+        Path::new(&claim.run.expected_path),
+        SasMotionOperation::Rewind,
+        cancellation,
+    )
+    .await
+    .map_err(|error| {
+        RehearsalFailure::failed(format!(
+            "restore-tape rewind failed for volume {next_volume_order}: {error}"
+        ))
+    })?;
+    let mount = adapter
+        .dispatch(&BaculaCommands::mount())
+        .await
+        .map_err(|error| {
+            RehearsalFailure::failed(format!(
+                "Bacula could not mount restore volume {next_volume_order}: {error}"
+            ))
+        })?;
+    validate_console_output("mount restore volume", &mount.stdout, &mount.stderr)?;
+
+    Ok(Some(ActiveRestoreMedia {
+        request_id: Some(loaded.request.id),
+        volume_order: loaded.volume.volume_order,
+        automatic_remount_attempted: false,
+    }))
+}
+
+fn validate_console_output(
+    operation: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(), RehearsalFailure> {
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    );
+    let lowercase = combined.to_ascii_lowercase();
+    if [
+        "error:",
+        "sql error",
+        "fatal",
+        "failed",
+        "not found",
+        "invalid command",
+        "permission denied",
+        "cannot mount",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker))
+    {
+        return Err(RehearsalFailure::failed(format!(
+            "Bacula {operation} returned an error response: {}",
+            concise_text(&combined, 512)
+        )));
+    }
+    Ok(())
 }
 
 async fn record_engine_dispatch(
@@ -1470,6 +2139,18 @@ async fn cancellation_requested(
                 "could not inspect restore-rehearsal cancellation state: {error}"
             ))
         })
+}
+
+async fn media_handoff_blocked_failure(
+    pool: &PgPool,
+    claim: &store::ClaimedRestoreRehearsalRun,
+    reason: String,
+) -> RehearsalFailure {
+    match cancellation_requested(pool, claim).await {
+        Ok(true) => RehearsalFailure::cancelled(reason),
+        Ok(false) => RehearsalFailure::failed(reason),
+        Err(failure) => failure,
+    }
 }
 
 async fn renew_claim(
@@ -2005,5 +2686,67 @@ mod tests {
             verified_restored_source_path(destination.path(), Path::new("/source/archive"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn restore_media_handoff_requires_the_exact_ordered_requested_volume() {
+        let active = ActiveRestoreMedia::initial();
+        assert_eq!(active.request_id, None);
+        assert_eq!(active.volume_order, 1);
+        assert!(!active.automatic_remount_attempted);
+        assert_eq!(active.next_volume_order().expect("next order"), 2);
+        let ordered = [
+            VolumeLabel::parse("TS-LTO-001").expect("volume one"),
+            VolumeLabel::parse("TS-LTO-002").expect("volume two"),
+            VolumeLabel::parse("TS-LTO-003").expect("volume three"),
+        ];
+
+        assert_eq!(
+            restore_media_wait_decision(active, &ordered, &ordered[0]).expect("remount"),
+            RestoreMediaWaitDecision::RemountCurrent
+        );
+        assert_eq!(
+            restore_media_wait_decision(active, &ordered, &ordered[1]).expect("handoff"),
+            RestoreMediaWaitDecision::AdvanceTo(2)
+        );
+        assert!(restore_media_wait_decision(active, &ordered, &ordered[2]).is_err());
+
+        let second = ActiveRestoreMedia {
+            request_id: Some(Uuid::now_v7()),
+            volume_order: 2,
+            automatic_remount_attempted: false,
+        };
+        assert_eq!(
+            restore_media_wait_decision(second, &ordered, &ordered[1]).expect("remount"),
+            RestoreMediaWaitDecision::RemountCurrent
+        );
+        assert_eq!(
+            restore_media_wait_decision(second, &ordered, &ordered[2]).expect("handoff"),
+            RestoreMediaWaitDecision::AdvanceTo(3)
+        );
+
+        let final_volume = ActiveRestoreMedia {
+            request_id: Some(Uuid::now_v7()),
+            volume_order: 3,
+            automatic_remount_attempted: false,
+        };
+        let unexpected = VolumeLabel::parse("TS-LTO-004").expect("unexpected volume");
+        assert!(restore_media_wait_decision(final_volume, &ordered, &unexpected).is_err());
+    }
+
+    #[test]
+    fn restore_media_allows_only_one_automatic_remount_per_active_volume() {
+        let mut active = ActiveRestoreMedia::initial();
+        assert!(active.claim_automatic_remount());
+        assert!(active.automatic_remount_attempted);
+        assert!(!active.claim_automatic_remount());
+
+        let mut next = ActiveRestoreMedia {
+            request_id: Some(Uuid::now_v7()),
+            volume_order: 2,
+            automatic_remount_attempted: false,
+        };
+        assert!(next.claim_automatic_remount());
+        assert!(!next.claim_automatic_remount());
     }
 }

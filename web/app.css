@@ -2171,6 +2171,55 @@ svg {
   box-shadow: 0 0 0 2px rgb(25 95 82 / 14%);
 }
 
+.restore-volume-plan li {
+  min-width: 150px;
+  align-items: flex-start;
+  background: white;
+}
+
+.restore-volume-plan li.done {
+  border-color: #acd0c6;
+  background: var(--teal-soft);
+}
+
+.restore-volume-plan li.pending {
+  border-color: var(--line);
+  color: var(--ink-soft);
+}
+
+.restore-volume-plan li > span:last-child,
+.restore-volume-plan li strong,
+.restore-volume-plan li code,
+.restore-volume-plan li small {
+  display: block;
+  min-width: 0;
+}
+
+.restore-volume-plan li code {
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 9px;
+}
+
+.restore-volume-plan li small {
+  margin-top: 3px;
+  color: var(--ink-faint);
+  font-size: 8px;
+}
+
+.restore-volume-marker {
+  display: grid;
+  width: 21px;
+  height: 21px;
+  flex: 0 0 21px;
+  place-items: center;
+  border-radius: 50%;
+  color: white;
+  background: var(--teal);
+  font: 750 9px var(--font-mono);
+}
+
 .backup-volume-summary {
   max-width: 320px;
 }
@@ -6013,6 +6062,50 @@ button.source-browser-name:hover strong {
   padding: 14px 16px 16px;
 }
 
+.restore-media-handoff {
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.restore-media-handoff .button {
+  align-self: center;
+  white-space: nowrap;
+}
+
+.restore-media-modal {
+  width: min(720px, calc(100vw - 30px));
+}
+
+.restore-media-boundary {
+  margin-bottom: 14px;
+}
+
+.restore-exact-media {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #e3bd89;
+  border-radius: var(--radius-sm);
+  background: var(--amber-soft);
+}
+
+.restore-exact-media strong {
+  overflow-wrap: anywhere;
+  font: 700 12px var(--font-mono);
+}
+
+.restore-exact-media span {
+  flex: none;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.backup-spooling-cue {
+  margin-top: 10px;
+}
+
 .restore-rehearsal-evidence-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.2fr) minmax(260px, 0.8fr);
@@ -6061,6 +6154,21 @@ button.source-browser-name:hover strong {
   .restore-rehearsal-summary > div,
   .restore-rehearsal-evidence-grid {
     grid-template-columns: 1fr;
+  }
+
+  .restore-media-handoff {
+    align-items: stretch;
+    grid-template-columns: 28px minmax(0, 1fr);
+  }
+
+  .restore-media-handoff .button {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .restore-exact-media {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 

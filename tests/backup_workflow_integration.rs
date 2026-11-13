@@ -1607,6 +1607,45 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     .execute(&pool)
     .await
     .expect("verified backup media should have confirmed custody");
+    sqlx::query(
+        "UPDATE cartridges
+         SET confirmed_location_id = $1, identity_status = 'reconciled',
+             health_status = 'written_verified', on_tape_identity = $2,
+             reserved_by = NULL, updated_at = now()
+         WHERE id = $3",
+    )
+    .bind(restore_location_id)
+    .bind(second_engine_volume)
+    .bind(continuation_second.id)
+    .execute(&pool)
+    .await
+    .expect("second restore volume should have verified identity and custody");
+    sqlx::query(
+        "INSERT INTO volume_records
+            (id, recovery_point_id, cartridge_id, volume_order, first_record,
+             last_record, encoded_bytes, finalized, engine_record_id)
+         VALUES ($1, $2, $3, 2, 'bacula-file:2', 'bacula-file:2', 2048, true,
+                 'bacula-media:92:job:9001')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(recovery_point_id)
+    .bind(continuation_second.id)
+    .execute(&pool)
+    .await
+    .expect("second finalized recovery volume should persist");
+    sqlx::query(
+        "UPDATE verification_records
+         SET media_ids = ARRAY[$1, $2]::uuid[],
+             scope = scope || jsonb_build_object('volume_count', 2)
+         WHERE recovery_point_id = $3 AND kind = 'full_readback'
+           AND outcome = 'passed'",
+    )
+    .bind(scratch.id)
+    .bind(continuation_second.id)
+    .bind(recovery_point_id)
+    .execute(&pool)
+    .await
+    .expect("full-readback proof should bind the complete ordered media set");
     sqlx::query("UPDATE drives SET last_observed_at = now() WHERE id = $1")
         .bind(drive.id)
         .execute(&pool)
@@ -1620,7 +1659,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         json!({
             "recovery_point_id": recovery_point_id,
             "mode": "file_archive",
-            "destination": "planned-restores/operational-single-volume",
+            "destination": "planned-restores/operational-multi-volume",
             "conflict_policy": "skip",
             "destination_approved": true,
             "is_new_destination": true,
@@ -1637,6 +1676,8 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     let restore_plan = response_json(restore_plan_response).await;
     assert_eq!(restore_plan["plan"]["ready"], true);
     assert_eq!(restore_plan["plan"]["execution_supported"], true);
+    assert_eq!(restore_plan["plan"]["execution"]["volume_count"], 2);
+    assert_eq!(restore_plan["plan"]["execution"]["multi_volume"], true);
     assert_eq!(
         restore_plan["plan"]["execution"]["origin_workflow_kind"],
         "backup"
@@ -1698,6 +1739,26 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         panic!("verified operational single-volume restore should be claimable");
     };
     assert_eq!(restore_claim.run.id, restore_rehearsal_id);
+    let restore_volumes = store::restore_rehearsal_volumes(&pool, restore_rehearsal_id)
+        .await
+        .expect("restore volume ledger should load");
+    assert_eq!(restore_volumes.len(), 2);
+    assert_eq!(restore_volumes[0].state, "loaded");
+    assert_eq!(restore_volumes[1].state, "reserved");
+    let ordered_restore_volumes = json!([
+        {
+            "volume_order": 1,
+            "cartridge_label": scratch.internal_label,
+            "volume_label": engine_volume,
+            "engine_media_id": 91
+        },
+        {
+            "volume_order": 2,
+            "cartridge_label": continuation_second.internal_label,
+            "volume_label": second_engine_volume,
+            "engine_media_id": 92
+        }
+    ]);
     assert!(store::transition_restore_rehearsal_phase(
         &pool,
         &restore_claim,
@@ -1706,9 +1767,206 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     )
     .await
     .expect("operational restore should enter restoring"));
+    assert!(
+        store::complete_restore_rehearsal_volume(&pool, &restore_claim, 1)
+            .await
+            .expect("initial restore volume completion should persist")
+    );
+    let next_restore_media =
+        store::ensure_restore_rehearsal_media_request(&pool, &restore_claim, 2)
+            .await
+            .expect("second restore volume request should persist");
+    let store::RestoreRehearsalMediaRequestResult::Ready(next_restore_media) = next_restore_media
+    else {
+        panic!("the exact second restore volume should be requested");
+    };
+    assert_eq!(next_restore_media.state, "pending");
+    sqlx::query(
+        "UPDATE restore_rehearsals
+         SET cancel_requested_at = now(), cancel_requested_by_label = 'integration cancellation race'
+         WHERE id = $1",
+    )
+    .bind(restore_rehearsal_id)
+    .execute(&pool)
+    .await
+    .expect("integration cancellation should become visible to every handoff transaction");
+    let cancelled_ensure = store::ensure_restore_rehearsal_media_request(&pool, &restore_claim, 2)
+        .await
+        .expect("cancelled media ensure should fail closed");
+    assert!(matches!(
+        cancelled_ensure,
+        store::RestoreRehearsalMediaRequestResult::Blocked(_)
+    ));
+    let cancelled_lookup = store::authorized_restore_rehearsal_media_request(&pool, &restore_claim)
+        .await
+        .expect("cancelled authorization lookup should fail closed");
+    assert!(matches!(
+        cancelled_lookup,
+        store::AuthorizedRestoreRehearsalMediaRequestResult::Blocked(_)
+    ));
+    let cancelled_authorization = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/restore-rehearsals/{restore_rehearsal_id}/media"),
+        json!({
+            "request_id": next_restore_media.id,
+            "drive_id": drive.id,
+            "expected_stable_id": drive.stable_id,
+            "cartridge_id": continuation_second.id,
+            "typed_cartridge_label": continuation_second.internal_label,
+            "volume_order": 2,
+            "loaded_media_confirmed": true,
+            "attended_confirmed": true,
+            "confirmation": format!(
+                "LOAD {} FOR RESTORE {} VOLUME 2",
+                continuation_second.internal_label, restore_rehearsal_id
+            ),
+            "actor": "Cancelled operational restore integration operator"
+        }),
+    )
+    .await;
+    assert_eq!(cancelled_authorization.status(), StatusCode::CONFLICT);
+    sqlx::query(
+        "UPDATE restore_rehearsals
+         SET cancel_requested_at = NULL, cancel_requested_by_label = NULL
+         WHERE id = $1",
+    )
+    .bind(restore_rehearsal_id)
+    .execute(&pool)
+    .await
+    .expect("the integration fixture should clear its synthetic cancellation race");
+    assert!(
+        store::renew_restore_rehearsal_run_leases(&pool, &restore_claim)
+            .await
+            .expect("drive-only waiting lease should renew")
+    );
+    let restore_readiness = api_request(
+        &application,
+        Method::GET,
+        format!("/api/v1/restore-rehearsals/{restore_rehearsal_id}/media-readiness"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(restore_readiness.status(), StatusCode::OK);
+    let restore_readiness = response_json(restore_readiness).await;
+    assert_eq!(restore_readiness["readiness"]["ready"], true);
+    assert_eq!(restore_readiness["media_handoff"]["volume_order"], 2);
+
+    let wrong_restore_media = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/restore-rehearsals/{restore_rehearsal_id}/media"),
+        json!({
+            "request_id": next_restore_media.id,
+            "drive_id": drive.id,
+            "expected_stable_id": drive.stable_id,
+            "cartridge_id": continuation_second.id,
+            "typed_cartridge_label": continuation_second.internal_label,
+            "volume_order": 1,
+            "loaded_media_confirmed": true,
+            "attended_confirmed": true,
+            "confirmation": format!(
+                "LOAD {} FOR RESTORE {} VOLUME 1",
+                continuation_second.internal_label, restore_rehearsal_id
+            ),
+            "actor": "Operational restore integration operator"
+        }),
+    )
+    .await;
+    assert_eq!(wrong_restore_media.status(), StatusCode::CONFLICT);
+    let authorize_restore_media = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/restore-rehearsals/{restore_rehearsal_id}/media"),
+        json!({
+            "request_id": next_restore_media.id,
+            "drive_id": drive.id,
+            "expected_stable_id": drive.stable_id,
+            "cartridge_id": continuation_second.id,
+            "typed_cartridge_label": continuation_second.internal_label,
+            "volume_order": 2,
+            "loaded_media_confirmed": true,
+            "attended_confirmed": true,
+            "confirmation": format!(
+                "LOAD {} FOR RESTORE {} VOLUME 2",
+                continuation_second.internal_label, restore_rehearsal_id
+            ),
+            "actor": "Operational restore integration operator"
+        }),
+    )
+    .await;
+    assert_eq!(authorize_restore_media.status(), StatusCode::OK);
+    let authorize_restore_media = response_json(authorize_restore_media).await;
+    assert_eq!(
+        authorize_restore_media["media_request"]["state"],
+        "authorized"
+    );
+    let authorized = store::authorized_restore_rehearsal_media_request(&pool, &restore_claim)
+        .await
+        .expect("authorized restore request should query");
+    assert!(matches!(
+        authorized,
+        store::AuthorizedRestoreRehearsalMediaRequestResult::Authorized { .. }
+    ));
+    sqlx::query(
+        "UPDATE restore_rehearsals
+         SET cancel_requested_at = now(), cancel_requested_by_label = 'integration load race'
+         WHERE id = $1",
+    )
+    .bind(restore_rehearsal_id)
+    .execute(&pool)
+    .await
+    .expect("integration load cancellation should persist before lease acquisition");
+    let cancelled_load = store::load_authorized_restore_rehearsal_media(
+        &pool,
+        &restore_claim,
+        next_restore_media.id,
+    )
+    .await
+    .expect("cancelled authorized media load should fail closed");
+    assert!(matches!(
+        cancelled_load,
+        store::LoadRestoreRehearsalMediaResult::Blocked(_)
+    ));
+    sqlx::query(
+        "UPDATE restore_rehearsals
+         SET cancel_requested_at = NULL, cancel_requested_by_label = NULL
+         WHERE id = $1",
+    )
+    .bind(restore_rehearsal_id)
+    .execute(&pool)
+    .await
+    .expect("the integration fixture should clear its synthetic load race");
+    let loaded = store::load_authorized_restore_rehearsal_media(
+        &pool,
+        &restore_claim,
+        next_restore_media.id,
+    )
+    .await
+    .expect("authorized second restore volume should load");
+    let store::LoadRestoreRehearsalMediaResult::Loaded(loaded) = loaded else {
+        panic!("the worker should acquire the exact second-volume media lease");
+    };
+    assert_eq!(loaded.volume.volume_order, 2);
+    assert!(
+        store::renew_restore_rehearsal_run_leases(&pool, &restore_claim)
+            .await
+            .expect("current normalized restore media lease should renew")
+    );
+    assert!(
+        store::complete_restore_rehearsal_volume(&pool, &restore_claim, 2)
+            .await
+            .expect("second restore volume completion should persist")
+    );
+    assert!(
+        store::open_restore_rehearsal_media_request(&pool, restore_rehearsal_id)
+            .await
+            .expect("restore request lookup should succeed")
+            .is_none()
+    );
     let restore_job_id = 9002_i64;
     let restore_destination =
-        format!("/restore/planned-restores/operational-single-volume/{restore_rehearsal_id}");
+        format!("/restore/planned-restores/operational-multi-volume/{restore_rehearsal_id}");
     assert!(store::append_restore_rehearsal_artifact(
         &pool,
         &restore_claim,
@@ -1726,6 +1984,8 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
             "engine_media_id": 91,
             "media_id": 91,
             "volume": engine_volume,
+            "volume_count": 2,
+            "volumes": ordered_restore_volumes,
             "destination": restore_destination
         }),
     )
@@ -1771,6 +2031,8 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
                 "complete": true,
                 "matched": true,
                 "read_only_media_operation": true,
+                "volume_count": 2,
+                "volumes": ordered_restore_volumes,
                 "source_manifest_digest": source_manifest.digest_sha256,
                 "restored_manifest_digest": source_manifest.digest_sha256
             }),
@@ -1792,7 +2054,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         &pool,
         &restore_claim,
         json!({
-            "scope": "integration attended operational single-volume restore",
+            "scope": "integration attended operational multi-volume restore",
             "production_eligible": false,
             "media_operation": "read_only",
             "source_backup_job_id": 9001,
@@ -1803,6 +2065,8 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
                 "source_backup_job_id": 9001,
                 "job": {"job_id": restore_job_id}
             },
+            "volume_count": 2,
+            "volumes": ordered_restore_volumes,
             "source_manifest_digest": source_manifest.digest_sha256,
             "restored_manifest_digest": source_manifest.digest_sha256,
             "restored_manifest_sha256": restored_artifact_sha256,
@@ -1825,26 +2089,28 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     else {
         panic!("complete operational restore evidence should pass");
     };
-    let (restore_scope, pass_result) = sqlx::query_as::<_, (Value, Value)>(
-        "SELECT verification.scope, rehearsal.result
+    let (restore_scope, pass_result, restore_media_ids) =
+        sqlx::query_as::<_, (Value, Value, Vec<Uuid>)>(
+            "SELECT verification.scope, rehearsal.result, verification.media_ids
          FROM verification_records verification
          JOIN restore_rehearsals rehearsal ON rehearsal.id = $2
          WHERE verification.id = $1
            AND verification.kind = 'restore_test' AND verification.outcome = 'passed'",
-    )
-    .bind(verification_record_id)
-    .bind(restore_rehearsal_id)
-    .fetch_one(&pool)
-    .await
-    .expect("operational restore-test verification should persist");
+        )
+        .bind(verification_record_id)
+        .bind(restore_rehearsal_id)
+        .fetch_one(&pool)
+        .await
+        .expect("operational restore-test verification should persist");
     assert_eq!(
         restore_scope["scope"],
-        "complete attended single-volume file recovery replay"
+        "complete attended ordered-volume file recovery replay"
     );
     assert_eq!(
         pass_result["execution_scope"],
-        "attended_single_volume_file_restore"
+        "attended_ordered_volume_file_restore"
     );
+    assert_eq!(restore_media_ids, vec![scratch.id, continuation_second.id]);
 
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))

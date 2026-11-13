@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -11,11 +12,20 @@ use std::{
 };
 
 use anyhow::Result;
+use rustix::fs::statvfs;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+// Bacula documents roughly 150 bytes of attribute spool per file. TapeScale
+// reserves a much more conservative 4 KiB for every manifest entry, twice the
+// serialized manifest size, and a fixed base before calculating the data-spool
+// ceiling. The normal free-space reserve remains on top of this estimate.
+const ATTRIBUTE_SPOOL_BYTES_PER_ENTRY: u64 = 4 * 1024;
+const ATTRIBUTE_SPOOL_MANIFEST_MULTIPLIER: u64 = 2;
+const ATTRIBUTE_SPOOL_BASE_BYTES: u64 = 64 * 1024 * 1024;
 
 use crate::{
     bacula_catalog::{
@@ -418,16 +428,19 @@ async fn perform_exercise(
                 "worker shutdown was requested before any tape command",
             ));
         }
-        let data_options = bacula_data_options(claim)?;
+        let (spool_limit, spool_capacity) =
+            bacula_spool_capacity(config, source_manifest.artifact())?;
+        let data_options =
+            bacula_data_options(claim)?.with_maximum_spool_size(spool_limit);
         transition(
             pool,
             claim,
             store::SingleTapeDataPhase::Writing,
             json!({
                 "detail": if claim.run.spanning_enabled {
-                    "source manifest retained; beginning Bacula write with authorized tape spanning"
+                    "source manifest retained; Bacula will stage data in the disk spool before sustained multi-tape streaming"
                 } else {
-                    "source manifest retained; beginning destructive single-volume Bacula write"
+                    "source manifest retained; Bacula will stage data in the disk spool before sustained tape streaming"
                 },
                 "source_manifest_sha256": source_manifest.artifact().manifest_digest,
                 "file_count": source_manifest.artifact().file_count,
@@ -435,6 +448,7 @@ async fn perform_exercise(
                 "compression_mode": claim.run.compression_mode,
                 "resolved_compression": claim.run.resolved_compression,
                 "spanning_enabled": claim.run.spanning_enabled,
+                "data_spooling": &spool_capacity,
                 "production_eligible": false
             }),
         )
@@ -668,6 +682,21 @@ async fn perform_exercise(
                 "resolved": claim.run.resolved_compression
             },
             "spanning_enabled": claim.run.spanning_enabled,
+            "data_spooling": {
+                "enabled": true,
+                "directory": config.bacula_spool_dir.display().to_string(),
+                "maximum_bytes": data_options.maximum_spool_size_bytes(),
+                "purpose": "disk buffer for sustained tape streaming; this does not limit archive size"
+            },
+            "attribute_spooling": {
+                "enabled": true,
+                "directory": config.bacula_spool_dir.display().to_string(),
+                "capacity_policy": "estimated per-entry and manifest allowance plus configured filesystem reserve"
+            },
+            "tape_file_boundaries": {
+                "maximum_bytes": crate::engine::bacula::MAXIMUM_TAPE_FILE_BYTES,
+                "purpose": "reduce EOF/filemark stops on modern LTO; this does not limit archive size"
+            },
             "encryption": if claim.run.workflow_kind == "backup" {
                 "disabled_by_explicit_test_slice_deviation"
             } else {
@@ -2277,6 +2306,141 @@ fn bacula_data_options(
     })
 }
 
+/// Select a run-scoped spool ceiling from the configured policy and the
+/// filesystem's current free space. Keeping a reserve prevents the data spool
+/// from exhausting its filesystem. The ceiling is a buffer size, not an
+/// archive-size limit: Bacula despools a full buffer and continues the same
+/// job.
+fn bacula_spool_capacity(
+    config: &Config,
+    manifest: &ManifestArtifactSummary,
+) -> Result<(NonZeroU64, Value), ExerciseFailure> {
+    let metadata = fs::symlink_metadata(&config.bacula_spool_dir).map_err(|error| {
+        ExerciseFailure::blocked(format!(
+            "the Bacula spool directory {} is unavailable: {error}",
+            config.bacula_spool_dir.display()
+        ))
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(ExerciseFailure::blocked(format!(
+            "the Bacula spool path {} must be a real directory",
+            config.bacula_spool_dir.display()
+        )));
+    }
+    let write_probe = config.bacula_spool_dir.join(format!(
+        ".tapescale-write-probe-{}",
+        Uuid::now_v7().simple()
+    ));
+    let probe = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&write_probe)
+        .map_err(|error| {
+            ExerciseFailure::blocked(format!(
+                "the Bacula spool directory {} is not writable: {error}",
+                config.bacula_spool_dir.display()
+            ))
+        })?;
+    let sync_result = probe.sync_all();
+    drop(probe);
+    let remove_result = fs::remove_file(&write_probe);
+    sync_result.map_err(|error| {
+        ExerciseFailure::blocked(format!(
+            "the Bacula spool filesystem could not persist a preflight write: {error}"
+        ))
+    })?;
+    remove_result.map_err(|error| {
+        ExerciseFailure::blocked(format!(
+            "the Bacula spool preflight file {} could not be removed: {error}",
+            write_probe.display()
+        ))
+    })?;
+    let status = statvfs(&config.bacula_spool_dir).map_err(|error| {
+        ExerciseFailure::blocked(format!(
+            "could not inspect Bacula spool capacity at {}: {error}",
+            config.bacula_spool_dir.display()
+        ))
+    })?;
+    let available_bytes = status.f_bavail.saturating_mul(status.f_frsize);
+    let filesystem_bytes = status.f_blocks.saturating_mul(status.f_frsize);
+    let attribute_spool_reserve_bytes =
+        estimated_attribute_spool_reserve(manifest.entry_count, manifest.size_bytes).ok_or_else(
+            || {
+                ExerciseFailure::blocked(
+                    "the Bacula attribute-spool capacity estimate overflowed for this manifest",
+                )
+            },
+        )?;
+    let total_reserved_bytes = config
+        .bacula_spool_reserve_bytes
+        .checked_add(attribute_spool_reserve_bytes)
+        .ok_or_else(|| ExerciseFailure::blocked("the combined Bacula spool reserve overflowed"))?;
+    let Some(limit) = effective_spool_limit(
+        available_bytes,
+        total_reserved_bytes,
+        config.bacula_spool_max_bytes,
+        config.bacula_spool_min_bytes,
+    ) else {
+        return Err(ExerciseFailure::blocked(format!(
+            "Bacula spooling needs at least {} data bytes plus {} attribute-spool bytes and a {} byte filesystem reserve, but {} has only {} bytes available",
+            config.bacula_spool_min_bytes,
+            attribute_spool_reserve_bytes,
+            config.bacula_spool_reserve_bytes,
+            config.bacula_spool_dir.display(),
+            available_bytes
+        )));
+    };
+    let effective_maximum_bytes = limit.get();
+    Ok((
+        limit,
+        json!({
+            "enabled": true,
+            "directory": config.bacula_spool_dir.display().to_string(),
+            "filesystem_bytes": filesystem_bytes,
+            "available_bytes_at_preflight": available_bytes,
+            "configured_filesystem_reserve_bytes": config.bacula_spool_reserve_bytes,
+            "estimated_attribute_spool_reserve_bytes": attribute_spool_reserve_bytes,
+            "total_reserved_bytes": total_reserved_bytes,
+            "attribute_spool_estimate": {
+                "manifest_entries": manifest.entry_count,
+                "manifest_size_bytes": manifest.size_bytes,
+                "bytes_per_entry": ATTRIBUTE_SPOOL_BYTES_PER_ENTRY,
+                "manifest_multiplier": ATTRIBUTE_SPOOL_MANIFEST_MULTIPLIER,
+                "base_bytes": ATTRIBUTE_SPOOL_BASE_BYTES
+            },
+            "configured_maximum_bytes": config.bacula_spool_max_bytes,
+            "effective_maximum_bytes": effective_maximum_bytes,
+            "minimum_required_bytes": config.bacula_spool_min_bytes,
+            "archive_size_limited": false,
+            "behavior_at_limit": "despool_to_tape_then_continue",
+            "attribute_spooling_enabled": true,
+            "storage_daemon_working_directory": config.bacula_spool_dir.display().to_string()
+        }),
+    ))
+}
+
+fn estimated_attribute_spool_reserve(entry_count: u64, manifest_size_bytes: u64) -> Option<u64> {
+    ATTRIBUTE_SPOOL_BASE_BYTES
+        .checked_add(entry_count.checked_mul(ATTRIBUTE_SPOOL_BYTES_PER_ENTRY)?)?
+        .checked_add(manifest_size_bytes.checked_mul(ATTRIBUTE_SPOOL_MANIFEST_MULTIPLIER)?)
+}
+
+fn effective_spool_limit(
+    available_bytes: u64,
+    reserve_bytes: u64,
+    configured_maximum_bytes: u64,
+    minimum_bytes: u64,
+) -> Option<NonZeroU64> {
+    let effective = available_bytes
+        .saturating_sub(reserve_bytes)
+        .min(configured_maximum_bytes);
+    if effective < minimum_bytes {
+        None
+    } else {
+        NonZeroU64::new(effective)
+    }
+}
+
 async fn data_run_engine_volumes(
     pool: &PgPool,
     claim: &store::ClaimedSingleTapeDataRun,
@@ -2896,5 +3060,36 @@ mod tests {
         assert_eq!(second.as_str(), "AA-0345-018f7cac2e2a-V0002");
         assert_ne!(first, second);
         assert!(engine_volume_label_for_order("AA0346", run_id, 0).is_err());
+    }
+
+    #[test]
+    fn spool_limit_preserves_reserve_and_does_not_limit_archive_size() {
+        let gib = 1024_u64 * 1024 * 1024;
+        assert_eq!(
+            effective_spool_limit(200 * gib, 8 * gib, 64 * gib, 8 * gib)
+                .expect("ample spool capacity")
+                .get(),
+            64 * gib
+        );
+        assert_eq!(
+            effective_spool_limit(48 * gib, 8 * gib, 64 * gib, 8 * gib)
+                .expect("available space caps the buffer")
+                .get(),
+            40 * gib
+        );
+        assert!(effective_spool_limit(15 * gib, 8 * gib, 64 * gib, 8 * gib).is_none());
+    }
+
+    #[test]
+    fn attribute_spool_estimate_scales_without_an_entry_ceiling() {
+        let estimate = estimated_attribute_spool_reserve(1_000_000, 256 * 1024 * 1024)
+            .expect("bounded estimate");
+        assert_eq!(
+            estimate,
+            ATTRIBUTE_SPOOL_BASE_BYTES
+                + 1_000_000 * ATTRIBUTE_SPOOL_BYTES_PER_ENTRY
+                + 512 * 1024 * 1024
+        );
+        assert!(estimated_attribute_spool_reserve(u64::MAX, u64::MAX).is_none());
     }
 }

@@ -29,8 +29,8 @@ use uuid::Uuid;
 use crate::{
     engine::bacula::{
         BaculaConfig, BaculaCredentials, BaculaDaemon, BaculaDataOptions, BaculaEndpoints,
-        BaculaPaths, BaculaPoolName, RenderedBaculaConfigs, BCONSOLE_CONFIG, DIRECTOR_CONFIG,
-        FILE_DAEMON_CONFIG, STORAGE_DAEMON_CONFIG,
+        BaculaPaths, BaculaPoolName, RenderedBaculaConfigs, BCONSOLE_CONFIG, DATA_SPOOL_DIRECTORY,
+        DIRECTOR_CONFIG, FILE_DAEMON_CONFIG, MAXIMUM_TAPE_FILE_BYTES, STORAGE_DAEMON_CONFIG,
     },
     tool_runner::{self, ToolCommand},
 };
@@ -165,6 +165,12 @@ pub struct BaculaRuntimeEvidence {
     pub bconsole_config_sha256: String,
     pub daemon_logs: Vec<PathBuf>,
     pub catalog_schema_version: i32,
+    pub backup_data_spooling_enabled: bool,
+    pub data_spool_directory: PathBuf,
+    pub maximum_backup_data_spool_bytes: u64,
+    pub backup_attribute_spooling_enabled: bool,
+    pub attribute_spool_directory: PathBuf,
+    pub maximum_tape_file_bytes: u64,
 }
 
 struct ManagedDaemon {
@@ -255,6 +261,12 @@ impl BaculaRuntime {
         .render();
         let mut evidence = write_configs(&rendered)?;
         evidence.catalog_schema_version = catalog_schema_version;
+        evidence.backup_data_spooling_enabled = true;
+        evidence.data_spool_directory = PathBuf::from(DATA_SPOOL_DIRECTORY);
+        evidence.maximum_backup_data_spool_bytes = data_options.maximum_spool_size_bytes();
+        evidence.backup_attribute_spooling_enabled = true;
+        evidence.attribute_spool_directory = PathBuf::from(DATA_SPOOL_DIRECTORY);
+        evidence.maximum_tape_file_bytes = MAXIMUM_TAPE_FILE_BYTES;
 
         for daemon in BaculaDaemon::STARTUP_ORDER {
             validate_daemon(daemon, cancellation).await?;
@@ -490,6 +502,7 @@ fn prepare_runtime_directories(evidence_directory: &Path) -> Result<(), BaculaRu
         Path::new(CONFIG_DIRECTORY),
         working_directory,
         bootstrap_directory.as_path(),
+        Path::new(DATA_SPOOL_DIRECTORY),
         Path::new("/run/bacula"),
         evidence_directory,
     ] {
@@ -526,6 +539,12 @@ fn write_configs(
         bconsole_config_sha256: digest(rendered.bconsole.as_bytes()),
         daemon_logs: Vec::new(),
         catalog_schema_version: 0,
+        backup_data_spooling_enabled: false,
+        data_spool_directory: PathBuf::new(),
+        maximum_backup_data_spool_bytes: 0,
+        backup_attribute_spooling_enabled: false,
+        attribute_spool_directory: PathBuf::new(),
+        maximum_tape_file_bytes: 0,
     })
 }
 

@@ -1686,6 +1686,104 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         "attended_confirmed": true,
         "actor": "integration recovery operator"
     });
+    let oversized_manifest_bytes = i64::try_from(store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES + 1)
+        .expect("fixed manifest limit plus one fits i64");
+    sqlx::query(
+        "ALTER TABLE single_tape_data_artifacts
+         DISABLE TRIGGER single_tape_data_artifacts_append_only",
+    )
+    .execute(&pool)
+    .await
+    .expect("integration fixture should temporarily expose a legacy oversized artifact");
+    assert_eq!(
+        sqlx::query(
+            "UPDATE single_tape_data_artifacts SET size_bytes = $1
+             WHERE single_tape_data_run_id = $2 AND artifact_kind = 'source_manifest'",
+        )
+        .bind(oversized_manifest_bytes)
+        .bind(data_claim.run.id)
+        .execute(&pool)
+        .await
+        .expect("legacy oversized manifest fixture should persist")
+        .rows_affected(),
+        1
+    );
+    let oversized_queue_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/restore-rehearsals".to_owned(),
+        Some(queue_rehearsal_body.clone()),
+    )
+    .await;
+    let oversized_plan_response = api_request(
+        &application,
+        Method::POST,
+        "/api/v1/restores/plan".to_owned(),
+        Some(json!({
+            "recovery_point_id": recovery_point_id,
+            "mode": "file_archive",
+            "destination": "planned-restores/integration-oversized-manifest",
+            "conflict_policy": "skip",
+            "destination_approved": true,
+            "is_new_destination": true,
+            "acl_semantics_supported": true,
+            "identity_mapping_complete": true,
+            "estimated_required_bytes": 4096,
+            "available_bytes": 1048576,
+            "required_free_reserve_bytes": 4096,
+            "automatic_publication_requested": false
+        })),
+    )
+    .await;
+    assert_eq!(
+        sqlx::query(
+            "UPDATE single_tape_data_artifacts SET size_bytes = 1024
+             WHERE single_tape_data_run_id = $1 AND artifact_kind = 'source_manifest'",
+        )
+        .bind(data_claim.run.id)
+        .execute(&pool)
+        .await
+        .expect("integration fixture should restore the supported manifest size")
+        .rows_affected(),
+        1
+    );
+    sqlx::query(
+        "ALTER TABLE single_tape_data_artifacts
+         ENABLE TRIGGER single_tape_data_artifacts_append_only",
+    )
+    .execute(&pool)
+    .await
+    .expect("append-only artifact enforcement should be restored");
+    assert_eq!(oversized_queue_response.status(), StatusCode::CONFLICT);
+    let oversized_queue = response_json(oversized_queue_response).await;
+    assert!(oversized_queue["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("attended restore supports at most")));
+    assert_eq!(oversized_plan_response.status(), StatusCode::CREATED);
+    let oversized_plan = response_json(oversized_plan_response).await;
+    assert_eq!(oversized_plan["plan"]["ready"], false);
+    assert_eq!(oversized_plan["plan"]["execution_supported"], false);
+    assert_eq!(
+        oversized_plan["plan"]["execution"]["source_manifest_artifact"]["size_bytes"],
+        oversized_manifest_bytes
+    );
+    assert_eq!(
+        oversized_plan["plan"]["execution"]["source_manifest_artifact"]["maximum_supported_bytes"],
+        store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES
+    );
+    assert_eq!(
+        oversized_plan["plan"]["execution"]["source_manifest_artifact"]["supported"],
+        false
+    );
+    assert!(oversized_plan["plan"]["blockers"]
+        .as_array()
+        .is_some_and(|blockers| blockers.iter().any(|blocker| {
+            blocker["code"] == "source_manifest_artifact_too_large"
+                && blocker["size_bytes"] == oversized_manifest_bytes
+        })));
+    assert!(oversized_plan["plan"]["execution_detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("attended restore supports artifacts")));
     let stale_rehearsal_response = api_request(
         &application,
         Method::POST,

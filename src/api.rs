@@ -185,6 +185,14 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         )
         .route("/api/v1/restore-rehearsals/{id}", get(restore_rehearsal))
         .route(
+            "/api/v1/restore-rehearsals/{id}/media-readiness",
+            get(restore_rehearsal_media_readiness),
+        )
+        .route(
+            "/api/v1/restore-rehearsals/{id}/media",
+            post(authorize_restore_rehearsal_media),
+        )
+        .route(
             "/api/v1/restore-rehearsals/{id}/cancel",
             post(cancel_restore_rehearsal),
         )
@@ -1503,9 +1511,9 @@ impl CreateMediaRequest {
         if internal_label.is_empty() {
             return Err(AppError::Invalid("internal_label is required".to_owned()));
         }
-        if internal_label.chars().count() > 128 {
+        if internal_label.len() > 128 {
             return Err(AppError::Invalid(
-                "internal_label must be at most 128 characters".to_owned(),
+                "internal_label must be at most 128 bytes".to_owned(),
             ));
         }
         if !internal_label
@@ -2786,11 +2794,24 @@ async fn plan_restore(
         .collect::<Vec<_>>();
 
     let all_chain_full_readback = chain_ids.iter().all(|id| {
-        aggregate.verifications.iter().any(|verification| {
-            verification.recovery_point_id == *id
-                && verification.kind == "full_readback"
-                && verification.outcome == "passed"
-        })
+        let mut expected_media_ids = aggregate
+            .volumes
+            .iter()
+            .filter(|volume| volume.recovery_point_id == *id)
+            .collect::<Vec<_>>();
+        expected_media_ids.sort_by_key(|volume| volume.volume_order);
+        let expected_media_ids = expected_media_ids
+            .iter()
+            .map(|volume| volume.cartridge_id)
+            .collect::<Vec<_>>();
+        !expected_media_ids.is_empty()
+            && aggregate.verifications.iter().any(|verification| {
+                verification.recovery_point_id == *id
+                    && verification.kind == "full_readback"
+                    && verification.outcome == "passed"
+                    && verification.finished_at.is_some()
+                    && verification.media_ids == expected_media_ids
+            })
     });
     let restore_test_passed = aggregate.verifications.iter().any(|verification| {
         verification.recovery_point_id == recovery_point_id
@@ -2855,11 +2876,63 @@ async fn plan_restore(
         "per_file_digests_available": restore_request.verification.per_file_digests_available
     });
     let preflight = preflight_restore(&restore_request);
-    let blockers = preflight
+    let source_manifest_artifact_id = aggregate
+        .recovery_point
+        .coverage
+        .get("source_manifest_artifact_id")
+        .and_then(Value::as_i64);
+    let source_manifest_artifact_size_bytes = source_manifest_artifact_id.and_then(|artifact_id| {
+        aggregate
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.id == artifact_id && artifact.artifact_kind == "source_manifest"
+            })
+            .map(|artifact| artifact.size_bytes)
+    });
+    let source_manifest_limit_applies = mode == RestoreMode::FileArchive
+        && matches!(
+            aggregate.origin.workflow_kind.as_deref(),
+            Some("recovery_exercise" | "backup")
+        );
+    let source_manifest_artifact_supported = !source_manifest_limit_applies
+        || source_manifest_artifact_size_bytes
+            .is_some_and(store::restore_manifest_artifact_size_supported);
+    let source_manifest_artifact_blocker = if !source_manifest_limit_applies
+        || source_manifest_artifact_supported
+    {
+        None
+    } else if let Some(size_bytes) = source_manifest_artifact_size_bytes {
+        let code = if size_bytes > 0 {
+            "source_manifest_artifact_too_large"
+        } else {
+            "source_manifest_artifact_invalid_size"
+        };
+        Some(json!({
+            "code": code,
+            "message": format!(
+                "The retained source manifest is {size_bytes} bytes; attended restore supports artifacts from 1 through {} bytes.",
+                store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES
+            ),
+            "size_bytes": size_bytes,
+            "maximum_supported_bytes": store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES
+        }))
+    } else {
+        Some(json!({
+            "code": "source_manifest_artifact_missing",
+            "message": "The exact retained source-manifest artifact metadata is unavailable for attended restore.",
+            "maximum_supported_bytes": store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES
+        }))
+    };
+    let mut blockers = preflight
         .blockers
         .iter()
         .map(restore_blocker_view)
         .collect::<Vec<_>>();
+    if let Some(blocker) = &source_manifest_artifact_blocker {
+        blockers.push(blocker.clone());
+    }
+    let plan_ready = preflight.ready() && source_manifest_artifact_supported;
     let warnings = preflight
         .warnings
         .iter()
@@ -2909,7 +2982,9 @@ async fn plan_restore(
         .find(|verification| {
             verification.recovery_point_id == recovery_point_id
                 && verification.outcome == "passed"
-                && matches!(verification.kind.as_str(), "full_readback" | "restore_test")
+                && verification.kind == "full_readback"
+                && verification.finished_at.is_some()
+                && verification.media_ids == required_media_ids
         })
         .and_then(|verification| verification.drive_id);
     let rehearsal_capacity_ready = request
@@ -2934,6 +3009,14 @@ async fn plan_restore(
                 .compatible_qualified_drives
                 .iter()
                 .filter(|drive| Some(drive.id) == original_rehearsal_drive_id)
+                .filter(|drive| {
+                    aggregate.volumes.iter().all(|candidate| {
+                        candidate
+                            .compatible_qualified_drives
+                            .iter()
+                            .any(|compatible| compatible.id == drive.id)
+                    })
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         })
@@ -2942,8 +3025,20 @@ async fn plan_restore(
         aggregate.origin.workflow_kind.as_deref(),
         Some("recovery_exercise" | "backup")
     );
+    let ordered_finalized_volumes = !aggregate.volumes.is_empty()
+        && aggregate.volumes.iter().enumerate().all(|(index, volume)| {
+            i32::try_from(index + 1) == Ok(volume.volume_order)
+                && volume.recovery_point_id == recovery_point_id
+                && volume.finalized
+                && volume.on_tape_identity.is_some()
+        });
+    let origin_volume_shape_supported = match aggregate.origin.workflow_kind.as_deref() {
+        Some("backup") => ordered_finalized_volumes,
+        Some("recovery_exercise") => ordered_finalized_volumes && aggregate.volumes.len() == 1,
+        _ => false,
+    };
     let execution_supported = state.lab_file_roundtrip_enabled
-        && preflight.ready()
+        && plan_ready
         && mode == RestoreMode::FileArchive
         && aggregate.recovery_point.representation == "file"
         && aggregate.recovery_point.level == "full"
@@ -2951,10 +3046,11 @@ async fn plan_restore(
         && aggregate.recovery_point.key_lineage_id.is_none()
         && rehearsal_capacity_ready
         && aggregate.dependencies.is_empty()
-        && aggregate.volumes.len() == 1
-        && required_media_ids.len() == 1
+        && ordered_finalized_volumes
+        && required_media_ids.len() == aggregate.volumes.len()
         && aggregate.origin.data_run_id.is_some()
         && supported_origin_workflow
+        && origin_volume_shape_supported
         && aggregate.origin.run_state == "verified"
         && aggregate.origin.engine_name.as_deref() == Some("Bacula Community")
         && aggregate.origin.engine_version.as_deref() == Some("15.0.3")
@@ -2968,12 +3064,18 @@ async fn plan_restore(
         && !aggregate.caps.verifications_truncated
         && !aggregate.caps.artifacts_truncated
         && !aggregate.caps.values_truncated;
-    let execution_detail = if execution_supported {
-        "This verified single-volume point supports an attended, read-only physical-tape restore into the isolated destination."
-    } else if !preflight.ready() {
-        "Resolve every restore-planning blocker and generate a fresh plan before execution can be considered."
+    let execution_detail = if let Some(blocker) = &source_manifest_artifact_blocker {
+        blocker
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("The retained source manifest is outside the attended restore read bound.")
+            .to_owned()
+    } else if execution_supported {
+        "This verified full recovery point supports an attended, read-only ordered-media restore into the isolated destination.".to_owned()
+    } else if !plan_ready {
+        "Resolve every restore-planning blocker and generate a fresh plan before execution can be considered.".to_owned()
     } else {
-        "This ready plan remains planning-only because its representation, dependency shape, retained format, origin workflow, or physical evidence is outside the single-volume restore adapter."
+        "This ready plan remains planning-only because its representation, dependency shape, retained format, origin workflow, ordered media, or physical evidence is outside the attended restore adapter.".to_owned()
     };
     let execution = json!({
         "kind": "attended_verified_point_recovery_rehearsal",
@@ -2984,6 +3086,13 @@ async fn plan_restore(
         "origin_workflow_kind": aggregate.origin.workflow_kind.clone(),
         "required_media_ids": required_media_ids,
         "required_tape_ids": required_tape_ids,
+        "volume_count": required_media_ids.len(),
+        "multi_volume": required_media_ids.len() > 1,
+        "source_manifest_artifact": {
+            "size_bytes": source_manifest_artifact_size_bytes,
+            "maximum_supported_bytes": store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES,
+            "supported": source_manifest_artifact_supported
+        },
         "destination_subpath": destination,
         "compatible_drives": compatible_execution_drives,
         "original_drive_id": original_rehearsal_drive_id,
@@ -3014,7 +3123,7 @@ async fn plan_restore(
     let preview_hash = format!("{:x}", Sha256::digest(canonical_json(&preview)?));
     let persisted_selection = json!({
         "request": selection,
-        "ready": preflight.ready(),
+        "ready": plan_ready,
         "execution_supported": execution_supported,
         "execution": execution,
         "dependencies": &aggregate.dependencies,
@@ -3048,8 +3157,8 @@ async fn plan_restore(
                 "preview_hash": record.preview_hash,
                 "created_at": record.created_at,
                 "expires_at": record.expires_at,
-                "ready": preflight.ready(),
-                "status": if preflight.ready() { "ready" } else { "blocked" },
+                "ready": plan_ready,
+                "status": if plan_ready { "ready" } else { "blocked" },
                 "execution_supported": execution_supported,
                 "execution_detail": execution_detail,
                 "execution": execution,
@@ -3149,18 +3258,63 @@ impl CancelRestoreRehearsalRequest {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct AuthorizeRestoreRehearsalMediaRequest {
+    request_id: Uuid,
+    drive_id: Uuid,
+    expected_stable_id: String,
+    cartridge_id: Uuid,
+    typed_cartridge_label: String,
+    volume_order: i32,
+    loaded_media_confirmed: bool,
+    attended_confirmed: bool,
+    confirmation: String,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+impl AuthorizeRestoreRehearsalMediaRequest {
+    fn actor(&self) -> Result<String, AppError> {
+        let actor = self.actor.as_deref().unwrap_or("Web operator").trim();
+        if actor.is_empty() || actor.chars().count() > 128 || actor.chars().any(char::is_control) {
+            return Err(AppError::Invalid(
+                "actor must contain 1 to 128 printable characters".to_owned(),
+            ));
+        }
+        Ok(actor.to_owned())
+    }
+}
+
 async fn restore_rehearsals(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let rehearsals = match state.pool.as_ref() {
-        Some(pool) => store::list_restore_rehearsals(pool)
-            .await?
-            .iter()
-            .map(restore_rehearsal_run_summary_view)
-            .collect::<Vec<_>>(),
+        Some(pool) => {
+            let records = store::list_restore_rehearsals(pool).await?;
+            let mut views = Vec::with_capacity(records.len());
+            for record in records {
+                let request = store::open_restore_rehearsal_media_request(pool, record.id).await?;
+                let mut view = restore_rehearsal_run_summary_view(&record);
+                if let Some(object) = view.as_object_mut() {
+                    object.insert(
+                        "media_request".to_owned(),
+                        request
+                            .as_ref()
+                            .map(restore_rehearsal_media_request_view)
+                            .unwrap_or(Value::Null),
+                    );
+                    object.insert(
+                        "media_handoff".to_owned(),
+                        restore_rehearsal_media_handoff_view(&record, request.as_ref()),
+                    );
+                }
+                views.push(view);
+            }
+            views
+        }
         None => Vec::new(),
     };
     Ok(Json(json!({
         "rehearsals": rehearsals,
-        "scope": "attended_verified_single_volume_physical_restore",
+        "scope": "attended_verified_ordered_volume_physical_restore",
         "production_eligible": false
     })))
 }
@@ -3176,10 +3330,17 @@ async fn restore_rehearsal(
         .ok_or(AppError::NotFound)?;
     let events = store::restore_rehearsal_events(pool, id).await?;
     let artifacts = store::restore_rehearsal_artifacts(pool, id).await?;
+    let volumes = store::restore_rehearsal_volumes(pool, id).await?;
+    let media_request = store::open_restore_rehearsal_media_request(pool, id).await?;
+    let media_requests = store::restore_rehearsal_media_requests(pool, id).await?;
     let events_truncated = events.len() > RESTORE_REHEARSAL_EVENT_LIMIT;
     let artifacts_truncated = artifacts.len() > RESTORE_REHEARSAL_ARTIFACT_LIMIT;
     Ok(Json(json!({
         "rehearsal": restore_rehearsal_run_view(&rehearsal),
+        "volumes": volumes.iter().map(restore_rehearsal_volume_view).collect::<Vec<_>>(),
+        "media_request": media_request.as_ref().map(restore_rehearsal_media_request_view),
+        "media_requests": media_requests.iter().map(restore_rehearsal_media_request_view).collect::<Vec<_>>(),
+        "media_handoff": restore_rehearsal_media_handoff_view(&rehearsal, media_request.as_ref()),
         "events": events.iter().take(RESTORE_REHEARSAL_EVENT_LIMIT).map(restore_rehearsal_event_view).collect::<Vec<_>>(),
         "artifacts": artifacts.iter().take(RESTORE_REHEARSAL_ARTIFACT_LIMIT).map(restore_rehearsal_artifact_view).collect::<Vec<_>>(),
         "caps": {
@@ -3188,9 +3349,132 @@ async fn restore_rehearsal(
             "artifacts_maximum": RESTORE_REHEARSAL_ARTIFACT_LIMIT,
             "artifacts_truncated": artifacts_truncated
         },
-        "scope": "attended_verified_single_volume_physical_restore",
+        "scope": "attended_verified_ordered_volume_physical_restore",
         "production_eligible": false
     })))
+}
+
+async fn restore_rehearsal_media_readiness(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let id = parse_uuid_path(&id, "restore rehearsal")?;
+    let rehearsal = store::get_restore_rehearsal(pool, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let volumes = store::restore_rehearsal_volumes(pool, id).await?;
+    let media_request = store::open_restore_rehearsal_media_request(pool, id).await?;
+    let media_requests = store::restore_rehearsal_media_requests(pool, id).await?;
+    let candidate = media_request.as_ref().and_then(|request| {
+        volumes
+            .iter()
+            .find(|volume| volume.volume_order == request.volume_order)
+            .map(|volume| {
+                json!({
+                    "cartridge_id": volume.cartridge_id,
+                    "internal_label": volume.expected_cartridge_label,
+                    "volume_order": volume.volume_order,
+                    "expected_engine_volume_name": volume.expected_volume_label,
+                    "media_generation": volume.expected_media_generation,
+                    "media_format": volume.expected_media_format
+                })
+            })
+    });
+    let (ready, reason) = match media_request.as_ref() {
+        Some(_) if rehearsal.state != "running" => (
+            false,
+            "the restore is not running; media authorization is closed",
+        ),
+        Some(request) if request.state == "pending" && candidate.is_some() => (
+            true,
+            "the durable handoff is actionable; load the exact retained cartridge and submit the attended confirmation, then the worker will perform live drive and media validation",
+        ),
+        Some(request) if request.state == "authorized" => (
+            false,
+            "the exact cartridge is authorized; the worker must revalidate and lease it",
+        ),
+        Some(request) if request.state == "loaded" => (
+            false,
+            "the worker has leased this volume; a restart at this boundary fails closed",
+        ),
+        Some(_) => (false, "the media request is not actionable"),
+        None => (
+            false,
+            "the restore is not currently waiting for another volume",
+        ),
+    };
+    Ok(Json(json!({
+        "rehearsal": restore_rehearsal_run_view(&rehearsal),
+        "volumes": volumes.iter().map(restore_rehearsal_volume_view).collect::<Vec<_>>(),
+        "media_request": media_request.as_ref().map(restore_rehearsal_media_request_view),
+        "media_requests": media_requests.iter().map(restore_rehearsal_media_request_view).collect::<Vec<_>>(),
+        "media_handoff": restore_rehearsal_media_handoff_view(&rehearsal, media_request.as_ref()),
+        "readiness": {
+            "ready": ready,
+            "advisory": true,
+            "scope": "durable_handoff_precheck",
+            "reason": reason,
+            "drive": {
+                "id": rehearsal.drive_id,
+                "stable_id": rehearsal.expected_stable_id,
+                "path": rehearsal.expected_path
+            },
+            "candidate": candidate,
+            "live_drive_validated": false,
+            "final_validation": "after authorization the worker atomically leases the exact retained cartridge, freshly re-probes the drive, verifies the loaded tape, rewinds it, and only then mounts it for Bacula"
+        }
+    })))
+}
+
+async fn authorize_restore_rehearsal_media(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<AuthorizeRestoreRehearsalMediaRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    require_file_roundtrip(&state)?;
+    let pool = require_pool(&state)?;
+    let id = parse_uuid_path(&id, "restore rehearsal")?;
+    let actor = request.actor()?;
+    let authorization = store::RestoreRehearsalMediaAuthorization {
+        request_id: request.request_id,
+        drive_id: request.drive_id,
+        expected_stable_id: request.expected_stable_id,
+        cartridge_id: request.cartridge_id,
+        typed_cartridge_label: request.typed_cartridge_label,
+        volume_order: request.volume_order,
+        loaded_media_confirmed: request.loaded_media_confirmed,
+        attended_confirmed: request.attended_confirmed,
+        confirmation: request.confirmation,
+        actor_label: actor,
+    };
+    match store::authorize_restore_rehearsal_media(pool, id, &authorization).await? {
+        store::AuthorizeRestoreRehearsalMediaResult::Authorized {
+            request,
+            volume,
+            idempotent_replay,
+        } => {
+            let rehearsal = store::get_restore_rehearsal(pool, id)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "rehearsal": restore_rehearsal_run_view(&rehearsal),
+                    "media_request": restore_rehearsal_media_request_view(&request),
+                    "volume": restore_rehearsal_volume_view(&volume),
+                    "media_handoff": restore_rehearsal_media_handoff_view(&rehearsal, Some(&request)),
+                    "idempotent_replay": idempotent_replay,
+                    "attended": true,
+                    "writes_tape": false
+                })),
+            ))
+        }
+        store::AuthorizeRestoreRehearsalMediaResult::NotFound => Err(AppError::NotFound),
+        store::AuthorizeRestoreRehearsalMediaResult::Blocked(reason) => {
+            Err(AppError::Blocked(reason))
+        }
+    }
 }
 
 async fn queue_restore_rehearsal(
@@ -3277,10 +3561,12 @@ async fn restore_rehearsal_evidence(
         .ok_or(AppError::NotFound)?;
     let events = store::restore_rehearsal_events(pool, id).await?;
     let artifacts = store::restore_rehearsal_artifacts(pool, id).await?;
+    let volumes = store::restore_rehearsal_volumes(pool, id).await?;
+    let media_request = store::open_restore_rehearsal_media_request(pool, id).await?;
     let evidence = json!({
         "format": "tapescale.restore-rehearsal-evidence.v1",
         "canonicalization": "UTF-8 compact JSON with lexicographically ordered object keys",
-        "execution_claim": "attended verified-point single-volume physical-tape Restore run; not production qualification",
+        "execution_claim": "attended verified-point ordered-volume physical-tape Restore run; not production qualification",
         "bounds": {
             "maximum_serialized_bytes": RESTORE_REHEARSAL_EXPORT_BYTES,
             "events_maximum": RESTORE_REHEARSAL_EVENT_LIMIT,
@@ -3290,6 +3576,8 @@ async fn restore_rehearsal_evidence(
             "nested_values": "depth, collection, and string bounded; worker-internal paths redacted"
         },
         "rehearsal": restore_rehearsal_run_view(&rehearsal),
+        "volumes": volumes.iter().map(restore_rehearsal_volume_view).collect::<Vec<_>>(),
+        "media_request": media_request.as_ref().map(restore_rehearsal_media_request_view),
         "events": events.iter().take(RESTORE_REHEARSAL_EVENT_LIMIT).map(restore_rehearsal_event_view).collect::<Vec<_>>(),
         "artifacts": artifacts.iter().take(RESTORE_REHEARSAL_ARTIFACT_LIMIT).map(restore_rehearsal_artifact_view).collect::<Vec<_>>()
     });
@@ -3345,6 +3633,7 @@ fn restore_rehearsal_run_view(run: &store::RestoreRehearsalRunRecord) -> Value {
         "result".to_owned(),
         bounded_restore_evidence_value(&run.result),
     );
+    object.insert("multi_volume".to_owned(), json!(run.volume_count > 1));
     view
 }
 
@@ -3357,6 +3646,60 @@ fn restore_rehearsal_run_summary_view(run: &store::RestoreRehearsalRunRecord) ->
         object.remove("source_manifest_digest");
     }
     view
+}
+
+fn restore_rehearsal_volume_view(volume: &store::RestoreRehearsalVolumeRecord) -> Value {
+    let mut view = serde_json::to_value(volume)
+        .expect("a serializable restore volume record always converts to JSON");
+    if let Some(object) = view.as_object_mut() {
+        object.remove("media_lease_id");
+        object.remove("media_fencing_token");
+    }
+    view
+}
+
+fn restore_rehearsal_media_request_view(
+    request: &store::RestoreRehearsalMediaRequestRecord,
+) -> Value {
+    let mut view = serde_json::to_value(request)
+        .expect("a serializable restore media request always converts to JSON");
+    if let Some(object) = view.as_object_mut() {
+        object.insert(
+            "confirmation_evidence".to_owned(),
+            bounded_restore_evidence_value(&request.confirmation_evidence),
+        );
+    }
+    view
+}
+
+fn restore_rehearsal_media_handoff_view(
+    run: &store::RestoreRehearsalRunRecord,
+    request: Option<&store::RestoreRehearsalMediaRequestRecord>,
+) -> Value {
+    let Some(request) = request else {
+        return json!({
+            "required": false,
+            "waiting": false,
+            "state": if run.state == "running" { "active" } else { run.state.as_str() },
+            "volume_order": Value::Null,
+            "confirmation_phrase": Value::Null
+        });
+    };
+    json!({
+        "required": true,
+        "waiting": matches!(request.state.as_str(), "pending" | "authorized"),
+        "state": request.state,
+        "request_id": request.id,
+        "volume_order": request.volume_order,
+        "volume_count": run.volume_count,
+        "expected_cartridge_id": request.expected_cartridge_id,
+        "expected_cartridge_label": request.expected_cartridge_label,
+        "expected_engine_volume_name": request.expected_engine_volume_name,
+        "confirmation_phrase": format!(
+            "LOAD {} FOR RESTORE {} VOLUME {}",
+            request.expected_cartridge_label, run.id, request.volume_order
+        )
+    })
 }
 
 fn restore_rehearsal_event_view(event: &store::RestoreRehearsalEventRecord) -> Value {

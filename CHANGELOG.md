@@ -2,6 +2,30 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.3] - 2026-11-13
+
+### Sustained tape writing
+
+- Bacula Full jobs now use the existing persistent spool volume instead of feeding tape directly from filesystem traversal and compression.
+- The worker proves spool writability and current capacity before the destructive media boundary, preserves an 8 GiB free-space reserve, and selects an effective buffer up to 64 GiB by default.
+- Reaching the spool ceiling despools and continues the same archive; it is not a backup-size limit. Run evidence records the effective ceiling and the console explains initial buffering without inventing progress.
+- Bacula's one-gigabyte tape-file default is overridden with a 32 GiB logical-file boundary, reducing EOF/filemark stops on modern LTO without limiting the archive or cartridge size.
+- Bacula's automatically enabled attribute spool now uses the same measured spool filesystem. Preflight reserves a conservative allowance from manifest size and entry count in addition to the configured free-space reserve before setting the data-spool ceiling.
+- The file-backed Bacula CI roundtrip now validates the same `Spool Data`, spool-directory, spool-bound, and tape-file-boundary Device directives.
+
+### Ordered-volume Restore runs
+
+- Compatible operational Full points can now be restored across their complete ordered cartridge set; legacy G0.2 points remain one volume.
+- Queueing atomically reserves every required tape and snapshots its inventory, on-tape, Bacula MediaId/label, and record-coordinate binding into a durable restore ledger.
+- The active Bacula restore pauses for exact read-only handoffs. Each next tape requires `LOAD <label> FOR RESTORE <run UUID> VOLUME <number>`, a new media fence, a fresh drive probe, rewind, and mount.
+- Cancellation, lease loss, wrong order/media, and worker restart fail closed. A pass requires every ordered volume completed, no open handoff, exact all-volume engine/report evidence, and the independent restored-manifest comparison.
+- Recovery Vault now presents the ordered tape sequence, current/next tape, durable waiting state, and exact handoff modal on desktop and mobile.
+
+### Alpha boundaries
+
+- Spooling, compression, end-of-media handling, and multi-volume restore are implemented but not physically qualified across the hardware matrix.
+- Restore remains complete-job, unencrypted, catalog-dependent, attended, and isolated; selective and clean-catalog recovery remain unavailable.
+
 ## [0.1.0-alpha.2] - 2026-11-13
 
 ### Restore workflow
@@ -46,5 +70,6 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.3]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.1

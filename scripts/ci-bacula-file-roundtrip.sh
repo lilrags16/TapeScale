@@ -70,6 +70,7 @@ readonly maximum_volumes maximum_volume_bytes_directive compression_directive fi
 readonly pool_name="TS-LTO-${run_token}"
 readonly config_root="/etc/tapescale"
 readonly work_root="/var/lib/bacula"
+readonly spool_root="/var/lib/tapescale/spool"
 readonly runtime_root="/run/bacula"
 readonly source_root="/source"
 readonly restore_root="/restore"
@@ -113,6 +114,7 @@ install -d -m 0750 \
   "$work_root" \
   "$work_root/bootstrap" \
   "$work_root/file-volumes" \
+  "$spool_root" \
   "$runtime_root" \
   "$source_root" \
   "$restore_root"
@@ -219,6 +221,7 @@ Job {
   Storage = TS-LTO
   Pool = $pool_name
   Messages = Standard
+  Spool Data = yes
   Spool Attributes = yes
   Write Bootstrap = "$work_root/bootstrap/%i.bsr"
 }
@@ -252,8 +255,8 @@ Console {
   Name = tapescale-adapter
   Password = "ci-console-password"
   Command ACL = run, cancel, status, .status, .api, .jlist, restore, label, mount, unmount, release
-  Job ACL = TS-Full, TS-VerifyData, TS-Restore
-  Client ACL = tapescale-fd
+  Job ACL = *all*
+  Client ACL = *all*
   Backup Client ACL = tapescale-fd
   Restore Client ACL = tapescale-fd
   Storage ACL = TS-LTO
@@ -285,10 +288,10 @@ Storage {
   Name = tapescale-sd
   SDPort = 9103
   SDAddress = 127.0.0.1
-  Working Directory = "$work_root"
+  Working Directory = "$spool_root"
   Pid Directory = "$runtime_root"
   Plugin Directory = "/usr/lib/bacula"
-  Maximum Concurrent Jobs = 1
+  Maximum Concurrent Jobs = 2
   TLS Enable = no
   TLS Require = yes
   TLS PSK Enable = yes
@@ -312,6 +315,10 @@ Device {
   Removable Media = no
   Random Access = yes
   Label Media = yes
+  Maximum File Size = 32G
+  Spool Directory = "$spool_root"
+  Maximum Spool Size = 64M
+  Maximum Job Spool Size = 64M
   Maximum Concurrent Jobs = 1
 }
 

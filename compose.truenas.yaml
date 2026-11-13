@@ -23,11 +23,11 @@ name: tapescale
 
 x-tapescale-common: &tapescale-common
   build:
-    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-alpha.2
+    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-alpha.3
     args:
-      TAPESCALE_VERSION: 0.1.0-alpha.2
-      TAPESCALE_REVISION: v0.1.0-alpha.2
-  image: tapescale:0.1.0-alpha.2
+      TAPESCALE_VERSION: 0.1.0-alpha.3
+      TAPESCALE_REVISION: v0.1.0-alpha.3
+  image: tapescale:0.1.0-alpha.3
   pull_policy: build
   restart: unless-stopped
   read_only: true
@@ -100,6 +100,12 @@ services:
       TAPESCALE_BTAPE_PATH: /usr/sbin/btape
       TAPESCALE_BCONSOLE_PATH: /usr/sbin/bconsole
       TAPESCALE_BACULA_STATE_DIR: /var/lib/tapescale/bacula
+      # Up to 64 GiB of data buffering plus an 8 GiB filesystem reserve.
+      # TapeScale also reserves an archive-specific attribute-spool allowance.
+      # Bacula drains a full data buffer and continues, so this is no size cap.
+      TAPESCALE_BACULA_SPOOL_MAX_BYTES: "68719476736"
+      TAPESCALE_BACULA_SPOOL_RESERVE_BYTES: "8589934592"
+      TAPESCALE_BACULA_SPOOL_MIN_BYTES: "8589934592"
       TAPESCALE_QUALIFICATION_TIMEOUT_SECS: "1800"
       TAPESCALE_DATA_RUN_TIMEOUT_SECS: "43200"
     healthcheck:

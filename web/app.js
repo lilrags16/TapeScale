@@ -78,13 +78,15 @@
       recoveryExerciseDetails: {},
       recoveryPointDetails: {},
       restoreRehearsals: [],
-      restoreRehearsalDetails: {}
+      restoreRehearsalDetails: {},
+      restoreMediaReadiness: {}
     },
     received: new Set(),
     errors: {},
     qualificationPollTimer: null,
     recoveryExercisePollTimer: null,
     restoreRehearsalPollTimer: null,
+    restoreMediaModalToken: 0,
     backupRunPollTimer: null,
     backupReadinessModalToken: 0,
     pendingBackupSetup: null,
@@ -704,6 +706,17 @@
     return null;
   }
 
+  function renderBackupSpoolingCue(run) {
+    if (backupRunState(run) !== "writing") return "";
+    const spooling = backupEvidenceValue(run, "data_spooling");
+    const details = spooling && typeof spooling === "object" && !Array.isArray(spooling) ? spooling : {};
+    const effectiveMaximum = Number(pick(details, "effective_maximum_bytes", "maximum_bytes"));
+    const limit = Number.isFinite(effectiveMaximum) && effectiveMaximum > 0
+      ? " Effective disk-buffer maximum for this run: " + bytes(effectiveMaximum) + "."
+      : "";
+    return '<div class="notice info backup-spooling-cue"><span class="notice-icon" aria-hidden="true">⇄</span><div class="notice-copy"><strong>Buffering on disk, then streaming to tape</strong><span>Bacula is using a bounded disk buffer to sustain the tape stream. The drive may remain idle while the buffer initially fills; once despooling begins, it should stream continuously for that buffered segment.' + esc(limit) + ' This buffer does not limit the total archive size.</span></div></div>';
+  }
+
   function backupPhaseIndex(run) {
     const runState = backupRunState(run);
     if (["verified", "passed", "completed", "complete"].includes(runState)) return BACKUP_PHASES.length - 1;
@@ -930,7 +943,7 @@
     const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="retry-backup-run" data-id="' + esc(id) + '">Retry</button></div>' : "";
     const measuredProgress = progress == null ? "" : '<div class="progress backup-progress"><div class="progress-track"><div class="progress-value" style="width:' + progress + '%"></div></div><div class="progress-meta"><span>Measured progress</span><span>' + progress + "%</span></div></div>";
     const technical = '<details class="backup-technical"><summary><span><strong>Technical details</strong><small>Request identity, engine evidence, and complete activity history</small></span></summary><div class="backup-technical-body"><dl class="vault-facts"><dt>Request ID</dt><dd class="mono">' + esc(id) + '</dd><dt>Created</dt><dd>' + esc(date(pick(run, "created_at", "started_at"))) + '</dd><dt>Raw state</dt><dd>' + esc(runState) + '</dd>' + (backupFailureDetail(run) ? '<dt>Recorded failure</dt><dd>' + esc(backupFailureDetail(run)) + "</dd>" : "") + '</dl><section class="backup-detail-section"><div class="backup-section-head"><div><span>Engine evidence</span><h3>Recorded facts</h3></div></div>' + renderBackupEvidence(run) + '</section><section class="backup-detail-section"><div class="backup-section-head"><div><span>Complete history</span><h3>Activity</h3></div></div>' + renderBackupTimeline(run) + "</section>" + renderBackupArtifacts(run) + "</div></details>";
-    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>Started ' + esc(date(pick(run, "created_at", "started_at"))) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header>' + renderBackupPhaseTrack(run) + '<div class="backup-run-actions">' + cancel + '<button class="button button-quiet button-small" type="button" data-action="refresh">Refresh status</button></div><div class="panel-body">' + detailFailure + notice + measuredProgress + '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>Backup result</h3></div></div>' + renderBackupOutcome(run) + "</section>" + technical + "</div></article>";
+    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>Started ' + esc(date(pick(run, "created_at", "started_at"))) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header>' + renderBackupPhaseTrack(run) + '<div class="backup-run-actions">' + cancel + '<button class="button button-quiet button-small" type="button" data-action="refresh">Refresh status</button></div><div class="panel-body">' + detailFailure + notice + renderBackupSpoolingCue(run) + measuredProgress + '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>Backup result</h3></div></div>' + renderBackupOutcome(run) + "</section>" + technical + "</div></article>";
   }
 
   function renderJobs() {
@@ -1544,7 +1557,7 @@
 
   function volumeLabel(volume) {
     const cartridge = volumeCartridge(volume);
-    return pick(volume, "media_label", "cartridge_label", "internal_label", "barcode") || pick(cartridge, "internal_label", "label", "barcode", "id") || "Unidentified cartridge";
+    return pick(volume, "media_label", "cartridge_label", "expected_cartridge_label", "expected_volume_label", "internal_label", "barcode") || pick(cartridge, "internal_label", "label", "barcode", "id") || "Unidentified cartridge";
   }
 
   function renderRecoveryPointCatalog(points, selected) {
@@ -1765,29 +1778,128 @@
     const partialWarning = truncated
       ? '<div class="notice warning source-browser-partial"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Showing the first ' + esc(entryLimit) + ' retained entries in this folder</strong><span>Only this browse-only directory view is bounded. The retained manifest and tape archive are complete, and the backup itself was not limited to these rows.</span></div></div>'
       : "";
-    return '<section class="vault-dossier-section recovery-file-browser-shell" data-recovery-files="' + esc(pointId) + '"><div class="vault-section-head"><div><h3>Files & directories</h3><p>Catalog view from the content-addressed manifest.</p></div><button class="icon-button" type="button" data-action="close-recovery-files" data-id="' + esc(pointId) + '" aria-label="Close retained contents browser">&times;</button></div><div class="notice info recovery-files-boundary"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Browse-only recovery inventory</strong><span>This view does not read tape and does not change restore scope. A current Alpha Restore run, when offered, restores the complete recovery point from one cartridge; selecting individual files or folders is not supported yet.</span></div></div>' + partialWarning + '<div class="backup-source-browser retained-browser"><div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(parentPath || "") + '" aria-label="Open parent retained directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Retained backup path">' + recoveryFileBreadcrumbs(pointId, currentPath) + '</nav></div><div class="source-browser-context"><div><span>Retained path</span><code>/' + esc(currentPath) + '</code></div><span class="source-browser-scope readonly"><span aria-hidden="true">◇</span> Manifest evidence</span></div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Action</span></div><div class="source-browser-entries" role="list" aria-label="Retained files and directories in ' + esc(currentPath || "backup root") + '">' + (entries.length ? entries.map((entry) => recoveryFileEntry(entry, currentPath, pointId)).join("") : empty) + '</div><p class="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + (truncated ? "+ retained entries available; partial view loaded" : " retained entries loaded")) + "</p></div></section>";
+    return '<section class="vault-dossier-section recovery-file-browser-shell" data-recovery-files="' + esc(pointId) + '"><div class="vault-section-head"><div><h3>Files & directories</h3><p>Catalog view from the content-addressed manifest.</p></div><button class="icon-button" type="button" data-action="close-recovery-files" data-id="' + esc(pointId) + '" aria-label="Close retained contents browser">&times;</button></div><div class="notice info recovery-files-boundary"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Browse-only recovery inventory</strong><span>This view does not read tape and does not change restore scope. A current Alpha Restore run, when explicitly offered by the server, restores the complete Full recovery point across its exact ordered archive. Selecting individual files or folders is not supported yet.</span></div></div>' + partialWarning + '<div class="backup-source-browser retained-browser"><div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(parentPath || "") + '" aria-label="Open parent retained directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Retained backup path">' + recoveryFileBreadcrumbs(pointId, currentPath) + '</nav></div><div class="source-browser-context"><div><span>Retained path</span><code>/' + esc(currentPath) + '</code></div><span class="source-browser-scope readonly"><span aria-hidden="true">◇</span> Manifest evidence</span></div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Action</span></div><div class="source-browser-entries" role="list" aria-label="Retained files and directories in ' + esc(currentPath || "backup root") + '">' + (entries.length ? entries.map((entry) => recoveryFileEntry(entry, currentPath, pointId)).join("") : empty) + '</div><p class="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + (truncated ? "+ retained entries available; partial view loaded" : " retained entries loaded")) + "</p></div></section>";
   }
 
   const RESTORE_REHEARSAL_PHASES = [
     { name: "Preflight", detail: "Revalidate plan, drive, and tape", aliases: ["queued", "started", "preparing", "preflight"] },
-    { name: "Restore files", detail: "Read the complete backup from one tape", aliases: ["reading", "restoring", "engine_dispatched", "engine_restore"] },
+    { name: "Restore files", detail: "Read the complete backup across its ordered tapes", aliases: ["reading", "restoring", "engine_dispatched", "engine_restore", "waiting_for_media", "media_required"] },
     { name: "Verify files", detail: "Hash and compare restored content", aliases: ["comparing", "restored_manifest", "comparison"] },
     { name: "Complete", detail: "Retain restore evidence", aliases: ["passed", "verified", "completed", "complete"] }
   ];
 
-  function restoreRehearsalDetailRecord(rehearsal) {
+  function restoreRehearsalDetailPayload(rehearsal) {
     const detail = rehearsal && state.data.restoreRehearsalDetails[recordId(rehearsal)];
+    return detail && typeof detail === "object" ? detail : {};
+  }
+
+  function restoreRehearsalDetailRecord(rehearsal) {
+    const detail = restoreRehearsalDetailPayload(rehearsal);
     return detail && (detail.rehearsal || detail.run) || rehearsal;
   }
 
   function restoreRehearsalEvents(rehearsal) {
-    const detail = rehearsal && state.data.restoreRehearsalDetails[recordId(rehearsal)];
-    return detail ? list(detail, "events") : [];
+    return list(restoreRehearsalDetailPayload(rehearsal), "events");
   }
 
   function restoreRehearsalArtifacts(rehearsal) {
-    const detail = rehearsal && state.data.restoreRehearsalDetails[recordId(rehearsal)];
-    return detail ? list(detail, "artifacts") : [];
+    return list(restoreRehearsalDetailPayload(rehearsal), "artifacts");
+  }
+
+  function restoreRehearsalVolumes(rehearsal) {
+    const detail = restoreRehearsalDetailPayload(rehearsal);
+    const record = restoreRehearsalDetailRecord(rehearsal) || {};
+    const result = record.result && typeof record.result === "object" ? record.result : {};
+    let volumes = arrayValue(detail, "volumes", "required_volumes");
+    if (!volumes.length) volumes = arrayValue(record, "volumes", "required_volumes");
+    if (!volumes.length) volumes = arrayValue(result, "volumes", "required_volumes");
+    if (!volumes.length && pick(record, "expected_volume_label", "cartridge_label")) {
+      volumes = [{
+        volume_order: 1,
+        cartridge_id: pick(record, "cartridge_id"),
+        cartridge_label: pick(record, "expected_volume_label", "cartridge_label"),
+        state: restoreRehearsalState(record)
+      }];
+    }
+    return volumes.map((volume, index) => ({
+      raw: volume,
+      sequence: Number(pick(volume, "volume_order", "volume_sequence", "sequence", "order") || index + 1),
+      cartridgeId: String(pick(volume, "cartridge_id", "media_id") || ""),
+      label: String(volumeLabel(volume)),
+      state: String(pick(volume, "state", "status", "restore_state") || "pending").toLowerCase()
+    })).sort((left, right) => left.sequence - right.sequence);
+  }
+
+  function restoreRehearsalMediaRequest(rehearsal) {
+    const detail = restoreRehearsalDetailPayload(rehearsal);
+    const record = restoreRehearsalDetailRecord(rehearsal) || {};
+    const result = record.result && typeof record.result === "object" ? record.result : {};
+    const sources = [pick(detail, "media_request", "current_media_request"), pick(record, "media_request", "current_media_request"), pick(result, "media_request", "current_media_request")];
+    return sources.find((value) => value && typeof value === "object" && !Array.isArray(value)) || {};
+  }
+
+  function restoreRehearsalMediaHandoff(rehearsal) {
+    const detail = restoreRehearsalDetailPayload(rehearsal);
+    const record = restoreRehearsalDetailRecord(rehearsal) || {};
+    const result = record.result && typeof record.result === "object" ? record.result : {};
+    const sources = [pick(detail, "media_handoff"), pick(record, "media_handoff"), pick(result, "media_handoff")];
+    return sources.find((value) => value && typeof value === "object" && !Array.isArray(value)) || {};
+  }
+
+  function restoreHandoffOrder(rehearsal, key) {
+    const handoff = restoreRehearsalMediaHandoff(rehearsal);
+    const request = restoreRehearsalMediaRequest(rehearsal);
+    const value = key === "next"
+      ? pick(handoff, "next_volume_order", "volume_order", "volume_sequence") ?? pick(request, "volume_order", "volume_sequence")
+      : pick(handoff, "current_volume_order", "loaded_volume_order") ?? pick(request, "current_volume_order");
+    const order = Number(value);
+    return Number.isInteger(order) && order > 0 ? order : null;
+  }
+
+  function restoreHandoffWaiting(rehearsal) {
+    const record = restoreRehearsalDetailRecord(rehearsal) || {};
+    const handoff = restoreRehearsalMediaHandoff(rehearsal);
+    const stateValue = String(pick(handoff, "state") || "").toLowerCase();
+    return pick(handoff, "required") === true && (pick(handoff, "waiting") === true || stateValue === "waiting_for_media" || restoreRehearsalPhase(record) === "waiting_for_media");
+  }
+
+  function restoreHandoffAccepted(rehearsal) {
+    const handoff = restoreRehearsalMediaHandoff(rehearsal);
+    const request = restoreRehearsalMediaRequest(rehearsal);
+    return [pick(handoff, "state"), pick(request, "state")].some((value) => ["authorized", "loaded", "accepted", "resuming"].includes(String(value || "").toLowerCase()));
+  }
+
+  function restoreHandoffLabel(rehearsal) {
+    const handoff = restoreRehearsalMediaHandoff(rehearsal);
+    const request = restoreRehearsalMediaRequest(rehearsal);
+    return String(pick(handoff, "next_cartridge_label", "next_volume_label", "expected_cartridge_label", "cartridge_label") || pick(request, "expected_cartridge_label", "cartridge_label", "expected_volume_label") || "");
+  }
+
+  function restoreHandoffTotal(rehearsal) {
+    const total = Number(pick(restoreRehearsalMediaHandoff(rehearsal), "total_volumes", "volume_count") || restoreRehearsalVolumes(rehearsal).length);
+    return Number.isInteger(total) && total > 0 ? total : restoreRehearsalVolumes(rehearsal).length;
+  }
+
+  function renderRestoreVolumeSequence(rehearsal) {
+    const volumes = restoreRehearsalVolumes(rehearsal);
+    if (!volumes.length) return "";
+    const record = restoreRehearsalDetailRecord(rehearsal);
+    const runState = restoreRehearsalState(record);
+    const passed = ["passed", "verified", "completed", "complete"].includes(runState);
+    const waiting = restoreHandoffWaiting(rehearsal);
+    const accepted = restoreHandoffAccepted(rehearsal);
+    const nextOrder = restoreHandoffOrder(rehearsal, "next");
+    const loadedVolume = volumes.find((volume) => volume.state === "loaded");
+    const currentOrder = restoreHandoffOrder(rehearsal, "current") || (loadedVolume && loadedVolume.sequence) || (accepted && nextOrder) || (!waiting && restoreRehearsalActive(record) ? 1 : null);
+    const rows = volumes.map((volume) => {
+      const explicitDone = ["read", "restored", "completed", "complete", "verified"].includes(volume.state);
+      const done = passed || explicitDone || Boolean(nextOrder && volume.sequence < nextOrder);
+      const next = waiting && volume.sequence === nextOrder;
+      const current = !next && !done && volume.sequence === currentOrder;
+      const stateText = done ? "Read" : next ? "Required next" : current ? accepted ? "Accepted; rechecking" : "Loaded now" : "Pending";
+      return '<li class="' + (done ? "done" : next ? "next" : current ? "current" : "pending") + '"' + (next || current ? ' aria-current="step"' : "") + '><span class="restore-volume-marker">' + esc(done ? "✓" : volume.sequence) + '</span><span><strong>Tape ' + esc(volume.sequence) + '</strong><code>' + esc(volume.label) + '</code><small>' + esc(stateText) + "</small></span></li>";
+    }).join("");
+    return '<div class="backup-volume-plan restore-volume-plan"><span>Exact ordered restore media</span><ol>' + rows + "</ol></div>";
   }
 
   function restoreRehearsalPhase(rehearsal) {
@@ -1843,29 +1955,51 @@
     const error = state.errors["restoreRehearsal:" + id];
     const result = record && record.result && typeof record.result === "object" ? record.result : {};
     const resultDetail = pick(record, "failure_detail", "detail") || pick(result, "failure_detail", "detail", "message");
+    const volumes = restoreRehearsalVolumes(rehearsal);
+    const multiVolume = volumes.length > 1;
+    const waiting = restoreHandoffWaiting(rehearsal);
+    const mediaAccepted = restoreHandoffAccepted(rehearsal);
+    const nextOrder = restoreHandoffOrder(rehearsal, "next");
+    const loadedVolume = volumes.find((volume) => volume.state === "loaded");
+    const currentOrder = restoreHandoffOrder(rehearsal, "current") || (loadedVolume && loadedVolume.sequence) || (mediaAccepted && nextOrder) || (!waiting && active ? 1 : null);
+    const currentVolume = volumes.find((volume) => volume.sequence === currentOrder);
+    const nextLabel = restoreHandoffLabel(rehearsal) || (volumes.find((volume) => volume.sequence === nextOrder) || {}).label || "";
+    const totalVolumes = restoreHandoffTotal(rehearsal) || volumes.length;
     const facts = [
       ["Run", id],
       ["Plan", pick(record, "plan_id", "restore_plan_id")],
       ["Drive", pick(record, "expected_stable_id", "drive_stable_id", "drive_id")],
-      ["Cartridge", pick(record, "expected_volume_label", "cartridge_label", "expected_cartridge_label")],
+      [volumes.length === 1 ? "Cartridge" : "Archive tapes", volumes.length ? volumes.map((volume) => volume.sequence + ". " + volume.label).join(" → ") : pick(record, "expected_volume_label", "cartridge_label", "expected_cartridge_label")],
+      ["Current tape", currentVolume ? currentVolume.sequence + ". " + currentVolume.label : null],
+      ["Next tape", waiting ? (nextOrder ? nextOrder + ". " : "") + (nextLabel || "Exact recorded tape") : null],
       ["Destination", pick(record, "destination_subpath", "destination", "restore_destination")],
       ["Started", date(pick(record, "started_at", "created_at"))],
       ["Finished", pick(record, "finished_at") ? date(pick(record, "finished_at")) : null]
     ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "");
-    let outcome = '<div class="notice info"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>' + esc(human(restoreRehearsalPhase(rehearsal))) + '</strong><span>Keep the exact single tape loaded and the isolated destination online. Cancellation is honored only at a safe boundary.</span></div></div>';
+    let outcome = '<div class="notice info"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>' + esc(human(restoreRehearsalPhase(rehearsal))) + '</strong><span>Keep ' + esc(currentVolume ? currentVolume.label : "the requested tape") + ' loaded and the isolated destination online. Cancellation is honored only at a safe boundary.</span></div></div>';
+    if (mediaAccepted) outcome = '<div class="notice info restore-media-handoff"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Tape accepted; Restore run is resuming</strong><span>Keep the selected drive and exact loaded tape available while Bacula validates its on-tape label and continues the same restore job.</span></div></div>';
+    if (waiting) outcome = '<div class="notice warning restore-media-handoff"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Load tape ' + esc(nextOrder || "?") + ' of ' + esc(totalVolumes || "?") + ': ' + esc(nextLabel || "exact recorded cartridge") + '</strong><span>The Restore run is durably paused at a read-only media boundary. Unload the previous tape, insert this exact next cartridge, and confirm it below. TapeScale will not erase, relabel, or append to it.</span></div><button class="button button-primary" type="button" data-action="open-restore-media-handoff" data-id="' + esc(id) + '">Load exact next tape</button></div>';
     if (["passed", "verified", "completed", "complete"].includes(runState)) outcome = '<div class="notice success"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Restore run passed</strong><span>Bacula restored the complete retained recovery point from physical tape and TapeScale independently matched the restored manifest.</span></div></div>';
     if (["failed", "blocked", "interrupted", "cancelled", "canceled"].includes(runState)) outcome = '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Restore run ' + esc(runState) + '</strong><span>' + esc(resultDetail || "Inspect the durable activity below for the terminal evidence.") + "</span></div></div>";
     const cancel = active ? '<button class="button button-danger button-small" type="button" data-action="open-cancel-restore-rehearsal" data-id="' + esc(id) + '">Request safe cancel</button>' : "";
-    return '<article class="restore-rehearsal-run"><header><div><span class="vault-kicker">Attended single-volume restore</span><h4>Restore run</h4><code>' + esc(id) + '</code></div><div class="restore-rehearsal-actions">' + status(runState) + '<button class="button button-quiet button-small" type="button" data-action="download-restore-rehearsal-evidence" data-id="' + esc(id) + '">Download restore evidence</button>' + cancel + '</div></header>' + renderRestoreRehearsalTrack(rehearsal) + '<div class="restore-rehearsal-body">' + (error ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not refresh run evidence</strong><span>' + esc(errorMessage(error)) + '</span></div></div>' : "") + outcome + '<dl class="restore-result-facts">' + facts.map(([name, value]) => '<dt>' + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-rehearsal-evidence-grid"><section><h5>Restore activity</h5>' + renderRestoreRehearsalTimeline(rehearsal) + '</section><section><h5>Restore evidence</h5>' + renderRestoreRehearsalArtifacts(rehearsal) + "</section></div></div></article>";
+    return '<article class="restore-rehearsal-run"><header><div><span class="vault-kicker">Attended ' + (multiVolume ? "multi-tape" : "single-tape") + ' restore</span><h4>Restore run</h4><code>' + esc(id) + '</code></div><div class="restore-rehearsal-actions">' + status(runState) + '<button class="button button-quiet button-small" type="button" data-action="download-restore-rehearsal-evidence" data-id="' + esc(id) + '">Download restore evidence</button>' + cancel + '</div></header>' + renderRestoreRehearsalTrack(rehearsal) + '<div class="restore-rehearsal-body">' + (error ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not refresh run evidence</strong><span>' + esc(errorMessage(error)) + '</span></div></div>' : "") + outcome + renderRestoreVolumeSequence(rehearsal) + '<dl class="restore-result-facts">' + facts.map(([name, value]) => '<dt>' + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-rehearsal-evidence-grid"><section><h5>Restore activity</h5>' + renderRestoreRehearsalTimeline(rehearsal) + '</section><section><h5>Restore evidence</h5>' + renderRestoreRehearsalArtifacts(rehearsal) + "</section></div></div></article>";
   }
 
   function renderRestoreRehearsals(pointId) {
     const runs = restoreRehearsalsForPoint(pointId);
-    if (!runs.length) return '<section class="vault-dossier-section restore-rehearsals"><div class="vault-section-head"><div><h3>Restore runs</h3><p>A supported verified Full recovery point on one cartridge can run an attended restore into isolation.</p></div><span>0 runs</span></div><div class="vault-section-empty">No Restore run has been started for this recovery point.</div></section>';
+    if (!runs.length) return '<section class="vault-dossier-section restore-rehearsals"><div class="vault-section-head"><div><h3>Restore runs</h3><p>A supported verified Full recovery point can run an attended one- or multi-tape restore into isolation when the server offers that exact execution contract.</p></div><span>0 runs</span></div><div class="vault-section-empty">No Restore run has been started for this recovery point.</div></section>';
     const selected = selectedRestoreRehearsal();
-    const choices = runs.length > 1 ? '<div class="restore-rehearsal-picker" role="list" aria-label="Restore run history">' + runs.map((run) => '<button class="' + (recordId(run) === recordId(selected) ? "active" : "") + '" type="button" data-action="select-restore-rehearsal" data-id="' + esc(recordId(run)) + '"><span>' + status(restoreRehearsalState(run)) + '</span><strong>' + esc(date(pick(run, "created_at", "started_at"))) + '</strong><small>' + esc(pick(run, "expected_volume_label", "cartridge_label") || recordId(run)) + "</small></button>").join("") + "</div>" : "";
+    const choices = runs.length > 1 ? '<div class="restore-rehearsal-picker" role="list" aria-label="Restore run history">' + runs.map((run) => {
+      const volumes = restoreRehearsalVolumes(run);
+      const nextOrder = restoreHandoffOrder(run, "next");
+      const nextLabel = restoreHandoffLabel(run);
+      const mediaSummary = restoreHandoffWaiting(run)
+        ? "Needs tape " + (nextOrder || "?") + (nextLabel ? " · " + nextLabel : "")
+        : volumes.length ? volumes.length + " tape" + (volumes.length === 1 ? "" : "s") + " · " + volumes.map((volume) => volume.label).join(" → ") : recordId(run);
+      return '<button class="' + (recordId(run) === recordId(selected) ? "active" : "") + '" type="button" data-action="select-restore-rehearsal" data-id="' + esc(recordId(run)) + '"><span>' + status(restoreRehearsalState(run)) + '</span><strong>' + esc(date(pick(run, "created_at", "started_at"))) + '</strong><small>' + esc(mediaSummary) + "</small></button>";
+    }).join("") + "</div>" : "";
     if (selected && !state.data.restoreRehearsalDetails[recordId(selected)] && !state.restoreRehearsalDetailLoading.has(recordId(selected)) && !state.errors["restoreRehearsal:" + recordId(selected)]) window.setTimeout(() => loadRestoreRehearsalDetail(recordId(selected)), 0);
-    return '<section class="vault-dossier-section restore-rehearsals"><div class="vault-section-head"><div><h3>Restore runs</h3><p>Every attempt remains visible with its physical read, file verification, and cancellation evidence.</p></div><span>' + runs.length + " run" + (runs.length === 1 ? "" : "s") + "</span></div>" + choices + renderRestoreRehearsal(selected) + "</section>";
+    return '<section class="vault-dossier-section restore-rehearsals"><div class="vault-section-head"><div><h3>Restore runs</h3><p>Every attempt retains its ordered media, current handoff, physical read, file verification, and cancellation evidence.</p></div><span>' + runs.length + " run" + (runs.length === 1 ? "" : "s") + "</span></div>" + choices + renderRestoreRehearsal(selected) + "</section>";
   }
 
   function renderRecoveryPointDossier(summary) {
@@ -1900,12 +2034,12 @@
     let feedback = "";
     if (loadingDetail) feedback = '<div class="notice info vault-detail-notice"><span class="notice-icon" aria-hidden="true">↻</span><div class="notice-copy"><strong>Loading durable recovery evidence</strong><span>The summary is visible while TapeScale assembles the ordered media and verification record.</span></div></div>';
     if (detailError) feedback = '<div class="notice danger vault-detail-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load the recovery dossier</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="retry-recovery-point" data-id="' + esc(id) + '">Retry</button></div>';
-    return '<article class="panel vault-dossier"><header class="vault-dossier-hero"><div><span class="vault-kicker">Recovery point · ' + esc(human(representation)) + '</span><div class="vault-dossier-title"><h2>' + esc(label(dataset)) + '</h2>' + status(recoveryPointState(point)) + '</div><p class="mono">' + esc(id) + '</p><span>' + esc(date(pick(point, "recovery_time", "created_at"))) + " · " + esc(human(pick(point, "level") || "unknown")) + ' backup</span></div><div class="vault-dossier-actions"><button class="button button-quiet" type="button" data-action="download-recovery-evidence" data-id="' + esc(id) + '">Download evidence</button><button class="button button-primary" type="button" data-action="open-restore-plan" data-id="' + esc(id) + '">Plan a restore</button></div></header><div class="vault-plan-boundary"><strong>Plan first; run only when explicitly offered</strong><span>Current Alpha execution is limited to supported verified Full recovery points from operational backups or the recovery exercise, held on exactly one cartridge. A Restore run recovers the complete point into a new isolated destination after exact drive and tape confirmation; file selection and multi-tape restore are not available yet.</span></div>' + feedback + renderRecoveryPointFiles(id) + renderRestoreRehearsals(id) + '<section class="vault-proof-grid">' + renderVaultProof("Full media readback", fullReadback, verifications.length ? "Recorded independently of write completion" : "Loading verification evidence") + renderVaultProof("Isolated restore test", restoreTest, verifications.length ? "Application recovery evidence" : "Loading verification evidence") + renderVaultProof("Required media", volumes.length ? "recorded" : "missing", volumes.length + " cartridge" + (volumes.length === 1 ? "" : "s") + " in read order") + renderVaultProof("Dependencies", dependencies.length ? "required" : "ready", dependencies.length ? dependencies.length + " prerequisite recovery point(s)" : "No earlier recovery point required") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Required media in read order</h3><p>Load cartridges in this exact volume sequence. Engine record boundaries are retained for reconstruction.</p></div><span>' + volumes.length + " volume" + (volumes.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVolumes(volumes) + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Verification evidence</h3><p>Write completion, full readback, and restore testing remain separate claims.</p></div><span>' + verifications.length + " record" + (verifications.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVerifications(verifications) + '</section><div class="vault-two-column"><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Recovery contract</h3><p>The durable identity and retention boundary.</p></div></div><dl class="vault-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="' + (/hash|manifest|lineage|format/i.test(name) ? "mono" : "") + '">' + esc(value) + "</dd>").join("") + '</dl>' + (Object.keys(coverage).length ? '<details class="vault-json"><summary>Recorded coverage</summary><pre>' + esc(JSON.stringify(coverage, null, 2)) + "</pre></details>" : "") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Dependencies & holds</h3><p>Every prerequisite remains visible before planning.</p></div></div><h4>Dependencies</h4>' + renderDependencyList(dependencies, "This is a self-contained full recovery point.") + '<h4>Active holds</h4>' + renderDependencyList(holds, "No active hold was returned.") + '</section></div><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Origin & retained evidence</h3><p>Correlation data for the job, physical exercise, catalog, and content-addressed artifacts.</p></div></div><div class="vault-origin-grid"><div><h4>Origin</h4>' + renderOrigin(origin, point) + '</div><div><h4>Artifacts</h4>' + renderRecoveryArtifacts(artifacts) + "</div></div>" + renderRecoveryEventsForVault(events) + "</section></article>";
+    return '<article class="panel vault-dossier"><header class="vault-dossier-hero"><div><span class="vault-kicker">Recovery point · ' + esc(human(representation)) + '</span><div class="vault-dossier-title"><h2>' + esc(label(dataset)) + '</h2>' + status(recoveryPointState(point)) + '</div><p class="mono">' + esc(id) + '</p><span>' + esc(date(pick(point, "recovery_time", "created_at"))) + " · " + esc(human(pick(point, "level") || "unknown")) + ' backup</span></div><div class="vault-dossier-actions"><button class="button button-quiet" type="button" data-action="download-recovery-evidence" data-id="' + esc(id) + '">Download evidence</button><button class="button button-primary" type="button" data-action="open-restore-plan" data-id="' + esc(id) + '">Plan a restore</button></div></header><div class="vault-plan-boundary"><strong>Plan first; run only when explicitly offered</strong><span>Current Alpha execution is limited to supported verified Full recovery points from operational backups or the recovery exercise. A Restore run recovers the complete point across its exact ordered tape set into a new isolated destination after attended drive and media confirmation. File or directory selection, encrypted recovery points, and clean-catalog recovery are not available yet.</span></div>' + feedback + renderRecoveryPointFiles(id) + renderRestoreRehearsals(id) + '<section class="vault-proof-grid">' + renderVaultProof("Full media readback", fullReadback, verifications.length ? "Recorded independently of write completion" : "Loading verification evidence") + renderVaultProof("Isolated restore test", restoreTest, verifications.length ? "Application recovery evidence" : "Loading verification evidence") + renderVaultProof("Required media", volumes.length ? "recorded" : "missing", volumes.length + " cartridge" + (volumes.length === 1 ? "" : "s") + " in read order") + renderVaultProof("Dependencies", dependencies.length ? "required" : "ready", dependencies.length ? dependencies.length + " prerequisite recovery point(s)" : "No earlier recovery point required") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Required media in read order</h3><p>Load cartridges in this exact volume sequence. Engine record boundaries are retained for reconstruction.</p></div><span>' + volumes.length + " volume" + (volumes.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVolumes(volumes) + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Verification evidence</h3><p>Write completion, full readback, and restore testing remain separate claims.</p></div><span>' + verifications.length + " record" + (verifications.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVerifications(verifications) + '</section><div class="vault-two-column"><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Recovery contract</h3><p>The durable identity and retention boundary.</p></div></div><dl class="vault-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="' + (/hash|manifest|lineage|format/i.test(name) ? "mono" : "") + '">' + esc(value) + "</dd>").join("") + '</dl>' + (Object.keys(coverage).length ? '<details class="vault-json"><summary>Recorded coverage</summary><pre>' + esc(JSON.stringify(coverage, null, 2)) + "</pre></details>" : "") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Dependencies & holds</h3><p>Every prerequisite remains visible before planning.</p></div></div><h4>Dependencies</h4>' + renderDependencyList(dependencies, "This is a self-contained full recovery point.") + '<h4>Active holds</h4>' + renderDependencyList(holds, "No active hold was returned.") + '</section></div><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Origin & retained evidence</h3><p>Correlation data for the job, physical exercise, catalog, and content-addressed artifacts.</p></div></div><div class="vault-origin-grid"><div><h4>Origin</h4>' + renderOrigin(origin, point) + '</div><div><h4>Artifacts</h4>' + renderRecoveryArtifacts(artifacts) + "</div></div>" + renderRecoveryEventsForVault(events) + "</section></article>";
   }
 
   function renderRestore() {
     const points = orderedRecoveryPoints();
-    let html = pageHead("Recovery vault", "Inspect durable recovery points, plan safely, and run attended single-volume restores where the retained Full backup format is supported.", refreshButton()) + noticeFor("recoveryPoints") + noticeFor("restoreRehearsals");
+    let html = pageHead("Recovery vault", "Inspect durable recovery points, plan safely, and run attended one- or multi-tape restores where the retained Full backup format is supported.", refreshButton()) + noticeFor("recoveryPoints") + noticeFor("restoreRehearsals");
     if (!points.length) return html + empty("No recovery points", state.errors.recoveryPoints ? "Recovery points could not be loaded." : "A verified Full backup or physical recovery exercise will create the first durable recovery point.", '<a class="button button-primary" href="#jobs">Open Backup Center</a> <a class="button button-quiet" href="#recovery-lab">Open recovery exercise</a>');
     const selected = selectedRecoveryPoint();
     const verified = points.filter((point) => recoveryPointState(point) === "verified").length;
@@ -2693,6 +2827,7 @@
   function closeModal(preserveBackupSetup) {
     if (modalLayer.hidden) return;
     state.backupReadinessModalToken += 1;
+    state.restoreMediaModalToken += 1;
     if (preserveBackupSetup !== true && modalLayer.querySelector("#tape-initialize-form")) state.pendingBackupSetup = null;
     modalLayer.hidden = true;
     modalLayer.innerHTML = "";
@@ -2749,7 +2884,7 @@
     const draft = recoveryPointPlanDraft(point);
     const media = recoveryPointVolumes(detail, point).map(volumeLabel);
     const keyLineage = pick(point, "key_lineage_id");
-    const body = '<form id="restore-plan-form" data-recovery-point-id="' + esc(id) + '"><div class="restore-plan-banner"><span aria-hidden="true">◇</span><div><strong>Generate a readiness plan</strong><p>This evaluates durable catalog evidence and your destination assessment. It cannot read tape or restore data. When execution is offered, this Alpha restores the complete supported Full point from exactly one cartridge.</p></div></div><div class="restore-plan-point"><div><small>Recovery point</small><strong>' + esc(label(pick(point, "dataset_name", "source", "dataset"))) + '</strong><code>' + esc(id) + '</code></div>' + status(recoveryPointState(point)) + '</div><div class="restore-plan-media"><span>Required media</span><strong>' + esc(media.length ? media.join(" → ") : "No ordered media returned") + '</strong></div><div class="form-grid restore-plan-fields"><div class="form-field"><label for="restore-plan-mode">Recovery mode</label><select class="select" id="restore-plan-mode" name="mode"><option value="file_archive"' + selectedOption(draft.mode, "file_archive") + '>File archive</option><option value="native_dataset"' + selectedOption(draft.mode, "native_dataset") + '>Native ZFS dataset</option><option value="files_from_native"' + selectedOption(draft.mode, "files_from_native") + '>Files from native stream</option></select><small>Native extraction may require temporary staging capacity.</small></div><div class="form-field"><label for="restore-conflict-policy">Existing-file behavior</label><select class="select" id="restore-conflict-policy" name="conflict_policy"><option value="skip"' + selectedOption(draft.conflict_policy, "skip") + '>Skip conflicts (safe default)</option><option value="rename"' + selectedOption(draft.conflict_policy, "rename") + '>Rename recovered files</option><option value="replace"' + selectedOption(draft.conflict_policy, "replace") + '>Replace existing data</option></select><small>Replacement stays blocked without administrator reauthentication and a destructive preview.</small></div><div class="form-field full"><label for="restore-destination">Destination inside the configured recovery root</label><input class="input input-mono" id="restore-destination" name="destination" value="' + esc(draft.destination) + '" maxlength="512" required placeholder="restores/2026-11-12-dataset"><small>Use a contained relative path. Absolute paths and parent traversal are rejected.</small></div><div class="form-field"><label for="restore-available-bytes">Available destination bytes</label><input class="input input-mono" id="restore-available-bytes" name="available_bytes" type="number" min="0" step="1" value="' + esc(draft.available_bytes == null ? "" : draft.available_bytes) + '" placeholder="Optional"><small>Leave blank to retain an explicit capacity-estimate warning.</small></div><div class="form-field"><label for="restore-reserve-bytes">Required free-space reserve</label><input class="input input-mono" id="restore-reserve-bytes" name="required_free_reserve_bytes" type="number" min="0" step="1" value="' + esc(draft.required_free_reserve_bytes) + '"><small>Logical recovery estimate: ' + esc(draft.estimated_required_bytes == null ? "not reported" : bytes(draft.estimated_required_bytes)) + '.</small></div><div class="form-field full"><fieldset class="restore-assessment"><legend>Destination assessment</legend><label class="check-option"><input type="checkbox" name="is_new_destination"' + checked(draft.is_new_destination) + '> This is a new, isolated destination.</label><label class="check-option"><input type="checkbox" name="destination_approved"' + checked(draft.destination_approved) + '> The path is inside the approved recovery area.</label><label class="check-option"><input type="checkbox" name="acl_semantics_supported"' + checked(draft.acl_semantics_supported) + '> The destination preserves the required ACL and metadata semantics.</label><label class="check-option"><input type="checkbox" name="identity_mapping_complete"' + checked(draft.identity_mapping_complete) + '> User and group identity mapping has been reviewed.</label>' + (keyLineage ? '<label class="check-option"><input type="checkbox" name="key_available"' + checked(draft.key_available) + '> Required key lineage <code>' + esc(keyLineage) + '</code> is available.</label><label class="check-option"><input type="checkbox" name="key_recovery_package_tested"' + checked(draft.key_recovery_package_tested) + '> The independent key recovery package has been tested.</label>' : '<div class="restore-no-key"><span aria-hidden="true">✓</span>No encryption key lineage is recorded for this point.</div>') + '</fieldset></div></div><div class="notice warning restore-replace-warning" id="restore-replace-warning"' + (draft.conflict_policy === "replace" ? "" : " hidden") + '><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Replacement cannot be authorized here</strong><span>The resulting plan will retain reauthentication and destructive-preview blockers. This form never executes the replacement.</span></div></div><p class="notice danger" id="restore-plan-error" hidden></p><div class="modal-foot restore-plan-submit"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Generate readiness plan</button></div></form>';
+    const body = '<form id="restore-plan-form" data-recovery-point-id="' + esc(id) + '"><div class="restore-plan-banner"><span aria-hidden="true">◇</span><div><strong>Generate a readiness plan</strong><p>This evaluates durable catalog evidence and your destination assessment. It cannot read tape or restore data. When execution is explicitly offered, this Alpha restores the complete supported Full point across the server-returned ordered tape set.</p></div></div><div class="restore-plan-point"><div><small>Recovery point</small><strong>' + esc(label(pick(point, "dataset_name", "source", "dataset"))) + '</strong><code>' + esc(id) + '</code></div>' + status(recoveryPointState(point)) + '</div><div class="restore-plan-media"><span>Required media</span><strong>' + esc(media.length ? media.join(" → ") : "No ordered media returned") + '</strong></div><div class="form-grid restore-plan-fields"><div class="form-field"><label for="restore-plan-mode">Recovery mode</label><select class="select" id="restore-plan-mode" name="mode"><option value="file_archive"' + selectedOption(draft.mode, "file_archive") + '>File archive</option><option value="native_dataset"' + selectedOption(draft.mode, "native_dataset") + '>Native ZFS dataset</option><option value="files_from_native"' + selectedOption(draft.mode, "files_from_native") + '>Files from native stream</option></select><small>Native extraction may require temporary staging capacity.</small></div><div class="form-field"><label for="restore-conflict-policy">Existing-file behavior</label><select class="select" id="restore-conflict-policy" name="conflict_policy"><option value="skip"' + selectedOption(draft.conflict_policy, "skip") + '>Skip conflicts (safe default)</option><option value="rename"' + selectedOption(draft.conflict_policy, "rename") + '>Rename recovered files</option><option value="replace"' + selectedOption(draft.conflict_policy, "replace") + '>Replace existing data</option></select><small>Replacement stays blocked without administrator reauthentication and a destructive preview.</small></div><div class="form-field full"><label for="restore-destination">Destination inside the configured recovery root</label><input class="input input-mono" id="restore-destination" name="destination" value="' + esc(draft.destination) + '" maxlength="512" required placeholder="restores/2026-11-12-dataset"><small>Use a contained relative path. Absolute paths and parent traversal are rejected.</small></div><div class="form-field"><label for="restore-available-bytes">Available destination bytes</label><input class="input input-mono" id="restore-available-bytes" name="available_bytes" type="number" min="0" step="1" value="' + esc(draft.available_bytes == null ? "" : draft.available_bytes) + '" placeholder="Optional"><small>Leave blank to retain an explicit capacity-estimate warning.</small></div><div class="form-field"><label for="restore-reserve-bytes">Required free-space reserve</label><input class="input input-mono" id="restore-reserve-bytes" name="required_free_reserve_bytes" type="number" min="0" step="1" value="' + esc(draft.required_free_reserve_bytes) + '"><small>Logical recovery estimate: ' + esc(draft.estimated_required_bytes == null ? "not reported" : bytes(draft.estimated_required_bytes)) + '.</small></div><div class="form-field full"><fieldset class="restore-assessment"><legend>Destination assessment</legend><label class="check-option"><input type="checkbox" name="is_new_destination"' + checked(draft.is_new_destination) + '> This is a new, isolated destination.</label><label class="check-option"><input type="checkbox" name="destination_approved"' + checked(draft.destination_approved) + '> The path is inside the approved recovery area.</label><label class="check-option"><input type="checkbox" name="acl_semantics_supported"' + checked(draft.acl_semantics_supported) + '> The destination preserves the required ACL and metadata semantics.</label><label class="check-option"><input type="checkbox" name="identity_mapping_complete"' + checked(draft.identity_mapping_complete) + '> User and group identity mapping has been reviewed.</label>' + (keyLineage ? '<label class="check-option"><input type="checkbox" name="key_available"' + checked(draft.key_available) + '> Required key lineage <code>' + esc(keyLineage) + '</code> is available.</label><label class="check-option"><input type="checkbox" name="key_recovery_package_tested"' + checked(draft.key_recovery_package_tested) + '> The independent key recovery package has been tested.</label>' : '<div class="restore-no-key"><span aria-hidden="true">✓</span>No encryption key lineage is recorded for this point.</div>') + '</fieldset></div></div><div class="notice warning restore-replace-warning" id="restore-replace-warning"' + (draft.conflict_policy === "replace" ? "" : " hidden") + '><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Replacement cannot be authorized here</strong><span>The resulting plan will retain reauthentication and destructive-preview blockers. This form never executes the replacement.</span></div></div><p class="notice danger" id="restore-plan-error" hidden></p><div class="modal-foot restore-plan-submit"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Generate readiness plan</button></div></form>';
     openModal("Plan a restore", body);
     const modal = modalLayer.querySelector(".modal");
     if (modal) modal.classList.add("restore-plan-modal");
@@ -2806,6 +2941,26 @@
     return direct.length ? direct : planArray(restorePlanExecution(plan), "required_tape_ids", "required_tapes", "tapes");
   }
 
+  function restorePlanMultiVolumeSupported(plan) {
+    const execution = restorePlanExecution(plan);
+    const tapes = restorePlanTapes(plan);
+    const declaredCount = Number(pick(execution, "volume_count"));
+    return tapes.length > 1 && pick(execution, "multi_volume") === true && Number.isInteger(declaredCount) && declaredCount === tapes.length;
+  }
+
+  function restorePlanVolumeContractReady(plan) {
+    const tapes = restorePlanTapes(plan);
+    return tapes.length === 1 || restorePlanMultiVolumeSupported(plan);
+  }
+
+  function renderRestorePlanTapeSequence(tapes, currentOrder) {
+    if (!tapes.length) return "";
+    return '<div class="backup-volume-plan restore-volume-plan"><span>Exact ordered restore media</span><ol>' + tapes.map((tape, index) => {
+      const sequence = index + 1;
+      return '<li class="' + (sequence === currentOrder ? "current" : "pending") + '"' + (sequence === currentOrder ? ' aria-current="step"' : "") + '><span class="restore-volume-marker">' + esc(sequence) + '</span><span><strong>Tape ' + esc(sequence) + '</strong><code>' + esc(tape) + '</code><small>' + (sequence === currentOrder ? "Load to start" : "Requested during restore") + "</small></span></li>";
+    }).join("") + "</ol></div>";
+  }
+
   function restorePlanDrives(plan) {
     const execution = restorePlanExecution(plan);
     const drives = arrayValue(execution, "compatible_drives", "eligible_drives", "drives");
@@ -2822,6 +2977,8 @@
     const blockers = planArray(plan, "blockers");
     const warnings = planArray(plan, "warnings");
     const tapes = restorePlanTapes(plan);
+    const multiVolume = tapes.length > 1;
+    const volumeContractReady = restorePlanVolumeContractReady(plan);
     const dependencies = planArray(plan, "dependency_chain", "required_dependencies", "dependencies");
     const keys = planArray(plan, "required_key_ids", "required_keys", "keys");
     const verification = planArray(plan, "verification_prerequisites");
@@ -2830,10 +2987,11 @@
     const planId = pick(plan, "id", "plan_id");
     const previewHash = pick(plan, "preview_hash", "sha256", "digest");
     const expiresAt = pick(plan, "expires_at");
-    const executionSupported = ready && pick(plan, "execution_supported") === true && tapes.length === 1;
+    const executionOffered = pick(plan, "execution_supported") === true;
+    const executionSupported = ready && executionOffered && volumeContractReady;
     const executionDrives = restorePlanDrives(plan);
     const resultNotice = ready
-      ? '<div class="restore-result-hero ready"><span aria-hidden="true">✓</span><div><small>Readiness result</small><h3>Prerequisites satisfied</h3><p>' + (executionSupported ? "This supported verified Full recovery point can advance to an attended Restore run." : "The plan is ready for review, but current Alpha execution is limited to a supported Full file point on exactly one cartridge.") + '</p></div></div>'
+      ? '<div class="restore-result-hero ready"><span aria-hidden="true">✓</span><div><small>Readiness result</small><h3>Prerequisites satisfied</h3><p>' + (executionSupported ? "This supported verified Full recovery point can advance to an attended " + (multiVolume ? tapes.length + "-tape" : "single-tape") + " Restore run." : "The plan is ready for review, but the server did not offer a matching attended execution contract for this ordered media set.") + '</p></div></div>'
       : '<div class="restore-result-hero blocked"><span aria-hidden="true">!</span><div><small>Readiness result</small><h3>Restore remains blocked</h3><p>' + blockers.length + " prerequisite" + (blockers.length === 1 ? "" : "s") + " must be resolved before any execution workflow.</p></div></div>";
     const facts = [
       ["Plan ID", planId],
@@ -2841,12 +2999,19 @@
       ["Generated", date(pick(plan, "created_at", "generated_at"))],
       ["Expires", date(expiresAt)],
       ["Plan status", pick(plan, "status")],
-      ["Recovery point", recordId(point)]
+      ["Recovery point", recordId(point)],
+      ["Restore media", tapes.length ? tapes.length + " ordered tape" + (tapes.length === 1 ? "" : "s") : null]
     ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "Not reported");
+    const executionDetail = executionOffered && !volumeContractReady
+      ? "The server did not bind this multi-tape plan to both multi_volume=true and an exact matching volume_count. Generate a fresh plan before loading media."
+      : pick(plan, "execution_detail") || (ready ? "This recovery format is not supported by the attended Restore run worker." : "Resolve every planning blocker and generate a fresh plan.");
+    const mediaInstructions = multiVolume
+      ? "Load tape 1 to start. TapeScale will pause durably at each media boundary and name the exact next cartridge before the same Bacula restore job continues."
+      : "Load the one retained cartridge to start and keep it in the selected drive until the read completes.";
     const executionAction = executionSupported
-      ? '<section class="restore-execution-offer"><div><span class="lab-badge">Alpha · attended Restore run</span><h3>Restore this complete recovery point</h3><p>' + esc(tapes.join(" → ") || "The exact retained cartridge") + ' is the only cartridge this Restore run will read and must be physically loaded in one of ' + executionDrives.length + ' compatible qualified drive' + (executionDrives.length === 1 ? "" : "s") + '. Current Alpha execution restores the entire Full point into the isolated destination, then compares the retained source manifest. File or directory selection and multi-tape restore are not available in this flow.</p></div><button class="button button-primary" type="button" data-action="open-restore-rehearsal" data-plan-id="' + esc(planId) + '">Start Restore run</button></section>'
-      : '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>' + (ready ? "This ready plan remains planning-only" : "Execution remains blocked") + '</strong><span>' + esc(pick(plan, "execution_detail") || (ready ? "This recovery format is not supported by the attended Restore run worker." : "Resolve every planning blocker and generate a fresh plan.")) + "</span></div></div>";
-    return resultNotice + '<div class="restore-result-boundary"><strong>Plan retained; nothing executed yet</strong><span>A Restore run starts only after separate exact-drive, single-tape, isolated-destination, and attended confirmation.</span></div><dl class="restore-result-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-result-grid">' + renderPlanRequirements("Required media", tapes, "No media requirement was returned.") + renderPlanRequirements("Dependency chain", dependencies, "No earlier recovery point is required.") + renderPlanRequirements("Required keys", keys, "No recovery key requirement was returned.") + renderPlanRequirements("Verification gates", verification, "No verification prerequisite was returned.") + renderPlanRequirements("Destination", destination, "No destination assessment was returned.") + renderPlanRequirements("Read & staging estimate", estimates, "No work estimate was returned.") + renderPlanRequirements("Blockers", blockers.map(planIssueText), "No blocking prerequisite remains.") + renderPlanRequirements("Warnings", warnings.map(planIssueText), "No planning warning was returned.") + "</div>" + executionAction;
+      ? '<section class="restore-execution-offer"><div><span class="lab-badge">Alpha · attended ' + (multiVolume ? "multi-tape" : "single-tape") + ' Restore run</span><h3>Restore this complete recovery point</h3><p>' + esc(mediaInstructions) + ' TapeScale writes only beneath the isolated destination and verifies the restored manifest. This flow remains Full-point-only and does not support file selection, encrypted recovery points, or clean-catalog recovery.</p>' + renderRestorePlanTapeSequence(tapes, 1) + '</div><button class="button button-primary" type="button" data-action="open-restore-rehearsal" data-plan-id="' + esc(planId) + '">Start Restore run</button></section>'
+      : '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>' + (ready ? "This ready plan remains planning-only" : "Execution remains blocked") + '</strong><span>' + esc(executionDetail) + "</span></div></div>";
+    return resultNotice + '<div class="restore-result-boundary"><strong>Plan retained; nothing executed yet</strong><span>A Restore run starts only after exact-drive, first-tape, isolated-destination, and attended confirmation. Every later tape requires its own exact attended handoff.</span></div><dl class="restore-result-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-result-grid">' + renderPlanRequirements("Required media in order", tapes.map((tape, index) => (index + 1) + ". " + tape), "No media requirement was returned.") + renderPlanRequirements("Dependency chain", dependencies, "No earlier recovery point is required.") + renderPlanRequirements("Required keys", keys, "No recovery key requirement was returned.") + renderPlanRequirements("Verification gates", verification, "No verification prerequisite was returned.") + renderPlanRequirements("Destination", destination, "No destination assessment was returned.") + renderPlanRequirements("Read & staging estimate", estimates, "No work estimate was returned.") + renderPlanRequirements("Blockers", blockers.map(planIssueText), "No blocking prerequisite remains.") + renderPlanRequirements("Warnings", warnings.map(planIssueText), "No planning warning was returned.") + "</div>" + executionAction;
   }
 
   async function submitRestorePlan(form) {
@@ -2909,15 +3074,17 @@
   function openRestoreRehearsal(planId) {
     const plan = state.restorePlans[String(planId)];
     if (!plan || plan.ready !== true || pick(plan, "execution_supported") !== true) {
-      toast("Restore run is not available", "Generate a fresh ready plan for a supported verified Full recovery point held on one cartridge.");
+      toast("Restore run is not available", "Generate a fresh ready plan for a supported verified Full recovery point with an attended execution contract.");
       return;
     }
     const drives = restorePlanDrives(plan);
     const tapes = restorePlanTapes(plan);
-    if (tapes.length !== 1) {
-      toast("Restore run is not available", "Current Alpha execution requires exactly one retained cartridge. Multi-tape recovery points remain planning-only.");
+    if (!restorePlanVolumeContractReady(plan)) {
+      toast("Restore run is not available", tapes.length > 1 ? "The server did not explicitly offer multi-volume execution with a matching ordered volume count." : "The server did not return one exact retained cartridge for this execution.");
       return;
     }
+    const multiVolume = tapes.length > 1;
+    const firstTape = tapes[0];
     const destination = objectValue(plan, "destination");
     const destinationPath = pick(destination, "path", "destination") || pick(restorePlanExecution(plan), "destination_subpath", "destination") || pick(plan, "destination_subpath") || "the recorded isolated destination";
     const phrase = restorePlanConfirmation(plan);
@@ -2927,7 +3094,10 @@
       const path = typeof drive === "string" ? null : pick(drive, "observed_path", "path");
       return '<option value="' + esc(driveId) + '">' + esc(name || driveId) + (path ? " · " + esc(path) : "") + "</option>";
     });
-    const body = '<form id="restore-rehearsal-form" data-plan-id="' + esc(planId) + '"><input type="hidden" name="preview_hash" value="' + esc(pick(plan, "preview_hash")) + '"><div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Attended Restore run</strong><span>This Alpha restores the complete recovery point from exactly one retained cartridge into the new isolated destination. It never writes to tape or source data. File or directory selection and multi-tape restore are not supported. This local console has no application sign-in, so use it only on a trusted management network and keep the operator present.</span></div></div><div class="restore-rehearsal-summary"><div><small>Single restore tape</small><strong>' + esc(tapes.join(" → ") || "Not reported") + '</strong></div><div><small>Isolated destination</small><strong class="mono">' + esc(destinationPath) + '</strong></div><div><small>Plan preview</small><code>' + esc(pick(plan, "preview_hash")) + '</code></div></div><div class="form-grid"><div class="form-field full"><label for="restore-rehearsal-drive">Exact loaded drive</label><select class="select" id="restore-rehearsal-drive" name="drive_id" required>' + driveOptions.join("") + '</select><small>The worker rechecks stable identity, path, firmware, cartridge, qualification, and plan hash before reading.</small></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="tape_loaded_confirmed" required> I physically verified that <strong>' + esc(tapes.join(" → ") || "the required tape") + '</strong> is loaded in the selected drive.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="isolated_destination_confirmed" required> I verified that <strong class="mono">' + esc(destinationPath) + '</strong> is a new isolated recovery destination, not live data.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="attended_confirmed" required> I will remain available for tape and safe-cancellation prompts until this Restore run finishes.</label></div><div class="form-field full"><label for="restore-rehearsal-confirmation">Type the exact attended confirmation</label><input class="input input-mono" id="restore-rehearsal-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small>Required: <strong class="mono">' + esc(phrase) + '</strong></small></div><div class="form-field full"><label for="restore-rehearsal-actor">Operator</label><input class="input" id="restore-rehearsal-actor" name="actor" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="restore-rehearsal-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit"' + (drives.length ? "" : " disabled") + '>Start Restore run</button></div></form>';
+    const boundary = multiVolume
+      ? "This Alpha restores the complete recovery point across " + tapes.length + " exact ordered cartridges. Load only tape 1 now; the run pauses durably and names each next tape before it can continue."
+      : "This Alpha restores the complete recovery point from one retained cartridge.";
+    const body = '<form id="restore-rehearsal-form" data-plan-id="' + esc(planId) + '"><input type="hidden" name="preview_hash" value="' + esc(pick(plan, "preview_hash")) + '"><div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Attended ' + (multiVolume ? "multi-tape" : "single-tape") + ' Restore run</strong><span>' + esc(boundary) + ' It writes only beneath the new isolated destination and never writes to tape or source data. File or directory selection, encrypted recovery points, and clean-catalog recovery are not supported. This local console has no application sign-in, so use it only on a trusted management network and keep the operator present.</span></div></div><div class="restore-rehearsal-summary"><div><small>Ordered restore tapes</small><strong>' + esc(tapes.join(" → ")) + '</strong></div><div><small>Load first</small><strong>' + esc(firstTape) + '</strong></div><div><small>Isolated destination</small><strong class="mono">' + esc(destinationPath) + '</strong></div><div><small>Plan preview</small><code>' + esc(pick(plan, "preview_hash")) + '</code></div></div>' + renderRestorePlanTapeSequence(tapes, 1) + '<div class="form-grid"><div class="form-field full"><label for="restore-rehearsal-drive">Drive containing tape 1</label><select class="select" id="restore-rehearsal-drive" name="drive_id" required>' + driveOptions.join("") + '</select><small>The worker rechecks stable identity, path, firmware, cartridge, qualification, and plan hash before reading. Later tapes use separate exact handoffs.</small></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="tape_loaded_confirmed" required> I physically verified that tape 1, <strong>' + esc(firstTape) + '</strong>, is loaded in the selected drive.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="isolated_destination_confirmed" required> I verified that <strong class="mono">' + esc(destinationPath) + '</strong> is a new isolated recovery destination, not live data.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="attended_confirmed" required> I will remain available for every exact tape handoff and safe-cancellation prompt until this Restore run finishes.</label></div><div class="form-field full"><label for="restore-rehearsal-confirmation">Type the exact attended confirmation</label><input class="input input-mono" id="restore-rehearsal-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small>Required: <strong class="mono">' + esc(phrase) + '</strong></small></div><div class="form-field full"><label for="restore-rehearsal-actor">Operator</label><input class="input" id="restore-rehearsal-actor" name="actor" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="restore-rehearsal-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit"' + (drives.length ? "" : " disabled") + '>Start Restore run</button></div></form>';
     openModal("Start Restore run", body);
     const input = document.querySelector("#restore-rehearsal-confirmation");
     if (input) input.focus();
@@ -2937,6 +3107,7 @@
     const values = new FormData(form);
     const planId = form.dataset.planId;
     const plan = state.restorePlans[String(planId)];
+    const multiVolume = restorePlanMultiVolumeSupported(plan || {});
     const submit = form.querySelector('[type="submit"]');
     const errorBox = form.querySelector("#restore-rehearsal-error");
     const phrase = restorePlanConfirmation(plan || { id: planId });
@@ -2976,12 +3147,186 @@
       render();
       scheduleRestoreRehearsalPoll();
       live.textContent = "Restore run queued. The Recovery Vault is showing its durable phase timeline.";
-      toast("Restore run queued", "Keep the exact single tape loaded and the isolated destination online.");
+      toast("Restore run queued", multiVolume ? "Keep tape 1 loaded. TapeScale will pause and identify each exact next cartridge in the Recovery Vault." : "Keep the exact tape loaded and the isolated destination online.");
     } catch (error) {
       errorBox.textContent = errorMessage(error);
       errorBox.hidden = false;
       submit.disabled = false;
       submit.textContent = "Start Restore run";
+    }
+  }
+
+  function restoreMediaReadinessValue(payload) {
+    if (!payload || typeof payload !== "object") return {};
+    const nested = payload.readiness && typeof payload.readiness === "object" ? payload.readiness : {};
+    return Object.assign({}, payload, nested);
+  }
+
+  async function loadRestoreMediaReadiness(id) {
+    const payload = await request(endpoints.restoreRehearsals + "/" + encodeURIComponent(id) + "/media-readiness");
+    const readiness = restoreMediaReadinessValue(payload);
+    state.data.restoreMediaReadiness[id] = readiness;
+    return readiness;
+  }
+
+  function restoreReadinessMediaRequest(readiness) {
+    return objectValue(readiness, "media_request", "current_media_request");
+  }
+
+  function restoreReadinessHandoff(readiness) {
+    return objectValue(readiness, "media_handoff", "handoff");
+  }
+
+  function restoreReadinessCandidates(readiness) {
+    const handoff = restoreReadinessHandoff(readiness);
+    let candidates = arrayValue(readiness, "candidates", "eligible_pairs", "compatible_pairs");
+    if (!candidates.length) candidates = arrayValue(handoff, "candidates", "eligible_pairs", "compatible_pairs");
+    const recommended = pick(readiness, "recommended_candidate", "candidate") || pick(handoff, "recommended_candidate", "candidate");
+    if (!candidates.length && recommended && typeof recommended === "object") candidates = [recommended];
+    const directDrive = objectValue(readiness, "drive");
+    if (Object.keys(directDrive).length) candidates = candidates.map((candidate) => Object.assign({ drive: directDrive }, candidate));
+    return candidates;
+  }
+
+  function restoreMediaCandidateDrive(candidate) {
+    const nested = objectValue(candidate, "drive");
+    const driveId = String(pick(candidate, "drive_id") || recordId(nested) || "");
+    return state.data.drives.find((drive) => recordId(drive) === driveId) || Object.assign({
+      id: driveId,
+      stable_id: pick(candidate, "stable_id", "expected_stable_id"),
+      observed_path: pick(candidate, "device_path", "observed_path", "path")
+    }, nested);
+  }
+
+  function restoreMediaBlockerMessage(readiness) {
+    const blockers = arrayValue(readiness, "blockers");
+    const blocker = blockers[0];
+    return blocker ? String(pick(blocker, "message", "detail", "reason") || planIssueText(blocker)) : String(pick(readiness, "reason") || "No currently safe drive can accept this exact restore tape.");
+  }
+
+  function restoreMediaModalCurrent(form, token) {
+    return token === state.restoreMediaModalToken && !modalLayer.hidden && Boolean(form && form.isConnected);
+  }
+
+  async function openRestoreMediaHandoff(id) {
+    if (!id) return;
+    const token = ++state.restoreMediaModalToken;
+    openModal("Load next restore tape", '<div class="source-browser-loading" role="status"><span class="spinner" aria-hidden="true"></span><strong>Rechecking the exact tape request…</strong><small>The Restore run remains durably paused while this page refreshes.</small></div>');
+    let readiness;
+    try {
+      readiness = await loadRestoreMediaReadiness(id);
+    } catch (error) {
+      if (token !== state.restoreMediaModalToken || modalLayer.hidden) return;
+      openModal("Load next restore tape", '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load the restore media request</strong><span>' + esc(errorMessage(error)) + '</span></div></div><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button button-primary" type="button" data-action="open-restore-media-handoff" data-id="' + esc(id) + '">Try again</button></div>');
+      return;
+    }
+    if (token !== state.restoreMediaModalToken || modalLayer.hidden) return;
+    const requestRecord = restoreReadinessMediaRequest(readiness);
+    const handoff = restoreReadinessHandoff(readiness);
+    const required = pick(handoff, "required") === true;
+    const waiting = pick(handoff, "waiting") === true || String(pick(handoff, "state") || "").toLowerCase() === "waiting_for_media";
+    if (!required || !waiting) {
+      closeModal();
+      await Promise.all([loadOne("restoreRehearsals"), loadRestoreRehearsalDetail(id, true)]);
+      render();
+      toast("Tape request changed", "This Restore run is no longer waiting for that handoff. Current durable status is now displayed.");
+      return;
+    }
+    const requestId = String(pick(requestRecord, "id", "request_id") || "");
+    const volumeOrder = Number(pick(handoff, "next_volume_order", "volume_order") || pick(requestRecord, "volume_order", "volume_sequence"));
+    const totalVolumes = Number(pick(handoff, "total_volumes", "volume_count") || arrayValue(readiness, "volumes", "required_volumes").length);
+    const cartridgeId = String(pick(handoff, "next_cartridge_id", "expected_cartridge_id", "cartridge_id") || pick(requestRecord, "expected_cartridge_id", "cartridge_id") || "");
+    const cartridgeLabel = String(pick(handoff, "next_cartridge_label", "next_volume_label", "expected_cartridge_label", "cartridge_label") || pick(requestRecord, "expected_cartridge_label", "cartridge_label", "expected_volume_label") || "");
+    const confirmation = String(pick(handoff, "confirmation_phrase", "required_confirmation") || pick(requestRecord, "confirmation_phrase", "required_confirmation") || "");
+    if (!requestId || !Number.isInteger(volumeOrder) || volumeOrder < 1 || !cartridgeId || !cartridgeLabel || !confirmation) {
+      openModal("Load next restore tape", '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Incomplete durable tape request</strong><span>The server did not bind this handoff to one request ID, ordered volume, cartridge, label, and confirmation phrase. No tape was accepted.</span></div></div><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button button-primary" type="button" data-action="open-restore-media-handoff" data-id="' + esc(id) + '">Check again</button></div>');
+      return;
+    }
+    const candidates = restoreReadinessCandidates(readiness);
+    const blockers = arrayValue(readiness, "blockers");
+    const drives = candidates.map(restoreMediaCandidateDrive).filter((drive, index, values) => recordId(drive) && values.findIndex((item) => recordId(item) === recordId(drive)) === index);
+    const blocked = pick(readiness, "ready") !== true || blockers.length > 0 || drives.length === 0;
+    const driveOptions = drives.map((drive) => '<option value="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '"' + (drives.length === 1 ? " selected" : "") + '>' + esc([pick(drive, "vendor"), pick(drive, "model", "stable_id"), pick(drive, "observed_path", "path")].filter(Boolean).join(" · ")) + "</option>").join("");
+    const pseudoRun = {
+      state: "running",
+      phase: "waiting_for_media",
+      volumes: arrayValue(readiness, "volumes", "required_volumes"),
+      media_request: requestRecord,
+      media_handoff: handoff
+    };
+    const blockedNotice = blocked ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Exact tape handoff is not ready</strong><span>' + esc(restoreMediaBlockerMessage(readiness)) + '</span></div><button class="button button-small" type="button" data-action="open-restore-media-handoff" data-id="' + esc(id) + '">Check again</button></div>' : "";
+    const body = '<form id="restore-media-handoff-form" data-run-id="' + esc(id) + '" data-request-id="' + esc(requestId) + '" data-volume-order="' + esc(volumeOrder) + '" data-cartridge-id="' + esc(cartridgeId) + '" data-cartridge-label="' + esc(cartridgeLabel) + '" data-confirmation="' + esc(confirmation) + '"><div class="backup-boundary warning restore-media-boundary"><span aria-hidden="true">!</span><div><strong>Load tape ' + esc(volumeOrder) + ' of ' + esc(totalVolumes || "?") + ': ' + esc(cartridgeLabel) + '</strong><p>Unload and remove the previous tape, then insert this exact recorded cartridge. This handoff is read-only: TapeScale will not erase, relabel, or append to it.</p></div></div>' + renderRestoreVolumeSequence(pseudoRun) + '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Attended Alpha boundary</strong><span>This continues one complete Full-point restore into its existing isolated destination. Selective, encrypted, and clean-catalog recovery remain unsupported. This local console has no application sign-in.</span></div></div>' + blockedNotice + '<div class="form-grid"' + (blocked ? " hidden" : "") + '><div class="form-field full"><label for="restore-media-drive">Drive containing the exact next tape</label><select class="select" id="restore-media-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select><small>The server will recheck drive identity, qualification, reservation, and the expected cartridge before Bacula resumes.</small></div><div class="form-field full"><label>Exact recorded tape</label><div class="restore-exact-media"><strong>' + esc(cartridgeLabel) + '</strong><span>Tape ' + esc(volumeOrder) + ' of ' + esc(totalVolumes || "?") + '</span></div></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="loaded_media_confirmed" required> I physically verified that <strong>' + esc(cartridgeLabel) + '</strong> is loaded in the selected drive.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="attended_confirmed" required> I am attending this handoff and will keep the isolated destination and tape drive available while the Restore run resumes.</label></div><div class="form-field full"><label for="restore-media-confirmation">Type the exact tape handoff confirmation</label><input class="input input-mono" id="restore-media-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small>Required: <strong class="mono">' + esc(confirmation) + '</strong></small></div></div><p class="notice danger" id="restore-media-error" role="alert" aria-live="assertive" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button button-primary" type="submit"' + (blocked ? " disabled" : "") + '>Confirm exact tape and continue</button></div></form>';
+    openModal("Load restore tape " + volumeOrder, body);
+    const modal = modalLayer.querySelector(".modal");
+    if (modal) modal.classList.add("restore-media-modal");
+  }
+
+  async function submitRestoreMediaHandoff(form) {
+    const runId = form.dataset.runId;
+    const token = state.restoreMediaModalToken;
+    const values = new FormData(form);
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#restore-media-error");
+    const loaded = values.get("loaded_media_confirmed") === "on";
+    const attended = values.get("attended_confirmed") === "on";
+    const typedConfirmation = String(values.get("confirmation") || "");
+    if (!loaded || !attended || typedConfirmation !== form.dataset.confirmation) {
+      errorBox.textContent = "Confirm the exact loaded tape, attended handoff, and server-provided phrase before continuing.";
+      errorBox.hidden = false;
+      return;
+    }
+    submit.disabled = true;
+    submit.textContent = "Rechecking exact tape request…";
+    errorBox.hidden = true;
+    try {
+      const driveId = String(values.get("drive_id") || "");
+      const readiness = await loadRestoreMediaReadiness(runId);
+      if (!restoreMediaModalCurrent(form, token)) return;
+      const requestRecord = restoreReadinessMediaRequest(readiness);
+      const handoff = restoreReadinessHandoff(readiness);
+      const currentRequestId = String(pick(requestRecord, "id", "request_id") || "");
+      const currentOrder = Number(pick(handoff, "next_volume_order", "volume_order") || pick(requestRecord, "volume_order", "volume_sequence"));
+      const currentCartridgeId = String(pick(handoff, "next_cartridge_id", "expected_cartridge_id", "cartridge_id") || pick(requestRecord, "expected_cartridge_id", "cartridge_id") || "");
+      const currentLabel = String(pick(handoff, "next_cartridge_label", "next_volume_label", "expected_cartridge_label", "cartridge_label") || pick(requestRecord, "expected_cartridge_label", "cartridge_label", "expected_volume_label") || "");
+      const currentConfirmation = String(pick(handoff, "confirmation_phrase", "required_confirmation") || pick(requestRecord, "confirmation_phrase", "required_confirmation") || "");
+      if (currentRequestId !== form.dataset.requestId || currentOrder !== Number(form.dataset.volumeOrder) || currentCartridgeId !== form.dataset.cartridgeId || currentLabel !== form.dataset.cartridgeLabel || currentConfirmation !== form.dataset.confirmation || typedConfirmation !== currentConfirmation) {
+        throw new Error("The exact restore tape request changed while this form was open. Review the current durable handoff before continuing.");
+      }
+      const candidate = restoreReadinessCandidates(readiness).find((item) => recordId(restoreMediaCandidateDrive(item)) === driveId);
+      if (!candidate) throw new Error(restoreMediaBlockerMessage(readiness));
+      if (String(pick(candidate, "cartridge_id") || "") !== currentCartridgeId || Number(pick(candidate, "volume_order")) !== currentOrder) throw new Error("The currently observed tape does not match the exact requested restore volume.");
+      const drive = restoreMediaCandidateDrive(candidate);
+      const stableId = String(pick(candidate, "stable_id", "expected_stable_id") || pick(drive, "stable_id") || "");
+      if (!stableId) throw new Error("The selected drive has no stable identity in the current readiness response.");
+      submit.textContent = "Continuing Restore run…";
+      await request(endpoints.restoreRehearsals + "/" + encodeURIComponent(runId) + "/media", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          request_id: currentRequestId,
+          drive_id: driveId,
+          expected_stable_id: stableId,
+          cartridge_id: currentCartridgeId,
+          typed_cartridge_label: currentLabel,
+          volume_order: currentOrder,
+          loaded_media_confirmed: loaded,
+          attended_confirmed: attended,
+          confirmation: currentConfirmation
+        })
+      });
+      await Promise.all([loadOne("restoreRehearsals"), loadOne("drives"), loadOne("media")]);
+      await loadRestoreRehearsalDetail(runId, true);
+      if (restoreMediaModalCurrent(form, token)) closeModal();
+      updateChrome();
+      render();
+      scheduleRestoreRehearsalPoll();
+      toast("Restore tape accepted", "TapeScale retained the attended handoff. Bacula will verify the on-tape label before continuing the same restore job.");
+    } catch (error) {
+      if (!restoreMediaModalCurrent(form, token)) return;
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Confirm exact tape and continue";
     }
   }
 
@@ -5477,6 +5822,7 @@
     if (action === "open-restore-plan" || action === "revise-restore-plan") openRestorePlan(target.dataset.id);
     if (action === "open-restore-rehearsal") openRestoreRehearsal(target.dataset.planId);
     if (action === "select-restore-rehearsal") selectRestoreRehearsal(target.dataset.id);
+    if (action === "open-restore-media-handoff") openRestoreMediaHandoff(target.dataset.id);
     if (action === "open-cancel-restore-rehearsal") openCancelRestoreRehearsal(target.dataset.id);
     if (action === "download-restore-rehearsal-evidence") downloadRestoreRehearsalEvidence(target);
     if (action === "open-qualification") openQualification(target);
@@ -5560,6 +5906,10 @@
     if (event.target.id === "restore-rehearsal-form") {
       event.preventDefault();
       submitRestoreRehearsal(event.target);
+    }
+    if (event.target.id === "restore-media-handoff-form") {
+      event.preventDefault();
+      submitRestoreMediaHandoff(event.target);
     }
     if (event.target.id === "cancel-restore-rehearsal-form") {
       event.preventDefault();

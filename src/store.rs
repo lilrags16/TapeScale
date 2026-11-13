@@ -481,6 +481,8 @@ pub struct RestoreRehearsalRunRecord {
     pub format_version: String,
     pub preview_hash: String,
     pub production_eligible: bool,
+    pub workflow_kind: String,
+    pub volume_count: i32,
     pub state: String,
     pub phase: String,
     pub requested_by_label: String,
@@ -496,6 +498,72 @@ pub struct RestoreRehearsalRunRecord {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RestoreRehearsalVolumeRecord {
+    pub id: Uuid,
+    pub restore_rehearsal_id: Uuid,
+    pub volume_order: i32,
+    pub cartridge_id: Uuid,
+    pub expected_cartridge_label: String,
+    pub expected_media_generation: Option<i16>,
+    pub expected_media_format: Option<String>,
+    pub expected_volume_label: String,
+    pub expected_on_tape_identity: String,
+    pub expected_engine_media_id: i64,
+    pub expected_engine_record_id: String,
+    pub expected_first_record: String,
+    pub expected_last_record: Option<String>,
+    pub expected_encoded_bytes: Option<i64>,
+    pub state: String,
+    pub active: bool,
+    pub media_lease_id: Option<Uuid>,
+    pub media_fencing_token: Option<i64>,
+    pub loaded_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RestoreRehearsalMediaRequestRecord {
+    pub id: Uuid,
+    pub restore_rehearsal_id: Uuid,
+    pub request_sequence: i32,
+    pub volume_order: i32,
+    pub expected_cartridge_id: Uuid,
+    pub expected_cartridge_label: String,
+    pub expected_engine_volume_name: String,
+    pub state: String,
+    pub authorized_cartridge_id: Option<Uuid>,
+    pub requested_at: DateTime<Utc>,
+    pub authorized_at: Option<DateTime<Utc>>,
+    pub loaded_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub confirmation_evidence: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct RestoreRehearsalMediaAuthorization {
+    pub request_id: Uuid,
+    pub drive_id: Uuid,
+    pub expected_stable_id: String,
+    pub cartridge_id: Uuid,
+    pub typed_cartridge_label: String,
+    pub volume_order: i32,
+    pub loaded_media_confirmed: bool,
+    pub attended_confirmed: bool,
+    pub confirmation: String,
+    pub actor_label: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct LoadedRestoreRehearsalMedia {
+    pub request: RestoreRehearsalMediaRequestRecord,
+    pub volume: RestoreRehearsalVolumeRecord,
+    pub media_lease_id: Uuid,
+    pub media_fencing_token: i64,
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -540,6 +608,46 @@ pub enum ClaimRestoreRehearsalRunResult {
     Claimed(Box<ClaimedRestoreRehearsalRun>),
     Blocked { id: Uuid, reason: String },
     Empty,
+}
+
+#[derive(Clone, Debug)]
+pub enum RestoreRehearsalMediaRequestResult {
+    Ready(Box<RestoreRehearsalMediaRequestRecord>),
+    FencedOut,
+    Blocked(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum AuthorizedRestoreRehearsalMediaRequestResult {
+    Waiting,
+    Authorized {
+        request: Box<RestoreRehearsalMediaRequestRecord>,
+        volume: Box<RestoreRehearsalVolumeRecord>,
+    },
+    LoadedAfterRestart {
+        request: Box<RestoreRehearsalMediaRequestRecord>,
+        volume: Box<RestoreRehearsalVolumeRecord>,
+    },
+    FencedOut,
+    Blocked(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum AuthorizeRestoreRehearsalMediaResult {
+    Authorized {
+        request: Box<RestoreRehearsalMediaRequestRecord>,
+        volume: Box<RestoreRehearsalVolumeRecord>,
+        idempotent_replay: bool,
+    },
+    NotFound,
+    Blocked(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum LoadRestoreRehearsalMediaResult {
+    Loaded(Box<LoadedRestoreRehearsalMedia>),
+    FencedOut,
+    Blocked(String),
 }
 
 #[derive(Clone, Debug)]
@@ -5023,7 +5131,8 @@ async fn queue_single_tape_data_run_inner(
              WHERE drive_id = $1 AND state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM qualification_runs
-             WHERE (drive_id = $1 OR cartridge_id = $2) AND state IN ('queued', 'running')
+             WHERE (drive_id = $1 OR cartridge_id = ANY($2::uuid[]))
+               AND state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM single_tape_data_runs
              WHERE (profile_id = $3 OR drive_id = $1 OR cartridge_id = $2)
@@ -5355,7 +5464,8 @@ pub async fn claim_next_single_tape_data_run(
              WHERE drive_id = $1 AND state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM qualification_runs
-             WHERE (drive_id = $1 OR cartridge_id = $2) AND state IN ('queued', 'running')
+             WHERE (drive_id = $1 OR cartridge_id = ANY($2::uuid[]))
+               AND state IN ('queued', 'running')
          )",
     )
     .bind(run.drive_id)
@@ -6379,17 +6489,32 @@ pub async fn renew_single_tape_data_run_leases(
     .bind(claim.drive_fencing_token)
     .execute(&mut *transaction)
     .await?;
-    let media = sqlx::query(
-        "UPDATE resource_leases SET expires_at = now() + interval '30 minutes'
-         WHERE id = $1 AND owner_id = $2 AND fencing_token = $3
-           AND released_at IS NULL AND expires_at > now()",
+    let loaded_media = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT media_lease_id, media_fencing_token
+         FROM restore_rehearsal_volumes
+         WHERE restore_rehearsal_id = $1 AND active AND state = 'loaded'
+         FOR UPDATE",
     )
-    .bind(claim.media_lease_id)
-    .bind(claim.worker_id)
-    .bind(claim.media_fencing_token)
-    .execute(&mut *transaction)
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
     .await?;
-    if drive.rows_affected() != 1 || media.rows_affected() != 1 {
+    let media_renewed = if let Some((lease_id, fencing_token)) = loaded_media {
+        sqlx::query(
+            "UPDATE resource_leases SET expires_at = now() + interval '30 minutes'
+             WHERE id = $1 AND owner_id = $2 AND fencing_token = $3
+               AND released_at IS NULL AND expires_at > now()",
+        )
+        .bind(lease_id)
+        .bind(claim.worker_id)
+        .bind(fencing_token)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            == 1
+    } else {
+        true
+    };
+    if drive.rows_affected() != 1 || !media_renewed {
         transaction.rollback().await?;
         return Ok(false);
     }
@@ -8247,6 +8372,12 @@ pub const RECOVERY_VERIFICATION_LIMIT: usize = 64;
 pub const RECOVERY_EVENT_LIMIT: usize = 128;
 pub const RECOVERY_ARTIFACT_LIMIT: usize = 32;
 pub const RECOVERY_JSON_VALUE_LIMIT_BYTES: usize = 8 * 1024;
+pub const RESTORE_MANIFEST_ARTIFACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+pub fn restore_manifest_artifact_size_supported(size_bytes: i64) -> bool {
+    u64::try_from(size_bytes)
+        .is_ok_and(|size| (1..=RESTORE_MANIFEST_ARTIFACT_MAX_BYTES).contains(&size))
+}
 
 /// Loads the bounded, operator-facing recovery-point aggregate used for both
 /// inspection and restore planning. Artifact payloads remain in their durable
@@ -8619,11 +8750,29 @@ const RESTORE_REHEARSAL_RUN_SELECT: &str = "SELECT id, restore_plan_id, job_id, 
             source_mount_path, logical_root, destination_subpath,
             estimated_required_bytes, available_bytes, required_free_reserve_bytes,
             engine_name, engine_version, adapter_version, format_version,
-            preview_hash, production_eligible, state, phase, requested_by_label,
+            preview_hash, production_eligible, workflow_kind, volume_count,
+            state, phase, requested_by_label,
             correlation_id, cancel_requested_at, cancel_requested_by_label,
             drive_lease_id, drive_fencing_token, media_lease_id, media_fencing_token,
             attempt, result, created_at, started_at, finished_at
      FROM restore_rehearsals";
+
+const RESTORE_REHEARSAL_VOLUME_SELECT: &str = "SELECT id, restore_rehearsal_id,
+            volume_order, cartridge_id, expected_cartridge_label,
+            expected_media_generation, expected_media_format,
+            expected_volume_label, expected_on_tape_identity,
+            expected_engine_media_id, expected_engine_record_id,
+            expected_first_record, expected_last_record, expected_encoded_bytes,
+            state, active, media_lease_id, media_fencing_token,
+            loaded_at, completed_at, created_at, updated_at
+     FROM restore_rehearsal_volumes";
+
+const RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT: &str = "SELECT id, restore_rehearsal_id,
+            request_sequence, volume_order, expected_cartridge_id,
+            expected_cartridge_label, expected_engine_volume_name,
+            state, authorized_cartridge_id, requested_at, authorized_at,
+            loaded_at, completed_at, confirmation_evidence
+     FROM restore_rehearsal_media_requests";
 
 #[derive(Clone, Debug, FromRow)]
 struct RestoreRehearsalOriginBinding {
@@ -8645,7 +8794,6 @@ struct RestoreRehearsalOriginBinding {
     origin_job_state: String,
     origin_engine_operation_id: Option<String>,
     origin_data_state: String,
-    origin_result: Value,
     engine_name: String,
     engine_version: String,
     adapter_version: String,
@@ -8663,9 +8811,26 @@ struct RestoreRehearsalOriginBinding {
 
 #[derive(Clone, Debug, FromRow)]
 struct RestoreRehearsalVolumeBinding {
+    volume_order: i32,
     cartridge_id: Uuid,
     engine_record_id: String,
+    first_record: String,
+    last_record: Option<String>,
+    encoded_bytes: Option<i64>,
     finalized: bool,
+    internal_label: String,
+    media_generation: Option<i16>,
+    media_format: Option<String>,
+    on_tape_identity: Option<String>,
+    identity_status: String,
+    health_status: String,
+    reserved_by: Option<String>,
+    confirmed_location_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct RestoreRehearsalCartridgeBinding {
+    id: Uuid,
     internal_label: String,
     media_generation: Option<i16>,
     media_format: Option<String>,
@@ -8713,6 +8878,47 @@ pub async fn restore_rehearsal_events(
     .await
 }
 
+pub async fn restore_rehearsal_volumes(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Vec<RestoreRehearsalVolumeRecord>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "{RESTORE_REHEARSAL_VOLUME_SELECT}
+         WHERE restore_rehearsal_id = $1 ORDER BY volume_order"
+    ))
+    .bind(id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn open_restore_rehearsal_media_request(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<RestoreRehearsalMediaRequestRecord>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "{RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT}
+         WHERE restore_rehearsal_id = $1
+           AND state IN ('pending', 'authorized', 'loaded')
+         ORDER BY request_sequence DESC LIMIT 1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn restore_rehearsal_media_requests(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Vec<RestoreRehearsalMediaRequestRecord>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "{RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT}
+         WHERE restore_rehearsal_id = $1 ORDER BY request_sequence"
+    ))
+    .bind(id)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn restore_rehearsal_artifacts(
     pool: &PgPool,
     id: Uuid,
@@ -8750,7 +8956,7 @@ async fn load_restore_rehearsal_origin(
                 rp.format_version AS recovery_format_version, rp.manifest_digest,
                 rp.coverage, job_run.state AS origin_job_state,
                 job_run.engine_operation_id AS origin_engine_operation_id,
-                data_run.state AS origin_data_state, data_run.result AS origin_result,
+                data_run.state AS origin_data_state,
                 data_run.engine_name, data_run.engine_version,
                 data_run.adapter_version, data_run.format_version,
                 profile.production_eligible, data_run.encryption_deviation_confirmed,
@@ -8775,24 +8981,26 @@ async fn load_restore_rehearsal_origin(
     .await
 }
 
-async fn load_restore_rehearsal_volume(
+async fn load_restore_rehearsal_volumes(
     transaction: &mut Transaction<'_, Postgres>,
     recovery_point_id: Uuid,
-) -> Result<Option<RestoreRehearsalVolumeBinding>, sqlx::Error> {
+) -> Result<Vec<RestoreRehearsalVolumeBinding>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT cartridge.id AS cartridge_id, volume.engine_record_id,
-                volume.finalized, cartridge.internal_label,
+        "SELECT volume.volume_order, cartridge.id AS cartridge_id,
+                volume.engine_record_id, volume.first_record, volume.last_record,
+                volume.encoded_bytes, volume.finalized, cartridge.internal_label,
                 cartridge.media_generation, cartridge.media_format,
                 cartridge.on_tape_identity, cartridge.identity_status,
                 cartridge.health_status, cartridge.reserved_by,
                 cartridge.confirmed_location_id
          FROM volume_records volume
          JOIN cartridges cartridge ON cartridge.id = volume.cartridge_id
-         WHERE volume.recovery_point_id = $1 AND volume.volume_order = 1
+         WHERE volume.recovery_point_id = $1
+         ORDER BY volume.volume_order
          FOR UPDATE OF volume, cartridge",
     )
     .bind(recovery_point_id)
-    .fetch_optional(&mut **transaction)
+    .fetch_all(&mut **transaction)
     .await
 }
 
@@ -8800,19 +9008,19 @@ async fn restore_rehearsal_full_readback_passed(
     transaction: &mut Transaction<'_, Postgres>,
     recovery_point_id: Uuid,
     drive_id: Uuid,
-    cartridge_id: Uuid,
+    cartridge_ids: &[Uuid],
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM verification_records
              WHERE recovery_point_id = $1 AND kind = 'full_readback'
                AND outcome = 'passed' AND finished_at IS NOT NULL
-               AND drive_id = $2 AND media_ids = ARRAY[$3]::uuid[]
+               AND drive_id = $2 AND media_ids = $3::uuid[]
          )",
     )
     .bind(recovery_point_id)
     .bind(drive_id)
-    .bind(cartridge_id)
+    .bind(cartridge_ids)
     .fetch_one(&mut **transaction)
     .await
 }
@@ -9045,8 +9253,8 @@ pub async fn queue_restore_rehearsal(
             "encrypted or key-dependent recovery points are outside the attended replay gate"
                 .to_owned(),
         )
-    } else if plan.required_media_ids.len() != 1 {
-        Some("attended replay requires exactly one finalized cartridge".to_owned())
+    } else if plan.required_media_ids.is_empty() {
+        Some("attended replay requires at least one finalized cartridge".to_owned())
     } else {
         None
     };
@@ -9056,14 +9264,14 @@ pub async fn queue_restore_rehearsal(
     }
 
     let origin = load_restore_rehearsal_origin(&mut transaction, recovery_point_id).await?;
-    let volume = load_restore_rehearsal_volume(&mut transaction, recovery_point_id).await?;
+    let volumes = load_restore_rehearsal_volumes(&mut transaction, recovery_point_id).await?;
     let drive = sqlx::query_as::<_, DriveRecord>(&format!(
         "{DRIVE_SELECT} WHERE d.id = $1 FOR UPDATE OF d"
     ))
     .bind(drive_id)
     .fetch_optional(&mut *transaction)
     .await?;
-    let (Some(origin), Some(volume), Some(drive)) = (origin, volume, drive) else {
+    let (Some(origin), Some(volume), Some(drive)) = (origin, volumes.first(), drive) else {
         transaction.rollback().await?;
         return Ok(QueueRestoreRehearsalResult::NotFound);
     };
@@ -9073,39 +9281,77 @@ pub async fn queue_restore_rehearsal(
     .bind(recovery_point_id)
     .fetch_one(&mut *transaction)
     .await?;
-    let volume_count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM volume_records WHERE recovery_point_id = $1",
-    )
-    .bind(recovery_point_id)
-    .fetch_one(&mut *transaction)
-    .await?;
     let backup_job_id = parse_bacula_job_id(origin.origin_engine_operation_id.as_deref());
-    let engine_record = parse_bacula_engine_record(&volume.engine_record_id);
-    let engine_volume_name = origin
-        .origin_result
-        .get("engine_volume_name")
-        .and_then(Value::as_str);
+    let ordered_cartridge_ids = volumes
+        .iter()
+        .map(|volume| volume.cartridge_id)
+        .collect::<Vec<_>>();
+    let volume_count = i32::try_from(volumes.len()).unwrap_or(i32::MAX);
+    let parsed_engine_records = volumes
+        .iter()
+        .map(|volume| parse_bacula_engine_record(&volume.engine_record_id))
+        .collect::<Vec<_>>();
     let coverage_artifact_id = origin
         .coverage
         .get("source_manifest_artifact_id")
         .and_then(Value::as_i64);
-    let qualification_passed =
-        single_tape_qualification_passed(&mut transaction, &drive, volume.cartridge_id).await?;
+    let mut every_volume_qualified = true;
+    let mut every_volume_readable = true;
+    for candidate in &volumes {
+        every_volume_qualified &=
+            single_tape_qualification_passed(&mut transaction, &drive, candidate.cartridge_id)
+                .await?;
+        every_volume_readable &= drive
+            .generation
+            .and_then(drive_generation)
+            .zip(media_format(
+                candidate.media_generation,
+                candidate.media_format.as_deref(),
+            ))
+            .is_some_and(|(drive, media)| can_read(drive, media));
+    }
     let full_readback_passed = restore_rehearsal_full_readback_passed(
         &mut transaction,
         recovery_point_id,
         drive.id,
-        volume.cartridge_id,
+        &ordered_cartridge_ids,
     )
     .await?;
-    let readable = drive
-        .generation
-        .and_then(drive_generation)
-        .zip(media_format(
-            volume.media_generation,
-            volume.media_format.as_deref(),
-        ))
-        .is_some_and(|(drive, media)| can_read(drive, media));
+    let volumes_contiguous = volumes
+        .iter()
+        .enumerate()
+        .all(|(index, candidate)| i32::try_from(index + 1) == Ok(candidate.volume_order));
+    let volumes_finalized = volumes.iter().all(|candidate| candidate.finalized);
+    let volume_bindings_valid =
+        volumes
+            .iter()
+            .zip(&parsed_engine_records)
+            .all(|(candidate, record)| {
+                candidate
+                    .on_tape_identity
+                    .as_deref()
+                    .is_some_and(|identity| {
+                        !identity.is_empty()
+                            && identity.len() <= 127
+                            && identity.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                            })
+                    })
+                    && !candidate.first_record.is_empty()
+                    && !candidate.internal_label.is_empty()
+                    && candidate.internal_label.len() <= 128
+                    && !candidate.internal_label.chars().any(char::is_control)
+                    && record.is_some_and(|(_, job)| Some(job) == backup_job_id)
+            });
+    let volumes_physically_ready = volumes.iter().all(|candidate| {
+        candidate.identity_status == "reconciled"
+            && matches!(
+                candidate.health_status.as_str(),
+                "written_verified" | "healthy" | "verified"
+            )
+            && candidate.confirmed_location_id.is_some()
+            && candidate.reserved_by.is_none()
+    });
 
     let eligibility_blocker = if origin.recovery_point_id != recovery_point_id
         || origin.representation != "file"
@@ -9141,25 +9387,35 @@ pub async fn queue_restore_rehearsal(
         || !origin.encryption_deviation_confirmed
     {
         Some("the originating physical backup is not a passed, verified run".to_owned())
-    } else if dependency_count != 0 || volume_count != 1 {
-        Some("the recovery point is not a dependency-free single-volume capture".to_owned())
-    } else if plan.required_media_ids.as_slice() != [volume.cartridge_id] {
-        Some("the plan's exact cartridge no longer matches the recovery point".to_owned())
-    } else if !volume.finalized {
-        Some("the recovery point's only volume record is not finalized".to_owned())
-    } else if backup_job_id.is_none()
-        || engine_record.is_none()
-        || engine_record.map(|(_, job)| job) != backup_job_id
-    {
-        Some("the retained Bacula backup JobId or media record binding is invalid".to_owned())
+    } else if dependency_count != 0 || volumes.is_empty() || !volumes_contiguous {
+        Some(
+            "the recovery point is not one dependency-free, contiguous ordered media set"
+                .to_owned(),
+        )
+    } else if origin.workflow_kind == "recovery_exercise" && volumes.len() != 1 {
+        Some("legacy G0.2 recovery exercises remain restricted to one volume".to_owned())
+    } else if plan.required_media_ids != ordered_cartridge_ids {
+        Some(
+            "the plan's exact ordered cartridge set no longer matches the recovery point"
+                .to_owned(),
+        )
+    } else if !volumes_finalized {
+        Some("at least one required recovery-point volume is not finalized".to_owned())
+    } else if backup_job_id.is_none() || !volume_bindings_valid {
+        Some("a retained Bacula backup JobId or ordered media record binding is invalid".to_owned())
     } else if coverage_artifact_id != Some(origin.source_manifest_artifact_id)
         || !restore_rehearsal_manifest_binding_valid(&origin)
         || origin.source_manifest_size_bytes <= 0
     {
         Some("the retained source-manifest identity is incomplete or inconsistent".to_owned())
+    } else if !restore_manifest_artifact_size_supported(origin.source_manifest_size_bytes) {
+        Some(format!(
+            "the retained source manifest is {} bytes; attended restore supports at most {} bytes",
+            origin.source_manifest_size_bytes, RESTORE_MANIFEST_ARTIFACT_MAX_BYTES
+        ))
     } else if !full_readback_passed {
         Some(
-            "the exact single-volume recovery point lacks a completed physical full-readback verification"
+            "the exact ordered recovery-point media set lacks a completed physical full-readback verification"
                 .to_owned(),
         )
     } else if drive.id != origin.origin_drive_id {
@@ -9169,24 +9425,13 @@ pub async fn queue_restore_rehearsal(
         )
     } else if let Some(reason) = drive_motion_blocker(&drive) {
         Some(reason)
-    } else if !readable || !qualification_passed {
-        Some("the exact drive/cartridge pair lacks current read eligibility and passed qualification".to_owned())
-    } else if volume.identity_status != "reconciled"
-        || !matches!(
-            volume.health_status.as_str(),
-            "written_verified" | "healthy" | "verified"
-        )
-        || volume.confirmed_location_id.is_none()
-    {
+    } else if !every_volume_readable || !every_volume_qualified {
+        Some("the exact drive and every ordered cartridge lack current read eligibility or passed qualification".to_owned())
+    } else if !volumes_physically_ready {
         Some(
-            "the cartridge identity, verified health, or confirmed custody is not ready".to_owned(),
+            "a cartridge identity, verified health, confirmed custody, or reservation is not ready"
+                .to_owned(),
         )
-    } else if volume.reserved_by.is_some() {
-        Some("the required cartridge is already reserved".to_owned())
-    } else if engine_volume_name.is_none()
-        || volume.on_tape_identity.as_deref() != engine_volume_name
-    {
-        Some("the current on-tape identity disagrees with the verified backup volume".to_owned())
     } else {
         None
     };
@@ -9195,30 +9440,41 @@ pub async fn queue_restore_rehearsal(
         return Ok(QueueRestoreRehearsalResult::Blocked(reason));
     }
 
+    let media_resource_ids = ordered_cartridge_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
     let busy = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(
              SELECT 1 FROM drive_operations
              WHERE drive_id = $1 AND state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM qualification_runs
-             WHERE (drive_id = $1 OR cartridge_id = $2) AND state IN ('queued', 'running')
+             WHERE (drive_id = $1 OR cartridge_id = ANY($2::uuid[]))
+               AND state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM single_tape_data_runs
-             WHERE (drive_id = $1 OR cartridge_id = $2) AND state IN ('queued', 'running')
-             UNION ALL
-             SELECT 1 FROM restore_rehearsals
-             WHERE (restore_plan_id = $3 OR drive_id = $1 OR cartridge_id = $2)
+             WHERE (drive_id = $1 OR cartridge_id = ANY($2::uuid[]))
                AND state IN ('queued', 'running')
+             UNION ALL
+             SELECT 1 FROM restore_rehearsals rehearsal
+             LEFT JOIN restore_rehearsal_volumes restore_volume
+               ON restore_volume.restore_rehearsal_id = rehearsal.id
+              AND restore_volume.active
+             WHERE (rehearsal.restore_plan_id = $3 OR rehearsal.drive_id = $1
+                    OR restore_volume.cartridge_id = ANY($2::uuid[]))
+               AND rehearsal.state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM resource_leases
              WHERE ((resource_kind = 'drive' AND resource_id = $1::text)
-                 OR (resource_kind = 'media' AND resource_id = $2::text))
+                 OR (resource_kind = 'media' AND resource_id = ANY($4::text[])))
                AND released_at IS NULL AND expires_at > now()
          )",
     )
     .bind(drive_id)
-    .bind(volume.cartridge_id)
+    .bind(&ordered_cartridge_ids)
     .bind(restore_plan_id)
+    .bind(&media_resource_ids)
     .fetch_one(&mut *transaction)
     .await?;
     if busy {
@@ -9237,9 +9493,12 @@ pub async fn queue_restore_rehearsal(
         .observed_path
         .as_deref()
         .expect("the drive gate requires an observed path");
-    let expected_volume_label = engine_volume_name.expect("the identity gate checked this");
+    let expected_volume_label = volume
+        .on_tape_identity
+        .as_deref()
+        .expect("the identity gate checked this");
     let backup_job_id = backup_job_id.expect("the backup JobId gate checked this");
-    let expected_engine_media_id = engine_record
+    let expected_engine_media_id = parsed_engine_records[0]
         .expect("the engine record gate checked this")
         .0;
     let source_manifest_digest = origin
@@ -9278,12 +9537,13 @@ pub async fn queue_restore_rehearsal(
              source_manifest_size_bytes, source_mount_path, logical_root,
              destination_subpath, estimated_required_bytes, available_bytes,
              required_free_reserve_bytes, engine_name, engine_version,
-             adapter_version, format_version, preview_hash,
+             adapter_version, format_version, preview_hash, workflow_kind, volume_count,
              requested_by_label, correlation_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                  $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
                  $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
-                 $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)",
+                 $31, $32, $33, $34, $35, $36, $37, $38, $39, $40,
+                 $41, $42)",
     )
     .bind(id)
     .bind(restore_plan_id)
@@ -9323,15 +9583,61 @@ pub async fn queue_restore_rehearsal(
     .bind(&origin.adapter_version)
     .bind(&origin.format_version)
     .bind(preview_hash)
+    .bind(&origin.workflow_kind)
+    .bind(volume_count)
     .bind(requested_by_label)
     .bind(correlation_id)
     .execute(&mut *transaction)
     .await?;
-    sqlx::query("UPDATE cartridges SET reserved_by = $1, updated_at = now() WHERE id = $2")
-        .bind(format!("restore_rehearsal:{id}"))
-        .bind(volume.cartridge_id)
+    for (candidate, engine_record) in volumes.iter().zip(&parsed_engine_records) {
+        let expected_on_tape_identity = candidate
+            .on_tape_identity
+            .as_deref()
+            .expect("the identity gate checked this");
+        let expected_engine_media_id = engine_record
+            .expect("the engine record gate checked this")
+            .0;
+        sqlx::query(
+            "INSERT INTO restore_rehearsal_volumes
+                (restore_rehearsal_id, volume_order, cartridge_id,
+                 expected_cartridge_label, expected_media_generation,
+                 expected_media_format, expected_volume_label,
+                 expected_on_tape_identity, expected_engine_media_id,
+                 expected_engine_record_id, expected_first_record,
+                 expected_last_record, expected_encoded_bytes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(id)
+        .bind(candidate.volume_order)
+        .bind(candidate.cartridge_id)
+        .bind(&candidate.internal_label)
+        .bind(candidate.media_generation)
+        .bind(&candidate.media_format)
+        .bind(expected_on_tape_identity)
+        .bind(expected_engine_media_id)
+        .bind(&candidate.engine_record_id)
+        .bind(&candidate.first_record)
+        .bind(&candidate.last_record)
+        .bind(candidate.encoded_bytes)
         .execute(&mut *transaction)
         .await?;
+    }
+    let reservation = format!("restore_rehearsal:{id}");
+    let reserved = sqlx::query(
+        "UPDATE cartridges SET reserved_by = $1, updated_at = now()
+         WHERE id = ANY($2::uuid[]) AND reserved_by IS NULL",
+    )
+    .bind(&reservation)
+    .bind(&ordered_cartridge_ids)
+    .execute(&mut *transaction)
+    .await?;
+    if reserved.rows_affected() != u64::try_from(volumes.len()).unwrap_or(u64::MAX) {
+        transaction.rollback().await?;
+        return Ok(QueueRestoreRehearsalResult::Blocked(
+            "one or more ordered restore cartridges became reserved while the run was queued"
+                .to_owned(),
+        ));
+    }
     append_job_transition(
         &mut transaction,
         job_run_id,
@@ -9358,6 +9664,8 @@ pub async fn queue_restore_rehearsal(
             "stable_id": drive.stable_id,
             "cartridge_id": volume.cartridge_id,
             "cartridge_label": volume.internal_label,
+            "ordered_cartridge_ids": ordered_cartridge_ids,
+            "volume_count": volume_count,
             "bacula_backup_job_id": backup_job_id,
             "bacula_media_id": expected_engine_media_id,
             "destination_subpath": destination_subpath,
@@ -9373,7 +9681,7 @@ pub async fn queue_restore_rehearsal(
                 "safety_authority": false
             },
             "origin_workflow_kind": origin.workflow_kind,
-            "scope": "attended single-volume full-file recovery replay",
+            "scope": "attended ordered-volume full-file recovery replay",
             "production_eligible": false
         }),
         requested_by_label,
@@ -9433,25 +9741,32 @@ async fn lock_valid_restore_rehearsal_claim(
         "SELECT rehearsal.id
          FROM restore_rehearsals rehearsal
          JOIN resource_leases drive_lease ON drive_lease.id = rehearsal.drive_lease_id
-         JOIN resource_leases media_lease ON media_lease.id = rehearsal.media_lease_id
          WHERE rehearsal.id = $1 AND rehearsal.state = 'running'
            AND rehearsal.drive_lease_id = $2 AND rehearsal.drive_fencing_token = $3
-           AND rehearsal.media_lease_id = $4 AND rehearsal.media_fencing_token = $5
-           AND drive_lease.owner_id = $6 AND drive_lease.fencing_token = $3
+           AND drive_lease.owner_id = $4 AND drive_lease.fencing_token = $3
            AND drive_lease.released_at IS NULL AND drive_lease.expires_at > now()
-           AND media_lease.owner_id = $6 AND media_lease.fencing_token = $5
-           AND media_lease.released_at IS NULL AND media_lease.expires_at > now()
-         FOR UPDATE OF rehearsal, drive_lease, media_lease",
+         FOR UPDATE OF rehearsal, drive_lease",
     )
     .bind(claim.run.id)
     .bind(claim.drive_lease_id)
     .bind(claim.drive_fencing_token)
-    .bind(claim.media_lease_id)
-    .bind(claim.media_fencing_token)
     .bind(claim.worker_id)
     .fetch_optional(&mut **transaction)
     .await?;
     Ok(locked.is_some())
+}
+
+async fn restore_rehearsal_cancel_pending_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    restore_rehearsal_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT cancel_requested_at IS NOT NULL
+         FROM restore_rehearsals WHERE id = $1",
+    )
+    .bind(restore_rehearsal_id)
+    .fetch_one(&mut **transaction)
+    .await
 }
 
 async fn release_restore_rehearsal_resources(
@@ -9477,11 +9792,43 @@ async fn release_restore_rehearsal_resources(
         .await?;
     }
     sqlx::query(
-        "UPDATE cartridges SET reserved_by = NULL, updated_at = now()
-         WHERE id = $1 AND reserved_by = $2",
+        "UPDATE resource_leases SET released_at = now()
+         WHERE id IN (
+             SELECT media_lease_id FROM restore_rehearsal_volumes
+             WHERE restore_rehearsal_id = $1 AND media_lease_id IS NOT NULL
+         ) AND released_at IS NULL",
     )
-    .bind(run.cartridge_id)
+    .bind(run.id)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "UPDATE cartridges SET reserved_by = NULL, updated_at = now()
+         WHERE id IN (
+             SELECT cartridge_id FROM restore_rehearsal_volumes
+             WHERE restore_rehearsal_id = $1
+         ) AND reserved_by = $2",
+    )
+    .bind(run.id)
     .bind(format!("restore_rehearsal:{}", run.id))
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "UPDATE restore_rehearsal_media_requests
+         SET state = 'cancelled', completed_at = NULL
+         WHERE restore_rehearsal_id = $1
+           AND state IN ('pending', 'authorized', 'loaded')",
+    )
+    .bind(run.id)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "UPDATE restore_rehearsal_volumes
+         SET active = false,
+             state = CASE WHEN state = 'completed' THEN state ELSE 'cancelled' END,
+             updated_at = now()
+         WHERE restore_rehearsal_id = $1 AND active",
+    )
+    .bind(run.id)
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -9570,15 +9917,27 @@ pub async fn claim_next_restore_rehearsal_run(
     .fetch_optional(&mut *transaction)
     .await?;
     let origin = load_restore_rehearsal_origin(&mut transaction, run.recovery_point_id).await?;
-    let volume = load_restore_rehearsal_volume(&mut transaction, run.recovery_point_id).await?;
+    let volumes = load_restore_rehearsal_volumes(&mut transaction, run.recovery_point_id).await?;
+    let restore_volumes = sqlx::query_as::<_, RestoreRehearsalVolumeRecord>(&format!(
+        "{RESTORE_REHEARSAL_VOLUME_SELECT}
+         WHERE restore_rehearsal_id = $1 ORDER BY volume_order FOR UPDATE"
+    ))
+    .bind(run.id)
+    .fetch_all(&mut *transaction)
+    .await?;
     let drive = sqlx::query_as::<_, DriveRecord>(&format!(
         "{DRIVE_SELECT} WHERE d.id = $1 FOR UPDATE OF d"
     ))
     .bind(run.drive_id)
     .fetch_optional(&mut *transaction)
     .await?;
-    let (Some(plan), Some(origin), Some(volume), Some(drive)) = (plan, origin, volume, drive)
-    else {
+    let (Some(plan), Some(origin), Some(volume), Some(restore_volume), Some(drive)) = (
+        plan,
+        origin,
+        volumes.first(),
+        restore_volumes.first(),
+        drive,
+    ) else {
         let reason =
             "a bound restore plan, recovery point, drive, or cartridge no longer exists".to_owned();
         block_restore_rehearsal_in_transaction(&mut transaction, &run, &reason).await?;
@@ -9589,51 +9948,69 @@ pub async fn claim_next_restore_rehearsal_run(
     let destination = restore_rehearsal_destination(&plan);
     let capacity = restore_rehearsal_capacity(&plan);
     let backup_job_id = parse_bacula_job_id(origin.origin_engine_operation_id.as_deref());
-    let engine_record = parse_bacula_engine_record(&volume.engine_record_id);
     let expected_reservation = format!("restore_rehearsal:{}", run.id);
-    let qualification_passed =
-        single_tape_qualification_passed(&mut transaction, &drive, run.cartridge_id).await?;
+    let ordered_cartridge_ids = volumes
+        .iter()
+        .map(|volume| volume.cartridge_id)
+        .collect::<Vec<_>>();
+    let parsed_engine_records = volumes
+        .iter()
+        .map(|volume| parse_bacula_engine_record(&volume.engine_record_id))
+        .collect::<Vec<_>>();
+    let mut every_volume_qualified = true;
+    let mut every_volume_readable = true;
+    for candidate in &volumes {
+        every_volume_qualified &=
+            single_tape_qualification_passed(&mut transaction, &drive, candidate.cartridge_id)
+                .await?;
+        every_volume_readable &= drive
+            .generation
+            .and_then(drive_generation)
+            .zip(media_format(
+                candidate.media_generation,
+                candidate.media_format.as_deref(),
+            ))
+            .is_some_and(|(drive, media)| can_read(drive, media));
+    }
     let full_readback_passed = restore_rehearsal_full_readback_passed(
         &mut transaction,
         run.recovery_point_id,
         run.drive_id,
-        run.cartridge_id,
+        &ordered_cartridge_ids,
     )
     .await?;
-    let (dependency_count, volume_count) = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT
-             (SELECT count(*) FROM recovery_dependencies WHERE recovery_point_id = $1),
-             (SELECT count(*) FROM volume_records WHERE recovery_point_id = $1)",
+    let dependency_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM recovery_dependencies WHERE recovery_point_id = $1",
     )
     .bind(run.recovery_point_id)
     .fetch_one(&mut *transaction)
     .await?;
-    let readable = drive
-        .generation
-        .and_then(drive_generation)
-        .zip(media_format(
-            volume.media_generation,
-            volume.media_format.as_deref(),
-        ))
-        .is_some_and(|(drive, media)| can_read(drive, media));
+    let volume_count = i32::try_from(volumes.len()).unwrap_or(i32::MAX);
     let conflicts = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(
              SELECT 1 FROM drive_operations
              WHERE drive_id = $1 AND state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM qualification_runs
-             WHERE (drive_id = $1 OR cartridge_id = $2) AND state IN ('queued', 'running')
+             WHERE (drive_id = $1 OR cartridge_id = ANY($2::uuid[]))
+               AND state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM single_tape_data_runs
-             WHERE (drive_id = $1 OR cartridge_id = $2) AND state IN ('queued', 'running')
-             UNION ALL
-             SELECT 1 FROM restore_rehearsals
-             WHERE id <> $3 AND (drive_id = $1 OR cartridge_id = $2)
+             WHERE (drive_id = $1 OR cartridge_id = ANY($2::uuid[]))
                AND state IN ('queued', 'running')
+             UNION ALL
+             SELECT 1 FROM restore_rehearsals rehearsal
+             LEFT JOIN restore_rehearsal_volumes restore_volume
+               ON restore_volume.restore_rehearsal_id = rehearsal.id
+              AND restore_volume.active
+             WHERE rehearsal.id <> $3
+               AND (rehearsal.drive_id = $1
+                    OR restore_volume.cartridge_id = ANY($2::uuid[]))
+               AND rehearsal.state IN ('queued', 'running')
          )",
     )
     .bind(run.drive_id)
-    .bind(run.cartridge_id)
+    .bind(&ordered_cartridge_ids)
     .bind(run.id)
     .fetch_one(&mut *transaction)
     .await?;
@@ -9641,6 +10018,52 @@ pub async fn claim_next_restore_rehearsal_run(
         .coverage
         .get("source_manifest_artifact_id")
         .and_then(Value::as_i64);
+    let source_volumes_valid = volumes.iter().enumerate().all(|(index, candidate)| {
+        i32::try_from(index + 1) == Ok(candidate.volume_order)
+            && candidate.finalized
+            && candidate.on_tape_identity.as_deref().is_some_and(|value| {
+                !value.is_empty()
+                    && value.len() <= 127
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            })
+            && !candidate.first_record.is_empty()
+            && candidate.identity_status == "reconciled"
+            && matches!(
+                candidate.health_status.as_str(),
+                "written_verified" | "healthy" | "verified"
+            )
+            && candidate.confirmed_location_id.is_some()
+            && candidate.reserved_by.as_deref() == Some(expected_reservation.as_str())
+    });
+    let ledger_matches_source = restore_volumes.len() == volumes.len()
+        && volumes
+            .iter()
+            .zip(&restore_volumes)
+            .zip(&parsed_engine_records)
+            .all(|((source, snapshot), record)| {
+                snapshot.restore_rehearsal_id == run.id
+                    && snapshot.volume_order == source.volume_order
+                    && snapshot.cartridge_id == source.cartridge_id
+                    && snapshot.expected_cartridge_label == source.internal_label
+                    && snapshot.expected_media_generation == source.media_generation
+                    && snapshot.expected_media_format == source.media_format
+                    && source.on_tape_identity.as_deref()
+                        == Some(snapshot.expected_volume_label.as_str())
+                    && snapshot.expected_on_tape_identity == snapshot.expected_volume_label
+                    && record.is_some_and(|(media, job)| {
+                        media == snapshot.expected_engine_media_id && Some(job) == backup_job_id
+                    })
+                    && snapshot.expected_engine_record_id == source.engine_record_id
+                    && snapshot.expected_first_record == source.first_record
+                    && snapshot.expected_last_record == source.last_record
+                    && snapshot.expected_encoded_bytes == source.encoded_bytes
+                    && snapshot.state == "reserved"
+                    && snapshot.active
+                    && snapshot.media_lease_id.is_none()
+                    && snapshot.media_fencing_token.is_none()
+            });
     let blocker = if run.cancel_requested_at.is_some() {
         Some("the recovery rehearsal was cancelled before worker dispatch".to_owned())
     } else if plan.preview_hash != run.preview_hash
@@ -9655,10 +10078,13 @@ pub async fn claim_next_restore_rehearsal_run(
     {
         Some("the restore plan expired, changed, or is no longer ready".to_owned())
     } else if plan.dependency_chain != vec![run.recovery_point_id]
-        || plan.required_media_ids.as_slice() != [run.cartridge_id]
+        || plan.required_media_ids != ordered_cartridge_ids
         || !plan.key_lineage_ids.is_empty()
     {
-        Some("the plan no longer describes the exact dependency-free single cartridge".to_owned())
+        Some(
+            "the plan no longer describes the exact dependency-free ordered cartridge set"
+                .to_owned(),
+        )
     } else if destination.as_deref() != Ok(run.destination_subpath.as_str())
         || capacity
             != Ok((
@@ -9670,6 +10096,7 @@ pub async fn claim_next_restore_rehearsal_run(
         Some("the approved destination or capacity assertions changed after queuing".to_owned())
     } else if origin.original_data_run_id != run.original_data_run_id
         || origin.origin_drive_id != run.drive_id
+        || origin.workflow_kind != run.workflow_kind
         || !matches!(
             origin.workflow_kind.as_str(),
             "recovery_exercise" | "backup"
@@ -9713,28 +10140,37 @@ pub async fn claim_next_restore_rehearsal_run(
         || !valid_sha256(&run.source_manifest_digest)
     {
         Some("the retained source-manifest binding changed or is incomplete".to_owned())
-    } else if dependency_count != 0 || volume_count != 1 || !full_readback_passed {
+    } else if !restore_manifest_artifact_size_supported(run.source_manifest_size_bytes) {
+        Some(format!(
+            "the retained source manifest is {} bytes; attended restore supports at most {} bytes",
+            run.source_manifest_size_bytes, RESTORE_MANIFEST_ARTIFACT_MAX_BYTES
+        ))
+    } else if dependency_count != 0
+        || volume_count != run.volume_count
+        || volume_count <= 0
+        || (origin.workflow_kind == "recovery_exercise" && volume_count != 1)
+        || !full_readback_passed
+    {
         Some(
-            "the recovery point no longer has one dependency-free, fully read-back physical volume"
+            "the recovery point no longer has its exact dependency-free, fully read-back ordered media set"
                 .to_owned(),
         )
     } else if backup_job_id != Some(run.backup_job_id)
-        || engine_record != Some((run.expected_engine_media_id, run.backup_job_id))
+        || parsed_engine_records.first().copied().flatten()
+            != Some((run.expected_engine_media_id, run.backup_job_id))
         || volume.engine_record_id != run.expected_engine_record_id
     {
         Some("the retained Bacula job, media, or record binding changed".to_owned())
     } else if volume.cartridge_id != run.cartridge_id
-        || !volume.finalized
+        || restore_volume.cartridge_id != run.cartridge_id
         || volume.on_tape_identity.as_deref() != Some(run.expected_volume_label.as_str())
-        || volume.identity_status != "reconciled"
-        || !matches!(
-            volume.health_status.as_str(),
-            "written_verified" | "healthy" | "verified"
-        )
-        || volume.confirmed_location_id.is_none()
-        || volume.reserved_by.as_deref() != Some(expected_reservation.as_str())
+        || !source_volumes_valid
+        || !ledger_matches_source
     {
-        Some("the exact cartridge identity, health, custody, or reservation changed".to_owned())
+        Some(
+            "an ordered cartridge snapshot, identity, health, custody, or reservation changed"
+                .to_owned(),
+        )
     } else if drive.stable_id != run.expected_stable_id
         || drive.observed_path.as_deref() != Some(run.expected_path.as_str())
         || drive.vendor != run.expected_vendor
@@ -9746,8 +10182,11 @@ pub async fn claim_next_restore_rehearsal_run(
         Some("the exact drive identity, path, or firmware changed after queuing".to_owned())
     } else if let Some(reason) = drive_motion_blocker(&drive) {
         Some(reason)
-    } else if !readable || !qualification_passed {
-        Some("the exact drive/cartridge pair is no longer read-eligible and qualified".to_owned())
+    } else if !every_volume_readable || !every_volume_qualified {
+        Some(
+            "the exact drive and every ordered cartridge are no longer read-eligible and qualified"
+                .to_owned(),
+        )
     } else if conflicts {
         Some("another tape operation conflicts with the queued recovery rehearsal".to_owned())
     } else {
@@ -9803,6 +10242,24 @@ pub async fn claim_next_restore_rehearsal_run(
         transaction.rollback().await?;
         return Ok(ClaimRestoreRehearsalRunResult::Empty);
     };
+    let loaded = sqlx::query(
+        "UPDATE restore_rehearsal_volumes
+         SET state = 'loaded', media_lease_id = $1, media_fencing_token = $2,
+             loaded_at = now(), updated_at = now()
+         WHERE id = $3 AND restore_rehearsal_id = $4 AND volume_order = 1
+           AND state = 'reserved' AND active
+           AND media_lease_id IS NULL AND media_fencing_token IS NULL",
+    )
+    .bind(media_lease_id)
+    .bind(media_fencing_token)
+    .bind(restore_volume.id)
+    .bind(run.id)
+    .execute(&mut *transaction)
+    .await?;
+    if loaded.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(ClaimRestoreRehearsalRunResult::Empty);
+    }
     sqlx::query(
         "UPDATE restore_rehearsals
          SET state = 'running', phase = 'preparing',
@@ -9830,6 +10287,8 @@ pub async fn claim_next_restore_rehearsal_run(
         "drive_fencing_token": drive_fencing_token,
         "media_lease_id": media_lease_id,
         "media_fencing_token": media_fencing_token,
+        "volume_order": 1,
+        "volume_count": run.volume_count,
         "read_only_rehearsal": true,
         "production_eligible": false
     });
@@ -9888,22 +10347,954 @@ pub async fn renew_restore_rehearsal_run_leases(
     .bind(claim.drive_fencing_token)
     .execute(&mut *transaction)
     .await?;
-    let media = sqlx::query(
-        "UPDATE resource_leases SET expires_at = now() + interval '30 minutes'
-         WHERE id = $1 AND owner_id = $2 AND fencing_token = $3
-           AND released_at IS NULL AND expires_at > now()",
+    let loaded_media = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT media_lease_id, media_fencing_token
+         FROM restore_rehearsal_volumes
+         WHERE restore_rehearsal_id = $1 AND active AND state = 'loaded'
+         ORDER BY volume_order FOR UPDATE",
     )
-    .bind(claim.media_lease_id)
-    .bind(claim.worker_id)
-    .bind(claim.media_fencing_token)
-    .execute(&mut *transaction)
+    .bind(claim.run.id)
+    .fetch_all(&mut *transaction)
     .await?;
-    if drive.rows_affected() != 1 || media.rows_affected() != 1 {
+    if loaded_media.len() > 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let media_renewed = if let Some((lease_id, fencing_token)) = loaded_media.first().copied() {
+        sqlx::query(
+            "UPDATE resource_leases SET expires_at = now() + interval '30 minutes'
+             WHERE id = $1 AND owner_id = $2 AND fencing_token = $3
+               AND released_at IS NULL AND expires_at > now()",
+        )
+        .bind(lease_id)
+        .bind(claim.worker_id)
+        .bind(fencing_token)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            == 1
+    } else {
+        true
+    };
+    if drive.rows_affected() != 1 || !media_renewed {
         transaction.rollback().await?;
         return Ok(false);
     }
     transaction.commit().await?;
     Ok(true)
+}
+
+pub async fn ensure_restore_rehearsal_media_request(
+    pool: &PgPool,
+    claim: &ClaimedRestoreRehearsalRun,
+    next_volume_order: i32,
+) -> Result<RestoreRehearsalMediaRequestResult, sqlx::Error> {
+    if next_volume_order <= 1 || next_volume_order > claim.run.volume_count {
+        return Ok(RestoreRehearsalMediaRequestResult::Blocked(
+            "the requested restore volume is outside the fenced ordered media set".to_owned(),
+        ));
+    }
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_restore_rehearsal_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(RestoreRehearsalMediaRequestResult::FencedOut);
+    }
+    if restore_rehearsal_cancel_pending_in_transaction(&mut transaction, claim.run.id).await? {
+        transaction.rollback().await?;
+        return Ok(RestoreRehearsalMediaRequestResult::Blocked(
+            "the recovery rehearsal was cancelled before the next media handoff".to_owned(),
+        ));
+    }
+    let existing = sqlx::query_as::<_, RestoreRehearsalMediaRequestRecord>(&format!(
+        "{RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT}
+         WHERE restore_rehearsal_id = $1
+           AND state IN ('pending', 'authorized', 'loaded')
+         ORDER BY request_sequence DESC LIMIT 1 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if let Some(existing) = existing {
+        transaction.commit().await?;
+        return if existing.volume_order == next_volume_order {
+            Ok(RestoreRehearsalMediaRequestResult::Ready(Box::new(
+                existing,
+            )))
+        } else {
+            Ok(RestoreRehearsalMediaRequestResult::Blocked(
+                "a different restore media handoff is already open".to_owned(),
+            ))
+        };
+    }
+    let job_state =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(claim.run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if job_state != "restoring" {
+        transaction.rollback().await?;
+        return Ok(RestoreRehearsalMediaRequestResult::Blocked(format!(
+            "the recovery run is in {job_state}, not restoring"
+        )));
+    }
+    let prior_incomplete = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM restore_rehearsal_volumes
+             WHERE restore_rehearsal_id = $1 AND volume_order < $2
+               AND (NOT active OR state <> 'completed'))",
+    )
+    .bind(claim.run.id)
+    .bind(next_volume_order)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let volume = sqlx::query_as::<_, RestoreRehearsalVolumeRecord>(&format!(
+        "{RESTORE_REHEARSAL_VOLUME_SELECT}
+         WHERE restore_rehearsal_id = $1 AND volume_order = $2 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(next_volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(volume) = volume else {
+        transaction.rollback().await?;
+        return Ok(RestoreRehearsalMediaRequestResult::Blocked(
+            "the next ordered restore volume is missing from the fenced ledger".to_owned(),
+        ));
+    };
+    if prior_incomplete
+        || !volume.active
+        || volume.state != "reserved"
+        || volume.media_lease_id.is_some()
+        || volume.media_fencing_token.is_some()
+    {
+        transaction.rollback().await?;
+        return Ok(RestoreRehearsalMediaRequestResult::Blocked(
+            "the prior volume is not durably complete or the next volume is not untouched"
+                .to_owned(),
+        ));
+    }
+    let request_sequence = sqlx::query_scalar::<_, i32>(
+        "SELECT COALESCE(max(request_sequence), 0) + 1
+         FROM restore_rehearsal_media_requests WHERE restore_rehearsal_id = $1",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let request_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO restore_rehearsal_media_requests
+            (id, restore_rehearsal_id, request_sequence, volume_order,
+             expected_cartridge_id, expected_cartridge_label,
+             expected_engine_volume_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(request_id)
+    .bind(claim.run.id)
+    .bind(request_sequence)
+    .bind(next_volume_order)
+    .bind(volume.cartridge_id)
+    .bind(&volume.expected_cartridge_label)
+    .bind(&volume.expected_volume_label)
+    .execute(&mut *transaction)
+    .await?;
+    let rehearsal_updated = sqlx::query(
+        "UPDATE restore_rehearsals SET phase = 'waiting_for_media'
+         WHERE id = $1 AND state = 'running' AND phase = 'restoring'",
+    )
+    .bind(claim.run.id)
+    .execute(&mut *transaction)
+    .await?;
+    let job_updated = sqlx::query(
+        "UPDATE job_runs SET state = 'waiting_for_media'
+         WHERE id = $1 AND state = 'restoring' AND finished_at IS NULL",
+    )
+    .bind(claim.run.job_run_id)
+    .execute(&mut *transaction)
+    .await?;
+    if rehearsal_updated.rows_affected() != 1 || job_updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(RestoreRehearsalMediaRequestResult::Blocked(
+            "the restore phase changed while the media request was published".to_owned(),
+        ));
+    }
+    let transition_evidence = json!({
+        "media_request_id": request_id,
+        "volume_order": next_volume_order,
+        "volume_count": claim.run.volume_count,
+        "expected_cartridge_id": volume.cartridge_id,
+        "expected_cartridge_label": volume.expected_cartridge_label,
+        "expected_engine_volume_name": volume.expected_volume_label,
+        "read_only": true
+    });
+    append_job_transition(
+        &mut transaction,
+        claim.run.job_run_id,
+        Some("restoring"),
+        "waiting_for_media",
+        "Bacula requires the next exact ordered restore cartridge",
+        transition_evidence.clone(),
+        claim.run.correlation_id,
+    )
+    .await?;
+    append_restore_rehearsal_event_in_transaction(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "media_required",
+        transition_evidence,
+        "tapescale-worker",
+    )
+    .await?;
+    let request = sqlx::query_as::<_, RestoreRehearsalMediaRequestRecord>(&format!(
+        "{RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT} WHERE id = $1"
+    ))
+    .bind(request_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(RestoreRehearsalMediaRequestResult::Ready(Box::new(request)))
+}
+
+pub async fn authorized_restore_rehearsal_media_request(
+    pool: &PgPool,
+    claim: &ClaimedRestoreRehearsalRun,
+) -> Result<AuthorizedRestoreRehearsalMediaRequestResult, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_restore_rehearsal_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(AuthorizedRestoreRehearsalMediaRequestResult::FencedOut);
+    }
+    if restore_rehearsal_cancel_pending_in_transaction(&mut transaction, claim.run.id).await? {
+        transaction.rollback().await?;
+        return Ok(AuthorizedRestoreRehearsalMediaRequestResult::Blocked(
+            "the recovery rehearsal was cancelled before media authorization could be consumed"
+                .to_owned(),
+        ));
+    }
+    let request = sqlx::query_as::<_, RestoreRehearsalMediaRequestRecord>(&format!(
+        "{RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT}
+         WHERE restore_rehearsal_id = $1
+           AND state IN ('pending', 'authorized', 'loaded')
+         ORDER BY request_sequence DESC LIMIT 1 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(request) = request else {
+        transaction.commit().await?;
+        return Ok(AuthorizedRestoreRehearsalMediaRequestResult::Waiting);
+    };
+    let volume = sqlx::query_as::<_, RestoreRehearsalVolumeRecord>(&format!(
+        "{RESTORE_REHEARSAL_VOLUME_SELECT}
+         WHERE restore_rehearsal_id = $1 AND volume_order = $2 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(request.volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(volume) = volume else {
+        transaction.rollback().await?;
+        return Ok(AuthorizedRestoreRehearsalMediaRequestResult::Blocked(
+            "the open handoff has no matching ordered restore volume".to_owned(),
+        ));
+    };
+    let exact = volume.active
+        && volume.cartridge_id == request.expected_cartridge_id
+        && volume.expected_cartridge_label == request.expected_cartridge_label
+        && volume.expected_volume_label == request.expected_engine_volume_name;
+    if !exact {
+        transaction.rollback().await?;
+        return Ok(AuthorizedRestoreRehearsalMediaRequestResult::Blocked(
+            "the open handoff no longer matches the fenced ordered volume".to_owned(),
+        ));
+    }
+    let result = match request.state.as_str() {
+        "pending" => AuthorizedRestoreRehearsalMediaRequestResult::Waiting,
+        "authorized" => AuthorizedRestoreRehearsalMediaRequestResult::Authorized {
+            request: Box::new(request),
+            volume: Box::new(volume),
+        },
+        "loaded" => AuthorizedRestoreRehearsalMediaRequestResult::LoadedAfterRestart {
+            request: Box::new(request),
+            volume: Box::new(volume),
+        },
+        _ => AuthorizedRestoreRehearsalMediaRequestResult::Blocked(
+            "the restore handoff is not open".to_owned(),
+        ),
+    };
+    transaction.commit().await?;
+    Ok(result)
+}
+
+pub async fn authorize_restore_rehearsal_media(
+    pool: &PgPool,
+    run_id: Uuid,
+    authorization: &RestoreRehearsalMediaAuthorization,
+) -> Result<AuthorizeRestoreRehearsalMediaResult, sqlx::Error> {
+    let actor_label = authorization.actor_label.trim();
+    let expected_confirmation = format!(
+        "LOAD {} FOR RESTORE {} VOLUME {}",
+        authorization.typed_cartridge_label, run_id, authorization.volume_order
+    );
+    if !authorization.loaded_media_confirmed
+        || !authorization.attended_confirmed
+        || authorization.confirmation != expected_confirmation
+        || actor_label.is_empty()
+        || actor_label.len() > 256
+        || actor_label.chars().any(char::is_control)
+    {
+        return Ok(AuthorizeRestoreRehearsalMediaResult::Blocked(
+            "the exact attended read-only media confirmation is required".to_owned(),
+        ));
+    }
+    let mut transaction = pool.begin().await?;
+    let run = sqlx::query_as::<_, RestoreRehearsalRunRecord>(&format!(
+        "{RESTORE_REHEARSAL_RUN_SELECT} WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(run_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(run) = run else {
+        transaction.rollback().await?;
+        return Ok(AuthorizeRestoreRehearsalMediaResult::NotFound);
+    };
+    if run.cancel_requested_at.is_some() {
+        transaction.rollback().await?;
+        return Ok(AuthorizeRestoreRehearsalMediaResult::Blocked(
+            "the recovery rehearsal was cancelled before media authorization".to_owned(),
+        ));
+    }
+    let request = sqlx::query_as::<_, RestoreRehearsalMediaRequestRecord>(&format!(
+        "{RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT}
+         WHERE id = $1 AND restore_rehearsal_id = $2 FOR UPDATE"
+    ))
+    .bind(authorization.request_id)
+    .bind(run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(request) = request else {
+        transaction.rollback().await?;
+        return Ok(AuthorizeRestoreRehearsalMediaResult::NotFound);
+    };
+    let volume = sqlx::query_as::<_, RestoreRehearsalVolumeRecord>(&format!(
+        "{RESTORE_REHEARSAL_VOLUME_SELECT}
+         WHERE restore_rehearsal_id = $1 AND volume_order = $2 FOR UPDATE"
+    ))
+    .bind(run.id)
+    .bind(request.volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(volume) = volume else {
+        transaction.rollback().await?;
+        return Ok(AuthorizeRestoreRehearsalMediaResult::Blocked(
+            "the requested ordered restore volume no longer exists".to_owned(),
+        ));
+    };
+    let evidence = json!({
+        "confirmation": authorization.confirmation,
+        "loaded_media_confirmed": authorization.loaded_media_confirmed,
+        "attended_confirmed": authorization.attended_confirmed,
+        "typed_cartridge_label": authorization.typed_cartridge_label,
+        "drive_id": authorization.drive_id,
+        "expected_stable_id": authorization.expected_stable_id,
+        "volume_order": authorization.volume_order,
+        "read_only": true
+    });
+    if request.state != "pending" {
+        let idempotent = request.state == "authorized"
+            && request.authorized_cartridge_id == Some(authorization.cartridge_id)
+            && request.confirmation_evidence == evidence;
+        if idempotent {
+            transaction.commit().await?;
+            return Ok(AuthorizeRestoreRehearsalMediaResult::Authorized {
+                request: Box::new(request),
+                volume: Box::new(volume),
+                idempotent_replay: true,
+            });
+        }
+        transaction.rollback().await?;
+        return Ok(AuthorizeRestoreRehearsalMediaResult::Blocked(
+            "the restore media request was already answered differently".to_owned(),
+        ));
+    }
+    let expected_reservation = format!("restore_rehearsal:{}", run.id);
+    let drive = sqlx::query_as::<_, DriveRecord>(&format!(
+        "{DRIVE_SELECT} WHERE d.id = $1 FOR UPDATE OF d"
+    ))
+    .bind(authorization.drive_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let cartridge = sqlx::query_as::<_, RestoreRehearsalCartridgeBinding>(
+        "SELECT id, internal_label, media_generation, media_format,
+                on_tape_identity, identity_status, health_status, reserved_by,
+                confirmed_location_id
+         FROM cartridges WHERE id = $1 FOR UPDATE",
+    )
+    .bind(authorization.cartridge_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let (Some(drive), Some(cartridge)) = (drive, cartridge) else {
+        transaction.rollback().await?;
+        return Ok(AuthorizeRestoreRehearsalMediaResult::NotFound);
+    };
+    let job_state =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    let exact = run.state == "running"
+        && run.phase == "waiting_for_media"
+        && job_state == "waiting_for_media"
+        && authorization.drive_id == run.drive_id
+        && authorization.expected_stable_id == run.expected_stable_id
+        && drive.stable_id == run.expected_stable_id
+        && drive.observed_path.as_deref() == Some(run.expected_path.as_str())
+        && drive.vendor == run.expected_vendor
+        && drive.model == run.expected_model
+        && drive.serial == run.expected_serial
+        && drive.wwn == run.expected_wwn
+        && drive.firmware == run.expected_firmware
+        && authorization.volume_order == request.volume_order
+        && authorization.cartridge_id == request.expected_cartridge_id
+        && cartridge.id == volume.cartridge_id
+        && cartridge.internal_label == authorization.typed_cartridge_label
+        && cartridge.internal_label == volume.expected_cartridge_label
+        && cartridge.media_generation == volume.expected_media_generation
+        && cartridge.media_format == volume.expected_media_format
+        && cartridge.on_tape_identity.as_deref() == Some(volume.expected_on_tape_identity.as_str())
+        && request.expected_engine_volume_name == volume.expected_volume_label
+        && cartridge.identity_status == "reconciled"
+        && matches!(
+            cartridge.health_status.as_str(),
+            "written_verified" | "healthy" | "verified"
+        )
+        && cartridge.confirmed_location_id.is_some()
+        && cartridge.reserved_by.as_deref() == Some(expected_reservation.as_str())
+        && volume.active
+        && volume.state == "reserved"
+        && volume.media_lease_id.is_none()
+        && volume.media_fencing_token.is_none();
+    if !exact {
+        transaction.rollback().await?;
+        return Ok(AuthorizeRestoreRehearsalMediaResult::Blocked(
+            "the drive, exact cartridge, ordered volume, custody, or retained identity changed"
+                .to_owned(),
+        ));
+    }
+    if let Some(reason) = drive_motion_blocker(&drive) {
+        transaction.rollback().await?;
+        return Ok(AuthorizeRestoreRehearsalMediaResult::Blocked(reason));
+    }
+    let readable = drive
+        .generation
+        .and_then(drive_generation)
+        .zip(media_format(
+            cartridge.media_generation,
+            cartridge.media_format.as_deref(),
+        ))
+        .is_some_and(|(drive, media)| can_read(drive, media));
+    if !readable
+        || !single_tape_qualification_passed(&mut transaction, &drive, cartridge.id).await?
+    {
+        transaction.rollback().await?;
+        return Ok(AuthorizeRestoreRehearsalMediaResult::Blocked(
+            "the exact drive/cartridge pair is no longer read-eligible and qualified".to_owned(),
+        ));
+    }
+    let prior_complete = sqlx::query_scalar::<_, bool>(
+        "SELECT NOT EXISTS(
+             SELECT 1 FROM restore_rehearsal_volumes
+             WHERE restore_rehearsal_id = $1 AND volume_order < $2
+               AND (NOT active OR state <> 'completed'))",
+    )
+    .bind(run.id)
+    .bind(volume.volume_order)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let live_drive_owner = sqlx::query_scalar::<_, Uuid>(
+        "SELECT owner_id FROM resource_leases
+         WHERE id = $1 AND resource_kind = 'drive' AND resource_id = $2::text
+           AND fencing_token = $3 AND released_at IS NULL AND expires_at > now()",
+    )
+    .bind(run.drive_lease_id)
+    .bind(run.drive_id)
+    .bind(run.drive_fencing_token)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let media_conflict = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM resource_leases
+             WHERE resource_kind = 'media' AND resource_id = $1::text
+               AND released_at IS NULL AND expires_at > now())",
+    )
+    .bind(cartridge.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !prior_complete || live_drive_owner.is_none() || media_conflict {
+        transaction.rollback().await?;
+        return Ok(AuthorizeRestoreRehearsalMediaResult::Blocked(
+            "the prior volume is incomplete, the drive fence expired, or the requested tape is leased"
+                .to_owned(),
+        ));
+    }
+    sqlx::query(
+        "UPDATE restore_rehearsal_media_requests
+         SET state = 'authorized', authorized_cartridge_id = $1,
+             authorized_at = now(), confirmation_evidence = $2
+         WHERE id = $3 AND state = 'pending'",
+    )
+    .bind(cartridge.id)
+    .bind(&evidence)
+    .bind(request.id)
+    .execute(&mut *transaction)
+    .await?;
+    append_restore_rehearsal_event_in_transaction(
+        &mut transaction,
+        run.id,
+        run.correlation_id,
+        "media_authorized",
+        json!({
+            "media_request_id": request.id,
+            "volume_order": request.volume_order,
+            "cartridge_id": cartridge.id,
+            "cartridge_label": cartridge.internal_label,
+            "loaded_media_identity_basis": "attended_operator_attestation_and_inventory_binding",
+            "machine_verified_loaded_cartridge": false,
+            "read_only": true
+        }),
+        actor_label,
+    )
+    .await?;
+    let request = sqlx::query_as::<_, RestoreRehearsalMediaRequestRecord>(&format!(
+        "{RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT} WHERE id = $1"
+    ))
+    .bind(request.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(AuthorizeRestoreRehearsalMediaResult::Authorized {
+        request: Box::new(request),
+        volume: Box::new(volume),
+        idempotent_replay: false,
+    })
+}
+
+pub async fn load_authorized_restore_rehearsal_media(
+    pool: &PgPool,
+    claim: &ClaimedRestoreRehearsalRun,
+    request_id: Uuid,
+) -> Result<LoadRestoreRehearsalMediaResult, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_restore_rehearsal_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::FencedOut);
+    }
+    if restore_rehearsal_cancel_pending_in_transaction(&mut transaction, claim.run.id).await? {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::Blocked(
+            "the recovery rehearsal was cancelled before the authorized cartridge could be leased"
+                .to_owned(),
+        ));
+    }
+    let request = sqlx::query_as::<_, RestoreRehearsalMediaRequestRecord>(&format!(
+        "{RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT}
+         WHERE id = $1 AND restore_rehearsal_id = $2 FOR UPDATE"
+    ))
+    .bind(request_id)
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(request) = request else {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::Blocked(
+            "the authorized restore media request no longer exists".to_owned(),
+        ));
+    };
+    if request.state != "authorized"
+        || request.authorized_cartridge_id != Some(request.expected_cartridge_id)
+    {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::Blocked(
+            "the restore media request is not exactly authorized".to_owned(),
+        ));
+    }
+    let (run_phase, job_state) = sqlx::query_as::<_, (String, String)>(
+        "SELECT rehearsal.phase, job_run.state
+         FROM restore_rehearsals rehearsal
+         JOIN job_runs job_run ON job_run.id = rehearsal.job_run_id
+         WHERE rehearsal.id = $1
+         FOR UPDATE OF rehearsal, job_run",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if run_phase != "waiting_for_media" || job_state != "waiting_for_media" {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::Blocked(
+            "the restore is no longer durably waiting for this cartridge".to_owned(),
+        ));
+    }
+    let volume = sqlx::query_as::<_, RestoreRehearsalVolumeRecord>(&format!(
+        "{RESTORE_REHEARSAL_VOLUME_SELECT}
+         WHERE restore_rehearsal_id = $1 AND volume_order = $2 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(request.volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(volume) = volume else {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::Blocked(
+            "the authorized ordered restore volume is missing".to_owned(),
+        ));
+    };
+    let drive = sqlx::query_as::<_, DriveRecord>(&format!(
+        "{DRIVE_SELECT} WHERE d.id = $1 FOR UPDATE OF d"
+    ))
+    .bind(claim.run.drive_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let cartridge = sqlx::query_as::<_, RestoreRehearsalCartridgeBinding>(
+        "SELECT id, internal_label, media_generation, media_format,
+                on_tape_identity, identity_status, health_status, reserved_by,
+                confirmed_location_id
+         FROM cartridges WHERE id = $1 FOR UPDATE",
+    )
+    .bind(volume.cartridge_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let expected_reservation = format!("restore_rehearsal:{}", claim.run.id);
+    let prior_complete = sqlx::query_scalar::<_, bool>(
+        "SELECT NOT EXISTS(
+             SELECT 1 FROM restore_rehearsal_volumes
+             WHERE restore_rehearsal_id = $1 AND volume_order < $2
+               AND (NOT active OR state <> 'completed'))",
+    )
+    .bind(claim.run.id)
+    .bind(volume.volume_order)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let exact = prior_complete
+        && drive.stable_id == claim.run.expected_stable_id
+        && drive.observed_path.as_deref() == Some(claim.run.expected_path.as_str())
+        && drive.vendor == claim.run.expected_vendor
+        && drive.model == claim.run.expected_model
+        && drive.serial == claim.run.expected_serial
+        && drive.wwn == claim.run.expected_wwn
+        && drive.firmware == claim.run.expected_firmware
+        && volume.active
+        && volume.state == "reserved"
+        && volume.cartridge_id == request.expected_cartridge_id
+        && volume.expected_cartridge_label == request.expected_cartridge_label
+        && volume.expected_volume_label == request.expected_engine_volume_name
+        && cartridge.internal_label == volume.expected_cartridge_label
+        && cartridge.media_generation == volume.expected_media_generation
+        && cartridge.media_format == volume.expected_media_format
+        && cartridge.on_tape_identity.as_deref() == Some(volume.expected_on_tape_identity.as_str())
+        && cartridge.identity_status == "reconciled"
+        && matches!(
+            cartridge.health_status.as_str(),
+            "written_verified" | "healthy" | "verified"
+        )
+        && cartridge.confirmed_location_id.is_some()
+        && cartridge.reserved_by.as_deref() == Some(expected_reservation.as_str());
+    if !exact {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::Blocked(
+            "the authorized restore cartridge changed before worker revalidation".to_owned(),
+        ));
+    }
+    if let Some(reason) = drive_motion_blocker(&drive) {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::Blocked(reason));
+    }
+    let readable = drive
+        .generation
+        .and_then(drive_generation)
+        .zip(media_format(
+            cartridge.media_generation,
+            cartridge.media_format.as_deref(),
+        ))
+        .is_some_and(|(drive, media)| can_read(drive, media));
+    if !readable
+        || !single_tape_qualification_passed(&mut transaction, &drive, cartridge.id).await?
+    {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::Blocked(
+            "the authorized drive/cartridge pair failed worker-side read revalidation".to_owned(),
+        ));
+    }
+    sqlx::query(
+        "UPDATE resource_leases SET released_at = now()
+         WHERE resource_kind = 'media' AND resource_id = $1::text
+           AND released_at IS NULL AND expires_at <= now()",
+    )
+    .bind(cartridge.id)
+    .execute(&mut *transaction)
+    .await?;
+    let media_lease_id = Uuid::now_v7();
+    let media_fencing_token = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO resource_leases
+            (id, resource_kind, resource_id, owner_id, fencing_token, expires_at)
+         VALUES ($1, 'media', $2::text, $3, nextval('resource_fencing_token_seq'),
+                 now() + interval '30 minutes')
+         ON CONFLICT DO NOTHING RETURNING fencing_token",
+    )
+    .bind(media_lease_id)
+    .bind(cartridge.id)
+    .bind(claim.worker_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(media_fencing_token) = media_fencing_token else {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::Blocked(
+            "the authorized restore cartridge is leased by another operation".to_owned(),
+        ));
+    };
+    let volume_updated = sqlx::query(
+        "UPDATE restore_rehearsal_volumes
+         SET state = 'loaded', media_lease_id = $1, media_fencing_token = $2,
+             loaded_at = now(), updated_at = now()
+         WHERE id = $3 AND state = 'reserved' AND active",
+    )
+    .bind(media_lease_id)
+    .bind(media_fencing_token)
+    .bind(volume.id)
+    .execute(&mut *transaction)
+    .await?;
+    let request_updated = sqlx::query(
+        "UPDATE restore_rehearsal_media_requests
+         SET state = 'loaded', loaded_at = now()
+         WHERE id = $1 AND state = 'authorized'",
+    )
+    .bind(request.id)
+    .execute(&mut *transaction)
+    .await?;
+    if volume_updated.rows_affected() != 1 || request_updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::Blocked(
+            "the restore media handoff changed while the worker acquired its lease".to_owned(),
+        ));
+    }
+    let rehearsal_updated = sqlx::query(
+        "UPDATE restore_rehearsals SET phase = 'restoring'
+         WHERE id = $1 AND state = 'running' AND phase = 'waiting_for_media'",
+    )
+    .bind(claim.run.id)
+    .execute(&mut *transaction)
+    .await?;
+    let job_updated = sqlx::query(
+        "UPDATE job_runs SET state = 'restoring'
+         WHERE id = $1 AND state = 'waiting_for_media' AND finished_at IS NULL",
+    )
+    .bind(claim.run.job_run_id)
+    .execute(&mut *transaction)
+    .await?;
+    if rehearsal_updated.rows_affected() != 1 || job_updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(LoadRestoreRehearsalMediaResult::Blocked(
+            "the restore phase changed while the cartridge lease was acquired".to_owned(),
+        ));
+    }
+    let transition_evidence = json!({
+        "media_request_id": request.id,
+        "volume_order": request.volume_order,
+        "cartridge_id": cartridge.id,
+        "media_lease_id": media_lease_id,
+        "media_fencing_token": media_fencing_token,
+        "drive_lease_id": claim.drive_lease_id,
+        "drive_fencing_token": claim.drive_fencing_token,
+        "read_only": true
+    });
+    append_job_transition(
+        &mut transaction,
+        claim.run.job_run_id,
+        Some("waiting_for_media"),
+        "restoring",
+        "worker revalidated and leased the exact next restore cartridge",
+        transition_evidence.clone(),
+        claim.run.correlation_id,
+    )
+    .await?;
+    append_restore_rehearsal_event_in_transaction(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "media_loaded",
+        transition_evidence,
+        "tapescale-worker",
+    )
+    .await?;
+    let request = sqlx::query_as::<_, RestoreRehearsalMediaRequestRecord>(&format!(
+        "{RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT} WHERE id = $1"
+    ))
+    .bind(request.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let volume = sqlx::query_as::<_, RestoreRehearsalVolumeRecord>(&format!(
+        "{RESTORE_REHEARSAL_VOLUME_SELECT} WHERE id = $1"
+    ))
+    .bind(volume.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(LoadRestoreRehearsalMediaResult::Loaded(Box::new(
+        LoadedRestoreRehearsalMedia {
+            request,
+            volume,
+            media_lease_id,
+            media_fencing_token,
+        },
+    )))
+}
+
+pub async fn complete_restore_rehearsal_volume(
+    pool: &PgPool,
+    claim: &ClaimedRestoreRehearsalRun,
+    volume_order: i32,
+) -> Result<bool, sqlx::Error> {
+    if volume_order <= 0 || volume_order > claim.run.volume_count {
+        return Ok(false);
+    }
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_restore_rehearsal_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let volume = sqlx::query_as::<_, RestoreRehearsalVolumeRecord>(&format!(
+        "{RESTORE_REHEARSAL_VOLUME_SELECT}
+         WHERE restore_rehearsal_id = $1 AND volume_order = $2 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(volume) = volume else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    if volume.state == "completed" && volume.active {
+        transaction.commit().await?;
+        return Ok(true);
+    }
+    let (Some(media_lease_id), Some(media_fencing_token)) =
+        (volume.media_lease_id, volume.media_fencing_token)
+    else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    if !volume.active || volume.state != "loaded" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let lease = sqlx::query(
+        "UPDATE resource_leases SET released_at = now()
+         WHERE id = $1 AND resource_kind = 'media' AND resource_id = $2::text
+           AND owner_id = $3 AND fencing_token = $4
+           AND released_at IS NULL AND expires_at > now()",
+    )
+    .bind(media_lease_id)
+    .bind(volume.cartridge_id)
+    .bind(claim.worker_id)
+    .bind(media_fencing_token)
+    .execute(&mut *transaction)
+    .await?;
+    if lease.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let prior_complete = sqlx::query_scalar::<_, bool>(
+        "SELECT NOT EXISTS(
+             SELECT 1 FROM restore_rehearsal_volumes
+             WHERE restore_rehearsal_id = $1 AND volume_order < $2
+               AND (NOT active OR state <> 'completed'))",
+    )
+    .bind(claim.run.id)
+    .bind(volume_order)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !prior_complete {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE restore_rehearsal_volumes
+         SET state = 'completed', completed_at = now(), updated_at = now()
+         WHERE id = $1 AND state = 'loaded' AND active",
+    )
+    .bind(volume.id)
+    .execute(&mut *transaction)
+    .await?;
+    let request = sqlx::query_as::<_, RestoreRehearsalMediaRequestRecord>(&format!(
+        "{RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT}
+         WHERE restore_rehearsal_id = $1 AND volume_order = $2 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if let Some(request) = &request {
+        if request.state != "loaded" || request.authorized_cartridge_id != Some(volume.cartridge_id)
+        {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE restore_rehearsal_media_requests
+             SET state = 'completed', completed_at = now()
+             WHERE id = $1 AND state = 'loaded'",
+        )
+        .bind(request.id)
+        .execute(&mut *transaction)
+        .await?;
+    } else if volume_order != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    append_restore_rehearsal_event_in_transaction(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "media_read",
+        json!({
+            "media_request_id": request.as_ref().map(|request| request.id),
+            "volume_order": volume_order,
+            "volume_count": claim.run.volume_count,
+            "cartridge_id": volume.cartridge_id,
+            "media_lease_id": media_lease_id,
+            "media_fencing_token": media_fencing_token,
+            "read_only": true
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+pub async fn complete_restore_rehearsal_media_request(
+    pool: &PgPool,
+    claim: &ClaimedRestoreRehearsalRun,
+    request_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let request = sqlx::query_as::<_, RestoreRehearsalMediaRequestRecord>(&format!(
+        "{RESTORE_REHEARSAL_MEDIA_REQUEST_SELECT}
+         WHERE id = $1 AND restore_rehearsal_id = $2"
+    ))
+    .bind(request_id)
+    .bind(claim.run.id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(request) = request else {
+        return Ok(false);
+    };
+    if request.state == "completed" {
+        return Ok(true);
+    }
+    if request.state != "loaded" {
+        return Ok(false);
+    }
+    complete_restore_rehearsal_volume(pool, claim, request.volume_order).await
 }
 
 pub async fn restore_rehearsal_cancellation_requested(
@@ -10408,6 +11799,65 @@ pub async fn finalize_restore_rehearsal_pass(
             "a rehearsal can pass only after physical restore and comparison".to_owned(),
         ));
     }
+    let volumes = sqlx::query_as::<_, RestoreRehearsalVolumeRecord>(&format!(
+        "{RESTORE_REHEARSAL_VOLUME_SELECT}
+         WHERE restore_rehearsal_id = $1 ORDER BY volume_order FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let open_media_request = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1 FROM restore_rehearsal_media_requests
+             WHERE restore_rehearsal_id = $1
+               AND state IN ('pending', 'authorized', 'loaded'))",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let complete_ordered_set = !volumes.is_empty()
+        && i32::try_from(volumes.len()) == Ok(claim.run.volume_count)
+        && volumes.iter().enumerate().all(|(index, volume)| {
+            i32::try_from(index + 1) == Ok(volume.volume_order)
+                && volume.restore_rehearsal_id == claim.run.id
+                && volume.active
+                && volume.state == "completed"
+                && volume.completed_at.is_some()
+        });
+    if !complete_ordered_set || open_media_request {
+        transaction.rollback().await?;
+        return Ok(FinalizeRestoreRehearsalResult::Rejected(
+            "every ordered restore volume must be durably read and no media handoff may remain open"
+                .to_owned(),
+        ));
+    }
+    let ordered_media_ids = volumes
+        .iter()
+        .map(|volume| volume.cartridge_id)
+        .collect::<Vec<_>>();
+    let ordered_volume_evidence = Value::Array(
+        volumes
+            .iter()
+            .map(|volume| {
+                json!({
+                    "volume_order": volume.volume_order,
+                    "cartridge_label": volume.expected_cartridge_label,
+                    "volume_label": volume.expected_volume_label,
+                    "engine_media_id": volume.expected_engine_media_id
+                })
+            })
+            .collect(),
+    );
+    let report_volume_set_valid = result.get("volume_count").and_then(Value::as_u64)
+        == u64::try_from(volumes.len()).ok()
+        && result.get("volumes") == Some(&ordered_volume_evidence);
+    if !report_volume_set_valid {
+        transaction.rollback().await?;
+        return Ok(FinalizeRestoreRehearsalResult::Rejected(
+            "the pass report does not contain the exact complete ordered restore-volume evidence"
+                .to_owned(),
+        ));
+    }
     let artifacts = sqlx::query_as::<_, RestoreRehearsalArtifactRecord>(
         "SELECT id, artifact_kind, storage_ref, sha256, size_bytes, metadata, created_at
          FROM restore_rehearsal_artifacts
@@ -10457,6 +11907,9 @@ pub async fn finalize_restore_rehearsal_pass(
             == Some(restore_job_id_i64)
         && engine.metadata.get("volume").and_then(Value::as_str)
             == Some(claim.run.expected_volume_label.as_str())
+        && engine.metadata.get("volume_count").and_then(Value::as_u64)
+            == u64::try_from(volumes.len()).ok()
+        && engine.metadata.get("volumes") == Some(&ordered_volume_evidence)
         && engine
             .metadata
             .get("destination")
@@ -10496,7 +11949,10 @@ pub async fn finalize_restore_rehearsal_pass(
             .metadata
             .get("restored_manifest_digest")
             .and_then(Value::as_str)
-            == Some(claim.run.source_manifest_digest.as_str());
+            == Some(claim.run.source_manifest_digest.as_str())
+        && report.metadata.get("volume_count").and_then(Value::as_u64)
+            == u64::try_from(volumes.len()).ok()
+        && report.metadata.get("volumes") == Some(&ordered_volume_evidence);
     if !engine_valid || !restored_valid || !comparison_valid || !report_valid {
         transaction.rollback().await?;
         return Ok(FinalizeRestoreRehearsalResult::Rejected(
@@ -10524,6 +11980,9 @@ pub async fn finalize_restore_rehearsal_pass(
         "bacula_backup_job_id": claim.run.backup_job_id,
         "bacula_restore_job_id": restore_job_id_i64,
         "bacula_media_id": claim.run.expected_engine_media_id,
+        "ordered_media_ids": ordered_media_ids,
+        "volume_count": claim.run.volume_count,
+        "volumes": ordered_volume_evidence,
         "engine_operation_id": expected_engine_operation_id,
         "physical_media_readback": true,
         "matched": true,
@@ -10534,18 +11993,20 @@ pub async fn finalize_restore_rehearsal_pass(
         "INSERT INTO verification_records
             (id, recovery_point_id, kind, scope, outcome, drive_id, media_ids,
              evidence, correlation_id, started_at, finished_at)
-         VALUES ($1, $2, 'restore_test', $3, 'passed', $4, ARRAY[$5]::uuid[],
+         VALUES ($1, $2, 'restore_test', $3, 'passed', $4, $5::uuid[],
                  $6, $7, $8, now())",
     )
     .bind(verification_record_id)
     .bind(claim.run.recovery_point_id)
     .bind(json!({
-        "scope": "complete attended single-volume file recovery replay",
+        "scope": "complete attended ordered-volume file recovery replay",
+        "volume_count": claim.run.volume_count,
+        "ordered_media_ids": ordered_media_ids,
         "source_manifest_digest": claim.run.source_manifest_digest,
         "destination_subpath": claim.run.destination_subpath
     }))
     .bind(claim.run.drive_id)
-    .bind(claim.run.cartridge_id)
+    .bind(&ordered_media_ids)
     .bind(&verification_evidence)
     .bind(claim.run.correlation_id)
     .bind(started_at)
@@ -10559,7 +12020,9 @@ pub async fn finalize_restore_rehearsal_pass(
         "restore_job_id": restore_job_id_i64,
         "source_manifest_digest": claim.run.source_manifest_digest,
         "production_eligible": false,
-        "execution_scope": "attended_single_volume_file_restore",
+        "execution_scope": "attended_ordered_volume_file_restore",
+        "volume_count": claim.run.volume_count,
+        "ordered_media_ids": ordered_media_ids,
         "evidence": result
     });
     let updated = sqlx::query(
@@ -10636,13 +12099,20 @@ pub async fn recover_expired_restore_rehearsal_runs(pool: &PgPool) -> Result<u64
              FROM restore_rehearsals rehearsal
              LEFT JOIN resource_leases drive_lease
                ON drive_lease.id = rehearsal.drive_lease_id
-             LEFT JOIN resource_leases media_lease
-               ON media_lease.id = rehearsal.media_lease_id
              WHERE rehearsal.state = 'running'
                AND (drive_lease.id IS NULL OR drive_lease.released_at IS NOT NULL
                     OR drive_lease.expires_at <= now()
-                    OR media_lease.id IS NULL OR media_lease.released_at IS NOT NULL
-                    OR media_lease.expires_at <= now())
+                    OR EXISTS(
+                        SELECT 1
+                        FROM restore_rehearsal_volumes volume
+                        LEFT JOIN resource_leases media_lease
+                          ON media_lease.id = volume.media_lease_id
+                        WHERE volume.restore_rehearsal_id = rehearsal.id
+                          AND volume.active AND volume.state = 'loaded'
+                          AND (media_lease.id IS NULL
+                               OR media_lease.released_at IS NOT NULL
+                               OR media_lease.expires_at <= now())
+                    ))
          ) FOR UPDATE"
     ))
     .fetch_all(&mut *transaction)
@@ -11134,6 +12604,18 @@ mod recovery_vault_tests {
         assert!(bounded
             .as_str()
             .is_some_and(|value| value.ends_with("…[truncated]")));
+    }
+
+    #[test]
+    fn restore_manifest_artifact_limit_matches_the_worker_read_bound() {
+        assert!(!restore_manifest_artifact_size_supported(0));
+        assert!(restore_manifest_artifact_size_supported(
+            i64::try_from(RESTORE_MANIFEST_ARTIFACT_MAX_BYTES).expect("fixed limit fits i64")
+        ));
+        assert!(!restore_manifest_artifact_size_supported(
+            i64::try_from(RESTORE_MANIFEST_ARTIFACT_MAX_BYTES + 1)
+                .expect("fixed limit plus one fits i64")
+        ));
     }
 
     #[test]

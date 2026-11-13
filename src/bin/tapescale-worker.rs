@@ -191,8 +191,12 @@ async fn main() -> Result<()> {
         warn!(
             source_root = %config.source_root.display(),
             restore_root = %config.restore_root.display(),
+            spool_directory = %config.bacula_spool_dir.display(),
+            spool_maximum_bytes = config.bacula_spool_max_bytes,
+            spool_reserve_bytes = config.bacula_spool_reserve_bytes,
+            spool_minimum_bytes = config.bacula_spool_min_bytes,
             timeout_seconds = config.data_run_timeout.as_secs(),
-            "attended Bacula compressed multi-tape Full backup, ordered physical readback, and single-volume recovery-exercise execution are enabled; they are not production-qualified"
+            "attended Bacula compressed multi-tape Full backup with bounded disk spooling, ordered physical readback, and recovery-exercise execution are enabled; they are not production-qualified"
         );
     }
     let btape_config = BtapeQualificationConfig {
