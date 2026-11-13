@@ -1,5 +1,5 @@
 use axum::{
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -60,7 +60,7 @@ impl IntoResponse for AppError {
                 )
             }
         };
-        (
+        let mut response = (
             status,
             Json(ErrorBody {
                 error: ErrorDetail {
@@ -70,6 +70,11 @@ impl IntoResponse for AppError {
                 },
             }),
         )
-            .into_response()
+            .into_response();
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+        response
     }
 }

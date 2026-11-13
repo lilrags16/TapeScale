@@ -370,6 +370,14 @@ pub struct RecoveryArtifactRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, FromRow)]
+pub struct RecoveryPointManifestBinding {
+    pub storage_ref: Option<String>,
+    pub artifact_sha256: Option<String>,
+    pub artifact_size_bytes: Option<i64>,
+    pub manifest_digest: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RecoveryAggregateCaps {
     pub dependencies_truncated: bool,
@@ -700,6 +708,8 @@ pub struct ClaimedQualificationRun {
 #[derive(Clone, Debug)]
 pub enum QueueQualificationRunResult {
     Queued(Box<QualificationRunRecord>),
+    Existing(Box<QualificationRunRecord>),
+    IdempotencyConflict,
     NotFound,
     Blocked(String),
 }
@@ -2173,7 +2183,108 @@ pub async fn queue_qualification_run(
     scratch_media_confirmed: bool,
     destructive_overwrite_confirmed: bool,
 ) -> Result<QueueQualificationRunResult, sqlx::Error> {
+    queue_qualification_run_inner(
+        pool,
+        drive_id,
+        expected_stable_id,
+        cartridge_id,
+        typed_cartridge_label,
+        scratch_media_confirmed,
+        destructive_overwrite_confirmed,
+        None,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn queue_qualification_run_idempotent(
+    pool: &PgPool,
+    drive_id: Uuid,
+    expected_stable_id: &str,
+    cartridge_id: Uuid,
+    typed_cartridge_label: &str,
+    scratch_media_confirmed: bool,
+    destructive_overwrite_confirmed: bool,
+    idempotency_key: &str,
+    request_fingerprint: &str,
+    creation_enabled: bool,
+) -> Result<QueueQualificationRunResult, sqlx::Error> {
+    queue_qualification_run_inner(
+        pool,
+        drive_id,
+        expected_stable_id,
+        cartridge_id,
+        typed_cartridge_label,
+        scratch_media_confirmed,
+        destructive_overwrite_confirmed,
+        Some((idempotency_key, request_fingerprint)),
+        creation_enabled,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn queue_qualification_run_inner(
+    pool: &PgPool,
+    drive_id: Uuid,
+    expected_stable_id: &str,
+    cartridge_id: Uuid,
+    typed_cartridge_label: &str,
+    scratch_media_confirmed: bool,
+    destructive_overwrite_confirmed: bool,
+    idempotency: Option<(&str, &str)>,
+    creation_enabled: bool,
+) -> Result<QueueQualificationRunResult, sqlx::Error> {
+    if let Some((key, fingerprint)) = idempotency {
+        if key.is_empty()
+            || key.len() > 256
+            || key.chars().any(char::is_control)
+            || fingerprint.len() != 64
+            || !fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Ok(QueueQualificationRunResult::Blocked(
+                "the qualification idempotency key or request fingerprint is invalid".to_owned(),
+            ));
+        }
+    }
     let mut transaction = pool.begin().await?;
+    if let Some((key, fingerprint)) = idempotency {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!("tapescale:qualification:{key}"))
+            .execute(&mut *transaction)
+            .await?;
+        let existing = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT id, request_fingerprint
+             FROM qualification_runs
+             WHERE idempotency_key = $1
+             FOR UPDATE",
+        )
+        .bind(key)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some((id, existing_fingerprint)) = existing {
+            if existing_fingerprint != fingerprint {
+                transaction.rollback().await?;
+                return Ok(QueueQualificationRunResult::IdempotencyConflict);
+            }
+            let run = sqlx::query_as(&format!("{QUALIFICATION_RUN_SELECT} WHERE id = $1"))
+                .bind(id)
+                .fetch_one(&mut *transaction)
+                .await?;
+            transaction.commit().await?;
+            return Ok(QueueQualificationRunResult::Existing(Box::new(run)));
+        }
+        if !creation_enabled {
+            transaction.rollback().await?;
+            return Ok(QueueQualificationRunResult::Blocked(
+                "destructive lab tape qualification is disabled; existing requests remain available for idempotent replay"
+                    .to_owned(),
+            ));
+        }
+    }
     let drive = sqlx::query_as::<_, DriveRecord>(&format!(
         "{DRIVE_SELECT} WHERE d.id = $1 FOR UPDATE OF d"
     ))
@@ -2255,9 +2366,9 @@ pub async fn queue_qualification_run(
              expected_vendor, expected_model, expected_serial, expected_wwn, expected_firmware,
              expected_cartridge_label, expected_media_generation, expected_media_format,
              scratch_media_confirmed, destructive_overwrite_confirmed,
-             requested_by_label, correlation_id)
+             idempotency_key, request_fingerprint, requested_by_label, correlation_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                 $11, $12, $13, $14, $15, 'local-api', $16)",
+                 $11, $12, $13, $14, $15, $16, $17, 'local-api', $18)",
     )
     .bind(id)
     .bind(drive_id)
@@ -2274,6 +2385,8 @@ pub async fn queue_qualification_run(
     .bind(&cartridge.media_format)
     .bind(scratch_media_confirmed)
     .bind(destructive_overwrite_confirmed)
+    .bind(idempotency.map(|(key, _)| key))
+    .bind(idempotency.map(|(_, fingerprint)| fingerprint))
     .bind(correlation_id)
     .execute(&mut *transaction)
     .await?;
@@ -5531,6 +5644,32 @@ pub async fn list_recovery_points(pool: &PgPool) -> Result<Vec<RecoveryPointReco
          ORDER BY rp.recovery_time DESC",
     )
     .fetch_all(pool)
+    .await
+}
+
+/// Resolve the content-addressed source manifest retained by the physical run
+/// that created a recovery point. Optional artifact fields distinguish an
+/// existing point with no browsable manifest from a missing recovery point.
+pub async fn recovery_point_manifest_binding(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<RecoveryPointManifestBinding>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT artifact.storage_ref,
+                artifact.sha256 AS artifact_sha256,
+                artifact.size_bytes AS artifact_size_bytes,
+                artifact.metadata->>'manifest_digest' AS manifest_digest
+         FROM recovery_points recovery_point
+         LEFT JOIN single_tape_data_runs data_run
+           ON data_run.job_run_id = recovery_point.run_id
+         LEFT JOIN single_tape_data_artifacts artifact
+           ON artifact.single_tape_data_run_id = data_run.id
+          AND artifact.artifact_kind = 'source_manifest'
+          AND recovery_point.coverage->>'source_manifest_artifact_id' = artifact.id::text
+         WHERE recovery_point.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
     .await
 }
 

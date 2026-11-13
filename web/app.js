@@ -2,6 +2,7 @@
   "use strict";
 
   const API = "/api/v1";
+  const sourceBrowserEndpoint = "/source-browser";
   const endpoints = {
     system: "/system",
     overview: "/overview",
@@ -108,6 +109,11 @@
     recoveryPointStatus: "all",
     recoveryPointRepresentation: "all",
     recoveryPointDetailLoading: new Set(),
+    recoveryFileBrowsers: {},
+    recoveryFileBrowserOpen: new Set(),
+    recoveryFileBrowserLoading: new Set(),
+    recoveryFileBrowserErrors: {},
+    recoveryFileBrowserRequests: {},
     restoreRehearsalDetailLoading: new Set(),
     movementDetailLoading: new Set(),
     restorePlanDrafts: {},
@@ -120,6 +126,16 @@
   const shell = document.querySelector("#app-shell");
   const live = document.querySelector("#live-region");
   let modalReturnFocus = null;
+  let sourceBrowserRequest = 0;
+  let sourceBrowserPath = "";
+  let sourceBrowserReadOnly = null;
+  let sourceBrowserSelectable = false;
+  let sourceBrowserTarget = {
+    inputId: "backup-source-subpath",
+    panelId: "backup-source-browser",
+    summaryId: "backup-source-selection",
+    nameId: "backup-profile-name"
+  };
 
   function esc(value) {
     return String(value == null ? "" : value)
@@ -1140,9 +1156,10 @@
   function renderMedia() {
     const inventory = orderedMedia();
     const selected = selectedMedia();
+    const initialize = '<button class="button button-danger" type="button" data-action="initialize-tape"' + (selected ? ' data-media-id="' + esc(recordId(selected)) + '"' : "") + '>Initialize tape</button>';
     const add = '<button class="button button-quiet" type="button" data-action="add-media">Register cartridge</button>';
     const createPool = '<button class="button button-quiet" type="button" data-action="create-media-pool">Create pool</button>';
-    let html = pageHead("Media Control Center", "Operational cartridge inventory, retention controls, and read-only reuse decisions.", refreshButton() + createPool + add) + noticeFor("media") + noticeFor("mediaPools");
+    let html = pageHead("Media Control Center", "Operational cartridge inventory, retention controls, and read-only reuse decisions.", refreshButton() + createPool + add + initialize) + noticeFor("media") + noticeFor("mediaPools");
     if (!inventory.length) return html + renderMediaPools() + empty("No cartridges", state.errors.media ? "Cartridge inventory could not be loaded." : "Register a cartridge to begin building the operational inventory.", add);
     const protectedCount = inventory.filter((item) => pick(item, "dependency_graph_truncated") === true || mediaRecoveryPointCount(item) > 0 || count(pick(item, "indefinite_archive_claims", "indefinite_claims")) > 0 || mediaOperationalState(item) === "protected").length;
     const heldCount = inventory.reduce((total, item) => total + count(pick(item, "active_holds", "hold_count")), 0);
@@ -1431,6 +1448,122 @@
     }).join("") + "</ol></details>";
   }
 
+  function recoveryFileBreadcrumbs(pointId, path) {
+    const segments = String(path || "").split("/").filter(Boolean);
+    const crumbs = ['<button class="source-browser-crumb" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path=""><span aria-hidden="true">⌂</span><span>backup root</span></button>'];
+    let accumulated = "";
+    segments.forEach((segment) => {
+      accumulated = sourceBrowserJoin(accumulated, segment);
+      crumbs.push('<span class="source-browser-separator" aria-hidden="true">/</span><button class="source-browser-crumb" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(accumulated) + '">' + esc(segment) + "</button>");
+    });
+    return crumbs.join("");
+  }
+
+  function recoveryFileEntry(entry, currentPath, pointId) {
+    const kind = sourceBrowserEntryKind(entry);
+    const name = String(pick(entry, "name", "display_name") || "Unnamed entry");
+    const path = String(pick(entry, "path", "relative_path") || sourceBrowserJoin(currentPath, name));
+    const modified = pick(entry, "modified_at", "mtime", "last_modified");
+    const size = pick(entry, "size_bytes", "size");
+    const linkTarget = pick(entry, "link_target", "target");
+    const icon = kind === "directory" ? "▰" : kind === "symlink" ? "↗" : kind === "file" ? "▤" : "?";
+    const facts = [kind === "directory" ? "Folder" : kind === "symlink" ? "Symbolic link" : kind === "file" ? "File" : "Unsupported object"];
+    if (kind === "file" && size !== null && size !== undefined) facts.push(bytes(size));
+    if (modified) facts.push(label(modified));
+    if (kind === "symlink" && linkTarget) facts.push("→ " + linkTarget);
+    const nameControl = kind === "directory"
+      ? '<button class="source-browser-name" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(path) + '" aria-label="Open retained folder ' + esc(name) + '"><strong>' + esc(name) + "</strong><small>" + esc(facts.join(" · ")) + "</small></button>"
+      : '<div class="source-browser-name"><strong>' + esc(name) + "</strong><small>" + esc(facts.join(" · ")) + "</small></div>";
+    const action = kind === "directory"
+      ? '<button class="button button-quiet button-small" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(path) + '">Open</button>'
+      : '<span class="source-browser-entry-note">Browse only</span>';
+    return '<div class="source-browser-entry ' + esc(kind) + '" role="row"><span class="source-browser-icon" aria-hidden="true">' + icon + '</span>' + nameControl + '<div class="source-browser-entry-action">' + action + "</div></div>";
+  }
+
+  async function loadRecoveryPointFiles(pointId, path, focusEntries) {
+    if (!pointId) return;
+    const requestedPath = String(path || "");
+    const requestNumber = (state.recoveryFileBrowserRequests[pointId] || 0) + 1;
+    state.recoveryFileBrowserRequests[pointId] = requestNumber;
+    state.recoveryFileBrowserOpen.add(pointId);
+    state.recoveryFileBrowserLoading.add(pointId);
+    delete state.recoveryFileBrowserErrors[pointId];
+    render();
+    try {
+      const query = requestedPath ? "?path=" + encodeURIComponent(requestedPath) : "";
+      const payload = await request(endpoints.recoveryPoints + "/" + encodeURIComponent(pointId) + "/files" + query);
+      if (state.recoveryFileBrowserRequests[pointId] !== requestNumber) return;
+      const hasCurrent = payload && Object.prototype.hasOwnProperty.call(payload, "current_path");
+      const currentPath = String(hasCurrent ? payload.current_path : pick(payload, "path", "relative_path") || requestedPath);
+      const entries = payload && Array.isArray(payload.entries) ? payload.entries : payload && Array.isArray(payload.items) ? payload.items : [];
+      state.recoveryFileBrowsers[pointId] = { payload: payload || {}, currentPath, entries };
+      delete state.recoveryFileBrowserErrors[pointId];
+    } catch (error) {
+      if (state.recoveryFileBrowserRequests[pointId] !== requestNumber) return;
+      error.failedPath = requestedPath;
+      state.recoveryFileBrowserErrors[pointId] = error;
+    } finally {
+      if (state.recoveryFileBrowserRequests[pointId] === requestNumber) state.recoveryFileBrowserLoading.delete(pointId);
+    }
+    render();
+    if (focusEntries && recordId(selectedRecoveryPoint()) === pointId) {
+      window.requestAnimationFrame(() => {
+        const first = document.querySelector('[data-recovery-files="' + CSS.escape(pointId) + '"] button.source-browser-name, [data-recovery-files="' + CSS.escape(pointId) + '"] .source-browser-entry button, [data-recovery-files="' + CSS.escape(pointId) + '"] .source-browser-up:not([disabled]), [data-recovery-files="' + CSS.escape(pointId) + '"] .source-browser-crumb');
+        if (first) first.focus();
+      });
+    }
+  }
+
+  function openRecoveryPointFiles(pointId) {
+    if (!pointId) return;
+    if (state.recoveryFileBrowsers[pointId]) {
+      state.recoveryFileBrowserOpen.add(pointId);
+      render();
+      return;
+    }
+    loadRecoveryPointFiles(pointId, "", true);
+  }
+
+  function closeRecoveryPointFiles(pointId) {
+    if (!pointId) return;
+    state.recoveryFileBrowserOpen.delete(pointId);
+    render();
+    window.requestAnimationFrame(() => {
+      const trigger = document.querySelector('[data-action="open-recovery-files"][data-id="' + CSS.escape(pointId) + '"]');
+      if (trigger) trigger.focus();
+    });
+  }
+
+  function renderRecoveryPointFiles(pointId) {
+    const open = state.recoveryFileBrowserOpen.has(pointId);
+    if (!open) {
+      return '<section class="vault-dossier-section recovery-file-browser-shell"><div class="vault-section-head"><div><h3>Files & directories</h3><p>Explore the retained backup manifest without loading or reading the physical tape.</p></div><button class="button button-quiet button-small" type="button" data-action="open-recovery-files" data-id="' + esc(pointId) + '"><span aria-hidden="true">▰</span> Browse contents</button></div></section>';
+    }
+    const browser = state.recoveryFileBrowsers[pointId];
+    const loading = state.recoveryFileBrowserLoading.has(pointId);
+    const error = state.recoveryFileBrowserErrors[pointId];
+    if (loading) {
+      const loadingPath = browser ? browser.currentPath : "";
+      return '<section class="vault-dossier-section recovery-file-browser-shell" data-recovery-files="' + esc(pointId) + '"><div class="source-browser-loading" role="status"><span class="spinner" aria-hidden="true"></span><strong>Opening retained folder…</strong><small>/' + esc(loadingPath) + "</small></div></section>";
+    }
+    if (error) {
+      const retryPath = error.failedPath !== undefined ? error.failedPath : browser ? browser.currentPath : "";
+      return '<section class="vault-dossier-section recovery-file-browser-shell" data-recovery-files="' + esc(pointId) + '"><div class="vault-section-head"><div><h3>Files & directories</h3><p>Retained manifest browser</p></div><button class="icon-button" type="button" data-action="close-recovery-files" data-id="' + esc(pointId) + '" aria-label="Close retained contents browser">&times;</button></div><div class="source-browser-error" role="alert"><span aria-hidden="true">!</span><div><strong>Could not load retained contents</strong><p>' + esc(errorMessage(error)) + '</p><button class="button button-quiet button-small" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(retryPath) + '">Try again</button></div></div></section>';
+    }
+    if (!browser) return "";
+    const currentPath = browser.currentPath;
+    const payload = browser.payload;
+    const parentPath = payload && Object.prototype.hasOwnProperty.call(payload, "parent_path") ? payload.parent_path : (currentPath ? sourceBrowserParent(currentPath) : null);
+    const entries = browser.entries.slice().sort((left, right) => {
+      const order = { directory: 0, file: 1, symlink: 2, other: 3 };
+      const kindDifference = order[sourceBrowserEntryKind(left)] - order[sourceBrowserEntryKind(right)];
+      if (kindDifference) return kindDifference;
+      return String(pick(left, "name", "display_name") || "").localeCompare(String(pick(right, "name", "display_name") || ""), undefined, { numeric: true, sensitivity: "base" });
+    });
+    const empty = '<div class="source-browser-empty"><span aria-hidden="true">□</span><strong>No retained entries in this directory</strong><small>The manifest reports an empty folder.</small></div>';
+    return '<section class="vault-dossier-section recovery-file-browser-shell" data-recovery-files="' + esc(pointId) + '"><div class="vault-section-head"><div><h3>Files & directories</h3><p>Catalog view from the content-addressed manifest.</p></div><button class="icon-button" type="button" data-action="close-recovery-files" data-id="' + esc(pointId) + '" aria-label="Close retained contents browser">&times;</button></div><div class="notice info recovery-files-boundary"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Browse-only recovery inventory</strong><span>This view does not read tape and does not change restore scope. The currently proven recovery action still restores the complete recovery point.</span></div></div><div class="backup-source-browser retained-browser"><div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="recovery-files-navigate" data-id="' + esc(pointId) + '" data-path="' + esc(parentPath || "") + '" aria-label="Open parent retained directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Retained backup path">' + recoveryFileBreadcrumbs(pointId, currentPath) + '</nav></div><div class="source-browser-context"><div><span>Retained path</span><code>/' + esc(currentPath) + '</code></div><span class="source-browser-scope readonly"><span aria-hidden="true">◇</span> Manifest evidence</span></div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Action</span></div><div class="source-browser-entries" role="table" aria-label="Retained files and directories in ' + esc(currentPath || "backup root") + '">' + (entries.length ? entries.map((entry) => recoveryFileEntry(entry, currentPath, pointId)).join("") : empty) + '</div><p class="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + " retained entries loaded") + "</p></div></section>";
+  }
+
   const RESTORE_REHEARSAL_PHASES = [
     { name: "Preflight", detail: "Revalidate plan, drive, and tape", aliases: ["queued", "started", "preparing", "preflight"] },
     { name: "Read tape", detail: "Dispatch the retained Bacula backup", aliases: ["reading", "restoring", "engine_dispatched", "engine_restore"] },
@@ -1563,7 +1696,7 @@
     let feedback = "";
     if (loadingDetail) feedback = '<div class="notice info vault-detail-notice"><span class="notice-icon" aria-hidden="true">↻</span><div class="notice-copy"><strong>Loading durable recovery evidence</strong><span>The summary is visible while TapeScale assembles the ordered media and verification record.</span></div></div>';
     if (detailError) feedback = '<div class="notice danger vault-detail-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load the recovery dossier</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="retry-recovery-point" data-id="' + esc(id) + '">Retry</button></div>';
-    return '<article class="panel vault-dossier"><header class="vault-dossier-hero"><div><span class="vault-kicker">Recovery point · ' + esc(human(representation)) + '</span><div class="vault-dossier-title"><h2>' + esc(label(dataset)) + '</h2>' + status(recoveryPointState(point)) + '</div><p class="mono">' + esc(id) + '</p><span>' + esc(date(pick(point, "recovery_time", "created_at"))) + " · " + esc(human(pick(point, "level") || "unknown")) + ' backup</span></div><div class="vault-dossier-actions"><button class="button button-quiet" type="button" data-action="download-recovery-evidence" data-id="' + esc(id) + '">Download evidence</button><button class="button button-primary" type="button" data-action="open-restore-plan" data-id="' + esc(id) + '">Plan restore</button></div></header><div class="vault-plan-boundary"><strong>Plan first; execute only when explicitly offered</strong><span>Most points remain planning-only. A ready, supported G0.2 point can advance to an attended restore rehearsal after exact drive and tape confirmation.</span></div>' + feedback + renderRestoreRehearsals(id) + '<section class="vault-proof-grid">' + renderVaultProof("Full media readback", fullReadback, verifications.length ? "Recorded independently of write completion" : "Loading verification evidence") + renderVaultProof("Isolated restore test", restoreTest, verifications.length ? "Application recovery evidence" : "Loading verification evidence") + renderVaultProof("Required media", volumes.length ? "recorded" : "missing", volumes.length + " cartridge" + (volumes.length === 1 ? "" : "s") + " in read order") + renderVaultProof("Dependencies", dependencies.length ? "required" : "ready", dependencies.length ? dependencies.length + " prerequisite recovery point(s)" : "No earlier recovery point required") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Required media in read order</h3><p>Load cartridges in this exact volume sequence. Engine record boundaries are retained for reconstruction.</p></div><span>' + volumes.length + " volume" + (volumes.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVolumes(volumes) + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Verification evidence</h3><p>Write completion, full readback, and restore testing remain separate claims.</p></div><span>' + verifications.length + " record" + (verifications.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVerifications(verifications) + '</section><div class="vault-two-column"><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Recovery contract</h3><p>The durable identity and retention boundary.</p></div></div><dl class="vault-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="' + (/hash|manifest|lineage|format/i.test(name) ? "mono" : "") + '">' + esc(value) + "</dd>").join("") + '</dl>' + (Object.keys(coverage).length ? '<details class="vault-json"><summary>Recorded coverage</summary><pre>' + esc(JSON.stringify(coverage, null, 2)) + "</pre></details>" : "") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Dependencies & holds</h3><p>Every prerequisite remains visible before planning.</p></div></div><h4>Dependencies</h4>' + renderDependencyList(dependencies, "This is a self-contained full recovery point.") + '<h4>Active holds</h4>' + renderDependencyList(holds, "No active hold was returned.") + '</section></div><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Origin & retained evidence</h3><p>Correlation data for the job, physical exercise, catalog, and content-addressed artifacts.</p></div></div><div class="vault-origin-grid"><div><h4>Origin</h4>' + renderOrigin(origin, point) + '</div><div><h4>Artifacts</h4>' + renderRecoveryArtifacts(artifacts) + "</div></div>" + renderRecoveryEventsForVault(events) + "</section></article>";
+    return '<article class="panel vault-dossier"><header class="vault-dossier-hero"><div><span class="vault-kicker">Recovery point · ' + esc(human(representation)) + '</span><div class="vault-dossier-title"><h2>' + esc(label(dataset)) + '</h2>' + status(recoveryPointState(point)) + '</div><p class="mono">' + esc(id) + '</p><span>' + esc(date(pick(point, "recovery_time", "created_at"))) + " · " + esc(human(pick(point, "level") || "unknown")) + ' backup</span></div><div class="vault-dossier-actions"><button class="button button-quiet" type="button" data-action="download-recovery-evidence" data-id="' + esc(id) + '">Download evidence</button><button class="button button-primary" type="button" data-action="open-restore-plan" data-id="' + esc(id) + '">Plan restore</button></div></header><div class="vault-plan-boundary"><strong>Plan first; execute only when explicitly offered</strong><span>Most points remain planning-only. A ready, supported G0.2 point can advance to an attended restore rehearsal after exact drive and tape confirmation.</span></div>' + feedback + renderRecoveryPointFiles(id) + renderRestoreRehearsals(id) + '<section class="vault-proof-grid">' + renderVaultProof("Full media readback", fullReadback, verifications.length ? "Recorded independently of write completion" : "Loading verification evidence") + renderVaultProof("Isolated restore test", restoreTest, verifications.length ? "Application recovery evidence" : "Loading verification evidence") + renderVaultProof("Required media", volumes.length ? "recorded" : "missing", volumes.length + " cartridge" + (volumes.length === 1 ? "" : "s") + " in read order") + renderVaultProof("Dependencies", dependencies.length ? "required" : "ready", dependencies.length ? dependencies.length + " prerequisite recovery point(s)" : "No earlier recovery point required") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Required media in read order</h3><p>Load cartridges in this exact volume sequence. Engine record boundaries are retained for reconstruction.</p></div><span>' + volumes.length + " volume" + (volumes.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVolumes(volumes) + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Verification evidence</h3><p>Write completion, full readback, and restore testing remain separate claims.</p></div><span>' + verifications.length + " record" + (verifications.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVerifications(verifications) + '</section><div class="vault-two-column"><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Recovery contract</h3><p>The durable identity and retention boundary.</p></div></div><dl class="vault-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="' + (/hash|manifest|lineage|format/i.test(name) ? "mono" : "") + '">' + esc(value) + "</dd>").join("") + '</dl>' + (Object.keys(coverage).length ? '<details class="vault-json"><summary>Recorded coverage</summary><pre>' + esc(JSON.stringify(coverage, null, 2)) + "</pre></details>" : "") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Dependencies & holds</h3><p>Every prerequisite remains visible before planning.</p></div></div><h4>Dependencies</h4>' + renderDependencyList(dependencies, "This is a self-contained full recovery point.") + '<h4>Active holds</h4>' + renderDependencyList(holds, "No active hold was returned.") + '</section></div><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Origin & retained evidence</h3><p>Correlation data for the job, physical exercise, catalog, and content-addressed artifacts.</p></div></div><div class="vault-origin-grid"><div><h4>Origin</h4>' + renderOrigin(origin, point) + '</div><div><h4>Artifacts</h4>' + renderRecoveryArtifacts(artifacts) + "</div></div>" + renderRecoveryEventsForVault(events) + "</section></article>";
   }
 
   function renderRestore() {
@@ -2102,7 +2235,8 @@
   function renderDrives() {
     const motionEnabled = pick(state.data.system, "lab_tape_motion_enabled") === true;
     const qualificationEnabled = pick(state.data.system, "lab_tape_qualification_enabled") === true;
-    let html = pageHead("Drives & libraries", "Hardware inventory returned by TapeScale.", refreshButton()) + noticeFor("drives");
+    const initialize = '<button class="button button-danger" type="button" data-action="initialize-tape"' + (qualificationEnabled ? "" : ' disabled title="Enable attended Bacula qualification first."') + '>Initialize tape</button>';
+    let html = pageHead("Drives & libraries", "Hardware inventory returned by TapeScale.", refreshButton() + initialize) + noticeFor("drives");
     if (qualificationEnabled) {
       html += '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Destructive Bacula qualification enabled</strong><span>The attended btape test overwrites the selected cartridge. It is limited to registered, unprotected, non-WORM scratch media and does not complete the broader G0 product gate.</span></div></div>';
     }
@@ -3095,7 +3229,22 @@
       toast("Recovery laboratory is disabled", "Enable the laboratory file roundtrip on both the API and worker first.");
       return;
     }
-    const body = '<form id="recovery-profile-form"><div class="notice info"><span class="notice-icon" aria-hidden="true">1</span><div class="notice-copy"><strong>Declare the prepared recovery fixture</strong><span>Both paths are contained subpaths of the source and restore roots configured by the TrueNAS Compose file. TapeScale will not accept host-absolute paths here.</span></div></div><div class="form-grid"><div class="form-field full"><label for="recovery-profile-name">Profile name</label><input class="input" id="recovery-profile-name" name="name" maxlength="128" placeholder="Quarterly recovery fixture" required><small>This name appears in the destructive confirmation and retained evidence.</small></div><div class="form-field"><label for="recovery-source-subpath">Immutable source subpath</label><input class="input input-mono" id="recovery-source-subpath" name="source_subpath" maxlength="512" placeholder="fixture-2026-11" required><small>Relative to the configured read-only source root.</small></div><div class="form-field"><label for="recovery-restore-subpath">Isolated restore subpath</label><input class="input input-mono" id="recovery-restore-subpath" name="restore_subpath" maxlength="512" placeholder="exercises" required><small>Relative to the configured restore root; each run receives its own directory.</small></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="immutable_snapshot_confirmed" required> I confirm the source subpath is a prepared immutable snapshot or expendable fixture and will not change during this exercise.</label></div></div><p class="notice danger" id="recovery-profile-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Save and choose hardware</button></div></form>';
+    const body = [
+      '<form id="recovery-profile-form">',
+      '<div class="notice info"><span class="notice-icon" aria-hidden="true">1</span><div class="notice-copy"><strong>Declare the prepared recovery fixture</strong><span>Both paths are contained subpaths of the source and restore roots configured by the TrueNAS Compose file. TapeScale will not accept host-absolute paths here.</span></div></div>',
+      '<div class="form-grid">',
+      '<div class="form-field full"><label for="recovery-profile-name">Profile name</label><input class="input" id="recovery-profile-name" name="name" maxlength="128" placeholder="Quarterly recovery fixture" required><small>This name appears in the destructive confirmation and retained evidence.</small></div>',
+      '<div class="form-field full"><label for="recovery-source-subpath">Immutable source directory</label><div class="source-browser-input"><input class="input input-mono" id="recovery-source-subpath" name="source_subpath" maxlength="512" placeholder="tank/test/.zfs/snapshot/fixture-2026-11" required autocomplete="off"><button class="button button-quiet" type="button" data-action="open-source-browser" data-browser-target="recovery" aria-controls="recovery-source-browser" aria-expanded="false"><span aria-hidden="true">▰</span> Browse</button></div><small>Browse the same contained read-only source mount used by Backup Center, or enter a relative directory manually.</small><div class="source-browser-selected" id="recovery-source-selection" hidden></div></div>',
+      '<section class="backup-source-browser" id="recovery-source-browser" aria-label="Recovery fixture source browser" hidden></section>',
+      '<div class="form-field full"><label for="recovery-restore-subpath">Isolated restore subpath</label><input class="input input-mono" id="recovery-restore-subpath" name="restore_subpath" maxlength="512" placeholder="exercises" required><small>Relative to the configured restore root; each run receives its own directory.</small></div>',
+      '<div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="immutable_snapshot_confirmed" required> I confirm the source directory is a prepared immutable snapshot or expendable fixture and will not change during this exercise.</label></div>',
+      '</div><p class="notice danger" id="recovery-profile-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Save and choose hardware</button></div></form>'
+    ].join("");
+    sourceBrowserRequest += 1;
+    sourceBrowserPath = "";
+    sourceBrowserReadOnly = null;
+    sourceBrowserSelectable = false;
+    sourceBrowserTarget = { inputId: "recovery-source-subpath", panelId: "recovery-source-browser", summaryId: "recovery-source-selection", nameId: "recovery-profile-name" };
     openModal("Set up a recovery exercise", body);
     document.querySelector("#recovery-profile-name").focus();
   }
@@ -3327,6 +3476,154 @@
     return null;
   }
 
+  function sourceBrowserEntryKind(entry) {
+    if (entry && (entry.symlink === true || entry.is_symlink === true)) return "symlink";
+    const kind = String(pick(entry, "kind", "entry_type", "type") || "").toLowerCase();
+    if (entry && entry.is_directory === true || ["directory", "dir", "folder"].includes(kind)) return "directory";
+    if (["symlink", "link", "symbolic_link"].includes(kind)) return "symlink";
+    if (["file", "regular", "regular_file"].includes(kind)) return "file";
+    return "other";
+  }
+
+  function sourceBrowserJoin(parent, name) {
+    return [String(parent || "").replace(/\/+$/, ""), String(name || "").replace(/^\/+/, "")]
+      .filter(Boolean)
+      .join("/");
+  }
+
+  function sourceBrowserParent(path) {
+    const parts = String(path || "").split("/").filter(Boolean);
+    parts.pop();
+    return parts.join("/");
+  }
+
+  function sourceBrowserSnapshotPath(path) {
+    const segments = String(path || "").split("/").filter(Boolean);
+    return segments.some((segment, index) => segment === ".zfs" && segments[index + 1] === "snapshot");
+  }
+
+  function sourceBrowserBreadcrumbs(path) {
+    const segments = String(path || "").split("/").filter(Boolean);
+    const crumbs = ['<button class="source-browser-crumb" type="button" data-action="source-browser-navigate" data-path="" aria-label="Open source root"><span aria-hidden="true">⌂</span><span>source</span></button>'];
+    let accumulated = "";
+    segments.forEach((segment) => {
+      accumulated = sourceBrowserJoin(accumulated, segment);
+      crumbs.push('<span class="source-browser-separator" aria-hidden="true">/</span><button class="source-browser-crumb" type="button" data-action="source-browser-navigate" data-path="' + esc(accumulated) + '">' + esc(segment) + "</button>");
+    });
+    return crumbs.join("");
+  }
+
+  function sourceBrowserEntry(entry, currentPath) {
+    const kind = sourceBrowserEntryKind(entry);
+    const name = String(pick(entry, "name", "display_name") || "Unnamed entry");
+    const path = String(pick(entry, "path", "relative_path") || sourceBrowserJoin(currentPath, name));
+    const modified = pick(entry, "modified_at", "mtime", "last_modified");
+    const size = pick(entry, "size_bytes", "size");
+    const readOnly = entry && (entry.read_only === true || entry.readonly === true);
+    const icon = kind === "directory" ? "▰" : kind === "symlink" ? "↗" : kind === "file" ? "▤" : "?";
+    const typeLabel = kind === "directory" ? "Folder" : kind === "symlink" ? "Symbolic link" : kind === "file" ? "File" : "Unsupported object";
+    const facts = [typeLabel];
+    if (kind === "file" && size !== null && size !== undefined) facts.push(bytes(size));
+    if (modified) facts.push(label(modified));
+    if (readOnly) facts.push("Read only");
+    const nameControl = kind === "directory"
+      ? '<button class="source-browser-name" type="button" data-action="source-browser-navigate" data-path="' + esc(path) + '" aria-label="Open folder ' + esc(name) + '"><strong>' + esc(name) + "</strong><small>" + esc(facts.join(" · ")) + "</small></button>"
+      : '<div class="source-browser-name"><strong>' + esc(name) + "</strong><small>" + esc(facts.join(" · ")) + "</small></div>";
+    const action = kind === "directory"
+      ? '<button class="button button-quiet button-small" type="button" data-action="source-browser-navigate" data-path="' + esc(path) + '">Open</button>'
+      : kind === "symlink" ? '<span class="source-browser-entry-note">Not followed</span>' : kind === "file" ? '<span class="source-browser-entry-note">Included with folder</span>' : '<span class="source-browser-entry-note">Backup will reject</span>';
+    return '<div class="source-browser-entry ' + esc(kind) + '" role="row"><span class="source-browser-icon" aria-hidden="true">' + icon + '</span>' + nameControl + '<div class="source-browser-entry-action">' + action + "</div></div>";
+  }
+
+  function renderSourceBrowser(payload, requestedPath) {
+    const panel = document.getElementById(sourceBrowserTarget.panelId);
+    if (!panel) return;
+    const hasCurrent = payload && Object.prototype.hasOwnProperty.call(payload, "current_path");
+    const currentPath = String(hasCurrent ? payload.current_path : pick(payload, "path", "relative_path") || requestedPath || "");
+    const rawEntries = payload && Array.isArray(payload.entries) ? payload.entries : payload && Array.isArray(payload.items) ? payload.items : [];
+    const entries = rawEntries.slice().sort((left, right) => {
+      const order = { directory: 0, file: 1, symlink: 2, other: 3 };
+      const kindDifference = order[sourceBrowserEntryKind(left)] - order[sourceBrowserEntryKind(right)];
+      if (kindDifference) return kindDifference;
+      return String(pick(left, "name", "display_name") || "").localeCompare(String(pick(right, "name", "display_name") || ""), undefined, { numeric: true, sensitivity: "base" });
+    });
+    const payloadReadOnly = payload && (payload.read_only ?? payload.current_read_only ?? payload.readonly);
+    sourceBrowserPath = currentPath;
+    sourceBrowserReadOnly = typeof payloadReadOnly === "boolean" ? payloadReadOnly : null;
+    sourceBrowserSelectable = Boolean(currentPath) && (!payload || payload.selectable !== false);
+    const parentPath = payload && Object.prototype.hasOwnProperty.call(payload, "parent_path") ? payload.parent_path : (currentPath ? sourceBrowserParent(currentPath) : null);
+    const snapshot = payload && (payload.is_snapshot === true || payload.snapshot === true) || sourceBrowserSnapshotPath(currentPath);
+    const scopeBadge = snapshot
+      ? '<span class="source-browser-scope snapshot"><span aria-hidden="true">◆</span> Snapshot path</span>'
+      : sourceBrowserReadOnly === true
+        ? '<span class="source-browser-scope readonly"><span aria-hidden="true">✓</span> Read-only mount</span>'
+        : '<span class="source-browser-scope caution"><span aria-hidden="true">!</span> Verify immutable snapshot</span>';
+    const empty = '<div class="source-browser-empty"><span aria-hidden="true">□</span><strong>This directory is empty</strong><small>Choose a different folder or use this empty scope intentionally.</small></div>';
+    const selectionBlocker = pick(payload, "selection_blocker", "blocked_reason", "reason") || (!currentPath ? "Open a directory below the source root first." : "This directory cannot be selected by the server.");
+    panel.innerHTML = '<div class="source-browser-toolbar"><button class="icon-button source-browser-up" type="button" data-action="source-browser-navigate" data-path="' + esc(parentPath || "") + '" aria-label="Open parent directory"' + (currentPath ? "" : " disabled") + '>↑</button><nav class="source-browser-breadcrumbs" aria-label="Source path">' + sourceBrowserBreadcrumbs(currentPath) + '</nav><button class="icon-button" type="button" data-action="close-source-browser" aria-label="Close source browser">&times;</button></div><div class="source-browser-context"><div><span>Browsing</span><code>/source' + (currentPath ? "/" + esc(currentPath) : "") + '</code></div>' + scopeBadge + '</div><div class="source-browser-column-head" aria-hidden="true"><span>Name</span><span>Action</span></div><div class="source-browser-entries" role="table" aria-label="Files and directories in ' + esc(currentPath || "source root") + '">' + (entries.length ? entries.map((entry) => sourceBrowserEntry(entry, currentPath)).join("") : empty) + '</div><div class="source-browser-footer"><div class="source-browser-selection"><span>Backup scope</span><strong>' + esc(currentPath || "Open a folder to select it") + '</strong><small>' + esc(sourceBrowserSelectable ? "Every visible file and nested folder beneath the selected directory is included in one Full backup." : selectionBlocker) + '</small></div><button class="button button-primary" type="button" data-action="select-source-directory"' + (sourceBrowserSelectable ? "" : ' disabled title="' + esc(selectionBlocker) + '"') + '>Use this directory</button></div><p class="source-browser-live" id="source-browser-live" role="status" aria-live="polite">' + esc(entries.length + " entries loaded") + "</p>";
+  }
+
+  async function loadSourceBrowser(path, focusEntries) {
+    const panel = document.getElementById(sourceBrowserTarget.panelId);
+    if (!panel) return;
+    const requestNumber = ++sourceBrowserRequest;
+    const requestedPath = String(path || "");
+    panel.innerHTML = '<div class="source-browser-loading" role="status"><span class="spinner" aria-hidden="true"></span><strong>Opening folder…</strong><small>/source' + (requestedPath ? "/" + esc(requestedPath) : "") + "</small></div>";
+    try {
+      const query = requestedPath ? "?path=" + encodeURIComponent(requestedPath) : "";
+      const payload = await request(sourceBrowserEndpoint + query);
+      if (requestNumber !== sourceBrowserRequest) return;
+      renderSourceBrowser(payload || {}, requestedPath);
+      if (focusEntries) {
+        const firstEntry = panel.querySelector("button.source-browser-name, .source-browser-entry button, .source-browser-up:not([disabled]), .source-browser-crumb");
+        if (firstEntry) firstEntry.focus();
+      }
+    } catch (error) {
+      if (requestNumber !== sourceBrowserRequest || !document.getElementById(sourceBrowserTarget.panelId)) return;
+      panel.innerHTML = '<div class="source-browser-error" role="alert"><span aria-hidden="true">!</span><div><strong>Could not open this directory</strong><p>' + esc(errorMessage(error)) + '</p><button class="button button-quiet button-small" type="button" data-action="source-browser-navigate" data-path="' + esc(requestedPath) + '">Try again</button></div></div>';
+    }
+  }
+
+  function openSourceBrowser(targetKind) {
+    sourceBrowserTarget = targetKind === "recovery"
+      ? { inputId: "recovery-source-subpath", panelId: "recovery-source-browser", summaryId: "recovery-source-selection", nameId: "recovery-profile-name" }
+      : { inputId: "backup-source-subpath", panelId: "backup-source-browser", summaryId: "backup-source-selection", nameId: "backup-profile-name" };
+    const panel = document.getElementById(sourceBrowserTarget.panelId);
+    const input = document.getElementById(sourceBrowserTarget.inputId);
+    const toggle = document.querySelector('[data-action="open-source-browser"][data-browser-target="' + (targetKind === "recovery" ? "recovery" : "backup") + '"]');
+    if (!panel || !input) return;
+    panel.hidden = false;
+    if (toggle) toggle.setAttribute("aria-expanded", "true");
+    const modal = modalLayer.querySelector(".modal");
+    if (modal) modal.classList.add("source-browser-modal");
+    loadSourceBrowser(input.value.trim(), true);
+  }
+
+  function closeSourceBrowser() {
+    const panel = document.getElementById(sourceBrowserTarget.panelId);
+    const toggle = document.querySelector('[data-action="open-source-browser"][aria-controls="' + sourceBrowserTarget.panelId + '"]');
+    if (panel) panel.hidden = true;
+    if (toggle) {
+      toggle.setAttribute("aria-expanded", "false");
+      toggle.focus();
+    }
+  }
+
+  function selectSourceDirectory() {
+    const input = document.getElementById(sourceBrowserTarget.inputId);
+    const summary = document.getElementById(sourceBrowserTarget.summaryId);
+    if (!input || !sourceBrowserPath || !sourceBrowserSelectable) return;
+    input.value = sourceBrowserPath;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    if (summary) {
+      summary.hidden = false;
+      summary.innerHTML = '<span aria-hidden="true">✓</span><div><strong>Directory selected</strong><code>/source/' + esc(sourceBrowserPath) + '</code><small>' + (sourceBrowserSnapshotPath(sourceBrowserPath) ? "This path is inside a visible ZFS snapshot namespace." : sourceBrowserReadOnly === true ? "The API reports this path on a read-only mount; immutable-snapshot attestation is still required." : "Confirm this directory is an immutable read-only snapshot before creating the plan.") + "</small></div>";
+    }
+    closeSourceBrowser();
+    const name = document.getElementById(sourceBrowserTarget.nameId);
+    if (name && !name.value.trim()) name.focus();
+  }
+
   function openBackupProfile() {
     const timezone = (() => {
       try {
@@ -3336,7 +3633,31 @@
       }
     })();
     const poolOptions = ['<option value="">No fixed pool</option>'].concat(state.data.mediaPools.filter((pool) => pick(pool, "purpose") !== "cleaning").map((pool) => '<option value="' + esc(recordId(pool)) + '">' + esc(label(pick(pool, "name"))) + " · " + esc(human(pick(pool, "purpose") || "routine")) + "</option>"));
-    const body = '<form id="backup-profile-form"><div class="backup-boundary"><span aria-hidden="true">B</span><div><strong>Full single-tape protection plan</strong><p>The source is resolved beneath the configured read-only mount. Weekly dispatch can queue a durable media request; incrementals, spanning, native ZFS, and encryption remain blocked.</p></div></div><div class="form-grid"><div class="form-field full"><label for="backup-profile-name">Plan name</label><input class="input" id="backup-profile-name" name="name" maxlength="128" required placeholder="Sports archive full backup"></div><div class="form-field full"><label for="backup-source-subpath">Source subpath</label><input class="input input-mono" id="backup-source-subpath" name="source_subpath" maxlength="512" required placeholder="Archive/Brandon Sports"><small>Relative path inside the mounted source root. Absolute paths, parent traversal, and symlink escape are rejected by the API.</small></div><div class="form-field"><label for="backup-media-pool">Preferred media pool</label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div><div class="form-field"><label for="backup-retention-days">Retention days</label><input class="input" id="backup-retention-days" name="retention_days" type="number" min="1" max="36500" value="28" required></div><div class="form-field"><label for="backup-timezone">Site timezone</label><input class="input" id="backup-timezone" name="schedule_timezone" maxlength="128" value="' + esc(timezone) + '" required></div><div class="form-field"><label>Run level</label><input class="input" value="Full only" disabled></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="schedule_enabled"> Queue a full backup every Saturday at 02:00 in this timezone.</label><small>Scheduled runs wait durably for attended media assignment. They never select or overwrite tape automatically.</small></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="source_snapshot_attested_read_only" required> I attest this path resolves to an immutable, read-only snapshot for every run.</label></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="limitations_acknowledged" required> I understand this current gate is single-volume, unencrypted, and full-readback verified.</label></div><div class="form-field full"><label for="backup-profile-operator">Operator</label><input class="input" id="backup-profile-operator" name="requested_by_label" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="backup-profile-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Create backup plan</button></div></form>';
+    const body = [
+      '<form id="backup-profile-form">',
+      '<div class="backup-boundary"><span aria-hidden="true">B</span><div><strong>Full single-tape protection plan</strong><p>Choose one directory beneath the configured source mount. Every file and nested folder in that scope is written together as one Full backup.</p></div></div>',
+      '<div class="form-grid">',
+      '<div class="form-field full"><label for="backup-profile-name">Plan name</label><input class="input" id="backup-profile-name" name="name" maxlength="128" required placeholder="Sports archive full backup"></div>',
+      '<div class="form-field full backup-source-field"><label for="backup-source-subpath">Source directory</label><div class="source-browser-input"><input class="input input-mono" id="backup-source-subpath" name="source_subpath" maxlength="512" required autocomplete="off" placeholder="tank/media/.zfs/snapshot/nightly"><button class="button button-quiet" type="button" data-action="open-source-browser" data-browser-target="backup" aria-controls="backup-source-browser" aria-expanded="false"><span aria-hidden="true">▰</span> Browse</button></div><small>Browse graphically or enter a contained relative path manually. Files are shown for context; the backup root must be a directory. A path inside <code>.zfs/snapshot</code> is preferred.</small><div class="source-browser-selected" id="backup-source-selection" hidden></div></div>',
+      '<section class="backup-source-browser" id="backup-source-browser" aria-label="Source file browser" hidden></section>',
+      '<div class="form-field"><label for="backup-media-pool">Preferred media pool</label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div>',
+      '<div class="form-field"><label for="backup-retention-days">Retention days</label><input class="input" id="backup-retention-days" name="retention_days" type="number" min="1" max="36500" value="28" required></div>',
+      '<div class="form-field"><label for="backup-timezone">Site timezone</label><input class="input" id="backup-timezone" name="schedule_timezone" maxlength="128" value="' + esc(timezone) + '" required></div>',
+      '<div class="form-field"><label>Run level</label><input class="input" value="Full only" disabled></div>',
+      '<div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="schedule_enabled"> Queue a full backup every Saturday at 02:00 in this timezone.</label><small>Scheduled runs wait durably for attended media assignment. They never select or overwrite tape automatically.</small></div>',
+      '<div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="source_snapshot_attested_read_only" required> I attest this directory resolves to an immutable, read-only snapshot for every run.</label></div>',
+      '<div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="limitations_acknowledged" required> I understand this current gate is single-volume, unencrypted, and full-readback verified.</label></div>',
+      '<div class="form-field full"><label for="backup-profile-operator">Operator</label><input class="input" id="backup-profile-operator" name="requested_by_label" maxlength="128" value="Web operator" required></div>',
+      '</div>',
+      '<p class="notice danger" id="backup-profile-error" hidden></p>',
+      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Create backup plan</button></div>',
+      '</form>'
+    ].join("");
+    sourceBrowserRequest += 1;
+    sourceBrowserPath = "";
+    sourceBrowserReadOnly = null;
+    sourceBrowserSelectable = false;
+    sourceBrowserTarget = { inputId: "backup-source-subpath", panelId: "backup-source-browser", summaryId: "backup-source-selection", nameId: "backup-profile-name" };
     openModal("Create backup plan", body);
     document.querySelector("#backup-profile-name").focus();
   }
@@ -3887,6 +4208,409 @@
     return state.data.media.filter((item) => item.worm !== true && count(pick(item, "active_holds")) === 0 && pick(item, "has_content") !== true && !pick(item, "reserved_by") && !["foreign", "mismatch"].includes(String(pick(item, "identity_status") || "")));
   }
 
+  function newQualificationIdempotencyKey() {
+    if (!window.crypto || typeof window.crypto.getRandomValues !== "function") throw new Error("This browser cannot create a safe qualification request identity.");
+    if (typeof window.crypto.randomUUID === "function") return window.crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 15) | 64;
+    bytes[8] = (bytes[8] & 63) | 128;
+    const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+    return hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16) + "-" + hex.slice(16, 20) + "-" + hex.slice(20);
+  }
+
+  function tapeInitializePendingKey(driveId, cartridgeId) {
+    return "tapescale.qualification-request.v1." + driveId + "." + cartridgeId;
+  }
+
+  function tapeInitializeIdempotencyKey(form, driveId, stableId, cartridgeId, cartridgeLabel) {
+    const storageKey = tapeInitializePendingKey(driveId, cartridgeId);
+    const requestScope = driveId + "\n" + stableId + "\n" + cartridgeId + "\n" + cartridgeLabel;
+    if (form && form.dataset.idempotencyScope === requestScope && form.dataset.idempotencyKey) return form.dataset.idempotencyKey;
+    try {
+      const retained = JSON.parse(window.localStorage.getItem(storageKey) || "null");
+      if (retained
+        && typeof retained.idempotencyKey === "string"
+        && retained.stableId === stableId
+        && retained.cartridgeLabel === cartridgeLabel) {
+        if (form) {
+          form.dataset.idempotencyScope = requestScope;
+          form.dataset.idempotencyKey = retained.idempotencyKey;
+        }
+        return retained.idempotencyKey;
+      }
+    } catch (_) {
+      // A corrupt or unavailable browser store must not weaken server checks.
+    }
+    const idempotencyKey = newQualificationIdempotencyKey();
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify({ idempotencyKey, stableId, cartridgeLabel }));
+    } catch (_) {
+      // The current form still retains the key for same-page retries.
+    }
+    if (form) {
+      form.dataset.idempotencyScope = requestScope;
+      form.dataset.idempotencyKey = idempotencyKey;
+    }
+    return idempotencyKey;
+  }
+
+  function clearTapeInitializeIdempotency(form, driveId, cartridgeId) {
+    try {
+      window.localStorage.removeItem(tapeInitializePendingKey(driveId, cartridgeId));
+    } catch (_) {
+      // Storage may be disabled; the server remains the authority.
+    }
+    if (form) {
+      delete form.dataset.idempotencyScope;
+      delete form.dataset.idempotencyKey;
+    }
+  }
+
+  function activeQualificationForDrive(driveId) {
+    return state.data.qualificationRuns.find((run) => String(pick(run, "drive_id")) === String(driveId) && ["queued", "running"].includes(String(pick(run, "state") || "").toLowerCase())) || null;
+  }
+
+  function tapeInitializeMedia(driveId) {
+    const eligible = qualificationMedia();
+    const active = activeQualificationForDrive(driveId);
+    const activeCartridge = active && state.data.media.find((item) => recordId(item) === String(pick(active, "cartridge_id")));
+    if (!activeCartridge || eligible.some((item) => recordId(item) === recordId(activeCartridge))) return eligible;
+    return [activeCartridge].concat(eligible);
+  }
+
+  function tapeInitializeCartridgeAllowed(item, driveId) {
+    if (!item) return false;
+    if (qualificationMedia().some((candidate) => recordId(candidate) === recordId(item))) return true;
+    const active = activeQualificationForDrive(driveId);
+    return Boolean(active)
+      && String(pick(active, "cartridge_id")) === recordId(item)
+      && String(pick(active, "expected_cartridge_label", "cartridge_label")) === String(mediaName(item));
+  }
+
+  function activeOperationForDrive(driveId) {
+    return state.data.driveOperations.find((operation) => String(pick(operation, "drive_id")) === String(driveId) && ["queued", "running"].includes(String(pick(operation, "state") || "").toLowerCase())) || null;
+  }
+
+  function tapeInitializeDriveBlocker(drive) {
+    if (!drive) return "Select a drive.";
+    const health = objectValue(drive, "health");
+    const observedAt = new Date(pick(drive, "last_observed_at") || 0).getTime();
+    if (pick(state.data.system, "lab_tape_qualification_enabled") !== true) return "Destructive tape qualification is disabled in this deployment.";
+    if (!Number.isFinite(observedAt) || Date.now() - observedAt > 120000) return "The drive observation is stale; refresh and wait for the worker.";
+    if (health.present !== true || health.accessible !== true) return "The configured tape device is not present and accessible.";
+    if (health.identity_verified !== true || health.identity_conflict === true) return "The drive lacks one unambiguous stable SCSI identity.";
+    if (health.motion_position_uncertain === true) return "A prior result left tape position uncertain; reconcile the drive first.";
+    if (health.immediate_mode !== false || health.in_flight !== 0) return "Kernel tape I/O state is not safe for qualification.";
+    if (health.medium_loaded !== true || health.ready !== true) return "Load the designated scratch cartridge and wait for the drive to report ready.";
+    if (activeOperationForDrive(recordId(drive))) return "A tape motion request is already active on this drive.";
+    return null;
+  }
+
+  function exactQualificationRun(driveId, cartridgeId, cartridgeLabel) {
+    const drive = state.data.drives.find((item) => recordId(item) === String(driveId));
+    const cartridge = state.data.media.find((item) => recordId(item) === String(cartridgeId));
+    return state.data.qualificationRuns
+      .filter((run) => String(pick(run, "drive_id")) === String(driveId) && String(pick(run, "cartridge_id")) === String(cartridgeId) && String(pick(run, "expected_cartridge_label", "cartridge_label")) === String(cartridgeLabel))
+      .sort((left, right) => new Date(pick(right, "created_at", "started_at") || 0) - new Date(pick(left, "created_at", "started_at") || 0))
+      .find((run) => {
+        const runState = String(pick(run, "state") || "").toLowerCase();
+        if (["queued", "running"].includes(runState)) return true;
+        return runState === "passed" && Boolean(drive) && Boolean(cartridge) && recoveryQualificationMatches(run, drive, cartridge);
+      }) || null;
+  }
+
+  function tapeInitializeDriveOptions(initialDriveId) {
+    return ['<option value="">Select the loaded tape drive</option>'].concat(state.data.drives.map((drive) => {
+      const blocker = tapeInitializeDriveBlocker(drive);
+      const active = activeQualificationForDrive(recordId(drive));
+      const selected = String(recordId(drive)) === String(initialDriveId) ? " selected" : "";
+      const unavailable = blocker && !active ? " disabled" : "";
+      const suffix = active ? " · qualification " + human(pick(active, "state")) : blocker ? " · " + blocker : drive.reconciled === true ? " · ready" : " · identity trust required";
+      return '<option value="' + esc(recordId(drive)) + '"' + selected + unavailable + '>' + esc(label(pick(drive, "model", "stable_id", "observed_path"))) + " · " + esc(label(pick(drive, "observed_path"))) + esc(suffix) + "</option>";
+    }));
+  }
+
+  function tapeInitializeMediaOptions(initialMediaId, driveId) {
+    const active = activeQualificationForDrive(driveId);
+    return ['<option value="">Select the physically loaded scratch cartridge</option>'].concat(tapeInitializeMedia(driveId).map((item) => {
+      const resume = active && String(pick(active, "cartridge_id")) === recordId(item);
+      return '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '"' + (String(recordId(item)) === String(initialMediaId) ? " selected" : "") + '>' + esc(mediaName(item)) + (pick(item, "barcode") ? " · " + esc(pick(item, "barcode")) : "") + " · " + esc(label(pick(item, "media_format", "media_generation"))) + (resume ? " · resume " + esc(human(pick(active, "state"))) : "") + "</option>";
+    }));
+  }
+
+  function openTapeInitialization(button) {
+    if (pick(state.data.system, "lab_tape_qualification_enabled") !== true) {
+      toast("Tape initialization is disabled", "Enable the attended Bacula qualification gate on both the API and worker first.");
+      return;
+    }
+    const requestedDriveId = button && button.dataset.driveId;
+    const safeDrives = state.data.drives.filter((drive) => !tapeInitializeDriveBlocker(drive) || activeQualificationForDrive(recordId(drive)));
+    const initialDriveId = requestedDriveId || (safeDrives.length === 1 ? recordId(safeDrives[0]) : "");
+    const requestedMediaId = button && button.dataset.mediaId || (state.route === "tapes" && selectedMedia() ? recordId(selectedMedia()) : "");
+    const existingMedia = tapeInitializeMedia(initialDriveId);
+    const active = activeQualificationForDrive(initialDriveId);
+    const activeMediaId = active && String(pick(active, "cartridge_id") || "");
+    const initialMediaId = existingMedia.some((item) => recordId(item) === activeMediaId) ? activeMediaId : existingMedia.some((item) => String(recordId(item)) === String(requestedMediaId)) ? requestedMediaId : existingMedia.length === 1 ? recordId(existingMedia[0]) : "";
+    const initialMode = existingMedia.length ? "existing" : "new";
+    const generations = [];
+    generations.push('<option value="">Select media generation</option>');
+    for (let generation = 1; generation <= 10; generation += 1) generations.push('<option value="' + generation + '">LTO-' + generation + "</option>");
+    const body = [
+      '<form id="tape-initialize-form">',
+      '<div class="tape-init-hero"><span aria-hidden="true">!</span><div><small>Attended destructive workflow</small><strong>Initialize one scratch tape with Bacula</strong><p>This wizard can trust the exact drive identity, register an inventory label, and queue the existing btape qualification. It cannot identify a cartridge inside a standalone drive.</p></div></div>',
+      '<ol class="tape-init-steps" aria-label="Tape initialization steps"><li><span>1</span><strong>Drive</strong><small>Bind hardware</small></li><li><span>2</span><strong>Cartridge</strong><small>Register label</small></li><li><span>3</span><strong>Destroy & test</strong><small>Run btape</small></li></ol>',
+      '<section class="tape-init-section"><div class="tape-init-section-head"><span>1</span><div><strong>Loaded SAS tape drive</strong><small>TapeScale revalidates this exact stable identity before any command.</small></div></div><div class="form-field"><label for="tape-init-drive">Drive reporting loaded and ready</label><select class="select" id="tape-init-drive" name="drive_id" required>' + tapeInitializeDriveOptions(initialDriveId).join("") + '</select></div><div class="tape-init-drive-state" id="tape-init-drive-state"></div><label class="check-option danger-check" id="tape-init-trust-wrap" hidden><input type="checkbox" name="trust_drive_identity"> Trust this exact stable drive identity and observed non-rewinding device path.</label></section>',
+      '<section class="tape-init-section"><div class="tape-init-section-head"><span>2</span><div><strong>Scratch cartridge inventory</strong><small>The selected label is an operator assertion because the standalone drive has no barcode reader.</small></div></div><div class="form-field"><label for="tape-init-media-mode">Cartridge record</label><select class="select" id="tape-init-media-mode" name="media_mode"><option value="existing"' + (initialMode === "existing" ? " selected" : "") + '>Use a registered eligible cartridge</option><option value="new"' + (initialMode === "new" ? " selected" : "") + '>Register a new non-WORM cartridge</option></select></div><div id="tape-init-existing"><div class="form-field"><label for="tape-init-cartridge">Registered scratch cartridge</label><select class="select" id="tape-init-cartridge" name="cartridge_id">' + tapeInitializeMediaOptions(initialMediaId, initialDriveId).join("") + '</select></div></div><div class="tape-init-new" id="tape-init-new" hidden><div class="form-grid"><div class="form-field full"><label for="tape-init-label">New internal label</label><input class="input input-mono" id="tape-init-label" name="internal_label" maxlength="128" pattern="[-A-Za-z0-9._:]+" placeholder="SCRATCH001"><small>Letters, numbers, hyphen, underscore, period, and colon.</small></div><div class="form-field"><label for="tape-init-barcode">Barcode</label><input class="input input-mono" id="tape-init-barcode" name="barcode" maxlength="128" placeholder="Optional"></div><div class="form-field"><label for="tape-init-generation">Media generation</label><select class="select" id="tape-init-generation" name="media_generation">' + generations.join("") + '</select></div></div><div class="tape-init-nonworm"><span aria-hidden="true">✓</span><div><strong>Non-WORM only</strong><small>This workflow always registers the new cartridge with WORM disabled.</small></div></div></div></section>',
+      '<section class="tape-init-section destructive"><div class="tape-init-section-head"><span>3</span><div><strong>Physical assertion and destructive authority</strong><small>Every existing byte on the loaded tape will be lost.</small></div></div><div class="form-field"><label class="check-option danger-check"><input type="checkbox" name="scratch_media_confirmed" required> I physically verified that the selected inventory label is the cartridge loaded in this standalone drive and that it is designated scratch.</label></div><div class="form-field"><label class="check-option danger-check"><input type="checkbox" name="destructive_overwrite_confirmed" required> I authorize Bacula btape to overwrite, rewind, space, append, and re-read this tape.</label></div><div class="form-field"><label for="tape-init-confirmation">Type the exact destructive confirmation</label><input class="input input-mono" id="tape-init-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small id="tape-init-confirmation-help">Select or enter a cartridge label first.</small></div></section>',
+      '<div class="tape-init-progress" id="tape-init-progress" role="status" aria-live="polite" hidden></div>',
+      '<p class="notice danger" id="tape-init-error" hidden></p>',
+      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-danger" type="submit"' + (safeDrives.length ? "" : " disabled") + '>Destroy tape and initialize</button></div>',
+      '</form>'
+    ].join("");
+    openModal("Initialize tape", body);
+    const modal = modalLayer.querySelector(".modal");
+    if (modal) modal.classList.add("tape-init-modal");
+    updateTapeInitializeForm(document.querySelector("#tape-initialize-form"));
+  }
+
+  function tapeInitializeLabel(form) {
+    if (!form) return "";
+    const mode = form.elements.media_mode.value;
+    if (mode === "new") return String(form.elements.internal_label.value || "").trim();
+    const select = form.elements.cartridge_id;
+    const option = select && select.options[select.selectedIndex];
+    return String(option && option.dataset.label || "");
+  }
+
+  function resetTapeInitializeAssertions(form, resetDriveTrust) {
+    if (!form) return;
+    if (resetDriveTrust && form.elements.trust_drive_identity) form.elements.trust_drive_identity.checked = false;
+    if (form.elements.scratch_media_confirmed) form.elements.scratch_media_confirmed.checked = false;
+    if (form.elements.destructive_overwrite_confirmed) form.elements.destructive_overwrite_confirmed.checked = false;
+    if (form.elements.confirmation) form.elements.confirmation.value = "";
+  }
+
+  function updateTapeInitializeForm(form) {
+    if (!form) return;
+    let mode = form.elements.media_mode.value;
+    const existing = form.querySelector("#tape-init-existing");
+    const fresh = form.querySelector("#tape-init-new");
+    const existingSelect = form.elements.cartridge_id;
+    const driveId = String(form.elements.drive_id.value || "");
+    if (form.dataset.driveId !== undefined && form.dataset.driveId !== driveId) {
+      const active = activeQualificationForDrive(driveId);
+      const choices = tapeInitializeMedia(driveId);
+      const preferred = active ? String(pick(active, "cartridge_id") || "") : choices.length === 1 ? recordId(choices[0]) : "";
+      existingSelect.innerHTML = tapeInitializeMediaOptions(preferred, driveId).join("");
+      if (active) {
+        form.elements.media_mode.value = "existing";
+        mode = "existing";
+      }
+    }
+    form.dataset.driveId = driveId;
+    const newControls = [form.elements.internal_label, form.elements.barcode, form.elements.media_generation].filter(Boolean);
+    existing.hidden = mode !== "existing";
+    fresh.hidden = mode !== "new";
+    existingSelect.disabled = mode !== "existing";
+    existingSelect.required = mode === "existing";
+    newControls.forEach((control) => { control.disabled = mode !== "new"; });
+    form.elements.internal_label.required = mode === "new";
+    form.elements.media_generation.required = mode === "new";
+    const drive = state.data.drives.find((item) => recordId(item) === driveId);
+    const driveGeneration = Number(pick(drive, "generation", "media_generation"));
+    if (mode === "new" && !form.elements.media_generation.value && Number.isInteger(driveGeneration) && driveGeneration >= 1 && driveGeneration <= 10) {
+      form.elements.media_generation.value = String(driveGeneration);
+    }
+    const driveState = form.querySelector("#tape-init-drive-state");
+    const trustWrap = form.querySelector("#tape-init-trust-wrap");
+    const trust = form.elements.trust_drive_identity;
+    const blocker = tapeInitializeDriveBlocker(drive);
+    const active = drive && activeQualificationForDrive(recordId(drive));
+    const stableId = drive && pick(drive, "stable_id");
+    if (driveState) {
+      driveState.className = "tape-init-drive-state " + (blocker && !active ? "blocked" : active ? "active" : "ready");
+      driveState.innerHTML = drive ? '<span aria-hidden="true">' + (blocker && !active ? "!" : active ? "▶" : "✓") + '</span><div><strong>' + esc(blocker && !active ? blocker : active ? "An exact qualification may already be active" : "Drive is loaded and motion-safe") + '</strong><small>' + esc(label(stableId)) + " · " + esc(label(pick(drive, "observed_path"))) + "</small></div>" : '<span aria-hidden="true">·</span><div><strong>Select a loaded drive</strong><small>No hardware is bound yet.</small></div>';
+    }
+    const needsTrust = Boolean(drive && drive.reconciled !== true && !blocker);
+    trustWrap.hidden = !needsTrust;
+    trust.disabled = !needsTrust;
+    trust.required = needsTrust;
+    const labelText = tapeInitializeLabel(form);
+    const help = form.querySelector("#tape-init-confirmation-help");
+    if (help) help.textContent = labelText ? "Required: DESTROY " + labelText + " WITH BACULA BTAPE TEST" : "Select or enter a cartridge label first.";
+  }
+
+  function setTapeInitializeProgress(form, step, detail) {
+    const progress = form.querySelector("#tape-init-progress");
+    progress.hidden = false;
+    progress.innerHTML = '<span class="spinner" aria-hidden="true"></span><div><strong>' + esc(step) + '</strong><small>' + esc(detail) + "</small></div>";
+  }
+
+  function tapeInitializeEligibleRecord(labelText, generation, barcode) {
+    const record = state.data.media.find((item) => String(mediaName(item)) === String(labelText));
+    if (!record) return null;
+    const expectedBarcode = String(barcode || "").trim();
+    const recordedBarcode = String(pick(record, "barcode") || "").trim();
+    if (record.worm === true || expectedBarcode !== recordedBarcode || (generation && Number(pick(record, "media_generation", "generation")) !== Number(generation)) || !qualificationMedia().some((item) => recordId(item) === recordId(record))) return null;
+    return record;
+  }
+
+  async function submitTapeInitialization(form) {
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#tape-init-error");
+    const driveId = String(form.elements.drive_id.value || "");
+    let drive = state.data.drives.find((item) => recordId(item) === driveId);
+    const expectedStableId = String(pick(drive, "stable_id") || "");
+    const labelText = tapeInitializeLabel(form);
+    const expectedConfirmation = "DESTROY " + labelText + " WITH BACULA BTAPE TEST";
+    const initialBlocker = tapeInitializeDriveBlocker(drive);
+    const activeAtSubmit = activeQualificationForDrive(driveId);
+    const selectedExistingCartridgeId = form.elements.media_mode.value === "existing" ? String(form.elements.cartridge_id.value || "") : "";
+    const resumeRunId = activeAtSubmit
+      && String(pick(activeAtSubmit, "cartridge_id")) === selectedExistingCartridgeId
+      && String(pick(activeAtSubmit, "expected_cartridge_label", "cartridge_label")) === labelText
+      ? recordId(activeAtSubmit)
+      : null;
+    if (!drive || (initialBlocker && !activeQualificationForDrive(driveId))) {
+      errorBox.textContent = initialBlocker || "Select a valid loaded drive.";
+      errorBox.hidden = false;
+      return;
+    }
+    if (!labelText || String(form.elements.confirmation.value || "") !== expectedConfirmation) {
+      errorBox.textContent = "Type the exact destructive confirmation shown above.";
+      errorBox.hidden = false;
+      return;
+    }
+    if (activeAtSubmit && !resumeRunId) {
+      errorBox.textContent = "This drive already has a different destructive qualification in progress. Resume its exact cartridge or wait for it to finish.";
+      errorBox.hidden = false;
+      return;
+    }
+    submit.disabled = true;
+    submit.textContent = "Initializing…";
+    errorBox.hidden = true;
+    try {
+      if (drive.reconciled !== true) {
+        if (!form.elements.trust_drive_identity.checked) throw new Error("Confirm trust in the exact drive identity before continuing.");
+        setTapeInitializeProgress(form, "Trusting exact drive identity", "Any later path, firmware, or stable-identity change invalidates this trust.");
+        try {
+          await request("/drives/" + encodeURIComponent(driveId) + "/reconcile", {
+            method: "POST",
+            headers: { Accept: "application/json", "Content-Type": "application/json" },
+            body: JSON.stringify({ stable_id: expectedStableId })
+          });
+        } catch (error) {
+          await loadOne("drives");
+          drive = state.data.drives.find((item) => recordId(item) === driveId);
+          if (!drive || drive.reconciled !== true) throw error;
+        }
+        await loadOne("drives");
+        drive = state.data.drives.find((item) => recordId(item) === driveId);
+        if (!drive || drive.reconciled !== true || String(pick(drive, "stable_id") || "") !== expectedStableId) {
+          throw new Error("The exact drive identity did not remain reconciled.");
+        }
+      }
+
+      let cartridge;
+      if (form.elements.media_mode.value === "new") {
+        const generation = Number(form.elements.media_generation.value);
+        const barcode = String(form.elements.barcode.value || "").trim();
+        setTapeInitializeProgress(form, "Registering non-WORM scratch cartridge", "The inventory label is retained before destructive qualification is queued.");
+        await loadOne("media");
+        cartridge = tapeInitializeEligibleRecord(labelText, generation, barcode);
+        if (!cartridge) {
+          try {
+            const response = await request(endpoints.media, {
+              method: "POST",
+              headers: { Accept: "application/json", "Content-Type": "application/json" },
+              body: JSON.stringify({
+                internal_label: labelText,
+                barcode: barcode || null,
+                media_generation: generation,
+                media_format: "LTO-" + generation,
+                worm: false
+              })
+            });
+            cartridge = response && (response.media || response);
+          } catch (error) {
+            await loadOne("media");
+            cartridge = tapeInitializeEligibleRecord(labelText, generation, barcode);
+            if (!cartridge) throw error;
+          }
+          await loadOne("media");
+          cartridge = tapeInitializeEligibleRecord(labelText, generation, barcode);
+        }
+      } else {
+        cartridge = tapeInitializeMedia(driveId).find((item) => recordId(item) === String(form.elements.cartridge_id.value));
+      }
+      if (!tapeInitializeCartridgeAllowed(cartridge, driveId)) throw new Error("The selected cartridge is no longer eligible scratch media and has no exact active qualification to resume.");
+
+      setTapeInitializeProgress(form, "Checking for an existing exact run", "Response-loss recovery prevents a second destructive qualification from being queued.");
+      await Promise.all([loadOne("qualificationRuns"), loadOne("drives"), loadOne("media")]);
+      let run = resumeRunId ? state.data.qualificationRuns.find((item) => recordId(item) === resumeRunId) : exactQualificationRun(driveId, recordId(cartridge), labelText);
+      if (resumeRunId && !run) {
+        try {
+          const detail = await request(endpoints.qualificationRuns + "/" + encodeURIComponent(resumeRunId));
+          run = detail && (detail.run || detail);
+        } catch (_) {
+          throw new Error("The exact qualification being resumed could not be reloaded. No replacement destructive run was queued.");
+        }
+      }
+      const otherActive = activeQualificationForDrive(driveId);
+      if (!run && otherActive) throw new Error("This drive already has a different destructive qualification in progress.");
+      if (run) clearTapeInitializeIdempotency(form, driveId, recordId(cartridge));
+      if (!run) {
+        const stableId = String(pick(drive, "stable_id"));
+        const idempotencyKey = tapeInitializeIdempotencyKey(form, driveId, stableId, recordId(cartridge), labelText);
+        setTapeInitializeProgress(form, "Queueing Bacula btape qualification", "The durable worker run will report write, motion, readback, and rewind-to-BOT evidence.");
+        try {
+          const response = await request(endpoints.qualificationRuns, {
+            method: "POST",
+            headers: { Accept: "application/json", "Content-Type": "application/json" },
+            body: JSON.stringify({
+              drive_id: driveId,
+              stable_id: stableId,
+              cartridge_id: recordId(cartridge),
+              cartridge_label: labelText,
+              confirmation: expectedConfirmation,
+              scratch_media_confirmed: form.elements.scratch_media_confirmed.checked,
+              destructive_overwrite_confirmed: form.elements.destructive_overwrite_confirmed.checked,
+              idempotency_key: idempotencyKey
+            })
+          });
+          run = response && response.run;
+          if (!run) throw new Error("The durable qualification response did not include a run.");
+          clearTapeInitializeIdempotency(form, driveId, recordId(cartridge));
+        } catch (error) {
+          await loadOne("qualificationRuns");
+          run = exactQualificationRun(driveId, recordId(cartridge), labelText);
+          if (run) clearTapeInitializeIdempotency(form, driveId, recordId(cartridge));
+          if (!run) throw error;
+        }
+      }
+      if (!run) throw new Error("The durable qualification response did not include a run.");
+      rememberQualificationRun(run);
+      closeModal();
+      state.settingsTab = "qualification";
+      if (location.hash !== "#settings") location.hash = "#settings";
+      updateChrome();
+      render();
+      scheduleQualificationPoll();
+      live.textContent = "Tape initialization is showing the durable Bacula qualification run for " + labelText + ".";
+      const runState = String(pick(run, "state") || "").toLowerCase();
+      const activeRun = ["queued", "running"].includes(runState);
+      toast(runState === "passed" ? "Tape already initialized" : activeRun ? "Tape initialization queued" : "Tape initialization did not pass", runState === "passed" ? "The exact retained qualification already passed; no duplicate destructive run was created." : activeRun ? "Opening durable progress for the exact drive and cartridge." : "Opening the retained terminal result. No replacement destructive run was queued.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      const progress = form.querySelector("#tape-init-progress");
+      if (progress) progress.hidden = true;
+      submit.disabled = false;
+      submit.textContent = "Destroy tape and initialize";
+    }
+  }
+
   function qualificationRunDetail(run) {
     const result = run && run.result && typeof run.result === "object" ? run.result : {};
     const evidence = result.evidence && typeof result.evidence === "object" ? result.evidence : {};
@@ -3936,6 +4660,16 @@
   function updateQualificationConfirmation(select) {
     const option = select.options[select.selectedIndex];
     const cartridgeLabel = option && option.dataset.label;
+    const form = select.form;
+    const cartridgeId = String(select.value || "");
+    if (form && form.dataset.qualificationCartridgeId !== cartridgeId) {
+      delete form.dataset.idempotencyKey;
+      delete form.dataset.idempotencyScope;
+      if (form.elements.scratch_media_confirmed) form.elements.scratch_media_confirmed.checked = false;
+      if (form.elements.destructive_overwrite_confirmed) form.elements.destructive_overwrite_confirmed.checked = false;
+      if (form.elements.confirmation) form.elements.confirmation.value = "";
+      form.dataset.qualificationCartridgeId = cartridgeId;
+    }
     const help = document.querySelector("#qualification-confirmation-help");
     if (help) help.textContent = cartridgeLabel ? "Required: DESTROY " + cartridgeLabel + " WITH BACULA BTAPE TEST" : "Select a cartridge to display the required phrase.";
   }
@@ -3952,20 +4686,25 @@
     submit.textContent = "Queueing destructive test…";
     errorBox.hidden = true;
     try {
+      const cartridgeId = String(values.get("cartridge_id"));
+      const idempotencyKey = tapeInitializeIdempotencyKey(form, form.dataset.driveId, form.dataset.stableId, cartridgeId, cartridgeLabel);
       const response = await request(endpoints.qualificationRuns, {
         method: "POST",
         headers: { Accept: "application/json", "Content-Type": "application/json" },
         body: JSON.stringify({
           drive_id: form.dataset.driveId,
           stable_id: form.dataset.stableId,
-          cartridge_id: String(values.get("cartridge_id")),
+          cartridge_id: cartridgeId,
           cartridge_label: cartridgeLabel,
           confirmation: String(values.get("confirmation") || ""),
           scratch_media_confirmed: values.get("scratch_media_confirmed") === "on",
-          destructive_overwrite_confirmed: values.get("destructive_overwrite_confirmed") === "on"
+          destructive_overwrite_confirmed: values.get("destructive_overwrite_confirmed") === "on",
+          idempotency_key: idempotencyKey
         })
       });
       const queuedRun = response && response.run;
+      if (!queuedRun) throw new Error("The durable qualification response did not include a run.");
+      clearTapeInitializeIdempotency(form, form.dataset.driveId, cartridgeId);
       rememberQualificationRun(queuedRun);
       closeModal();
       state.settingsTab = "qualification";
@@ -3973,8 +4712,9 @@
       updateChrome();
       render();
       scheduleQualificationPoll();
-      live.textContent = "Bacula qualification queued for " + cartridgeLabel + ". Opening durable run status.";
-      toast("Bacula qualification queued", "Opening the durable run status. Keep the worker and tape drive online.");
+      const queuedState = String(pick(queuedRun, "state") || "").toLowerCase();
+      live.textContent = "Bacula qualification " + human(queuedState || "queued") + " for " + cartridgeLabel + ". Opening durable run status.";
+      toast(queuedState === "passed" ? "Bacula qualification already passed" : ["failed", "blocked", "interrupted"].includes(queuedState) ? "Bacula qualification did not pass" : "Bacula qualification queued", response && response.idempotent_replay === true ? "The server returned the original durable request; no duplicate destructive run was created." : "Opening the durable run status. Keep the worker and tape drive online.");
       await Promise.all([loadOne("qualificationRuns"), loadOne("drives"), loadOne("media")]);
       updateChrome();
       render();
@@ -4096,12 +4836,17 @@
     if (action === "close-nav") shell.classList.remove("nav-open");
     if (action === "refresh") loadAll(false);
     if (action === "create-backup-profile") openBackupProfile();
+    if (action === "open-source-browser") openSourceBrowser(target.dataset.browserTarget || "backup");
+    if (action === "close-source-browser") closeSourceBrowser();
+    if (action === "source-browser-navigate") loadSourceBrowser(target.dataset.path || "", true);
+    if (action === "select-source-directory") selectSourceDirectory();
     if (action === "start-backup") openStartBackup(target.dataset.profileId);
     if (action === "select-backup-run") selectBackupRun(target.dataset.id);
     if (action === "retry-backup-run") loadBackupRunDetail(target.dataset.id, true);
     if (action === "assign-backup-media") openAssignBackupMedia(target.dataset.id);
     if (action === "cancel-backup-run") openCancelBackupRun(target.dataset.id);
     if (action === "add-media") openAddMedia();
+    if (action === "initialize-tape") openTapeInitialization(target);
     if (action === "create-media-pool") openMediaPoolForm();
     if (action === "select-media") selectMedia(target.dataset.id);
     if (action === "retry-media-detail") loadMediaDetail(target.dataset.id, true);
@@ -4122,6 +4867,9 @@
     if (action === "correct-custody") openCustodyCorrection(target);
     if (action === "print-movement-manifest") printMovementManifest();
     if (action === "retry-recovery-point") loadRecoveryPointDetail(target.dataset.id, true);
+    if (action === "open-recovery-files") openRecoveryPointFiles(target.dataset.id);
+    if (action === "close-recovery-files") closeRecoveryPointFiles(target.dataset.id);
+    if (action === "recovery-files-navigate") loadRecoveryPointFiles(target.dataset.id, target.dataset.path || "", true);
     if (action === "download-recovery-evidence") downloadRecoveryEvidence(target);
     if (action === "open-restore-plan" || action === "revise-restore-plan") openRestorePlan(target.dataset.id);
     if (action === "open-restore-rehearsal") openRestoreRehearsal(target.dataset.planId);
@@ -4146,6 +4894,10 @@
   });
 
   document.addEventListener("submit", (event) => {
+    if (event.target.id === "tape-initialize-form") {
+      event.preventDefault();
+      submitTapeInitialization(event.target);
+    }
     if (event.target.id === "backup-profile-form") {
       event.preventDefault();
       submitBackupProfile(event.target);
@@ -4233,6 +4985,15 @@
   });
 
   document.addEventListener("input", (event) => {
+    if (["tape-init-label", "tape-init-barcode"].includes(event.target.id)) {
+      resetTapeInitializeAssertions(event.target.form, false);
+      updateTapeInitializeForm(event.target.form);
+    }
+    if (["backup-source-subpath", "recovery-source-subpath"].includes(event.target.id)) {
+      const summaryId = event.target.id === "recovery-source-subpath" ? "recovery-source-selection" : "backup-source-selection";
+      const summary = document.getElementById(summaryId);
+      if (summary && event.target.value.trim() !== sourceBrowserPath) summary.hidden = true;
+    }
     if (event.target.id === "backup-search") {
       state.backupQuery = event.target.value;
       applyBackupFilters();
@@ -4248,6 +5009,10 @@
   });
 
   document.addEventListener("change", (event) => {
+    if (["tape-init-drive", "tape-init-media-mode", "tape-init-cartridge", "tape-init-generation"].includes(event.target.id)) {
+      resetTapeInitializeAssertions(event.target.form, event.target.id === "tape-init-drive");
+      updateTapeInitializeForm(event.target.form);
+    }
     if (event.target.id === "backup-media-drive") updateBackupMediaForDrive(event.target.form);
     if (event.target.id === "backup-media-cartridge") updateBackupMediaConfirmation(event.target.form);
     if (event.target.id === "backup-state-filter") {

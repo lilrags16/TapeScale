@@ -21,6 +21,7 @@ use tapescale::{
     },
 };
 use tower::ServiceExt;
+use uuid::Uuid;
 
 async fn api_request(
     application: &Router,
@@ -353,22 +354,135 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     let scratch = store::create_media(&pool, &scratch_request)
         .await
         .expect("scratch cartridge should be inserted");
-    let queued_qualification = store::queue_qualification_run(
-        &pool,
-        drive_id,
-        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
-        scratch.id,
-        &scratch.internal_label,
-        true,
-        true,
+    let qualification_web = tempfile::tempdir().expect("qualification web root should exist");
+    let qualification_application = api::router(
+        AppState::new(
+            Some(pool.clone()),
+            false,
+            true,
+            true,
+            true,
+            PathBuf::from("/source"),
+            PathBuf::from("/restore"),
+        ),
+        qualification_web.path().to_path_buf(),
+    );
+    let qualification_idempotency_key = "store-integration-qualification-001";
+    let qualification_request = json!({
+        "drive_id": drive_id,
+        "stable_id": "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        "cartridge_id": scratch.id,
+        "cartridge_label": scratch.internal_label,
+        "confirmation": format!(
+            "DESTROY {} WITH BACULA BTAPE TEST",
+            scratch.internal_label
+        ),
+        "scratch_media_confirmed": true,
+        "destructive_overwrite_confirmed": true,
+        "idempotency_key": qualification_idempotency_key
+    });
+    let mut missing_idempotency_key = qualification_request.clone();
+    missing_idempotency_key
+        .as_object_mut()
+        .expect("qualification request is an object")
+        .remove("idempotency_key");
+    let missing_key_response = api_request(
+        &qualification_application,
+        Method::POST,
+        "/api/v1/qualification/runs".to_owned(),
+        Some(missing_idempotency_key),
     )
-    .await
-    .expect("qualification request should persist");
-    let QueueQualificationRunResult::Queued(queued_qualification) = queued_qualification else {
-        panic!("eligible qualification request should queue");
+    .await;
+    assert_eq!(missing_key_response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qualification_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("missing key must not create a qualification run"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qualification_events")
+            .fetch_one(&pool)
+            .await
+            .expect("missing key must not append a qualification event"),
+        0
+    );
+    let (first_response, second_response) = tokio::join!(
+        api_request(
+            &qualification_application,
+            Method::POST,
+            "/api/v1/qualification/runs".to_owned(),
+            Some(qualification_request.clone()),
+        ),
+        api_request(
+            &qualification_application,
+            Method::POST,
+            "/api/v1/qualification/runs".to_owned(),
+            Some(qualification_request.clone()),
+        )
+    );
+    let first_status = first_response.status();
+    let second_status = second_response.status();
+    assert!(matches!(
+        (first_status, second_status),
+        (StatusCode::ACCEPTED, StatusCode::OK) | (StatusCode::OK, StatusCode::ACCEPTED)
+    ));
+    let first_response = response_json(first_response).await;
+    let second_response = response_json(second_response).await;
+    assert_eq!(first_response["run"]["id"], second_response["run"]["id"]);
+    let (queued_response, replay_response) = if first_status == StatusCode::ACCEPTED {
+        (&first_response, &second_response)
+    } else {
+        (&second_response, &first_response)
     };
+    assert_eq!(queued_response["idempotent_replay"], false);
+    assert_eq!(queued_response["audit"], "appended");
+    assert_eq!(queued_response["disposition"], "queued");
+    assert_eq!(replay_response["idempotent_replay"], true);
+    assert_eq!(replay_response["audit"], "existing");
+    assert_eq!(replay_response["disposition"], "existing");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM qualification_runs WHERE idempotency_key = $1"
+        )
+        .bind(qualification_idempotency_key)
+        .fetch_one(&pool)
+        .await
+        .expect("idempotent qualification row count should query"),
+        1
+    );
+    let qualification_id = Uuid::parse_str(
+        queued_response["run"]["id"]
+            .as_str()
+            .expect("queued run should expose its id"),
+    )
+    .expect("queued qualification id should parse");
+    let queued_qualification = store::get_qualification_run(&pool, qualification_id)
+        .await
+        .expect("qualification request should reload")
+        .expect("qualification request should persist");
     assert_eq!(queued_qualification.state, "queued");
     assert_eq!(queued_qualification.engine_version, "15.0.3");
+    let mut changed_qualification_request = qualification_request.clone();
+    changed_qualification_request["cartridge_id"] = json!(created.id);
+    let changed_replay = api_request(
+        &qualification_application,
+        Method::POST,
+        "/api/v1/qualification/runs".to_owned(),
+        Some(changed_qualification_request),
+    )
+    .await;
+    assert_eq!(changed_replay.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        store::qualification_events(&pool, queued_qualification.id)
+            .await
+            .expect("idempotent retry should preserve events")
+            .iter()
+            .filter(|event| event.event_type == "queued")
+            .count(),
+        1
+    );
     assert!(matches!(
         store::queue_drive_operation(
             &pool,
@@ -409,6 +523,63 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         .expect("qualification should reload")
         .expect("qualification remains in history");
     assert_eq!(completed_qualification.state, "passed");
+    let terminal_replay = api_request(
+        &qualification_application,
+        Method::POST,
+        "/api/v1/qualification/runs".to_owned(),
+        Some(qualification_request.clone()),
+    )
+    .await;
+    assert_eq!(terminal_replay.status(), StatusCode::OK);
+    let terminal_replay = response_json(terminal_replay).await;
+    assert_eq!(terminal_replay["run"]["id"], json!(queued_qualification.id));
+    assert_eq!(terminal_replay["run"]["state"], "passed");
+    assert_eq!(terminal_replay["idempotent_replay"], true);
+    let disabled_web = tempfile::tempdir().expect("disabled qualification web root should exist");
+    let disabled_qualification_application = api::router(
+        AppState::new(
+            Some(pool.clone()),
+            false,
+            true,
+            false,
+            true,
+            PathBuf::from("/source"),
+            PathBuf::from("/restore"),
+        ),
+        disabled_web.path().to_path_buf(),
+    );
+    let disabled_known_replay = api_request(
+        &disabled_qualification_application,
+        Method::POST,
+        "/api/v1/qualification/runs".to_owned(),
+        Some(qualification_request.clone()),
+    )
+    .await;
+    assert_eq!(disabled_known_replay.status(), StatusCode::OK);
+    let disabled_known_replay = response_json(disabled_known_replay).await;
+    assert_eq!(
+        disabled_known_replay["run"]["id"],
+        json!(queued_qualification.id)
+    );
+    assert_eq!(disabled_known_replay["run"]["state"], "passed");
+    assert_eq!(disabled_known_replay["idempotent_replay"], true);
+    let mut disabled_new_request = qualification_request.clone();
+    disabled_new_request["idempotency_key"] = json!("disabled-new-qualification-request");
+    let disabled_new_response = api_request(
+        &disabled_qualification_application,
+        Method::POST,
+        "/api/v1/qualification/runs".to_owned(),
+        Some(disabled_new_request),
+    )
+    .await;
+    assert_eq!(disabled_new_response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qualification_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("disabled gate must not create a qualification run"),
+        1
+    );
     let qualification_events = store::qualification_events(&pool, queued_qualification.id)
         .await
         .expect("qualification events should reload");
@@ -419,6 +590,124 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             .collect::<Vec<_>>(),
         vec!["queued", "started", "passed"]
     );
+    for (suffix, terminal_state, expected_state) in [
+        ("failed", QualificationTerminalState::Failed, "failed"),
+        ("blocked", QualificationTerminalState::Blocked, "blocked"),
+        (
+            "interrupted",
+            QualificationTerminalState::Interrupted,
+            "interrupted",
+        ),
+    ] {
+        let idempotency_key = format!("store-integration-qualification-{suffix}");
+        let mut terminal_request = qualification_request.clone();
+        terminal_request["idempotency_key"] = json!(idempotency_key);
+        let queued_response = api_request(
+            &qualification_application,
+            Method::POST,
+            "/api/v1/qualification/runs".to_owned(),
+            Some(terminal_request.clone()),
+        )
+        .await;
+        assert_eq!(queued_response.status(), StatusCode::ACCEPTED);
+        let queued_response = response_json(queued_response).await;
+        let terminal_run_id = Uuid::parse_str(
+            queued_response["run"]["id"]
+                .as_str()
+                .expect("terminal replay fixture should expose a run id"),
+        )
+        .expect("terminal replay fixture id should parse");
+        let claimed = store::claim_next_qualification_run(&pool, Uuid::now_v7())
+            .await
+            .expect("terminal replay fixture should be claimable");
+        let ClaimQualificationRunResult::Claimed(claimed) = claimed else {
+            panic!("terminal replay fixture should be claimed");
+        };
+        assert_eq!(claimed.run.id, terminal_run_id);
+        assert!(store::finish_qualification_run(
+            &pool,
+            &claimed,
+            terminal_state,
+            json!({
+                "detail": format!("integration {suffix} terminal replay fixture"),
+                "position_uncertain": false
+            }),
+        )
+        .await
+        .expect("terminal replay fixture should finish"));
+
+        let replay = api_request(
+            &qualification_application,
+            Method::POST,
+            "/api/v1/qualification/runs".to_owned(),
+            Some(terminal_request),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay = response_json(replay).await;
+        assert_eq!(replay["run"]["id"], json!(terminal_run_id));
+        assert_eq!(replay["run"]["state"], expected_state);
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM qualification_runs WHERE idempotency_key = $1"
+            )
+            .bind(&idempotency_key)
+            .fetch_one(&pool)
+            .await
+            .expect("terminal replay row count should query"),
+            1
+        );
+        assert_eq!(
+            store::qualification_events(&pool, terminal_run_id)
+                .await
+                .expect("terminal replay events should reload")
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["queued", "started", expected_state]
+        );
+    }
+    // The terminal-replay matrix intentionally creates newer non-passing
+    // evidence for the exact tuple. Re-establish a latest passing run before
+    // the rest of this end-to-end test exercises the qualified data path.
+    let mut restored_pass_request = qualification_request.clone();
+    restored_pass_request["idempotency_key"] =
+        json!("store-integration-qualification-restored-pass");
+    let restored_pass = api_request(
+        &qualification_application,
+        Method::POST,
+        "/api/v1/qualification/runs".to_owned(),
+        Some(restored_pass_request),
+    )
+    .await;
+    assert_eq!(restored_pass.status(), StatusCode::ACCEPTED);
+    let restored_pass = response_json(restored_pass).await;
+    let restored_pass_id = Uuid::parse_str(
+        restored_pass["run"]["id"]
+            .as_str()
+            .expect("restored qualification pass should expose a run id"),
+    )
+    .expect("restored qualification pass id should parse");
+    let restored_pass_claim = store::claim_next_qualification_run(&pool, Uuid::now_v7())
+        .await
+        .expect("restored qualification pass should be claimable");
+    let ClaimQualificationRunResult::Claimed(restored_pass_claim) = restored_pass_claim else {
+        panic!("restored qualification pass should be claimed");
+    };
+    assert_eq!(restored_pass_claim.run.id, restored_pass_id);
+    assert!(store::finish_qualification_run(
+        &pool,
+        &restored_pass_claim,
+        QualificationTerminalState::Passed,
+        json!({
+            "detail": "integration qualification restored after terminal replay matrix",
+            "position_uncertain": false,
+            "engine_version": "15.0.3"
+        }),
+    )
+    .await
+    .expect("restored qualification pass should persist"));
     let reservation =
         sqlx::query_scalar::<_, Option<String>>("SELECT reserved_by FROM cartridges WHERE id = $1")
             .bind(scratch.id)
@@ -831,6 +1120,18 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     else {
         panic!("complete matching evidence should create a verified recovery point");
     };
+    let legacy_manifest_binding = store::recovery_point_manifest_binding(&pool, recovery_point_id)
+        .await
+        .expect("G0.2 manifest binding should query")
+        .expect("G0.2 recovery point should retain a manifest binding");
+    assert_eq!(
+        legacy_manifest_binding.manifest_digest.as_deref(),
+        Some(source_manifest_digest.as_str())
+    );
+    assert_eq!(
+        legacy_manifest_binding.artifact_sha256.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
     assert!(matches!(
         store::finalize_single_tape_data_pass(&pool, &data_claim, &pass_evidence)
             .await

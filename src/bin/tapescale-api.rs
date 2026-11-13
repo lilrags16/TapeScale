@@ -30,7 +30,8 @@ async fn main() -> Result<()> {
         config.lab_file_roundtrip_enabled,
         config.source_root,
         config.restore_root,
-    );
+    )
+    .with_evidence_root(config.evidence_root);
     let app = api::router(state, config.web_dir);
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await

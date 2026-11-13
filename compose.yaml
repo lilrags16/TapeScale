@@ -48,6 +48,7 @@ services:
       - control
       - edge
     volumes:
+      - recovery_exports:/var/lib/tapescale/recovery:ro
       - ${TAPESCALE_SOURCE_HOST_PATH:-./fixtures}:/source:ro
       - type: bind
         source: ${TAPESCALE_RESTORE_HOST_PATH:-./restore}

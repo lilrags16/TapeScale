@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     services::{ServeDir, ServeFile},
@@ -35,7 +36,9 @@ use crate::{
     },
     engine::{simulator::SimulatorEngine, TapeEngine},
     error::AppError,
-    media_ops, qualification, store, VERSION,
+    media_ops, qualification,
+    source_browser::{self, RetainedManifestReference, SourceBrowserError},
+    store, VERSION,
 };
 
 #[derive(Clone)]
@@ -48,7 +51,11 @@ pub struct AppState {
     pub lab_file_roundtrip_enabled: bool,
     pub source_root: PathBuf,
     pub restore_root: PathBuf,
+    pub evidence_root: PathBuf,
+    retained_manifest_browser_slots: Arc<Semaphore>,
 }
+
+const RETAINED_MANIFEST_BROWSER_CONCURRENCY: usize = 1;
 
 impl AppState {
     #[must_use]
@@ -70,7 +77,17 @@ impl AppState {
             lab_file_roundtrip_enabled,
             source_root,
             restore_root,
+            evidence_root: PathBuf::from("/var/lib/tapescale/recovery"),
+            retained_manifest_browser_slots: Arc::new(Semaphore::new(
+                RETAINED_MANIFEST_BROWSER_CONCURRENCY,
+            )),
         }
+    }
+
+    #[must_use]
+    pub fn with_evidence_root(mut self, evidence_root: PathBuf) -> Self {
+        self.evidence_root = evidence_root;
+        self
     }
 }
 
@@ -83,6 +100,7 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/jobs", get(jobs))
         .route("/api/v1/jobs/{id}", get(job))
+        .route("/api/v1/source-browser", get(source_browser_listing))
         .route(
             "/api/v1/backup-profiles",
             get(backup_profiles).post(create_backup_profile),
@@ -124,6 +142,10 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .route("/api/v1/verification", get(verification))
         .route("/api/v1/recovery-points", get(recovery_points))
         .route("/api/v1/recovery-points/{id}", get(recovery_point))
+        .route(
+            "/api/v1/recovery-points/{id}/files",
+            get(recovery_point_files),
+        )
         .route(
             "/api/v1/recovery-points/{id}/evidence",
             get(recovery_point_evidence),
@@ -287,6 +309,26 @@ async fn job(
         None => Vec::new(),
     };
     Ok(Json(json!({"job":job,"transitions":transitions})))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BrowserQuery {
+    #[serde(default)]
+    path: String,
+}
+
+async fn source_browser_listing(
+    State(state): State<AppState>,
+    Query(query): Query<BrowserQuery>,
+) -> Result<Response, AppError> {
+    let source_root = state.source_root.clone();
+    let listing = tokio::task::spawn_blocking(move || {
+        source_browser::browse_source(&source_root, &query.path)
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("source browser task failed: {error}")))?
+    .map_err(map_source_browser_error)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(listing)).into_response())
 }
 
 async fn backup_profiles(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -1655,6 +1697,61 @@ async fn recovery_point(
     ))
 }
 
+async fn recovery_point_files(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<BrowserQuery>,
+) -> Result<Response, AppError> {
+    let pool = require_pool(&state)?;
+    let recovery_point_id = parse_uuid_path(&id, "recovery point")?;
+    let binding = store::recovery_point_manifest_binding(pool, recovery_point_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let reference = RetainedManifestReference {
+        storage_ref: binding.storage_ref.ok_or_else(|| {
+            AppError::Blocked("the recovery point has no retained source manifest".to_owned())
+        })?,
+        artifact_sha256: binding.artifact_sha256.ok_or_else(|| {
+            AppError::Blocked("the recovery point has no retained source manifest".to_owned())
+        })?,
+        artifact_size_bytes: binding.artifact_size_bytes.ok_or_else(|| {
+            AppError::Blocked("the recovery point has no retained source manifest".to_owned())
+        })?,
+        manifest_digest: binding.manifest_digest.ok_or_else(|| {
+            AppError::Blocked("the recovery point has no retained source manifest".to_owned())
+        })?,
+    };
+    // A retained manifest can be a large, valid artifact. Serialize this
+    // memory-heavy read/hash/decode path so concurrent unauthenticated reads
+    // cannot multiply its peak memory use inside the API container.
+    let permit = state
+        .retained_manifest_browser_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::Internal("manifest browser concurrency gate closed".to_owned()))?;
+    let evidence_root = state.evidence_root.clone();
+    let listing = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        source_browser::browse_retained_manifest(&evidence_root, &reference, &query.path)
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("manifest browser task failed: {error}")))?
+    .map_err(map_source_browser_error)?;
+    let mut response =
+        serde_json::to_value(listing).map_err(|error| AppError::Internal(error.to_string()))?;
+    let object = response
+        .as_object_mut()
+        .expect("serialized browser listing is an object");
+    object.insert("recovery_point_id".to_owned(), json!(recovery_point_id));
+    object.insert("browse_only".to_owned(), Value::Bool(true));
+    object.insert(
+        "path_selective_restore_supported".to_owned(),
+        Value::Bool(false),
+    );
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response())
+}
+
 async fn recovery_point_evidence(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2869,7 +2966,7 @@ async fn qualification_run(
     })))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct QueueQualificationRunRequest {
     drive_id: Uuid,
     stable_id: String,
@@ -2878,6 +2975,8 @@ struct QueueQualificationRunRequest {
     confirmation: String,
     scratch_media_confirmed: bool,
     destructive_overwrite_confirmed: bool,
+    #[serde(default)]
+    idempotency_key: String,
 }
 
 impl QueueQualificationRunRequest {
@@ -2885,7 +2984,7 @@ impl QueueQualificationRunRequest {
         format!("DESTROY {} WITH BACULA BTAPE TEST", self.cartridge_label)
     }
 
-    fn validate(&self) -> Result<(&str, &str), AppError> {
+    fn validate(&self) -> Result<(&str, &str, &str), AppError> {
         let stable_id = self.stable_id.trim();
         if stable_id.is_empty()
             || stable_id.chars().count() > 512
@@ -2915,7 +3014,37 @@ impl QueueQualificationRunRequest {
                 self.expected_confirmation()
             )));
         }
-        Ok((stable_id, &self.cartridge_label))
+        let idempotency_key = self.idempotency_key.trim();
+        if idempotency_key.is_empty()
+            || idempotency_key.len() > 256
+            || idempotency_key.chars().any(char::is_control)
+        {
+            return Err(AppError::Invalid(
+                "idempotency_key must contain 1 to 256 printable bytes".to_owned(),
+            ));
+        }
+        Ok((stable_id, &self.cartridge_label, idempotency_key))
+    }
+
+    fn request_fingerprint(&self, stable_id: &str, cartridge_label: &str) -> String {
+        let payload = json!([
+            "tapescale.qualification-request.v1",
+            self.drive_id,
+            stable_id,
+            self.cartridge_id,
+            cartridge_label,
+            self.scratch_media_confirmed,
+            self.destructive_overwrite_confirmed,
+            "Bacula Community",
+            "15.0.3",
+            "btape_test"
+        ]);
+        format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&payload).expect("qualification fingerprint JSON is infallible")
+            )
+        )
     }
 }
 
@@ -2923,15 +3052,10 @@ async fn queue_qualification_run(
     State(state): State<AppState>,
     Json(request): Json<QueueQualificationRunRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    if !state.lab_tape_qualification_enabled {
-        return Err(AppError::Blocked(
-            "destructive lab tape qualification is disabled; set TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED=true on the API and worker only for an attended scratch-media test host"
-                .to_owned(),
-        ));
-    }
     let pool = require_pool(&state)?;
-    let (stable_id, cartridge_label) = request.validate()?;
-    match store::queue_qualification_run(
+    let (stable_id, cartridge_label, idempotency_key) = request.validate()?;
+    let fingerprint = request.request_fingerprint(stable_id, cartridge_label);
+    let disposition = store::queue_qualification_run_idempotent(
         pool,
         request.drive_id,
         stable_id,
@@ -2939,9 +3063,12 @@ async fn queue_qualification_run(
         cartridge_label,
         request.scratch_media_confirmed,
         request.destructive_overwrite_confirmed,
+        idempotency_key,
+        &fingerprint,
+        state.lab_tape_qualification_enabled,
     )
-    .await?
-    {
+    .await?;
+    match disposition {
         store::QueueQualificationRunResult::Queued(run) => {
             info!(
                 qualification_run_id = %run.id,
@@ -2957,12 +3084,30 @@ async fn queue_qualification_run(
                     "run":run,
                     "durability":"postgresql",
                     "audit":"appended",
+                    "disposition":"queued",
+                    "idempotent_replay":false,
                     "destructive":true,
                     "engine_candidate":"Bacula Community 15.0.3",
                     "physical_qualification":"not_established"
                 })),
             ))
         }
+        store::QueueQualificationRunResult::Existing(run) => Ok((
+            StatusCode::OK,
+            Json(json!({
+                "run":run,
+                "durability":"postgresql",
+                "audit":"existing",
+                "disposition":"existing",
+                "idempotent_replay":true,
+                "destructive":true,
+                "engine_candidate":"Bacula Community 15.0.3",
+                "physical_qualification":"not_established"
+            })),
+        )),
+        store::QueueQualificationRunResult::IdempotencyConflict => Err(AppError::Conflict(
+            "idempotency_key was already used for a different qualification request".to_owned(),
+        )),
         store::QueueQualificationRunResult::NotFound => Err(AppError::NotFound),
         store::QueueQualificationRunResult::Blocked(reason) => Err(AppError::Blocked(reason)),
     }
@@ -3069,6 +3214,25 @@ fn media_inventory_view(record: &media_ops::MediaInventorySummary) -> Value {
         object.insert("overwrite_blockers".to_owned(), json!([blocker]));
     }
     value
+}
+
+fn map_source_browser_error(error: SourceBrowserError) -> AppError {
+    match error {
+        SourceBrowserError::InvalidPath
+        | SourceBrowserError::PathTooLong
+        | SourceBrowserError::NotDirectory
+        | SourceBrowserError::SymlinkTraversal => AppError::Invalid(error.to_string()),
+        SourceBrowserError::NotFound => AppError::NotFound,
+        SourceBrowserError::TooManyEntries { .. }
+        | SourceBrowserError::InvalidRoot
+        | SourceBrowserError::NonUtf8Name
+        | SourceBrowserError::UnsafeEntryName
+        | SourceBrowserError::ManifestUnavailable
+        | SourceBrowserError::ManifestOutsideRoot
+        | SourceBrowserError::InvalidManifestBinding
+        | SourceBrowserError::ManifestIntegrity
+        | SourceBrowserError::Io(_) => AppError::Blocked(error.to_string()),
+    }
 }
 
 fn map_backup_ops_error(error: backup_ops::BackupOpsError) -> AppError {
@@ -3458,14 +3622,37 @@ mod tests {
             confirmation: "DESTROY SCRATCH-L9-001 WITH BACULA BTAPE TEST".to_owned(),
             scratch_media_confirmed: true,
             destructive_overwrite_confirmed: true,
+            idempotency_key: "  qualification-test-001  ".to_owned(),
         };
-        assert!(request.validate().is_ok());
+        let (stable_id, cartridge_label, idempotency_key) =
+            request.validate().expect("qualification request is valid");
+        assert_eq!(idempotency_key, "qualification-test-001");
+        let fingerprint = request.request_fingerprint(stable_id, cartridge_label);
+        assert_eq!(fingerprint.len(), 64);
+        let changed = QueueQualificationRunRequest {
+            cartridge_id: Uuid::now_v7(),
+            ..request.clone()
+        };
+        assert_ne!(
+            fingerprint,
+            changed.request_fingerprint(stable_id, cartridge_label)
+        );
 
         let invalid = QueueQualificationRunRequest {
             confirmation: "DESTROY THE TAPE".to_owned(),
-            ..request
+            ..request.clone()
         };
         assert!(matches!(invalid.validate(), Err(AppError::Invalid(_))));
+        let invalid_key = QueueQualificationRunRequest {
+            idempotency_key: "qualification\nretry".to_owned(),
+            ..request.clone()
+        };
+        assert!(matches!(invalid_key.validate(), Err(AppError::Invalid(_))));
+        let missing_key = QueueQualificationRunRequest {
+            idempotency_key: String::new(),
+            ..request
+        };
+        assert!(matches!(missing_key.validate(), Err(AppError::Invalid(_))));
     }
 
     #[test]
@@ -3573,5 +3760,37 @@ mod tests {
         assert_ne!(first, other);
         assert!(first.starts_with("TS-MOVE-"));
         assert_eq!(first.len(), 32);
+    }
+
+    #[test]
+    fn retained_manifest_browser_capacity_is_shared_across_state_clones() {
+        let state = AppState::new(
+            None,
+            false,
+            false,
+            false,
+            false,
+            PathBuf::from("/source"),
+            PathBuf::from("/restore"),
+        );
+        let all_slots = state
+            .retained_manifest_browser_slots
+            .clone()
+            .try_acquire_many_owned(
+                u32::try_from(RETAINED_MANIFEST_BROWSER_CONCURRENCY)
+                    .expect("concurrency limit fits u32"),
+            )
+            .expect("configured browser slots are available");
+
+        assert!(state
+            .clone()
+            .retained_manifest_browser_slots
+            .try_acquire_owned()
+            .is_err());
+        drop(all_slots);
+        assert!(state
+            .retained_manifest_browser_slots
+            .try_acquire_owned()
+            .is_ok());
     }
 }

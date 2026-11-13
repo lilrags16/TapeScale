@@ -21,7 +21,7 @@ The design considers:
 
 - Browser and API inputs are untrusted, even for administrators.
 - Tape labels, barcodes, engine output, manifests recovered from media, and archive paths are untrusted until authenticated and reconciled.
-- The API service cannot access devices or source data.
+- The API service cannot access devices or writable source/recovery data. The current test stack is an explicit exception: it gives the API read-only `/source` and recovery-artifact views plus `DAC_READ_SEARCH` for contained metadata browsing and preflight. It must never return file contents, absolute paths, symlink targets, or artifact storage references.
 - The privileged worker receives only explicit intents already authorized by the API, then independently rechecks policy, object versions, lease ownership, and current physical state.
 - PostgreSQL is durable product state, not proof that a physical write completed.
 - Engine state is authoritative for its records but does not override TapeScale retention or authorization.
@@ -60,6 +60,10 @@ Media is write-protected in policy unless every overwrite-gate condition in [ARC
 The preview's optional rewind/unload path is an isolated-lab exception, not the production authorization model. It requires an exact reconciled drive, known zero-in-flight kernel state, a durable fenced lease, and an explicit designated-scratch-media acknowledgement. Linux permits these two endpoint operations to recover from its internal lost-position state; this does not authorize data I/O or relative positioning. Linux can finalize another controller's prior write with a filemark before motion, so the control must never be used with retained, production, unknown, or foreign media. The preview API has no accounts yet; when the lab flag is enabled, its network must be isolated and attended.
 
 The optional `btape` path is a more destructive isolated-lab exception. Queueing requires two independent boolean acknowledgements and the exact phrase `DESTROY <registered-label> WITH BACULA BTAPE TEST`. The selected inventory record must be non-WORM, unheld, content-free, unreserved, and neither foreign nor mismatched; this remains an operator assertion because a standalone drive cannot prove the printed inventory label. The worker rechecks the exact device identity and fenced reservation, accepts only the pinned `/usr/sbin/btape` binary/digest and fixed `test\n` transcript, requires completed-test output markers, and rewinds to an observed BOT before recording a pass. It never promotes the broader qualification state. The preview has no authentication, so the test Compose's port 18080 is an unauthenticated destructive surface: deploy it only on an isolated attended lab network, disable `TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED` whenever the test is not actively required, and never load non-scratch media while it is enabled.
+
+The **Initialize tape** wizard does not combine these checks into one authority-bearing request. It sequences drive reconciliation, cartridge registration or exact-record reuse, and qualification through their existing API contracts. It may auto-select only one current safe drive; it cannot infer which physical cartridge is loaded, mark WORM media scratch, suppress holds/content/reservations, or dispatch a tape command before both destructive booleans and the exact phrase are accepted. Each wizard qualification submission carries a browser-generated idempotency key. PostgreSQL serializes that key, fingerprints the exact drive/media request, returns the original current or terminal run on a matching replay, and rejects changed-payload reuse. An ambiguous network retry therefore cannot silently create a second destructive run.
+
+The source and recovery-manifest browsers expand filename visibility on the unauthenticated test API. Both are GET-only, non-cacheable, one-level, bounded metadata projections. Source browsing holds the read-only root/selection as descriptors, resolves beneath them without following symlinks, and obtains entry metadata relative to the held directory; special objects remain non-navigable. Recovery browsing first verifies the retained manifest artifact and then projects its recorded entries without exposing the artifact path or reading source/tape content. This disclosure is another reason to keep port 18080 on an isolated attended network. Browser output is advisory: plan creation and restore execution continue to revalidate their authoritative inputs.
 
 ## External command execution
 
@@ -122,7 +126,7 @@ The preview database schema and domain rules establish this contract; full authe
 - Run as non-root whenever device access permits; use explicit uid/gid and supplementary device groups.
 - Drop all capabilities, then add only a documented minimum to the worker or constrained host helper.
 - Prefer read-only root filesystems and writable named volumes for exact state paths.
-- Mount source data read-only and approved restore destinations narrowly.
+- Mount source data read-only and approved restore destinations narrowly. If manifest browsing is enabled, expose only the exact recovery-artifact volume to the API as read-only; never mount the worker spool, Bacula runtime, or writable recovery state there.
 - Do not mount `/`, the Docker socket, arbitrary `/dev`, or broad host configuration.
 - Apply CPU, memory, process, and spool/staging limits.
 - Generate an SBOM and scan the release image; pin base images and dependencies.

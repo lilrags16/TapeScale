@@ -19,6 +19,7 @@ pub mod error;
 pub mod media_ops;
 pub mod qualification;
 pub mod restore_rehearsal;
+pub mod source_browser;
 pub mod store;
 pub mod tool_runner;
 pub mod truenas;

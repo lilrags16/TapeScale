@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf, time::Duration};
 
 use axum::{
     body::{to_bytes, Body},
@@ -11,6 +11,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use tapescale::{
     api::{self, AppState},
     backup_ops::{self, CancelBackupRequestResult, CreateBackupRequestResult, NewBackupProfile},
+    data_path::{build_manifest, persist_manifest},
     device::SasDriveObservation,
     store::{
         self, ClaimQualificationRunResult, CreateSingleTapeDataProfileResult, NewMedia,
@@ -415,6 +416,8 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     );
 
     let web_directory = tempfile::tempdir().expect("temporary web directory should exist");
+    let evidence_directory =
+        tempfile::tempdir().expect("temporary evidence directory should exist");
     let application = api::router(
         AppState::new(
             Some(pool.clone()),
@@ -424,7 +427,8 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
             true,
             PathBuf::from("/source"),
             PathBuf::from("/restore"),
-        ),
+        )
+        .with_evidence_root(evidence_directory.path().to_path_buf()),
         web_directory.path().to_path_buf(),
     );
     let assignment_body = json!({
@@ -573,18 +577,34 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         panic!("the exact qualified backup should be claimable");
     };
     assert_eq!(claimed.run.id, final_run.id);
+    let manifest_source = tempfile::tempdir().expect("manifest source should exist");
+    fs::write(
+        manifest_source.path().join("payload.bin"),
+        vec![0_u8; 1_024],
+    )
+    .expect("manifest payload should be written");
+    let source_manifest = build_manifest(manifest_source.path()).expect("manifest should build");
+    let source_manifest_artifact = persist_manifest(
+        &evidence_directory.path().join(final_run.id.to_string()),
+        "source-manifest",
+        &source_manifest,
+    )
+    .expect("manifest artifact should persist");
     assert!(store::append_single_tape_data_artifact(
         &pool,
         &claimed,
         "source_manifest",
-        "/integration/source-manifest.json",
-        &"a".repeat(64),
-        128,
+        source_manifest_artifact
+            .storage_path
+            .to_str()
+            .expect("artifact path should be UTF-8"),
+        &source_manifest_artifact.artifact_sha256,
+        source_manifest_artifact.size_bytes,
         json!({
-            "manifest_digest": "c".repeat(64),
-            "entry_count": 2,
-            "file_count": 1,
-            "logical_bytes": 1024,
+            "manifest_digest": source_manifest.digest_sha256,
+            "entry_count": source_manifest.entry_count,
+            "file_count": source_manifest.file_count,
+            "logical_bytes": source_manifest.logical_bytes,
             "coverage": {"complete": true}
         }),
     )
@@ -721,6 +741,29 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert!(backup_audit_actions
         .iter()
         .all(|action| action.starts_with("backup.data_run.")));
+
+    let manifest_response = api_request(
+        &application,
+        Method::GET,
+        format!("/api/v1/recovery-points/{recovery_point_id}/files?path="),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(manifest_response.status(), StatusCode::OK);
+    assert_eq!(
+        manifest_response.headers().get(header::CACHE_CONTROL),
+        Some(&header::HeaderValue::from_static("no-store"))
+    );
+    let manifest_response = response_json(manifest_response).await;
+    assert_eq!(manifest_response["browse_only"], true);
+    assert_eq!(manifest_response["path_selective_restore_supported"], false);
+    assert_eq!(manifest_response["current_path"], "");
+    assert_eq!(manifest_response["entries"][0]["name"], "payload.bin");
+    assert_eq!(manifest_response["entries"][0]["kind"], "file");
+    assert_eq!(manifest_response["entries"][0]["size_bytes"], 1_024);
+    assert!(manifest_response["entries"][0]
+        .get("content_sha256")
+        .is_none());
 
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))

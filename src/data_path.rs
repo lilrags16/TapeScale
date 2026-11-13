@@ -581,12 +581,33 @@ pub fn load_manifest(path: &Path) -> Result<FileManifest, ManifestError> {
         path: path.to_owned(),
         source,
     })?;
-    let manifest: FileManifest = serde_json::from_slice(&bytes)?;
+    load_manifest_bytes(&bytes)
+}
+
+/// Decode and validate a manifest from one caller-owned byte snapshot.
+///
+/// Callers that separately authenticate an artifact must use this entry point
+/// so the bytes they validate are exactly the bytes that are decoded. Reopening
+/// a pathname after hashing would leave a time-of-check/time-of-use gap.
+pub fn load_manifest_bytes(bytes: &[u8]) -> Result<FileManifest, ManifestError> {
+    load_manifest_bytes_with_limit(bytes, MAX_G02_MANIFEST_ENTRIES)
+}
+
+fn load_manifest_bytes_with_limit(
+    bytes: &[u8],
+    max_entries: u64,
+) -> Result<FileManifest, ManifestError> {
+    let manifest: FileManifest = serde_json::from_slice(bytes)?;
     if manifest.format != MANIFEST_FORMAT {
         return Err(ManifestError::Integrity("unsupported format"));
     }
     if manifest.entry_count != manifest.entries.len() as u64 {
         return Err(ManifestError::Integrity("entry count mismatch"));
+    }
+    if manifest.entry_count > max_entries {
+        return Err(ManifestError::Integrity(
+            "entry count exceeds product limit",
+        ));
     }
     if manifest.file_count
         != manifest
@@ -1102,6 +1123,47 @@ mod tests {
             load_manifest(&evidence.path().join("corrupted.json")),
             Err(ManifestError::Integrity("logical byte count mismatch"))
         ));
+    }
+
+    #[test]
+    fn authenticated_manifest_bytes_are_decoded_without_reopening_the_path() {
+        let source = tempdir().expect("source");
+        fs::write(source.path().join("evidence.txt"), b"recoverable").expect("file");
+        let manifest = build_manifest(source.path()).expect("manifest");
+        let evidence = tempdir().expect("evidence");
+        let artifact =
+            persist_manifest(evidence.path(), "source-manifest", &manifest).expect("persist");
+        let authenticated_bytes = fs::read(&artifact.storage_path).expect("artifact bytes");
+
+        // Simulate a pathname replacement after the caller has authenticated a
+        // byte snapshot. Decoding that snapshot remains deterministic and does
+        // not consult the now-invalid pathname.
+        fs::write(&artifact.storage_path, b"not a manifest").expect("replace pathname contents");
+        assert_eq!(
+            load_manifest_bytes(&authenticated_bytes).expect("authenticated snapshot"),
+            manifest
+        );
+        assert!(load_manifest(&artifact.storage_path).is_err());
+    }
+
+    #[test]
+    fn manifest_byte_decoder_enforces_the_entry_limit() {
+        let source = tempdir().expect("source");
+        fs::write(source.path().join("one.txt"), b"one").expect("file");
+        let manifest = build_manifest(source.path()).expect("manifest");
+        assert_eq!(manifest.entry_count, 2);
+        let bytes = serde_json::to_vec(&manifest).expect("serialize manifest");
+
+        assert!(matches!(
+            load_manifest_bytes_with_limit(&bytes, 1),
+            Err(ManifestError::Integrity(
+                "entry count exceeds product limit"
+            ))
+        ));
+        assert_eq!(
+            load_manifest_bytes_with_limit(&bytes, 2).expect("limit permits manifest"),
+            manifest
+        );
     }
 
     #[test]
