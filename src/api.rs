@@ -127,6 +127,19 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         )
         .route("/api/v1/recovery-exercises/{id}", get(recovery_exercise))
         .route("/api/v1/restores/plan", post(plan_restore))
+        .route(
+            "/api/v1/restore-rehearsals",
+            get(restore_rehearsals).post(queue_restore_rehearsal),
+        )
+        .route("/api/v1/restore-rehearsals/{id}", get(restore_rehearsal))
+        .route(
+            "/api/v1/restore-rehearsals/{id}/cancel",
+            post(cancel_restore_rehearsal),
+        )
+        .route(
+            "/api/v1/restore-rehearsals/{id}/evidence",
+            get(restore_rehearsal_evidence),
+        )
         .route("/api/v1/preflight", get(preflight))
         .route("/api/v1/qualification", get(qualification_report))
         .route(
@@ -1639,6 +1652,89 @@ async fn plan_restore(
         "destructive_preview_accepted": request.destructive_preview_accepted,
         "automatic_publication_requested": request.automatic_publication_requested
     });
+    let original_rehearsal_drive_id = aggregate
+        .verifications
+        .iter()
+        .find(|verification| {
+            verification.recovery_point_id == recovery_point_id
+                && verification.outcome == "passed"
+                && matches!(verification.kind.as_str(), "full_readback" | "restore_test")
+        })
+        .and_then(|verification| verification.drive_id);
+    let rehearsal_capacity_ready = request
+        .estimated_required_bytes
+        .and_then(|required| {
+            required
+                .checked_add(request.required_free_reserve_bytes)
+                .zip(request.available_bytes)
+                .map(|(needed, available)| (required, needed, available))
+        })
+        .is_some_and(|(required, required_with_reserve, available)| {
+            available >= required_with_reserve
+                && required <= i64::MAX.unsigned_abs()
+                && request.required_free_reserve_bytes <= i64::MAX.unsigned_abs()
+                && available <= i64::MAX.unsigned_abs()
+        });
+    let compatible_execution_drives = aggregate
+        .volumes
+        .first()
+        .map(|volume| {
+            volume
+                .compatible_qualified_drives
+                .iter()
+                .filter(|drive| Some(drive.id) == original_rehearsal_drive_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let execution_supported = state.lab_file_roundtrip_enabled
+        && preflight.ready()
+        && mode == RestoreMode::FileArchive
+        && aggregate.recovery_point.representation == "file"
+        && aggregate.recovery_point.level == "full"
+        && aggregate.recovery_point.status == "verified"
+        && aggregate.recovery_point.key_lineage_id.is_none()
+        && rehearsal_capacity_ready
+        && aggregate.dependencies.is_empty()
+        && aggregate.volumes.len() == 1
+        && required_media_ids.len() == 1
+        && aggregate.origin.data_run_id.is_some()
+        && aggregate.origin.run_state == "verified"
+        && aggregate.origin.engine_name.as_deref() == Some("Bacula Community")
+        && aggregate.origin.engine_version.as_deref() == Some("15.0.3")
+        && aggregate.origin.adapter_version.as_deref() == Some("g0.2-lab-v1")
+        && aggregate.recovery_point.format_version == "bacula-community-15.0.3-lab-v1"
+        && all_chain_full_readback
+        && restore_test_passed
+        && per_file_digests_available
+        && !compatible_execution_drives.is_empty()
+        && !aggregate.caps.dependencies_truncated
+        && !aggregate.caps.volumes_truncated
+        && !aggregate.caps.verifications_truncated
+        && !aggregate.caps.artifacts_truncated
+        && !aggregate.caps.values_truncated;
+    let execution_detail = if execution_supported {
+        "This ready G0.2 point supports an attended, read-only physical-tape restore rehearsal into the isolated destination."
+    } else if !preflight.ready() {
+        "Resolve every restore-planning blocker and generate a fresh plan before execution can be considered."
+    } else {
+        "This ready plan remains planning-only because its representation, dependency shape, retained format, or physical evidence is outside the narrow G0.2 rehearsal adapter."
+    };
+    let execution = json!({
+        "kind": "attended_verified_point_recovery_rehearsal",
+        "supported": execution_supported,
+        "production_eligible": false,
+        "recovery_point_id": recovery_point_id,
+        "origin_data_run_id": aggregate.origin.data_run_id,
+        "required_media_ids": required_media_ids,
+        "required_tape_ids": required_tape_ids,
+        "destination_subpath": destination,
+        "compatible_drives": compatible_execution_drives,
+        "original_drive_id": original_rehearsal_drive_id,
+        "attended": true,
+        "writes_tape": false,
+        "writes_only_to_isolated_destination": true
+    });
     let selection = json!({
         "recovery_point_id": recovery_point_id,
         "mode": restore_mode_name(mode),
@@ -1656,13 +1752,15 @@ async fn plan_restore(
         "warnings": warnings,
         "estimates": estimates,
         "verification": verification_prerequisites,
-        "execution_supported": false
+        "execution_supported": execution_supported,
+        "execution": execution
     });
     let preview_hash = format!("{:x}", Sha256::digest(canonical_json(&preview)?));
     let persisted_selection = json!({
         "request": selection,
         "ready": preflight.ready(),
-        "execution_supported": false,
+        "execution_supported": execution_supported,
+        "execution": execution,
         "dependencies": &aggregate.dependencies,
         "volumes": &aggregate.volumes,
         "verifications": &aggregate.verifications,
@@ -1696,8 +1794,11 @@ async fn plan_restore(
                 "expires_at": record.expires_at,
                 "ready": preflight.ready(),
                 "status": if preflight.ready() { "ready" } else { "blocked" },
-                "execution_supported": false,
-                "execution_detail": "This release persists and audits restore planning only; it does not dispatch tape reads or write a destination.",
+                "execution_supported": execution_supported,
+                "execution_detail": execution_detail,
+                "execution": execution,
+                "execution_drives": compatible_execution_drives,
+                "confirmation_phrase": format!("RESTORE PLAN {} TO ISOLATED DESTINATION", record.id),
                 "selection": selection,
                 "recovery_point": aggregate.recovery_point,
                 "dependencies": aggregate.dependencies,
@@ -1721,6 +1822,378 @@ async fn plan_restore(
             }
         })),
     ))
+}
+
+const RESTORE_REHEARSAL_EVENT_LIMIT: usize = 256;
+const RESTORE_REHEARSAL_ARTIFACT_LIMIT: usize = 64;
+const RESTORE_REHEARSAL_EXPORT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct QueueRestoreRehearsalRequest {
+    plan_id: Uuid,
+    preview_hash: String,
+    drive_id: Uuid,
+    confirmation: String,
+    tape_loaded_confirmed: bool,
+    isolated_destination_confirmed: bool,
+    attended_confirmed: bool,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+impl QueueRestoreRehearsalRequest {
+    fn validate(&self) -> Result<String, AppError> {
+        let expected = format!("RESTORE PLAN {} TO ISOLATED DESTINATION", self.plan_id);
+        if self.confirmation != expected {
+            return Err(AppError::Invalid(format!(
+                "confirmation must exactly equal {expected}"
+            )));
+        }
+        if !self.tape_loaded_confirmed
+            || !self.isolated_destination_confirmed
+            || !self.attended_confirmed
+        {
+            return Err(AppError::Invalid(
+                "tape_loaded_confirmed, isolated_destination_confirmed, and attended_confirmed must all be true"
+                    .to_owned(),
+            ));
+        }
+        let actor = self.actor.as_deref().unwrap_or("Web operator").trim();
+        if actor.is_empty() || actor.chars().count() > 128 || actor.chars().any(char::is_control) {
+            return Err(AppError::Invalid(
+                "actor must contain 1 to 128 printable characters".to_owned(),
+            ));
+        }
+        Ok(actor.to_owned())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelRestoreRehearsalRequest {
+    confirmation: String,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+impl CancelRestoreRehearsalRequest {
+    fn validate(&self, id: Uuid) -> Result<String, AppError> {
+        let expected = format!("CANCEL RESTORE REHEARSAL {id}");
+        if self.confirmation != expected {
+            return Err(AppError::Invalid(format!(
+                "confirmation must exactly equal {expected}"
+            )));
+        }
+        let actor = self.actor.as_deref().unwrap_or("Web operator").trim();
+        if actor.is_empty() || actor.chars().count() > 128 || actor.chars().any(char::is_control) {
+            return Err(AppError::Invalid(
+                "actor must contain 1 to 128 printable characters".to_owned(),
+            ));
+        }
+        Ok(actor.to_owned())
+    }
+}
+
+async fn restore_rehearsals(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let rehearsals = match state.pool.as_ref() {
+        Some(pool) => store::list_restore_rehearsals(pool)
+            .await?
+            .iter()
+            .map(restore_rehearsal_run_summary_view)
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
+    Ok(Json(json!({
+        "rehearsals": rehearsals,
+        "scope": "attended_verified_g0_2_physical_restore_rehearsal",
+        "production_eligible": false
+    })))
+}
+
+async fn restore_rehearsal(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let id = parse_uuid_path(&id, "restore rehearsal")?;
+    let rehearsal = store::get_restore_rehearsal(pool, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let events = store::restore_rehearsal_events(pool, id).await?;
+    let artifacts = store::restore_rehearsal_artifacts(pool, id).await?;
+    let events_truncated = events.len() > RESTORE_REHEARSAL_EVENT_LIMIT;
+    let artifacts_truncated = artifacts.len() > RESTORE_REHEARSAL_ARTIFACT_LIMIT;
+    Ok(Json(json!({
+        "rehearsal": restore_rehearsal_run_view(&rehearsal),
+        "events": events.iter().take(RESTORE_REHEARSAL_EVENT_LIMIT).map(restore_rehearsal_event_view).collect::<Vec<_>>(),
+        "artifacts": artifacts.iter().take(RESTORE_REHEARSAL_ARTIFACT_LIMIT).map(restore_rehearsal_artifact_view).collect::<Vec<_>>(),
+        "caps": {
+            "events_maximum": RESTORE_REHEARSAL_EVENT_LIMIT,
+            "events_truncated": events_truncated,
+            "artifacts_maximum": RESTORE_REHEARSAL_ARTIFACT_LIMIT,
+            "artifacts_truncated": artifacts_truncated
+        },
+        "scope": "attended_verified_g0_2_physical_restore_rehearsal",
+        "production_eligible": false
+    })))
+}
+
+async fn queue_restore_rehearsal(
+    State(state): State<AppState>,
+    Json(request): Json<QueueRestoreRehearsalRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    require_file_roundtrip(&state)?;
+    let pool = require_pool(&state)?;
+    let actor = request.validate()?;
+    match store::queue_restore_rehearsal(
+        pool,
+        request.plan_id,
+        request.preview_hash.trim(),
+        request.drive_id,
+        &actor,
+    )
+    .await?
+    {
+        store::QueueRestoreRehearsalResult::Queued(rehearsal) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "rehearsal": restore_rehearsal_run_view(&rehearsal),
+                "durability": "postgresql",
+                "attended": true,
+                "writes_tape": false,
+                "production_eligible": false
+            })),
+        )),
+        store::QueueRestoreRehearsalResult::NotFound => Err(AppError::NotFound),
+        store::QueueRestoreRehearsalResult::Blocked(reason) => Err(AppError::Blocked(reason)),
+    }
+}
+
+async fn cancel_restore_rehearsal(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<CancelRestoreRehearsalRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let pool = require_pool(&state)?;
+    let id = parse_uuid_path(&id, "restore rehearsal")?;
+    let actor = request.validate(id)?;
+    match store::request_cancel_restore_rehearsal(pool, id, &actor).await? {
+        store::CancelRestoreRehearsalResult::Cancelled(rehearsal) => Ok((
+            StatusCode::OK,
+            Json(json!({
+                "rehearsal": restore_rehearsal_run_view(&rehearsal),
+                "cancel": "completed_before_worker_claim"
+            })),
+        )),
+        store::CancelRestoreRehearsalResult::Requested(rehearsal) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "rehearsal": restore_rehearsal_run_view(&rehearsal),
+                "cancel": "requested_for_safe_worker_boundary"
+            })),
+        )),
+        store::CancelRestoreRehearsalResult::AlreadyTerminal(rehearsal) => Ok((
+            StatusCode::OK,
+            Json(json!({
+                "rehearsal": restore_rehearsal_run_view(&rehearsal),
+                "cancel": "already_terminal"
+            })),
+        )),
+        store::CancelRestoreRehearsalResult::NotFound => Err(AppError::NotFound),
+        store::CancelRestoreRehearsalResult::Blocked(reason) => Err(AppError::Blocked(reason)),
+    }
+}
+
+async fn restore_rehearsal_evidence(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let pool = require_pool(&state)?;
+    let id = parse_uuid_path(&id, "restore rehearsal")?;
+    let rehearsal = store::get_restore_rehearsal(pool, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let events = store::restore_rehearsal_events(pool, id).await?;
+    let artifacts = store::restore_rehearsal_artifacts(pool, id).await?;
+    let evidence = json!({
+        "format": "tapescale.restore-rehearsal-evidence.v1",
+        "canonicalization": "UTF-8 compact JSON with lexicographically ordered object keys",
+        "execution_claim": "attended G0.2 physical-tape restore rehearsal; not production qualification",
+        "bounds": {
+            "maximum_serialized_bytes": RESTORE_REHEARSAL_EXPORT_BYTES,
+            "events_maximum": RESTORE_REHEARSAL_EVENT_LIMIT,
+            "events_truncated": events.len() > RESTORE_REHEARSAL_EVENT_LIMIT,
+            "artifacts_maximum": RESTORE_REHEARSAL_ARTIFACT_LIMIT,
+            "artifacts_truncated": artifacts.len() > RESTORE_REHEARSAL_ARTIFACT_LIMIT,
+            "nested_values": "depth, collection, and string bounded; worker-internal paths redacted"
+        },
+        "rehearsal": restore_rehearsal_run_view(&rehearsal),
+        "events": events.iter().take(RESTORE_REHEARSAL_EVENT_LIMIT).map(restore_rehearsal_event_view).collect::<Vec<_>>(),
+        "artifacts": artifacts.iter().take(RESTORE_REHEARSAL_ARTIFACT_LIMIT).map(restore_rehearsal_artifact_view).collect::<Vec<_>>()
+    });
+    let body = canonical_json(&evidence)?;
+    if body.len() > RESTORE_REHEARSAL_EXPORT_BYTES {
+        return Err(AppError::Blocked(format!(
+            "the bounded rehearsal evidence export is {} bytes, exceeding the {} byte response limit",
+            body.len(),
+            RESTORE_REHEARSAL_EXPORT_BYTES
+        )));
+    }
+    let digest = format!("{:x}", Sha256::digest(&body));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"tapescale-restore-rehearsal-{id}-evidence.json\""),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::ETAG, format!("\"sha256-{digest}\""))
+        .header("x-content-type-options", "nosniff")
+        .body(Body::from(body))
+        .map_err(|error| AppError::Internal(error.to_string()))
+}
+
+fn restore_rehearsal_run_view(run: &store::RestoreRehearsalRunRecord) -> Value {
+    let mut view = serde_json::to_value(run)
+        .expect("a serializable restore rehearsal record always converts to JSON");
+    let object = view
+        .as_object_mut()
+        .expect("a restore rehearsal record serializes as an object");
+    for internal in [
+        "source_manifest_storage_ref",
+        "source_mount_path",
+        "drive_lease_id",
+        "drive_fencing_token",
+        "media_lease_id",
+        "media_fencing_token",
+    ] {
+        object.remove(internal);
+    }
+    object.insert(
+        "source_manifest".to_owned(),
+        json!({
+            "artifact_id": run.source_manifest_artifact_id,
+            "sha256": run.source_manifest_sha256,
+            "manifest_digest": run.source_manifest_digest,
+            "size_bytes": run.source_manifest_size_bytes
+        }),
+    );
+    object.insert(
+        "result".to_owned(),
+        bounded_restore_evidence_value(&run.result),
+    );
+    view
+}
+
+fn restore_rehearsal_run_summary_view(run: &store::RestoreRehearsalRunRecord) -> Value {
+    let mut view = restore_rehearsal_run_view(run);
+    if let Some(object) = view.as_object_mut() {
+        object.remove("result");
+        object.remove("source_manifest");
+        object.remove("source_manifest_sha256");
+        object.remove("source_manifest_digest");
+    }
+    view
+}
+
+fn restore_rehearsal_event_view(event: &store::RestoreRehearsalEventRecord) -> Value {
+    json!({
+        "id": event.id,
+        "event_type": event.event_type,
+        "evidence": bounded_restore_evidence_value(&event.evidence),
+        "correlation_id": event.correlation_id,
+        "occurred_at": event.occurred_at
+    })
+}
+
+fn restore_rehearsal_artifact_view(artifact: &store::RestoreRehearsalArtifactRecord) -> Value {
+    json!({
+        "id": artifact.id,
+        "artifact_kind": artifact.artifact_kind,
+        "sha256": artifact.sha256,
+        "size_bytes": artifact.size_bytes,
+        "metadata": bounded_restore_evidence_value(&artifact.metadata),
+        "created_at": artifact.created_at
+    })
+}
+
+fn bounded_restore_evidence_value(value: &Value) -> Value {
+    const MAX_VALUE_BYTES: usize = 8 * 1024;
+    let mut truncated = false;
+    let bounded = sanitize_restore_evidence_value(value, 0, &mut truncated);
+    let encoded = serde_json::to_vec(&bounded).expect("a JSON value always serializes");
+    if encoded.len() <= MAX_VALUE_BYTES {
+        bounded
+    } else {
+        json!({
+            "_tapescale_truncated": "sanitized value exceeded the per-value export bound",
+            "sanitized_size_bytes": encoded.len(),
+            "sanitized_sha256": format!("{:x}", Sha256::digest(&encoded))
+        })
+    }
+}
+
+fn sanitize_restore_evidence_value(value: &Value, depth: usize, truncated: &mut bool) -> Value {
+    const MAX_DEPTH: usize = 8;
+    const MAX_MEMBERS: usize = 64;
+    const MAX_STRING_CHARS: usize = 4 * 1024;
+    if depth >= MAX_DEPTH {
+        *truncated = true;
+        return json!({"_tapescale_truncated": "maximum JSON depth reached"});
+    }
+    match value {
+        Value::String(text) if text.chars().count() > MAX_STRING_CHARS => {
+            *truncated = true;
+            let mut bounded = text.chars().take(MAX_STRING_CHARS).collect::<String>();
+            bounded.push_str("…[truncated]");
+            Value::String(bounded)
+        }
+        Value::Array(values) => {
+            let mut bounded = values
+                .iter()
+                .take(MAX_MEMBERS)
+                .map(|item| sanitize_restore_evidence_value(item, depth + 1, truncated))
+                .collect::<Vec<_>>();
+            if values.len() > MAX_MEMBERS {
+                *truncated = true;
+                bounded.push(json!({"_tapescale_truncated_items": values.len() - MAX_MEMBERS}));
+            }
+            Value::Array(bounded)
+        }
+        Value::Object(values) => {
+            let mut bounded = serde_json::Map::new();
+            for (key, item) in values.iter().take(MAX_MEMBERS) {
+                let normalized = key.to_ascii_lowercase();
+                if normalized.contains("storage_ref")
+                    || matches!(
+                        normalized.as_str(),
+                        "source_mount_path"
+                            | "restore_root_path"
+                            | "daemon_logs"
+                            | "working_directory"
+                            | "state_directory"
+                            | "runtime_root"
+                    )
+                    || normalized.ends_with("_config_path")
+                {
+                    continue;
+                }
+                bounded.insert(
+                    key.clone(),
+                    sanitize_restore_evidence_value(item, depth + 1, truncated),
+                );
+            }
+            if values.len() > MAX_MEMBERS {
+                *truncated = true;
+                bounded.insert(
+                    "_tapescale_truncated_members".to_owned(),
+                    Value::from(values.len() - MAX_MEMBERS),
+                );
+            }
+            Value::Object(bounded)
+        }
+        _ => value.clone(),
+    }
 }
 
 async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -2433,6 +2906,55 @@ mod tests {
             dedupe_preserving_order(["tape-b", "tape-a", "tape-b", "tape-c"]),
             vec!["tape-b", "tape-a", "tape-c"]
         );
+    }
+
+    #[test]
+    fn restore_rehearsal_requires_exact_attended_confirmation() {
+        let plan_id = Uuid::now_v7();
+        let mut request = QueueRestoreRehearsalRequest {
+            plan_id,
+            preview_hash: "a".repeat(64),
+            drive_id: Uuid::now_v7(),
+            confirmation: format!("RESTORE PLAN {plan_id} TO ISOLATED DESTINATION"),
+            tape_loaded_confirmed: true,
+            isolated_destination_confirmed: true,
+            attended_confirmed: true,
+            actor: Some("attending operator".to_owned()),
+        };
+        assert_eq!(
+            request.validate().expect("valid request"),
+            "attending operator"
+        );
+
+        request.confirmation = "RESTORE IT".to_owned();
+        assert!(matches!(request.validate(), Err(AppError::Invalid(_))));
+        request.confirmation = format!("RESTORE PLAN {plan_id} TO ISOLATED DESTINATION");
+        request.tape_loaded_confirmed = false;
+        assert!(matches!(request.validate(), Err(AppError::Invalid(_))));
+    }
+
+    #[test]
+    fn rehearsal_evidence_redacts_worker_paths_and_bounds_values() {
+        let sanitized = bounded_restore_evidence_value(&json!({
+            "runtime": {
+                "director_config_sha256": "a".repeat(64),
+                "daemon_logs": ["/var/lib/tapescale/private/director.log"]
+            },
+            "source_mount_path": "/source/private-snapshot",
+            "artifact": {
+                "storage_ref": "/var/lib/tapescale/evidence/private.json",
+                "sha256": "b".repeat(64)
+            },
+            "restore_destination": "planned-restores/run-1",
+            "oversized": "x".repeat(5000)
+        }));
+        assert!(sanitized["runtime"].get("daemon_logs").is_none());
+        assert!(sanitized.get("source_mount_path").is_none());
+        assert!(sanitized["artifact"].get("storage_ref").is_none());
+        assert_eq!(sanitized["restore_destination"], "planned-restores/run-1");
+        assert!(sanitized["oversized"]
+            .as_str()
+            .is_some_and(|value| value.ends_with("…[truncated]")));
     }
 
     #[test]

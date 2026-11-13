@@ -17,7 +17,8 @@
     qualification: "/qualification",
     qualificationRuns: "/qualification/runs",
     recoveryProfiles: "/recovery-exercises/profiles",
-    recoveryExercises: "/recovery-exercises"
+    recoveryExercises: "/recovery-exercises",
+    restoreRehearsals: "/restore-rehearsals"
   };
   const routes = new Set(["overview", "recovery-lab", "jobs", "restore", "movements", "tapes", "drives", "verification", "settings"]);
   const RECOVERY_PHASES = [
@@ -58,14 +59,18 @@
       recoveryProfiles: [],
       recoveryExercises: [],
       recoveryExerciseDetails: {},
-      recoveryPointDetails: {}
+      recoveryPointDetails: {},
+      restoreRehearsals: [],
+      restoreRehearsalDetails: {}
     },
     received: new Set(),
     errors: {},
     qualificationPollTimer: null,
     recoveryExercisePollTimer: null,
+    restoreRehearsalPollTimer: null,
     selectedRecoveryExerciseId: null,
     selectedRecoveryPointId: null,
+    selectedRestoreRehearsalId: null,
     selectedMovementId: null,
     selectedMediaId: null,
     mediaQuery: "",
@@ -83,8 +88,10 @@
     recoveryPointStatus: "all",
     recoveryPointRepresentation: "all",
     recoveryPointDetailLoading: new Set(),
+    restoreRehearsalDetailLoading: new Set(),
     movementDetailLoading: new Set(),
-    restorePlanDrafts: {}
+    restorePlanDrafts: {},
+    restorePlans: {}
   };
 
   const main = document.querySelector("#main-content");
@@ -189,6 +196,10 @@
       const exercises = list(payload, "exercises");
       return exercises.length ? exercises : list(payload, "runs");
     }
+    if (key === "restoreRehearsals") {
+      const rehearsals = list(payload, "rehearsals");
+      return rehearsals.length ? rehearsals : list(payload, "runs");
+    }
     if (key === "drives") {
       return { drives: list(payload, "drives"), slots: list(payload, "slots"), operations: list(payload, "operations") };
     }
@@ -256,6 +267,8 @@
     if (state.route === "restore") {
       const point = selectedRecoveryPoint();
       if (point && recordId(point)) await loadRecoveryPointDetail(recordId(point), !initial);
+      const rehearsal = selectedRestoreRehearsal();
+      if (rehearsal && recordId(rehearsal)) await loadRestoreRehearsalDetail(recordId(rehearsal), !initial);
     }
     if (state.route === "movements") {
       const movement = selectedMovement();
@@ -271,6 +284,7 @@
     render();
     scheduleQualificationPoll();
     scheduleRecoveryExercisePoll();
+    scheduleRestoreRehearsalPoll();
   }
 
   function setBadge(id, value) {
@@ -875,6 +889,57 @@
     await loadRecoveryPointDetail(id);
   }
 
+  function restoreRehearsalState(rehearsal) {
+    return String(pick(rehearsal, "state", "status") || "queued").toLowerCase();
+  }
+
+  function restoreRehearsalActive(rehearsal) {
+    return !RECOVERY_TERMINAL_STATES.has(restoreRehearsalState(rehearsal));
+  }
+
+  function restoreRehearsalPointId(rehearsal) {
+    return String(pick(rehearsal, "recovery_point_id", "recoveryPointId") || "");
+  }
+
+  function restoreRehearsalsForPoint(pointId) {
+    return state.data.restoreRehearsals
+      .filter((rehearsal) => restoreRehearsalPointId(rehearsal) === pointId)
+      .sort((left, right) => new Date(pick(right, "created_at", "started_at") || 0) - new Date(pick(left, "created_at", "started_at") || 0));
+  }
+
+  function selectedRestoreRehearsal() {
+    const point = selectedRecoveryPoint();
+    const runs = restoreRehearsalsForPoint(recordId(point));
+    const selected = state.selectedRestoreRehearsalId && runs.find((run) => recordId(run) === state.selectedRestoreRehearsalId);
+    const run = selected || runs[0] || null;
+    if (run) state.selectedRestoreRehearsalId = recordId(run);
+    return run;
+  }
+
+  async function loadRestoreRehearsalDetail(id, force) {
+    if (!id || state.restoreRehearsalDetailLoading.has(id) || (!force && state.data.restoreRehearsalDetails[id])) return;
+    const errorKey = "restoreRehearsal:" + id;
+    state.restoreRehearsalDetailLoading.add(id);
+    delete state.errors[errorKey];
+    try {
+      const detail = await request(endpoints.restoreRehearsals + "/" + encodeURIComponent(id));
+      state.data.restoreRehearsalDetails[id] = detail && typeof detail === "object" ? detail : {};
+      delete state.errors[errorKey];
+    } catch (error) {
+      state.errors[errorKey] = error;
+    } finally {
+      state.restoreRehearsalDetailLoading.delete(id);
+    }
+    if (state.route === "restore" && recordId(selectedRestoreRehearsal()) === id) render();
+  }
+
+  async function selectRestoreRehearsal(id) {
+    if (!id) return;
+    state.selectedRestoreRehearsalId = id;
+    await loadRestoreRehearsalDetail(id);
+    render();
+  }
+
   function recoveryPointMatches(point) {
     const query = state.recoveryPointQuery.trim().toLowerCase();
     const pointState = recoveryPointState(point);
@@ -1033,6 +1098,106 @@
     }).join("") + "</ol></details>";
   }
 
+  const RESTORE_REHEARSAL_PHASES = [
+    { name: "Preflight", detail: "Revalidate plan, drive, and tape", aliases: ["queued", "started", "preparing", "preflight"] },
+    { name: "Read tape", detail: "Dispatch the retained Bacula backup", aliases: ["reading", "restoring", "engine_dispatched", "engine_restore"] },
+    { name: "Compare", detail: "Hash and compare restored content", aliases: ["comparing", "restored_manifest", "comparison"] },
+    { name: "Proven", detail: "Retain rehearsal evidence", aliases: ["passed", "verified", "completed", "complete"] }
+  ];
+
+  function restoreRehearsalDetailRecord(rehearsal) {
+    const detail = rehearsal && state.data.restoreRehearsalDetails[recordId(rehearsal)];
+    return detail && (detail.rehearsal || detail.run) || rehearsal;
+  }
+
+  function restoreRehearsalEvents(rehearsal) {
+    const detail = rehearsal && state.data.restoreRehearsalDetails[recordId(rehearsal)];
+    return detail ? list(detail, "events") : [];
+  }
+
+  function restoreRehearsalArtifacts(rehearsal) {
+    const detail = rehearsal && state.data.restoreRehearsalDetails[recordId(rehearsal)];
+    return detail ? list(detail, "artifacts") : [];
+  }
+
+  function restoreRehearsalPhase(rehearsal) {
+    const record = restoreRehearsalDetailRecord(rehearsal);
+    const events = restoreRehearsalEvents(rehearsal).slice().sort((left, right) => new Date(pick(right, "occurred_at", "created_at") || 0) - new Date(pick(left, "occurred_at", "created_at") || 0));
+    const latest = events[0];
+    const evidence = latest && latest.evidence && typeof latest.evidence === "object" ? latest.evidence : {};
+    const result = record && record.result && typeof record.result === "object" ? record.result : {};
+    return String(pick(record, "phase", "current_phase") || pick(result, "phase", "current_phase") || pick(evidence, "phase", "current_phase") || pick(latest, "event_type", "to_state", "phase") || restoreRehearsalState(record)).toLowerCase();
+  }
+
+  function restoreRehearsalPhaseIndex(rehearsal) {
+    const record = restoreRehearsalDetailRecord(rehearsal);
+    if (["passed", "verified", "completed", "complete"].includes(restoreRehearsalState(record))) return RESTORE_REHEARSAL_PHASES.length - 1;
+    const phase = restoreRehearsalPhase(rehearsal);
+    const index = RESTORE_REHEARSAL_PHASES.findIndex((item) => item.aliases.includes(phase));
+    return index >= 0 ? index : 0;
+  }
+
+  function renderRestoreRehearsalTrack(rehearsal) {
+    const current = restoreRehearsalPhaseIndex(rehearsal);
+    const currentState = restoreRehearsalState(restoreRehearsalDetailRecord(rehearsal));
+    const passed = ["passed", "verified", "completed", "complete"].includes(currentState);
+    const failed = ["failed", "blocked", "interrupted", "cancelled", "canceled"].includes(currentState);
+    return '<div class="phase-track restore-rehearsal-track" aria-label="Recovery rehearsal phases">' + RESTORE_REHEARSAL_PHASES.map((phase, index) => {
+      const phaseClass = passed || index < current ? " done" : index === current ? failed ? " failed" : " current" : "";
+      return '<div class="phase' + phaseClass + '"' + (index === current && !passed ? ' aria-current="step"' : "") + '><span class="phase-marker">' + esc(passed || index < current ? "✓" : index + 1) + '</span><strong>' + esc(phase.name) + '</strong><small>' + esc(phase.detail) + "</small></div>";
+    }).join("") + "</div>";
+  }
+
+  function renderRestoreRehearsalTimeline(rehearsal) {
+    const events = restoreRehearsalEvents(rehearsal);
+    if (!events.length) return '<div class="vault-section-empty compact">The first durable worker event has not arrived yet.</div>';
+    return '<ol class="timeline restore-rehearsal-timeline">' + events.map((event) => {
+      const evidence = event && event.evidence && typeof event.evidence === "object" ? event.evidence : {};
+      const detail = pick(evidence, "detail", "message", "path", "reason") || pick(event, "detail", "reason") || "Evidence recorded";
+      return '<li class="timeline-item"><time class="timeline-time">' + esc(date(pick(event, "occurred_at", "created_at"))) + '</time><span class="timeline-marker" aria-hidden="true"></span><div class="timeline-copy"><strong>' + esc(human(pick(event, "event_type", "to_state", "phase") || "event")) + '</strong><span>' + esc(detail) + "</span></div></li>";
+    }).join("") + "</ol>";
+  }
+
+  function renderRestoreRehearsalArtifacts(rehearsal) {
+    const artifacts = restoreRehearsalArtifacts(rehearsal);
+    if (!artifacts.length) return '<div class="vault-section-empty compact">Evidence artifacts will appear as physical phases finish.</div>';
+    return '<ul class="vault-artifact-list restore-rehearsal-artifacts">' + artifacts.map((artifact) => '<li><div><strong>' + esc(human(pick(artifact, "artifact_kind", "kind") || "artifact")) + '</strong><span>' + esc(pick(artifact, "size_bytes") == null ? "Retained evidence" : bytes(pick(artifact, "size_bytes"))) + '</span></div><code>' + esc(label(pick(artifact, "sha256", "digest"))) + "</code></li>").join("") + "</ul>";
+  }
+
+  function renderRestoreRehearsal(rehearsal) {
+    if (!rehearsal) return "";
+    const id = recordId(rehearsal);
+    const record = restoreRehearsalDetailRecord(rehearsal);
+    const runState = restoreRehearsalState(record);
+    const active = restoreRehearsalActive(record);
+    const error = state.errors["restoreRehearsal:" + id];
+    const result = record && record.result && typeof record.result === "object" ? record.result : {};
+    const resultDetail = pick(record, "failure_detail", "detail") || pick(result, "failure_detail", "detail", "message");
+    const facts = [
+      ["Run", id],
+      ["Plan", pick(record, "plan_id", "restore_plan_id")],
+      ["Drive", pick(record, "expected_stable_id", "drive_stable_id", "drive_id")],
+      ["Cartridge", pick(record, "expected_volume_label", "cartridge_label", "expected_cartridge_label")],
+      ["Destination", pick(record, "destination_subpath", "destination", "restore_destination")],
+      ["Started", date(pick(record, "started_at", "created_at"))],
+      ["Finished", pick(record, "finished_at") ? date(pick(record, "finished_at")) : null]
+    ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "");
+    let outcome = '<div class="notice info"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>' + esc(human(restoreRehearsalPhase(rehearsal))) + '</strong><span>Keep the exact tape loaded and the isolated destination online. Cancellation is honored only at a safe boundary.</span></div></div>';
+    if (["passed", "verified", "completed", "complete"].includes(runState)) outcome = '<div class="notice success"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Recovery rehearsal passed</strong><span>Bacula restored the retained point from physical tape and TapeScale independently matched the restored manifest.</span></div></div>';
+    if (["failed", "blocked", "interrupted", "cancelled", "canceled"].includes(runState)) outcome = '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Recovery rehearsal ' + esc(runState) + '</strong><span>' + esc(resultDetail || "Inspect the durable activity below for the terminal evidence.") + "</span></div></div>";
+    const cancel = active ? '<button class="button button-danger button-small" type="button" data-action="open-cancel-restore-rehearsal" data-id="' + esc(id) + '">Request safe cancel</button>' : "";
+    return '<article class="restore-rehearsal-run"><header><div><span class="vault-kicker">Attended physical restore</span><h4>Recovery rehearsal</h4><code>' + esc(id) + '</code></div><div class="restore-rehearsal-actions">' + status(runState) + '<button class="button button-quiet button-small" type="button" data-action="download-restore-rehearsal-evidence" data-id="' + esc(id) + '">Download evidence</button>' + cancel + '</div></header>' + renderRestoreRehearsalTrack(rehearsal) + '<div class="restore-rehearsal-body">' + (error ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not refresh run evidence</strong><span>' + esc(errorMessage(error)) + '</span></div></div>' : "") + outcome + '<dl class="restore-result-facts">' + facts.map(([name, value]) => '<dt>' + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-rehearsal-evidence-grid"><section><h5>Durable activity</h5>' + renderRestoreRehearsalTimeline(rehearsal) + '</section><section><h5>Retained artifacts</h5>' + renderRestoreRehearsalArtifacts(rehearsal) + "</section></div></div></article>";
+  }
+
+  function renderRestoreRehearsals(pointId) {
+    const runs = restoreRehearsalsForPoint(pointId);
+    if (!runs.length) return '<section class="vault-dossier-section restore-rehearsals"><div class="vault-section-head"><div><h3>Recovery rehearsals</h3><p>Ready G0.2 restore plans can produce an attended physical-tape rehearsal here.</p></div><span>0 runs</span></div><div class="vault-section-empty">No restore rehearsal has been queued for this recovery point.</div></section>';
+    const selected = selectedRestoreRehearsal();
+    const choices = runs.length > 1 ? '<div class="restore-rehearsal-picker" role="list" aria-label="Recovery rehearsal history">' + runs.map((run) => '<button class="' + (recordId(run) === recordId(selected) ? "active" : "") + '" type="button" data-action="select-restore-rehearsal" data-id="' + esc(recordId(run)) + '"><span>' + status(restoreRehearsalState(run)) + '</span><strong>' + esc(date(pick(run, "created_at", "started_at"))) + '</strong><small>' + esc(pick(run, "expected_volume_label", "cartridge_label") || recordId(run)) + "</small></button>").join("") + "</div>" : "";
+    if (selected && !state.data.restoreRehearsalDetails[recordId(selected)] && !state.restoreRehearsalDetailLoading.has(recordId(selected)) && !state.errors["restoreRehearsal:" + recordId(selected)]) window.setTimeout(() => loadRestoreRehearsalDetail(recordId(selected)), 0);
+    return '<section class="vault-dossier-section restore-rehearsals"><div class="vault-section-head"><div><h3>Recovery rehearsals</h3><p>Every attempt remains visible with its physical read, comparison, and cancellation evidence.</p></div><span>' + runs.length + " run" + (runs.length === 1 ? "" : "s") + "</span></div>" + choices + renderRestoreRehearsal(selected) + "</section>";
+  }
+
   function renderRecoveryPointDossier(summary) {
     const id = recordId(summary);
     const detail = recoveryPointDetail(id);
@@ -1065,12 +1230,12 @@
     let feedback = "";
     if (loadingDetail) feedback = '<div class="notice info vault-detail-notice"><span class="notice-icon" aria-hidden="true">↻</span><div class="notice-copy"><strong>Loading durable recovery evidence</strong><span>The summary is visible while TapeScale assembles the ordered media and verification record.</span></div></div>';
     if (detailError) feedback = '<div class="notice danger vault-detail-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load the recovery dossier</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="retry-recovery-point" data-id="' + esc(id) + '">Retry</button></div>';
-    return '<article class="panel vault-dossier"><header class="vault-dossier-hero"><div><span class="vault-kicker">Recovery point · ' + esc(human(representation)) + '</span><div class="vault-dossier-title"><h2>' + esc(label(dataset)) + '</h2>' + status(recoveryPointState(point)) + '</div><p class="mono">' + esc(id) + '</p><span>' + esc(date(pick(point, "recovery_time", "created_at"))) + " · " + esc(human(pick(point, "level") || "unknown")) + ' backup</span></div><div class="vault-dossier-actions"><button class="button button-quiet" type="button" data-action="download-recovery-evidence" data-id="' + esc(id) + '">Download evidence</button><button class="button button-primary" type="button" data-action="open-restore-plan" data-id="' + esc(id) + '">Plan restore</button></div></header><div class="vault-plan-boundary"><strong>Readiness planning only</strong><span>Planning does not move a tape, start Bacula, create a destination, or restore data.</span></div>' + feedback + '<section class="vault-proof-grid">' + renderVaultProof("Full media readback", fullReadback, verifications.length ? "Recorded independently of write completion" : "Loading verification evidence") + renderVaultProof("Isolated restore test", restoreTest, verifications.length ? "Application recovery evidence" : "Loading verification evidence") + renderVaultProof("Required media", volumes.length ? "recorded" : "missing", volumes.length + " cartridge" + (volumes.length === 1 ? "" : "s") + " in read order") + renderVaultProof("Dependencies", dependencies.length ? "required" : "ready", dependencies.length ? dependencies.length + " prerequisite recovery point(s)" : "No earlier recovery point required") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Required media in read order</h3><p>Load cartridges in this exact volume sequence. Engine record boundaries are retained for reconstruction.</p></div><span>' + volumes.length + " volume" + (volumes.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVolumes(volumes) + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Verification evidence</h3><p>Write completion, full readback, and restore testing remain separate claims.</p></div><span>' + verifications.length + " record" + (verifications.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVerifications(verifications) + '</section><div class="vault-two-column"><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Recovery contract</h3><p>The durable identity and retention boundary.</p></div></div><dl class="vault-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="' + (/hash|manifest|lineage|format/i.test(name) ? "mono" : "") + '">' + esc(value) + "</dd>").join("") + '</dl>' + (Object.keys(coverage).length ? '<details class="vault-json"><summary>Recorded coverage</summary><pre>' + esc(JSON.stringify(coverage, null, 2)) + "</pre></details>" : "") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Dependencies & holds</h3><p>Every prerequisite remains visible before planning.</p></div></div><h4>Dependencies</h4>' + renderDependencyList(dependencies, "This is a self-contained full recovery point.") + '<h4>Active holds</h4>' + renderDependencyList(holds, "No active hold was returned.") + '</section></div><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Origin & retained evidence</h3><p>Correlation data for the job, physical exercise, catalog, and content-addressed artifacts.</p></div></div><div class="vault-origin-grid"><div><h4>Origin</h4>' + renderOrigin(origin, point) + '</div><div><h4>Artifacts</h4>' + renderRecoveryArtifacts(artifacts) + "</div></div>" + renderRecoveryEventsForVault(events) + "</section></article>";
+    return '<article class="panel vault-dossier"><header class="vault-dossier-hero"><div><span class="vault-kicker">Recovery point · ' + esc(human(representation)) + '</span><div class="vault-dossier-title"><h2>' + esc(label(dataset)) + '</h2>' + status(recoveryPointState(point)) + '</div><p class="mono">' + esc(id) + '</p><span>' + esc(date(pick(point, "recovery_time", "created_at"))) + " · " + esc(human(pick(point, "level") || "unknown")) + ' backup</span></div><div class="vault-dossier-actions"><button class="button button-quiet" type="button" data-action="download-recovery-evidence" data-id="' + esc(id) + '">Download evidence</button><button class="button button-primary" type="button" data-action="open-restore-plan" data-id="' + esc(id) + '">Plan restore</button></div></header><div class="vault-plan-boundary"><strong>Plan first; execute only when explicitly offered</strong><span>Most points remain planning-only. A ready, supported G0.2 point can advance to an attended restore rehearsal after exact drive and tape confirmation.</span></div>' + feedback + renderRestoreRehearsals(id) + '<section class="vault-proof-grid">' + renderVaultProof("Full media readback", fullReadback, verifications.length ? "Recorded independently of write completion" : "Loading verification evidence") + renderVaultProof("Isolated restore test", restoreTest, verifications.length ? "Application recovery evidence" : "Loading verification evidence") + renderVaultProof("Required media", volumes.length ? "recorded" : "missing", volumes.length + " cartridge" + (volumes.length === 1 ? "" : "s") + " in read order") + renderVaultProof("Dependencies", dependencies.length ? "required" : "ready", dependencies.length ? dependencies.length + " prerequisite recovery point(s)" : "No earlier recovery point required") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Required media in read order</h3><p>Load cartridges in this exact volume sequence. Engine record boundaries are retained for reconstruction.</p></div><span>' + volumes.length + " volume" + (volumes.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVolumes(volumes) + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Verification evidence</h3><p>Write completion, full readback, and restore testing remain separate claims.</p></div><span>' + verifications.length + " record" + (verifications.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVerifications(verifications) + '</section><div class="vault-two-column"><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Recovery contract</h3><p>The durable identity and retention boundary.</p></div></div><dl class="vault-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="' + (/hash|manifest|lineage|format/i.test(name) ? "mono" : "") + '">' + esc(value) + "</dd>").join("") + '</dl>' + (Object.keys(coverage).length ? '<details class="vault-json"><summary>Recorded coverage</summary><pre>' + esc(JSON.stringify(coverage, null, 2)) + "</pre></details>" : "") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Dependencies & holds</h3><p>Every prerequisite remains visible before planning.</p></div></div><h4>Dependencies</h4>' + renderDependencyList(dependencies, "This is a self-contained full recovery point.") + '<h4>Active holds</h4>' + renderDependencyList(holds, "No active hold was returned.") + '</section></div><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Origin & retained evidence</h3><p>Correlation data for the job, physical exercise, catalog, and content-addressed artifacts.</p></div></div><div class="vault-origin-grid"><div><h4>Origin</h4>' + renderOrigin(origin, point) + '</div><div><h4>Artifacts</h4>' + renderRecoveryArtifacts(artifacts) + "</div></div>" + renderRecoveryEventsForVault(events) + "</section></article>";
   }
 
   function renderRestore() {
     const points = orderedRecoveryPoints();
-    let html = pageHead("Recovery vault", "Search durable recovery points, inspect exact media and verification evidence, and generate a non-executing restore readiness plan.", refreshButton()) + noticeFor("recoveryPoints");
+    let html = pageHead("Recovery vault", "Inspect durable recovery points, plan safely, and run attended physical restore rehearsals where the retained format is supported.", refreshButton()) + noticeFor("recoveryPoints") + noticeFor("restoreRehearsals");
     if (!points.length) return html + empty("No recovery points", state.errors.recoveryPoints ? "Recovery points could not be loaded." : "A verified physical recovery exercise will create the first durable recovery point.", '<a class="button button-primary" href="#recovery-lab">Open recovery laboratory</a>');
     const selected = selectedRecoveryPoint();
     const verified = points.filter((point) => recoveryPointState(point) === "verified").length;
@@ -1957,6 +2122,22 @@
       .map(([key, item]) => human(key) + ": " + (typeof item === "object" ? conciseEvidence(item) : item));
   }
 
+  function restorePlanExecution(plan) {
+    const value = pick(plan, "execution", "rehearsal_execution");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  }
+
+  function restorePlanDrives(plan) {
+    const execution = restorePlanExecution(plan);
+    const drives = arrayValue(execution, "compatible_drives", "eligible_drives", "drives");
+    return drives.length ? drives : planArray(plan, "execution_drives", "compatible_drives", "eligible_drives");
+  }
+
+  function restorePlanConfirmation(plan) {
+    const planId = pick(plan, "id", "plan_id");
+    return String(pick(restorePlanExecution(plan), "confirmation", "confirmation_phrase") || pick(plan, "confirmation", "confirmation_phrase") || (planId ? "RESTORE PLAN " + planId + " TO ISOLATED DESTINATION" : ""));
+  }
+
   function renderRestorePlanResult(plan, point) {
     const ready = plan && plan.ready === true;
     const blockers = planArray(plan, "blockers");
@@ -1970,8 +2151,10 @@
     const planId = pick(plan, "id", "plan_id");
     const previewHash = pick(plan, "preview_hash", "sha256", "digest");
     const expiresAt = pick(plan, "expires_at");
+    const executionSupported = ready && pick(plan, "execution_supported") === true;
+    const executionDrives = restorePlanDrives(plan);
     const resultNotice = ready
-      ? '<div class="restore-result-hero ready"><span aria-hidden="true">✓</span><div><small>Readiness result</small><h3>Prerequisites satisfied</h3><p>This point can advance to an attended restore workflow when execution support is enabled.</p></div></div>'
+      ? '<div class="restore-result-hero ready"><span aria-hidden="true">✓</span><div><small>Readiness result</small><h3>Prerequisites satisfied</h3><p>' + (executionSupported ? "This retained G0.2 point can advance to an attended physical restore rehearsal." : "The plan is ready, but this retained format has no execution adapter in the current build.") + '</p></div></div>'
       : '<div class="restore-result-hero blocked"><span aria-hidden="true">!</span><div><small>Readiness result</small><h3>Restore remains blocked</h3><p>' + blockers.length + " prerequisite" + (blockers.length === 1 ? "" : "s") + " must be resolved before any execution workflow.</p></div></div>";
     const facts = [
       ["Plan ID", planId],
@@ -1981,7 +2164,10 @@
       ["Plan status", pick(plan, "status")],
       ["Recovery point", recordId(point)]
     ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "Not reported");
-    return resultNotice + '<div class="restore-result-boundary"><strong>Plan retained; nothing executed</strong><span>TapeScale did not move media, invoke Bacula, create a destination, or write recovered data.</span></div><dl class="restore-result-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-result-grid">' + renderPlanRequirements("Required media", tapes, "No media requirement was returned.") + renderPlanRequirements("Dependency chain", dependencies, "No earlier recovery point is required.") + renderPlanRequirements("Required keys", keys, "No recovery key requirement was returned.") + renderPlanRequirements("Verification gates", verification, "No verification prerequisite was returned.") + renderPlanRequirements("Destination", destination, "No destination assessment was returned.") + renderPlanRequirements("Read & staging estimate", estimates, "No work estimate was returned.") + renderPlanRequirements("Blockers", blockers.map(planIssueText), "No blocking prerequisite remains.") + renderPlanRequirements("Warnings", warnings.map(planIssueText), "No planning warning was returned.") + '</div>' + (pick(plan, "execution_supported") === false ? '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Execution is not exposed in this build</strong><span>The readiness plan is durable evidence, not a restore command.</span></div></div>' : "");
+    const executionAction = executionSupported
+      ? '<section class="restore-execution-offer"><div><span class="lab-badge">Attended G0.2 restore</span><h3>This plan can run a physical recovery rehearsal</h3><p>' + esc(tapes.join(" → ") || "The exact retained cartridge") + ' must be physically loaded in one of ' + executionDrives.length + ' compatible qualified drive' + (executionDrives.length === 1 ? "" : "s") + '. TapeScale restores only into the isolated destination recorded above, then compares the retained source manifest.</p></div><button class="button button-primary" type="button" data-action="open-restore-rehearsal" data-plan-id="' + esc(planId) + '">Start attended rehearsal</button></section>'
+      : '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>' + (ready ? "This ready plan remains planning-only" : "Execution remains blocked") + '</strong><span>' + esc(pick(plan, "execution_detail") || (ready ? "This recovery format is not supported by the attended rehearsal worker." : "Resolve every planning blocker and generate a fresh plan.")) + "</span></div></div>";
+    return resultNotice + '<div class="restore-result-boundary"><strong>Plan retained; nothing executed yet</strong><span>A rehearsal starts only after a separate exact-drive selection and attended confirmation.</span></div><dl class="restore-result-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-result-grid">' + renderPlanRequirements("Required media", tapes, "No media requirement was returned.") + renderPlanRequirements("Dependency chain", dependencies, "No earlier recovery point is required.") + renderPlanRequirements("Required keys", keys, "No recovery key requirement was returned.") + renderPlanRequirements("Verification gates", verification, "No verification prerequisite was returned.") + renderPlanRequirements("Destination", destination, "No destination assessment was returned.") + renderPlanRequirements("Read & staging estimate", estimates, "No work estimate was returned.") + renderPlanRequirements("Blockers", blockers.map(planIssueText), "No blocking prerequisite remains.") + renderPlanRequirements("Warnings", warnings.map(planIssueText), "No planning warning was returned.") + "</div>" + executionAction;
   }
 
   async function submitRestorePlan(form) {
@@ -2028,6 +2214,7 @@
         body: JSON.stringify(payload)
       });
       const plan = response && response.plan && typeof response.plan === "object" ? response.plan : response;
+      if (plan && pick(plan, "id", "plan_id")) state.restorePlans[String(pick(plan, "id", "plan_id"))] = plan;
       openModal("Restore readiness plan", renderRestorePlanResult(plan || {}, point), '<button class="button button-quiet" type="button" data-action="revise-restore-plan" data-id="' + esc(id) + '">Revise assessment</button><button class="button button-primary" type="button" data-action="close-modal">Done</button>');
       const modal = modalLayer.querySelector(".modal");
       if (modal) modal.classList.add("restore-plan-modal", "restore-plan-result-modal");
@@ -2037,6 +2224,161 @@
       errorBox.hidden = false;
       submit.disabled = false;
       submit.textContent = "Generate readiness plan";
+    }
+  }
+
+  function openRestoreRehearsal(planId) {
+    const plan = state.restorePlans[String(planId)];
+    if (!plan || plan.ready !== true || pick(plan, "execution_supported") !== true) {
+      toast("Rehearsal is not available", "Generate a fresh ready plan for a supported G0.2 recovery point.");
+      return;
+    }
+    const drives = restorePlanDrives(plan);
+    const tapes = planArray(plan, "required_tape_ids", "required_tapes", "tapes");
+    const destination = objectValue(plan, "destination");
+    const destinationPath = pick(destination, "path", "destination") || pick(plan, "destination_subpath") || "the recorded isolated destination";
+    const phrase = restorePlanConfirmation(plan);
+    const driveOptions = drives.map((drive) => {
+      const driveId = typeof drive === "string" ? drive : recordId(drive);
+      const name = typeof drive === "string" ? drive : [pick(drive, "vendor"), pick(drive, "model"), pick(drive, "stable_id")].filter(Boolean).join(" ");
+      const path = typeof drive === "string" ? null : pick(drive, "observed_path", "path");
+      return '<option value="' + esc(driveId) + '">' + esc(name || driveId) + (path ? " · " + esc(path) : "") + "</option>";
+    });
+    const body = '<form id="restore-rehearsal-form" data-plan-id="' + esc(planId) + '"><input type="hidden" name="preview_hash" value="' + esc(pick(plan, "preview_hash")) + '"><div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Attended physical-tape restore</strong><span>This reads the exact retained cartridge and writes recovered files beneath the isolated destination. It does not overwrite the source or write to tape. Keep the operator present until the run reaches a terminal state.</span></div></div><div class="restore-rehearsal-summary"><div><small>Exact tape</small><strong>' + esc(tapes.join(" → ") || "Not reported") + '</strong></div><div><small>Isolated destination</small><strong class="mono">' + esc(destinationPath) + '</strong></div><div><small>Plan preview</small><code>' + esc(pick(plan, "preview_hash")) + '</code></div></div><div class="form-grid"><div class="form-field full"><label for="restore-rehearsal-drive">Exact loaded drive</label><select class="select" id="restore-rehearsal-drive" name="drive_id" required>' + driveOptions.join("") + '</select><small>The worker rechecks stable identity, path, firmware, cartridge, qualification, and plan hash before reading.</small></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="tape_loaded_confirmed" required> I physically verified that <strong>' + esc(tapes.join(" → ") || "the required tape") + '</strong> is loaded in the selected drive.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="isolated_destination_confirmed" required> I verified that <strong class="mono">' + esc(destinationPath) + '</strong> is a new isolated recovery destination, not live data.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="attended_confirmed" required> I will remain available for tape and safe-cancellation prompts until this rehearsal finishes.</label></div><div class="form-field full"><label for="restore-rehearsal-confirmation">Type the exact attended confirmation</label><input class="input input-mono" id="restore-rehearsal-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small>Required: <strong class="mono">' + esc(phrase) + '</strong></small></div><div class="form-field full"><label for="restore-rehearsal-actor">Operator</label><input class="input" id="restore-rehearsal-actor" name="actor" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="restore-rehearsal-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit"' + (drives.length ? "" : " disabled") + '>Queue attended restore</button></div></form>';
+    openModal("Start recovery rehearsal", body);
+    const input = document.querySelector("#restore-rehearsal-confirmation");
+    if (input) input.focus();
+  }
+
+  async function submitRestoreRehearsal(form) {
+    const values = new FormData(form);
+    const planId = form.dataset.planId;
+    const plan = state.restorePlans[String(planId)];
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#restore-rehearsal-error");
+    const phrase = restorePlanConfirmation(plan || { id: planId });
+    if (String(values.get("confirmation") || "") !== phrase) {
+      errorBox.textContent = "Confirmation must exactly match the displayed phrase.";
+      errorBox.hidden = false;
+      return;
+    }
+    submit.disabled = true;
+    submit.textContent = "Queueing attended restore…";
+    errorBox.hidden = true;
+    try {
+      const response = await request(endpoints.restoreRehearsals, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          plan_id: planId,
+          preview_hash: String(values.get("preview_hash") || ""),
+          drive_id: String(values.get("drive_id") || ""),
+          confirmation: String(values.get("confirmation") || ""),
+          tape_loaded_confirmed: values.get("tape_loaded_confirmed") === "on",
+          isolated_destination_confirmed: values.get("isolated_destination_confirmed") === "on",
+          attended_confirmed: values.get("attended_confirmed") === "on",
+          actor: String(values.get("actor") || "").trim()
+        })
+      });
+      const rehearsal = response && (response.rehearsal || response.run || response);
+      if (rehearsal && typeof rehearsal === "object") {
+        state.data.restoreRehearsals = [rehearsal].concat(state.data.restoreRehearsals.filter((item) => recordId(item) !== recordId(rehearsal)));
+        state.selectedRestoreRehearsalId = recordId(rehearsal);
+      }
+      closeModal();
+      await loadOne("restoreRehearsals");
+      const selected = selectedRestoreRehearsal();
+      if (selected) await loadRestoreRehearsalDetail(recordId(selected), true);
+      updateChrome();
+      render();
+      scheduleRestoreRehearsalPoll();
+      live.textContent = "Attended physical restore queued. The Recovery Vault is showing its durable phase timeline.";
+      toast("Recovery rehearsal queued", "Keep the exact tape loaded and the isolated destination online.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Queue attended restore";
+    }
+  }
+
+  function openCancelRestoreRehearsal(id) {
+    const phrase = "CANCEL RESTORE REHEARSAL " + id;
+    const body = '<form id="cancel-restore-rehearsal-form" data-rehearsal-id="' + esc(id) + '"><div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Cancellation is a request, not an immediate tape interruption</strong><span>The worker will stop at a safe engine boundary and retain every event and artifact already produced.</span></div></div><div class="form-field"><label for="cancel-restore-rehearsal-confirmation">Type the exact confirmation</label><input class="input input-mono" id="cancel-restore-rehearsal-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small>Required: <strong class="mono">' + esc(phrase) + '</strong></small></div><div class="form-field section"><label for="cancel-restore-rehearsal-actor">Operator</label><input class="input" id="cancel-restore-rehearsal-actor" name="actor" maxlength="128" value="Web operator" required></div><p class="notice danger" id="cancel-restore-rehearsal-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Keep running</button><button class="button button-danger" type="submit">Request safe cancel</button></div></form>';
+    openModal("Cancel recovery rehearsal", body);
+    document.querySelector("#cancel-restore-rehearsal-confirmation").focus();
+  }
+
+  async function submitCancelRestoreRehearsal(form) {
+    const id = form.dataset.rehearsalId;
+    const values = new FormData(form);
+    const errorBox = form.querySelector("#cancel-restore-rehearsal-error");
+    const submit = form.querySelector('[type="submit"]');
+    const phrase = "CANCEL RESTORE REHEARSAL " + id;
+    if (String(values.get("confirmation") || "") !== phrase) {
+      errorBox.textContent = "Confirmation must exactly match the displayed phrase.";
+      errorBox.hidden = false;
+      return;
+    }
+    submit.disabled = true;
+    submit.textContent = "Recording request…";
+    errorBox.hidden = true;
+    try {
+      await request(endpoints.restoreRehearsals + "/" + encodeURIComponent(id) + "/cancel", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmation: phrase, actor: String(values.get("actor") || "").trim() })
+      });
+      closeModal();
+      await Promise.all([loadOne("restoreRehearsals"), loadRestoreRehearsalDetail(id, true)]);
+      updateChrome();
+      render();
+      scheduleRestoreRehearsalPoll();
+      toast("Safe cancellation requested", "The worker will retain evidence and stop at an allowed boundary.");
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Request safe cancel";
+    }
+  }
+
+  async function downloadRestoreRehearsalEvidence(button) {
+    const id = button.dataset.id;
+    if (!id) return;
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = "Preparing evidence…";
+    try {
+      const response = await fetch(API + endpoints.restoreRehearsals + "/" + encodeURIComponent(id) + "/evidence", { headers: { Accept: "application/json" }, cache: "no-store" });
+      const body = await response.text();
+      if (!response.ok) {
+        let payload = null;
+        try { payload = JSON.parse(body); } catch (_) { payload = null; }
+        const error = new Error("Request failed with HTTP " + response.status);
+        error.payload = payload || { message: body };
+        throw error;
+      }
+      let content = body;
+      try { content = JSON.stringify(JSON.parse(body), null, 2) + "\n"; } catch (_) { /* Preserve server bytes if JSON formatting is unavailable. */ }
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const match = disposition.match(/filename\*?=(?:UTF-8''|\")?([^\";]+)/i);
+      const suggested = match ? decodeURIComponent(match[1].replace(/^\"|\"$/g, "")) : "tapescale-restore-rehearsal-" + id + "-evidence.json";
+      const filename = suggested.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+/, "") || "tapescale-restore-rehearsal-evidence.json";
+      const url = URL.createObjectURL(new Blob([content], { type: "application/json;charset=utf-8" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast("Rehearsal evidence downloaded", "Saved the bounded canonical report as " + filename + ".");
+    } catch (error) {
+      toast("Evidence download failed", errorMessage(error));
+    } finally {
+      button.disabled = false;
+      button.textContent = original;
     }
   }
 
@@ -2610,6 +2952,26 @@
     }, 4000);
   }
 
+  function scheduleRestoreRehearsalPoll() {
+    if (state.restoreRehearsalPollTimer) window.clearTimeout(state.restoreRehearsalPollTimer);
+    const active = state.data.restoreRehearsals.filter(restoreRehearsalActive);
+    if (!active.length) {
+      state.restoreRehearsalPollTimer = null;
+      return;
+    }
+    state.restoreRehearsalPollTimer = window.setTimeout(async () => {
+      const previouslyActive = new Set(active.map(recordId));
+      await Promise.all([loadOne("restoreRehearsals"), loadOne("recoveryPoints"), loadOne("verification"), loadOne("drives"), loadOne("media")]);
+      const selected = selectedRestoreRehearsal();
+      if (selected) await loadRestoreRehearsalDetail(recordId(selected), true);
+      const completed = state.data.restoreRehearsals.find((run) => previouslyActive.has(recordId(run)) && !restoreRehearsalActive(run));
+      if (completed) toast("Recovery rehearsal " + restoreRehearsalState(completed), "The durable restore result and evidence are ready in the Recovery Vault.");
+      updateChrome();
+      render();
+      scheduleRestoreRehearsalPoll();
+    }, 3500);
+  }
+
   function openAddMedia() {
     const options = ['<option value="">Select a generation</option>'];
     for (let generation = 1; generation <= 10; generation += 1) options.push('<option value="' + generation + '">LTO-' + generation + "</option>");
@@ -3139,6 +3501,10 @@
     if (action === "retry-recovery-point") loadRecoveryPointDetail(target.dataset.id, true);
     if (action === "download-recovery-evidence") downloadRecoveryEvidence(target);
     if (action === "open-restore-plan" || action === "revise-restore-plan") openRestorePlan(target.dataset.id);
+    if (action === "open-restore-rehearsal") openRestoreRehearsal(target.dataset.planId);
+    if (action === "select-restore-rehearsal") selectRestoreRehearsal(target.dataset.id);
+    if (action === "open-cancel-restore-rehearsal") openCancelRestoreRehearsal(target.dataset.id);
+    if (action === "download-restore-rehearsal-evidence") downloadRestoreRehearsalEvidence(target);
     if (action === "open-qualification") openQualification(target);
     if (action === "reconcile-drive") reconcileDrive(target);
     if (action === "drive-motion") queueDriveMotion(target);
@@ -3196,6 +3562,14 @@
     if (event.target.id === "restore-plan-form") {
       event.preventDefault();
       submitRestorePlan(event.target);
+    }
+    if (event.target.id === "restore-rehearsal-form") {
+      event.preventDefault();
+      submitRestoreRehearsal(event.target);
+    }
+    if (event.target.id === "cancel-restore-rehearsal-form") {
+      event.preventDefault();
+      submitCancelRestoreRehearsal(event.target);
     }
     if (event.target.id === "location-form") {
       event.preventDefault();
@@ -3333,6 +3707,9 @@
       const point = selectedRecoveryPoint();
       const id = recordId(point);
       if (id && !state.data.recoveryPointDetails[id]) loadRecoveryPointDetail(id);
+      const rehearsal = selectedRestoreRehearsal();
+      const rehearsalId = recordId(rehearsal);
+      if (rehearsalId && !state.data.restoreRehearsalDetails[rehearsalId]) loadRestoreRehearsalDetail(rehearsalId);
     }
     if (state.route === "movements") {
       const movement = selectedMovement();
