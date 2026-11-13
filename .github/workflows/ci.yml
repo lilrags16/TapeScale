@@ -51,7 +51,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate browser JavaScript
-        run: node --check web/app.js
+        run: |
+          node --check web/app.js
+          node --test scripts/test-web-backup-ux.mjs
       - name: Validate Compose files
         run: |
           TAPESCALE_POSTGRES_PASSWORD_FILE=./secrets/postgres_password.example docker compose config --quiet

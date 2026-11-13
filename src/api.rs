@@ -109,9 +109,17 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
             get(backup_profiles).post(create_backup_profile),
         )
         .route("/api/v1/backup-profiles/{id}", get(backup_profile))
+        .route(
+            "/api/v1/backup-profiles/{id}/media-readiness",
+            get(backup_profile_media_readiness),
+        )
         .route("/api/v1/backup-profiles/{id}/runs", post(create_backup_run))
         .route("/api/v1/backup-runs", get(backup_runs))
         .route("/api/v1/backup-runs/{id}", get(backup_run))
+        .route(
+            "/api/v1/backup-runs/{id}/media-readiness",
+            get(backup_run_media_readiness),
+        )
         .route("/api/v1/backup-runs/{id}/media", post(assign_backup_media))
         .route("/api/v1/backup-runs/{id}/cancel", post(cancel_backup_run))
         .route("/api/v1/media", get(media).post(create_media))
@@ -528,6 +536,28 @@ struct CreateBackupRunRequest {
     idempotency_key: Option<String>,
 }
 
+fn verify_backup_source_preflight(
+    state: &AppState,
+    profile: &backup_ops::BackupProfileRecord,
+) -> Result<(), AppError> {
+    let source_mount =
+        resolve_existing_zfs_snapshot_selection(&state.source_root, &profile.source_subpath)
+            .map_err(|error| AppError::Blocked(error.to_string()))?;
+    let persisted_source_mount =
+        std::fs::canonicalize(&profile.source_mount_path).map_err(|error| {
+            AppError::Blocked(format!(
+                "configured backup source mount {} is unavailable: {error}",
+                profile.source_mount_path
+            ))
+        })?;
+    if source_mount != persisted_source_mount {
+        return Err(AppError::Blocked(
+            "configured backup source no longer resolves to its retained snapshot mount".to_owned(),
+        ));
+    }
+    verify_read_only_mount(&source_mount).map_err(|error| AppError::Blocked(error.to_string()))
+}
+
 async fn create_backup_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -555,26 +585,7 @@ async fn create_backup_run(
         .await
         .map_err(map_backup_ops_error)?
         .ok_or(AppError::NotFound)?;
-    let source_preflight =
-        resolve_existing_zfs_snapshot_selection(&state.source_root, &profile.source_subpath)
-            .map_err(|error| AppError::Blocked(error.to_string()))
-            .and_then(|source_mount| {
-                let persisted_source_mount = std::fs::canonicalize(&profile.source_mount_path)
-                    .map_err(|error| {
-                        AppError::Blocked(format!(
-                            "configured backup source mount {} is unavailable: {error}",
-                            profile.source_mount_path
-                        ))
-                    })?;
-                if source_mount != persisted_source_mount {
-                    return Err(AppError::Blocked(
-                        "configured backup source no longer resolves to its retained snapshot mount"
-                            .to_owned(),
-                    ));
-                }
-                verify_read_only_mount(&source_mount)
-                    .map_err(|error| AppError::Blocked(error.to_string()))
-            });
+    let source_preflight = verify_backup_source_preflight(&state, &profile);
     if let Err(error) = source_preflight {
         // A concurrent request may have committed after the first lookup but
         // before this source check. Preserve exact idempotent replay semantics
@@ -702,6 +713,117 @@ async fn backup_run(
     })))
 }
 
+fn backup_media_readiness_response(value: Value) -> Response {
+    let mut response = Json(value).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("static cache-control is valid"),
+    );
+    response
+}
+
+fn backup_source_unavailable_response(
+    profile_id: Uuid,
+    backup_request_id: Option<Uuid>,
+    error: &AppError,
+) -> Response {
+    let detail = match error {
+        AppError::Blocked(detail) => detail.as_str(),
+        _ => "the configured snapshot could not be verified",
+    };
+    let readiness = store::blocked_backup_media_readiness(
+        profile_id,
+        backup_request_id,
+        store::BackupMediaReadinessBlocker {
+            code: "snapshot_unavailable".to_owned(),
+            scope: "profile".to_owned(),
+            resource_id: Some(profile_id),
+            related_resource_id: None,
+            message: format!("the saved snapshot is unavailable or no longer read-only: {detail}"),
+            action: "choose_snapshot".to_owned(),
+        },
+    );
+    backup_media_readiness_response(json!({
+        "readiness": readiness,
+        "safety_authority": false,
+        "revalidated_on_assignment": true
+    }))
+}
+
+async fn backup_profile_media_readiness(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    require_file_roundtrip(&state)?;
+    let pool = require_pool(&state)?;
+    let profile_id = parse_uuid_path(&id, "backup profile")?;
+    let profile = backup_ops::get_backup_profile(pool, profile_id)
+        .await
+        .map_err(map_backup_ops_error)?
+        .ok_or(AppError::NotFound)?;
+    if let Err(error) = verify_backup_source_preflight(&state, &profile) {
+        return Ok(backup_source_unavailable_response(profile_id, None, &error));
+    }
+    match store::backup_media_readiness(pool, profile_id, None).await? {
+        store::BackupMediaReadinessResult::Readiness(readiness) => {
+            Ok(backup_media_readiness_response(json!({
+                "readiness": readiness,
+                "safety_authority": false,
+                "revalidated_on_assignment": true
+            })))
+        }
+        store::BackupMediaReadinessResult::NotFound => Err(AppError::NotFound),
+    }
+}
+
+async fn backup_run_media_readiness(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    require_file_roundtrip(&state)?;
+    let pool = require_pool(&state)?;
+    let request_id = parse_uuid_path(&id, "backup run")?;
+    let request = backup_ops::get_backup_request(pool, request_id)
+        .await
+        .map_err(map_backup_ops_error)?
+        .ok_or(AppError::NotFound)?;
+    if request.assigned_data_run_id.is_some() {
+        let readiness = store::assigned_backup_media_readiness(request.profile_id, request.id);
+        return Ok(backup_media_readiness_response(json!({
+            "readiness": readiness,
+            "safety_authority": false,
+            "revalidated_on_assignment": true
+        })));
+    }
+    let profile = backup_ops::get_backup_profile(pool, request.profile_id)
+        .await
+        .map_err(map_backup_ops_error)?
+        .ok_or(AppError::NotFound)?;
+    if let Err(error) = verify_backup_source_preflight(&state, &profile) {
+        return Ok(backup_source_unavailable_response(
+            request.profile_id,
+            Some(request.id),
+            &error,
+        ));
+    }
+    match store::backup_media_readiness(
+        pool,
+        request.profile_id,
+        Some((request.id, request.job_run_id)),
+    )
+    .await?
+    {
+        store::BackupMediaReadinessResult::Readiness(readiness) => {
+            Ok(backup_media_readiness_response(json!({
+                "readiness": readiness,
+                "safety_authority": false,
+                "revalidated_on_assignment": true
+            })))
+        }
+        store::BackupMediaReadinessResult::NotFound => Err(AppError::NotFound),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AssignBackupMediaRequest {
     drive_id: Uuid,
@@ -796,6 +918,7 @@ async fn assign_backup_media(
             })),
         ));
     }
+    verify_backup_source_preflight(&state, &profile)?;
     match store::attach_single_tape_backup_run(
         pool,
         backup_request.profile_id,

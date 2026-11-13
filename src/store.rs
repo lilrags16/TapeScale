@@ -862,6 +862,79 @@ pub enum QueueSingleTapeDataRunResult {
     Blocked(String),
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct BackupMediaReadinessCandidate {
+    pub drive_id: Uuid,
+    pub stable_id: String,
+    pub device_path: String,
+    pub cartridge_id: Uuid,
+    pub cartridge_label: String,
+    pub media_generation: Option<i16>,
+    pub media_format: Option<String>,
+    pub qualification_run_id: Uuid,
+    pub required_confirmation: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct BackupMediaReadinessBlocker {
+    pub code: String,
+    pub scope: String,
+    pub resource_id: Option<Uuid>,
+    pub related_resource_id: Option<Uuid>,
+    pub message: String,
+    pub action: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct BackupMediaReadinessCounts {
+    pub drives_total: i64,
+    pub drives_evaluated: usize,
+    pub cartridges_total: i64,
+    pub cartridges_evaluated: usize,
+    pub pairs_evaluated: usize,
+    pub candidates_matched: usize,
+    pub candidates_returned: usize,
+    pub blockers_matched: usize,
+    pub blockers_returned: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct BackupMediaReadinessLimits {
+    pub drives: usize,
+    pub cartridges: usize,
+    pub pairs: usize,
+    pub candidates: usize,
+    pub blockers: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct BackupMediaReadinessTruncation {
+    pub drives: bool,
+    pub cartridges: bool,
+    pub pairs: bool,
+    pub candidates: bool,
+    pub blockers: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct BackupMediaReadiness {
+    pub state: String,
+    pub profile_id: Uuid,
+    pub backup_request_id: Option<Uuid>,
+    pub candidates: Vec<BackupMediaReadinessCandidate>,
+    pub recommended_candidate: Option<BackupMediaReadinessCandidate>,
+    pub blockers: Vec<BackupMediaReadinessBlocker>,
+    pub counts: BackupMediaReadinessCounts,
+    pub limits: BackupMediaReadinessLimits,
+    pub truncated: BackupMediaReadinessTruncation,
+}
+
+#[derive(Clone, Debug)]
+pub enum BackupMediaReadinessResult {
+    Readiness(Box<BackupMediaReadiness>),
+    NotFound,
+}
+
 #[derive(Clone, Debug)]
 pub enum CancelSingleTapeDataRunResult {
     Cancelled(Box<SingleTapeDataRunRecord>),
@@ -3465,6 +3538,572 @@ struct ExistingBackupRequest {
     retention_days: i32,
 }
 
+const BACKUP_READINESS_DRIVE_LIMIT: usize = 16;
+const BACKUP_READINESS_CARTRIDGE_LIMIT: usize = 256;
+const BACKUP_READINESS_PAIR_LIMIT: usize =
+    BACKUP_READINESS_DRIVE_LIMIT * BACKUP_READINESS_CARTRIDGE_LIMIT;
+const BACKUP_READINESS_CANDIDATE_LIMIT: usize = 256;
+const BACKUP_READINESS_BLOCKER_LIMIT: usize = 256;
+
+fn backup_media_readiness_limits() -> BackupMediaReadinessLimits {
+    BackupMediaReadinessLimits {
+        drives: BACKUP_READINESS_DRIVE_LIMIT,
+        cartridges: BACKUP_READINESS_CARTRIDGE_LIMIT,
+        pairs: BACKUP_READINESS_PAIR_LIMIT,
+        candidates: BACKUP_READINESS_CANDIDATE_LIMIT,
+        blockers: BACKUP_READINESS_BLOCKER_LIMIT,
+    }
+}
+
+fn unevaluated_backup_media_readiness_counts(blocker_count: usize) -> BackupMediaReadinessCounts {
+    BackupMediaReadinessCounts {
+        drives_total: 0,
+        drives_evaluated: 0,
+        cartridges_total: 0,
+        cartridges_evaluated: 0,
+        pairs_evaluated: 0,
+        candidates_matched: 0,
+        candidates_returned: 0,
+        blockers_matched: blocker_count,
+        blockers_returned: blocker_count,
+    }
+}
+
+#[must_use]
+pub fn blocked_backup_media_readiness(
+    profile_id: Uuid,
+    backup_request_id: Option<Uuid>,
+    blocker: BackupMediaReadinessBlocker,
+) -> BackupMediaReadiness {
+    BackupMediaReadiness {
+        state: "blocked".to_owned(),
+        profile_id,
+        backup_request_id,
+        candidates: Vec::new(),
+        recommended_candidate: None,
+        blockers: vec![blocker],
+        counts: unevaluated_backup_media_readiness_counts(1),
+        limits: backup_media_readiness_limits(),
+        truncated: BackupMediaReadinessTruncation::default(),
+    }
+}
+
+#[must_use]
+pub fn assigned_backup_media_readiness(
+    profile_id: Uuid,
+    backup_request_id: Uuid,
+) -> BackupMediaReadiness {
+    BackupMediaReadiness {
+        state: "assigned".to_owned(),
+        profile_id,
+        backup_request_id: Some(backup_request_id),
+        candidates: Vec::new(),
+        recommended_candidate: None,
+        blockers: Vec::new(),
+        counts: unevaluated_backup_media_readiness_counts(0),
+        limits: backup_media_readiness_limits(),
+        truncated: BackupMediaReadinessTruncation::default(),
+    }
+}
+
+fn backup_media_blocker(
+    code: &str,
+    scope: &str,
+    resource_id: Option<Uuid>,
+    related_resource_id: Option<Uuid>,
+    message: impl Into<String>,
+    action: &str,
+) -> BackupMediaReadinessBlocker {
+    BackupMediaReadinessBlocker {
+        code: code.to_owned(),
+        scope: scope.to_owned(),
+        resource_id,
+        related_resource_id,
+        message: message.into(),
+        action: action.to_owned(),
+    }
+}
+
+fn drive_readiness_code(reason: &str) -> (&'static str, &'static str) {
+    if reason.contains("not been reconciled") {
+        ("drive_identity_unconfirmed", "reconcile_drive")
+    } else if reason.contains("trusted path") {
+        ("drive_path_changed", "reconcile_drive")
+    } else if reason.contains("observation is stale") {
+        ("drive_observation_stale", "refresh")
+    } else if reason.contains("not present") {
+        ("drive_not_present", "connect_drive")
+    } else if reason.contains("cannot access") {
+        ("drive_inaccessible", "check_device_access")
+    } else if reason.contains("verified stable") || reason.contains("more than one configured") {
+        ("drive_identity_ambiguous", "reconcile_drive")
+    } else if reason.contains("not ready") || reason.contains("no ready cartridge") {
+        ("tape_not_loaded", "load_tape")
+    } else if reason.contains("tape-motion") {
+        ("drive_position_uncertain", "reconcile_drive")
+    } else {
+        ("drive_io_busy", "wait")
+    }
+}
+
+fn cartridge_readiness_code(reason: &str) -> (&'static str, &'static str) {
+    if reason.contains("WORM") {
+        ("media_worm", "choose_other_tape")
+    } else if reason.contains("protected content") || reason.contains("active hold") {
+        ("media_protected", "open_media")
+    } else if reason.contains("foreign") || reason.contains("mismatched") {
+        ("media_identity_conflict", "reconcile_media")
+    } else if reason.contains("reserved") {
+        ("media_reserved", "wait")
+    } else {
+        ("media_ineligible", "open_media")
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct BackupMediaReadinessPairRow {
+    drive_id: Uuid,
+    cartridge_id: Uuid,
+    qualification_run_id: Option<Uuid>,
+    busy: bool,
+}
+
+/// Returns a read-only preview of exact media pairs that the destructive
+/// assignment transaction would currently accept. The mutation and worker
+/// always repeat every gate under locks; callers must not treat this preview as
+/// authority to write.
+pub async fn backup_media_readiness(
+    pool: &PgPool,
+    profile_id: Uuid,
+    backup_request: Option<(Uuid, Uuid)>,
+) -> Result<BackupMediaReadinessResult, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let profile = sqlx::query_as::<_, SingleTapeDataProfileRecord>(&format!(
+        "{SINGLE_TAPE_DATA_PROFILE_SELECT} WHERE id = $1"
+    ))
+    .bind(profile_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(profile) = profile else {
+        transaction.rollback().await?;
+        return Ok(BackupMediaReadinessResult::NotFound);
+    };
+    let request_id = backup_request.map(|(request_id, _)| request_id);
+    let mut blockers = Vec::new();
+    if let Some((request_id, job_run_id)) = backup_request {
+        let waiting = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM backup_requests request
+                 JOIN job_runs run ON run.id = request.job_run_id
+                 WHERE request.id = $1 AND request.profile_id = $2
+                   AND request.job_run_id = $3
+                   AND request.assigned_data_run_id IS NULL
+                   AND request.cancelled_at IS NULL
+                   AND run.state = 'waiting_for_media'
+                   AND run.finished_at IS NULL)",
+        )
+        .bind(request_id)
+        .bind(profile_id)
+        .bind(job_run_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !waiting {
+            blockers.push(backup_media_blocker(
+                "request_not_waiting_for_media",
+                "request",
+                Some(request_id),
+                None,
+                "the backup request is no longer waiting for a tape",
+                "open_backup",
+            ));
+        }
+    }
+    if profile.workflow_kind != "backup" {
+        blockers.push(backup_media_blocker(
+            "profile_wrong_workflow",
+            "profile",
+            Some(profile_id),
+            None,
+            "the selected profile is not an operational backup",
+            "open_backup",
+        ));
+    }
+    if !profile.enabled {
+        blockers.push(backup_media_blocker(
+            "profile_disabled",
+            "profile",
+            Some(profile_id),
+            None,
+            "the selected backup is disabled",
+            "open_backup",
+        ));
+    }
+    if profile.production_eligible || !profile.immutable_snapshot_confirmed {
+        blockers.push(backup_media_blocker(
+            "profile_safety_contract_invalid",
+            "profile",
+            Some(profile_id),
+            None,
+            "the backup profile no longer has the required read-only snapshot safety contract",
+            "choose_snapshot",
+        ));
+    }
+    let snapshot = sqlx::query_as::<_, SingleTapeSnapshotBinding>(
+        "SELECT id, source_id, snapshot_guid, snapshot_name, logical_root,
+                physical_path, released_at
+         FROM snapshots WHERE id = $1",
+    )
+    .bind(profile.source_snapshot_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if snapshot.as_ref().is_none_or(|snapshot| {
+        snapshot.source_id != profile.source_id
+            || snapshot.released_at.is_some()
+            || snapshot.logical_root != profile.logical_root
+            || snapshot.physical_path.as_deref() != Some(profile.source_mount_path.as_str())
+    }) {
+        blockers.push(backup_media_blocker(
+            "snapshot_unavailable",
+            "profile",
+            Some(profile_id),
+            None,
+            "the saved read-only snapshot is unavailable or no longer matches this backup",
+            "choose_snapshot",
+        ));
+    }
+    if !blockers.is_empty() {
+        let counts = unevaluated_backup_media_readiness_counts(blockers.len());
+        transaction.commit().await?;
+        return Ok(BackupMediaReadinessResult::Readiness(Box::new(
+            BackupMediaReadiness {
+                state: "blocked".to_owned(),
+                profile_id,
+                backup_request_id: request_id,
+                candidates: Vec::new(),
+                recommended_candidate: None,
+                blockers,
+                counts,
+                limits: backup_media_readiness_limits(),
+                truncated: BackupMediaReadinessTruncation::default(),
+            },
+        )));
+    }
+
+    let drives_total = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM drives")
+        .fetch_one(&mut *transaction)
+        .await?;
+    let drives = sqlx::query_as::<_, DriveRecord>(&format!(
+        "{DRIVE_SELECT}
+         ORDER BY d.reconciled DESC,
+                  (d.observed_path IS NOT NULL AND d.observed_path = d.expected_path) DESC,
+                  d.last_observed_at DESC NULLS LAST, d.stable_id, d.id
+         LIMIT $1"
+    ))
+    .bind(BACKUP_READINESS_DRIVE_LIMIT as i64)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let cartridges_total = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM cartridges c
+         WHERE $1::uuid IS NULL OR c.pool_id = $1",
+    )
+    .bind(profile.media_pool_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let cartridges = sqlx::query_as::<_, QualificationCartridge>(&format!(
+        "{QUALIFICATION_CARTRIDGE_SELECT}
+         WHERE $1::uuid IS NULL OR c.pool_id = $1
+         ORDER BY c.worm,
+                  (c.health_status IN ('write_in_progress', 'write_unverified')),
+                  (c.identity_status IN ('foreign', 'mismatch')),
+                  (c.reserved_by IS NOT NULL), active_holds, has_content,
+                  c.internal_label, c.id
+         LIMIT $2"
+    ))
+    .bind(profile.media_pool_id)
+    .bind(BACKUP_READINESS_CARTRIDGE_LIMIT as i64)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let drives_evaluated = drives.len();
+    let cartridges_evaluated = cartridges.len();
+    let mut truncated = BackupMediaReadinessTruncation {
+        drives: drives_total > drives_evaluated as i64,
+        cartridges: cartridges_total > cartridges_evaluated as i64,
+        ..BackupMediaReadinessTruncation::default()
+    };
+    if drives_total == 0 {
+        blockers.push(backup_media_blocker(
+            "no_tape_drive",
+            "system",
+            None,
+            None,
+            "no tape drive has been discovered",
+            "connect_drive",
+        ));
+    }
+    if cartridges_total == 0 {
+        blockers.push(backup_media_blocker(
+            if profile.media_pool_id.is_some() {
+                "no_media_in_pool"
+            } else {
+                "no_registered_media"
+            },
+            "system",
+            None,
+            profile.media_pool_id,
+            if profile.media_pool_id.is_some() {
+                "no tape is registered in this backup's media pool"
+            } else {
+                "no scratch tape has been registered"
+            },
+            if profile.media_pool_id.is_some() {
+                "open_media"
+            } else {
+                "prepare_tape"
+            },
+        ));
+    }
+    let mut ready_drives = Vec::new();
+    for drive in drives {
+        if let Some(reason) = drive_motion_blocker(&drive) {
+            let (code, action) = drive_readiness_code(&reason);
+            blockers.push(backup_media_blocker(
+                code,
+                "drive",
+                Some(drive.id),
+                None,
+                reason,
+                action,
+            ));
+        } else {
+            ready_drives.push(drive);
+        }
+    }
+    let mut ready_cartridges = Vec::new();
+    for cartridge in cartridges {
+        let reason = if matches!(
+            cartridge.health_status.as_str(),
+            "write_in_progress" | "write_unverified"
+        ) {
+            Some("the tape has an unverified prior write".to_owned())
+        } else {
+            qualification_cartridge_blocker(&cartridge, None)
+        };
+        if let Some(reason) = reason {
+            let (code, action) = if reason.contains("unverified prior write") {
+                ("media_write_unverified", "prepare_tape")
+            } else {
+                cartridge_readiness_code(&reason)
+            };
+            blockers.push(backup_media_blocker(
+                code,
+                "cartridge",
+                Some(cartridge.id),
+                None,
+                reason,
+                action,
+            ));
+        } else {
+            ready_cartridges.push(cartridge);
+        }
+    }
+
+    let ready_drive_ids = ready_drives
+        .iter()
+        .map(|drive| drive.id)
+        .collect::<Vec<_>>();
+    let ready_cartridge_ids = ready_cartridges
+        .iter()
+        .map(|cartridge| cartridge.id)
+        .collect::<Vec<_>>();
+    let pair_count = ready_drive_ids
+        .len()
+        .saturating_mul(ready_cartridge_ids.len());
+    let pair_rows = if ready_drive_ids.is_empty() || ready_cartridge_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as::<_, BackupMediaReadinessPairRow>(
+            "WITH drive_ids AS (
+                 SELECT drive_id, drive_order
+                 FROM unnest($1::uuid[]) WITH ORDINALITY AS selected(drive_id, drive_order)
+             ), cartridge_ids AS (
+                 SELECT cartridge_id, cartridge_order
+                 FROM unnest($2::uuid[]) WITH ORDINALITY AS selected(cartridge_id, cartridge_order)
+             ), pairs AS (
+                 SELECT drive_id, cartridge_id, drive_order, cartridge_order
+                 FROM drive_ids CROSS JOIN cartridge_ids
+             )
+             SELECT pair.drive_id, pair.cartridge_id,
+                    CASE WHEN latest.state = 'passed' THEN latest.id END
+                        AS qualification_run_id,
+                    EXISTS(
+                        SELECT 1 FROM drive_operations operation
+                        WHERE operation.drive_id = pair.drive_id
+                          AND operation.state IN ('queued', 'running')
+                        UNION ALL
+                        SELECT 1 FROM qualification_runs active_qualification
+                        WHERE (active_qualification.drive_id = pair.drive_id
+                               OR active_qualification.cartridge_id = pair.cartridge_id)
+                          AND active_qualification.state IN ('queued', 'running')
+                        UNION ALL
+                        SELECT 1 FROM single_tape_data_runs data_run
+                        WHERE (data_run.profile_id = $3
+                               OR data_run.drive_id = pair.drive_id
+                               OR data_run.cartridge_id = pair.cartridge_id)
+                          AND data_run.state IN ('queued', 'running')
+                        UNION ALL
+                        SELECT 1 FROM resource_leases lease
+                        WHERE ((lease.resource_kind = 'drive'
+                                AND lease.resource_id = pair.drive_id::text)
+                               OR (lease.resource_kind = 'media'
+                                   AND lease.resource_id = pair.cartridge_id::text))
+                          AND lease.released_at IS NULL AND lease.expires_at > now()
+                    ) AS busy
+             FROM pairs pair
+             JOIN drives drive ON drive.id = pair.drive_id
+             JOIN cartridges cartridge ON cartridge.id = pair.cartridge_id
+             LEFT JOIN LATERAL (
+                 SELECT qualification.id, qualification.state
+                 FROM qualification_runs qualification
+                 WHERE qualification.drive_id = drive.id
+                   AND qualification.cartridge_id = cartridge.id
+                   AND qualification.expected_stable_id = drive.stable_id
+                   AND qualification.expected_path = drive.observed_path
+                   AND qualification.expected_vendor IS NOT DISTINCT FROM drive.vendor
+                   AND qualification.expected_model IS NOT DISTINCT FROM drive.model
+                   AND qualification.expected_serial IS NOT DISTINCT FROM drive.serial
+                   AND qualification.expected_wwn IS NOT DISTINCT FROM drive.wwn
+                   AND qualification.expected_firmware IS NOT DISTINCT FROM drive.firmware
+                   AND qualification.expected_cartridge_label = cartridge.internal_label
+                   AND qualification.expected_media_generation
+                       IS NOT DISTINCT FROM cartridge.media_generation
+                   AND qualification.expected_media_format
+                       IS NOT DISTINCT FROM cartridge.media_format
+                   AND qualification.engine_name = 'Bacula Community'
+                   AND qualification.engine_version = '15.0.3'
+                   AND qualification.test_kind = 'btape_test'
+                   AND qualification.attempt > 0
+                 ORDER BY qualification.created_at DESC, qualification.id DESC
+                 LIMIT 1
+             ) latest ON true
+             ORDER BY pair.drive_order, pair.cartridge_order
+             LIMIT $4",
+        )
+        .bind(&ready_drive_ids)
+        .bind(&ready_cartridge_ids)
+        .bind(profile_id)
+        .bind(BACKUP_READINESS_PAIR_LIMIT as i64)
+        .fetch_all(&mut *transaction)
+        .await?
+    };
+    truncated.pairs = pair_count > pair_rows.len();
+    let mut candidates = Vec::new();
+    for pair in pair_rows {
+        if pair.busy {
+            blockers.push(backup_media_blocker(
+                "resource_busy",
+                "pair",
+                Some(pair.drive_id),
+                Some(pair.cartridge_id),
+                "the backup, drive, or tape already has active work",
+                "wait",
+            ));
+            continue;
+        }
+        let Some(qualification_run_id) = pair.qualification_run_id else {
+            blockers.push(backup_media_blocker(
+                "setup_test_required",
+                "pair",
+                Some(pair.drive_id),
+                Some(pair.cartridge_id),
+                "this exact drive and tape need the setup test before backup use",
+                "prepare_tape",
+            ));
+            continue;
+        };
+        let drive = ready_drives
+            .iter()
+            .find(|drive| drive.id == pair.drive_id)
+            .expect("the bounded pair query only returns selected drives");
+        let cartridge = ready_cartridges
+            .iter()
+            .find(|cartridge| cartridge.id == pair.cartridge_id)
+            .expect("the bounded pair query only returns selected cartridges");
+        let required_confirmation = request_id.map(|request_id| {
+            format!(
+                "OVERWRITE {} FOR BACKUP {request_id}",
+                cartridge.internal_label
+            )
+        });
+        candidates.push(BackupMediaReadinessCandidate {
+            drive_id: drive.id,
+            stable_id: drive.stable_id.clone(),
+            device_path: drive
+                .observed_path
+                .clone()
+                .expect("drive readiness requires an observed path"),
+            cartridge_id: cartridge.id,
+            cartridge_label: cartridge.internal_label.clone(),
+            media_generation: cartridge.media_generation,
+            media_format: cartridge.media_format.clone(),
+            qualification_run_id,
+            required_confirmation,
+        });
+    }
+    if truncated.drives || truncated.cartridges || truncated.pairs {
+        blockers.insert(
+            0,
+            backup_media_blocker(
+                "readiness_scan_truncated",
+                "system",
+                None,
+                None,
+                "the bounded readiness preview did not inspect the complete drive and tape inventory",
+                "open_media",
+            ),
+        );
+    }
+    let candidates_matched = candidates.len();
+    truncated.candidates = candidates_matched > BACKUP_READINESS_CANDIDATE_LIMIT;
+    candidates.truncate(BACKUP_READINESS_CANDIDATE_LIMIT);
+    let recommended_candidate = (candidates_matched == 1).then(|| candidates[0].clone());
+    let state = if candidates_matched == 0 {
+        "blocked"
+    } else if candidates_matched == 1 {
+        "ready"
+    } else {
+        "selection_required"
+    };
+    let blockers_matched = blockers.len();
+    truncated.blockers = blockers_matched > BACKUP_READINESS_BLOCKER_LIMIT;
+    blockers.truncate(BACKUP_READINESS_BLOCKER_LIMIT);
+    let counts = BackupMediaReadinessCounts {
+        drives_total,
+        drives_evaluated,
+        cartridges_total,
+        cartridges_evaluated,
+        pairs_evaluated: pair_count.min(BACKUP_READINESS_PAIR_LIMIT),
+        candidates_matched,
+        candidates_returned: candidates.len(),
+        blockers_matched,
+        blockers_returned: blockers.len(),
+    };
+    transaction.commit().await?;
+    Ok(BackupMediaReadinessResult::Readiness(Box::new(
+        BackupMediaReadiness {
+            state: state.to_owned(),
+            profile_id,
+            backup_request_id: request_id,
+            candidates,
+            recommended_candidate,
+            blockers,
+            counts,
+            limits: backup_media_readiness_limits(),
+            truncated,
+        },
+    )))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn attach_single_tape_backup_run(
     pool: &PgPool,
@@ -5359,29 +5998,40 @@ async fn single_tape_qualification_passed(
     drive: &DriveRecord,
     cartridge_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT COALESCE((
-             SELECT qualification.state = 'passed'
-             FROM qualification_runs qualification
-             JOIN cartridges cartridge ON cartridge.id = qualification.cartridge_id
-             WHERE qualification.drive_id = $1
-               AND qualification.cartridge_id = $2
-               AND qualification.expected_stable_id = $3
-               AND qualification.expected_path = $4
-               AND qualification.expected_vendor IS NOT DISTINCT FROM $5
-               AND qualification.expected_model IS NOT DISTINCT FROM $6
-               AND qualification.expected_serial IS NOT DISTINCT FROM $7
-               AND qualification.expected_wwn IS NOT DISTINCT FROM $8
-               AND qualification.expected_firmware IS NOT DISTINCT FROM $9
-               AND qualification.expected_cartridge_label = cartridge.internal_label
-               AND qualification.expected_media_generation IS NOT DISTINCT FROM cartridge.media_generation
-               AND qualification.expected_media_format IS NOT DISTINCT FROM cartridge.media_format
-               AND qualification.engine_name = 'Bacula Community'
-               AND qualification.engine_version = '15.0.3'
-               AND qualification.test_kind = 'btape_test'
-               AND qualification.attempt > 0
-             ORDER BY qualification.created_at DESC, qualification.id DESC
-             LIMIT 1), false)",
+    Ok(
+        single_tape_qualification_passed_id(transaction, drive, cartridge_id)
+            .await?
+            .is_some(),
+    )
+}
+
+async fn single_tape_qualification_passed_id(
+    transaction: &mut Transaction<'_, Postgres>,
+    drive: &DriveRecord,
+    cartridge_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let result = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT CASE WHEN qualification.state = 'passed' THEN qualification.id END
+         FROM qualification_runs qualification
+         JOIN cartridges cartridge ON cartridge.id = qualification.cartridge_id
+         WHERE qualification.drive_id = $1
+           AND qualification.cartridge_id = $2
+           AND qualification.expected_stable_id = $3
+           AND qualification.expected_path = $4
+           AND qualification.expected_vendor IS NOT DISTINCT FROM $5
+           AND qualification.expected_model IS NOT DISTINCT FROM $6
+           AND qualification.expected_serial IS NOT DISTINCT FROM $7
+           AND qualification.expected_wwn IS NOT DISTINCT FROM $8
+           AND qualification.expected_firmware IS NOT DISTINCT FROM $9
+           AND qualification.expected_cartridge_label = cartridge.internal_label
+           AND qualification.expected_media_generation IS NOT DISTINCT FROM cartridge.media_generation
+           AND qualification.expected_media_format IS NOT DISTINCT FROM cartridge.media_format
+           AND qualification.engine_name = 'Bacula Community'
+           AND qualification.engine_version = '15.0.3'
+           AND qualification.test_kind = 'btape_test'
+           AND qualification.attempt > 0
+         ORDER BY qualification.created_at DESC, qualification.id DESC
+         LIMIT 1",
     )
     .bind(drive.id)
     .bind(cartridge_id)
@@ -5392,8 +6042,9 @@ async fn single_tape_qualification_passed(
     .bind(&drive.serial)
     .bind(&drive.wwn)
     .bind(&drive.firmware)
-    .fetch_one(&mut **transaction)
-    .await
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(result.flatten())
 }
 
 #[allow(clippy::too_many_arguments)]

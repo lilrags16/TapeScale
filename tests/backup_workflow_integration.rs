@@ -172,6 +172,42 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(manual_profile.verification_mode, "full_readback");
     assert!(!manual_profile.production_eligible);
 
+    let empty_pool_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO media_pools (id, name, purpose, indefinite_retention)
+         VALUES ($1, 'Empty backup integration pool', 'scratch', false)",
+    )
+    .bind(empty_pool_id)
+    .execute(&pool)
+    .await
+    .expect("empty fixed-pool fixture should persist");
+    let empty_pool_source =
+        create_source_profile(&pool, "Empty pool backup integration", "empty-pool-source").await;
+    let mut empty_pool_request = NewBackupProfile::attended_full_file(empty_pool_source.id);
+    empty_pool_request.media_pool_id = Some(empty_pool_id);
+    empty_pool_request.actor_label = "Backup integration operator".to_owned();
+    let empty_pool_profile = backup_ops::create_backup_profile(&pool, &empty_pool_request)
+        .await
+        .expect("fixed-pool backup profile should persist");
+    let empty_pool_readiness = store::backup_media_readiness(&pool, empty_pool_profile.id, None)
+        .await
+        .expect("fixed-pool readiness should be queryable");
+    let store::BackupMediaReadinessResult::Readiness(empty_pool_readiness) = empty_pool_readiness
+    else {
+        panic!("the fixed-pool profile should have a readiness result");
+    };
+    let empty_pool_blocker = empty_pool_readiness
+        .blockers
+        .iter()
+        .find(|blocker| blocker.code == "no_media_in_pool")
+        .expect("an empty fixed pool should direct the operator to tape inventory");
+    assert_eq!(empty_pool_blocker.action, "open_media");
+    assert_eq!(empty_pool_blocker.related_resource_id, Some(empty_pool_id));
+    assert!(!empty_pool_readiness
+        .blockers
+        .iter()
+        .any(|blocker| blocker.code == "no_registered_media"));
+
     let first = backup_ops::create_manual_backup_request(
         &pool,
         manual_profile.id,
@@ -396,6 +432,46 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     )
     .await
     .expect("scratch media fixture should persist");
+    let readiness = store::backup_media_readiness(
+        &pool,
+        assignment_profile.id,
+        Some((assignment_request.id, assignment_request.job_run_id)),
+    )
+    .await
+    .expect("readiness preview should be queryable");
+    let store::BackupMediaReadinessResult::Readiness(readiness) = readiness else {
+        panic!("the retained backup profile should have a readiness result");
+    };
+    assert_eq!(readiness.state, "blocked");
+    assert!(readiness.candidates.is_empty());
+    assert!(readiness
+        .blockers
+        .iter()
+        .any(|blocker| blocker.code == "media_worm"
+            && blocker.resource_id == Some(protected_media.id)));
+    assert!(readiness.blockers.iter().any(|blocker| {
+        blocker.code == "setup_test_required"
+            && blocker.resource_id == Some(drive.id)
+            && blocker.related_resource_id == Some(scratch.id)
+    }));
+
+    let blocked_preview = api_request(
+        &replay_application,
+        Method::GET,
+        format!(
+            "/api/v1/backup-runs/{}/media-readiness",
+            assignment_request.id
+        ),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(blocked_preview.status(), StatusCode::OK);
+    assert_eq!(blocked_preview.headers()[header::CACHE_CONTROL], "no-store");
+    let blocked_preview = response_json(blocked_preview).await;
+    assert_eq!(blocked_preview["readiness"]["state"], "blocked");
+    assert_eq!(blocked_preview["safety_authority"], false);
+    assert_eq!(blocked_preview["revalidated_on_assignment"], true);
+
     let qualification = store::queue_qualification_run(
         &pool,
         drive.id,
@@ -430,6 +506,124 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     .await
     .expect("qualification pass should persist"));
 
+    sqlx::query(
+        "INSERT INTO cartridges
+            (internal_label, media_generation, media_format, worm)
+         SELECT 'ZZZ-BACKUP-BOUND-' || lpad(series::text, 4, '0'), 9, 'LTO-9', false
+         FROM generate_series(1, 300) AS series",
+    )
+    .execute(&pool)
+    .await
+    .expect("bounded-readiness inventory fixtures should persist");
+
+    let profile_readiness = store::backup_media_readiness(&pool, assignment_profile.id, None)
+        .await
+        .expect("profile readiness should use the bounded set-based query");
+    let store::BackupMediaReadinessResult::Readiness(profile_readiness) = profile_readiness else {
+        panic!("the retained backup profile should have a readiness result");
+    };
+    assert_eq!(profile_readiness.state, "ready");
+    assert_eq!(profile_readiness.counts.candidates_matched, 1);
+    assert_eq!(profile_readiness.counts.candidates_returned, 1);
+    assert!(profile_readiness.counts.pairs_evaluated <= profile_readiness.limits.pairs);
+    assert!(!profile_readiness.truncated.drives);
+    assert!(profile_readiness.truncated.cartridges);
+    assert_eq!(
+        profile_readiness.counts.cartridges_evaluated,
+        profile_readiness.limits.cartridges
+    );
+    assert!(profile_readiness
+        .blockers
+        .iter()
+        .any(|blocker| blocker.code == "readiness_scan_truncated"));
+    assert_eq!(
+        profile_readiness
+            .recommended_candidate
+            .as_ref()
+            .map(|candidate| candidate.cartridge_id),
+        Some(scratch.id)
+    );
+    assert!(profile_readiness
+        .recommended_candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.required_confirmation.is_none()));
+
+    let run_readiness = store::backup_media_readiness(
+        &pool,
+        assignment_profile.id,
+        Some((assignment_request.id, assignment_request.job_run_id)),
+    )
+    .await
+    .expect("request readiness should use the same bounded query");
+    let store::BackupMediaReadinessResult::Readiness(run_readiness) = run_readiness else {
+        panic!("the retained backup request should have a readiness result");
+    };
+    let candidate = run_readiness
+        .recommended_candidate
+        .as_ref()
+        .expect("the one qualified pair should be recommended");
+    assert_eq!(candidate.drive_id, drive.id);
+    assert_eq!(candidate.cartridge_id, scratch.id);
+    assert_eq!(candidate.qualification_run_id, qualification.id);
+    let expected_confirmation = format!(
+        "OVERWRITE {} FOR BACKUP {}",
+        scratch.internal_label, assignment_request.id
+    );
+    assert_eq!(
+        candidate.required_confirmation.as_deref(),
+        Some(expected_confirmation.as_str())
+    );
+
+    let profile_preview = api_request(
+        &replay_application,
+        Method::GET,
+        format!(
+            "/api/v1/backup-profiles/{}/media-readiness",
+            assignment_profile.id
+        ),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(profile_preview.status(), StatusCode::OK);
+    assert_eq!(profile_preview.headers()[header::CACHE_CONTROL], "no-store");
+    let profile_preview = response_json(profile_preview).await;
+    assert_eq!(profile_preview["readiness"]["state"], "blocked");
+    assert_eq!(
+        profile_preview["readiness"]["blockers"][0]["code"],
+        "snapshot_unavailable"
+    );
+    assert_eq!(
+        profile_preview["readiness"]["blockers"][0]["action"],
+        "choose_snapshot"
+    );
+    assert_eq!(
+        profile_preview["readiness"]["counts"]["blockers_returned"],
+        1
+    );
+    assert_eq!(profile_preview["readiness"]["limits"]["candidates"], 256);
+    assert_eq!(
+        profile_preview["readiness"]["truncated"]["candidates"],
+        false
+    );
+
+    let source_blocked_preview = api_request(
+        &replay_application,
+        Method::GET,
+        format!(
+            "/api/v1/backup-runs/{}/media-readiness",
+            assignment_request.id
+        ),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(source_blocked_preview.status(), StatusCode::OK);
+    let source_blocked_preview = response_json(source_blocked_preview).await;
+    assert_eq!(source_blocked_preview["readiness"]["state"], "blocked");
+    assert_eq!(
+        source_blocked_preview["readiness"]["blockers"][0]["code"],
+        "snapshot_unavailable"
+    );
+
     let assignment = store::attach_single_tape_backup_run(
         &pool,
         assignment_profile.id,
@@ -462,6 +656,24 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         .expect("assigned request remains durable");
     assert_eq!(assigned_request.state, "queued");
     assert_eq!(assigned_request.assigned_data_run_id, Some(assignment.id));
+    let assigned_preview = api_request(
+        &replay_application,
+        Method::GET,
+        format!(
+            "/api/v1/backup-runs/{}/media-readiness",
+            assignment_request.id
+        ),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(assigned_preview.status(), StatusCode::OK);
+    let assigned_preview = response_json(assigned_preview).await;
+    assert_eq!(assigned_preview["readiness"]["state"], "assigned");
+    assert_eq!(
+        assigned_preview["readiness"]["counts"]["candidates_returned"],
+        0
+    );
+    assert_eq!(assigned_preview["readiness"]["truncated"]["pairs"], false);
     assert_eq!(
         backup_ops::backup_request_events(&pool, assignment_request.id)
             .await

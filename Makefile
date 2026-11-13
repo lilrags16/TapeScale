@@ -1,4 +1,4 @@
-.PHONY: check test build run secrets
+.PHONY: check test web-test build run secrets
 
 check:
 	cargo fmt --all -- --check
@@ -6,6 +6,10 @@ check:
 
 test:
 	cargo test --all-targets --locked
+
+web-test:
+	node --check web/app.js
+	node --test scripts/test-web-backup-ux.mjs
 
 build:
 	cargo build --release --bins --locked

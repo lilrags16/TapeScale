@@ -21,11 +21,11 @@ name: tapescale
 
 x-tapescale-common: &tapescale-common
   build:
-    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-test.18
+    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-test.19
     args:
-      TAPESCALE_VERSION: 0.1.0-test.18
-      TAPESCALE_REVISION: v0.1.0-test.18
-  image: tapescale:0.1.0-test.18
+      TAPESCALE_VERSION: 0.1.0-test.19
+      TAPESCALE_REVISION: v0.1.0-test.19
+  image: tapescale:0.1.0-test.19
   pull_policy: build
   restart: unless-stopped
   read_only: true
