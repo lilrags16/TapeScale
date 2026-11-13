@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+};
 
 use axum::{
     body::Body,
@@ -37,7 +40,10 @@ use crate::{
             VerificationEvidence,
         },
     },
-    engine::{simulator::SimulatorEngine, TapeEngine},
+    engine::{
+        bacula::BACULA_VERSION, simulator::SimulatorEngine, EngineCapabilities, EngineIdentity,
+        QualificationStatus, TapeEngine,
+    },
     error::AppError,
     media_ops, qualification,
     source_browser::{self, RetainedManifestReference, SourceBrowserError},
@@ -59,6 +65,8 @@ pub struct AppState {
 }
 
 const RETAINED_MANIFEST_BROWSER_CONCURRENCY: usize = 1;
+const BACULA_ADAPTER_VERSION: &str = "g0.2-lab-v1";
+const BACULA_FORMAT_VERSION: &str = "bacula-community-15.0.3-lab-v1";
 
 impl AppState {
     #[must_use]
@@ -234,19 +242,13 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let identity = state
-        .engine
-        .identity()
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    let capabilities = state
-        .engine
-        .capabilities()
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let (identity, capabilities) = system_engine_metadata(&state).await?;
     Ok(Json(json!({
         "product":"TapeScale",
         "version":VERSION,
+        "release_channel": crate::RELEASE_CHANNEL,
+        "release_stage": "pre_release",
+        "support_scope": "attended_non_production",
         "mode":runtime_mode(&state),
         "backend_language":"Rust",
         "engine":identity,
@@ -262,7 +264,9 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
         "operational_backup_data_path": {
             "enabled": state.lab_file_roundtrip_enabled,
             "engine": "Bacula Community",
-            "engine_version": "15.0.3",
+            "engine_version": BACULA_VERSION,
+            "adapter_version": BACULA_ADAPTER_VERSION,
+            "format_version": BACULA_FORMAT_VERSION,
             "backup_level": "full",
             "compression_modes": ["auto_gzip1", "gzip6", "lzo", "none"],
             "manual_media_spanning": true,
@@ -272,13 +276,81 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
         "laboratory_data_path": {
             "enabled": state.lab_file_roundtrip_enabled,
             "engine": "Bacula Community",
-            "engine_version": "15.0.3",
-            "adapter_version": "g0.2-lab-v1",
+            "engine_version": BACULA_VERSION,
+            "adapter_version": BACULA_ADAPTER_VERSION,
+            "format_version": BACULA_FORMAT_VERSION,
             "production_eligible": false,
             "encryption": "disabled_with_explicit_per_run_deviation"
         },
-        "operational_data":"attended_bacula_full_backup_preview"
+        "operational_data":"attended_bacula_full_backup_alpha"
     })))
+}
+
+async fn system_engine_metadata(
+    state: &AppState,
+) -> Result<(EngineIdentity, EngineCapabilities), AppError> {
+    if state.demo_mode {
+        let identity = state
+            .engine
+            .identity()
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        let capabilities = state
+            .engine
+            .capabilities()
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        return Ok((identity, capabilities));
+    }
+
+    Ok((
+        EngineIdentity {
+            adapter: "tapescale-bacula-attended".to_owned(),
+            adapter_version: BACULA_ADAPTER_VERSION.to_owned(),
+            engine_name: "Bacula Community".to_owned(),
+            engine_version: BACULA_VERSION.to_owned(),
+            qualification: QualificationStatus::DetectedUnqualified,
+            format_selected: false,
+        },
+        EngineCapabilities {
+            file_backup: true,
+            native_stream: false,
+            multi_volume: true,
+            full_readback: true,
+            changer_control: false,
+            catalog_rebuild: false,
+            evidence: [
+                (
+                    "availability".to_owned(),
+                    if state.lab_file_roundtrip_enabled {
+                        "enabled for attended alpha workflows".to_owned()
+                    } else {
+                        "disabled by configuration".to_owned()
+                    },
+                ),
+                (
+                    "scope".to_owned(),
+                    "compressed or uncompressed Full file backup, attended standalone-drive spanning, and complete physical readback"
+                        .to_owned(),
+                ),
+                (
+                    "physical_hardware".to_owned(),
+                    "qualification is retained only for each exact recorded drive and cartridge tuple"
+                        .to_owned(),
+                ),
+                (
+                    "format".to_owned(),
+                    "Bacula format exercised; not selected or qualified for production"
+                        .to_owned(),
+                ),
+                (
+                    "encryption".to_owned(),
+                    "not implemented in the attended alpha data path".to_owned(),
+                ),
+            ]
+            .into(),
+        },
+    ))
 }
 
 async fn overview(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -3386,23 +3458,30 @@ fn sanitize_restore_evidence_value(value: &Value, depth: usize, truncated: &mut 
 
 async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let Some(pool) = state.pool.as_ref() else {
+        let checks = vec![
+            preflight_check(
+                "database",
+                "Database",
+                "blocked",
+                "PostgreSQL is not configured",
+            ),
+            preflight_check(
+                "engine",
+                "Tape backup engine",
+                "blocked",
+                "PostgreSQL is required before the attended Bacula backup path can retain requests and evidence",
+            ),
+        ];
         return Ok(Json(json!({
-            "status":"blocked",
+            "status":derived_preflight_status(&checks),
             "checked_at":chrono::Utc::now(),
-            "checks":[
-                preflight_check("database", "Database", "blocked", "PostgreSQL is not configured"),
-                preflight_check("engine", "Tape backup engine", "blocked", "PostgreSQL is required before the attended Bacula backup path can retain requests and evidence")
-            ],
+            "checks":checks,
             "inventory":empty_inventory()
         })));
     };
 
     let inventory = store::inventory_counts(pool).await?;
-    let truenas_status = if inventory.truenas_instances > 0 {
-        "registered"
-    } else {
-        "blocked"
-    };
+    let prepared_pair_available = has_ready_prepared_tape_pair(pool).await?;
     let access_status = if inventory.accessible_drives > 0 {
         "passed"
     } else {
@@ -3413,13 +3492,13 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     } else {
         "blocked"
     };
-    let qualification_status = if inventory.qualified_drives > 0 {
+    let qualification_status = if prepared_pair_available {
         "passed"
     } else {
         "blocked"
     };
     let media_status = if inventory.cartridges > 0 {
-        "registered"
+        "passed"
     } else {
         "blocked"
     };
@@ -3428,26 +3507,147 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     } else {
         "blocked"
     };
+    let checks = vec![
+        preflight_check("database", "Database", "passed", "PostgreSQL responded"),
+        direct_source_mount_preflight(&state.source_root),
+        preflight_check(
+            "sas_device_access",
+            "SAS tape device access",
+            access_status,
+            if inventory.accessible_drives > 0 {
+                "The worker can read status from a configured non-rewinding tape device"
+            } else {
+                "No configured SAS tape device is currently accessible"
+            },
+        ),
+        preflight_check(
+            "stable_drive_identity",
+            "Stable drive identity",
+            identity_status,
+            if inventory.reconciled_drives > 0 {
+                "An accessible drive is bound to its observed stable identity"
+            } else {
+                "No accessible drive identity has been reconciled"
+            },
+        ),
+        preflight_check(
+            "prepared_tape_path",
+            "Prepared drive and tape",
+            qualification_status,
+            if prepared_pair_available {
+                "A current passing Bacula setup test matches the exact ready drive and eligible loaded scratch cartridge; this is narrow setup evidence, not general physical qualification"
+            } else {
+                "No current passing Bacula setup test matches an exact ready drive and eligible loaded scratch cartridge"
+            },
+        ),
+        preflight_check(
+            "media_inventory",
+            "Media inventory",
+            media_status,
+            if inventory.cartridges > 0 {
+                "Cartridges are registered; on-tape identity still governs safe use"
+            } else {
+                "No cartridges are registered"
+            },
+        ),
+        preflight_check(
+            "engine",
+            "Tape backup engine",
+            engine_status,
+            if state.lab_file_roundtrip_enabled {
+                "Pinned Bacula 15.0.3 is enabled for attended compressed, ordered multi-tape Full backups and single-volume recovery exercises; this alpha path is not production-qualified"
+            } else {
+                "The attended Bacula backup and recovery data path is disabled"
+            },
+        ),
+    ];
     Ok(Json(json!({
-        "status":"blocked",
+        "status":derived_preflight_status(&checks),
         "checked_at":chrono::Utc::now(),
-        "checks":[
-            preflight_check("database", "Database", "passed", "PostgreSQL responded"),
-            preflight_check("truenas_registration", "TrueNAS registration", truenas_status,
-                if inventory.truenas_instances > 0 {"A registration exists; live connectivity is not checked yet"} else {"No TrueNAS system is registered"}),
-            preflight_check("sas_device_access", "SAS tape device access", access_status,
-                if inventory.accessible_drives > 0 {"The worker can read status from a configured non-rewinding tape device"} else {"No configured SAS tape device is currently accessible"}),
-            preflight_check("stable_drive_identity", "Stable drive identity", identity_status,
-                if inventory.reconciled_drives > 0 {"An accessible drive is bound to its observed stable identity"} else {"No accessible drive identity has been reconciled"}),
-            preflight_check("physical_drive", "Qualified tape drive", qualification_status,
-                if inventory.qualified_drives > 0 {"A physically qualified drive is recorded"} else {"No physically qualified drive is recorded"}),
-            preflight_check("media_inventory", "Media inventory", media_status,
-                if inventory.cartridges > 0 {"Cartridges are registered; on-tape identity still governs safe use"} else {"No cartridges are registered"}),
-            preflight_check("engine", "Tape backup engine", engine_status,
-                if state.lab_file_roundtrip_enabled {"Pinned Bacula 15.0.3 is enabled for attended compressed, ordered multi-tape Full backups and single-volume recovery exercises; this test slice is not production-qualified"} else {"The attended Bacula backup and recovery data path is disabled"})
-        ],
+        "checks":checks,
+        "prepared_pair_available":prepared_pair_available,
+        "physical_qualification":"not_established",
         "inventory":inventory
     })))
+}
+
+fn direct_source_mount_preflight(source_root: &FsPath) -> Value {
+    match verify_read_only_mount(source_root) {
+        Ok(()) => preflight_check(
+            "source_mount",
+            "Read-only source mount",
+            "passed",
+            "The configured direct source mount is readable and kernel-reported read-only; a separate TrueNAS API registration is not required for this deployment mode",
+        ),
+        Err(_) => preflight_check(
+            "source_mount",
+            "Read-only source mount",
+            "blocked",
+            "The configured direct source mount is missing, inaccessible, or not kernel-reported read-only",
+        ),
+    }
+}
+
+async fn has_ready_prepared_tape_pair(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM qualification_runs qualification
+               JOIN drives drive ON drive.id = qualification.drive_id
+               JOIN cartridges cartridge ON cartridge.id = qualification.cartridge_id
+              WHERE qualification.state = 'passed'
+                AND qualification.attempt > 0
+                AND qualification.engine_name = 'Bacula Community'
+                AND qualification.engine_version = $1
+                AND qualification.test_kind = 'btape_test'
+                AND qualification.id = (
+                    SELECT latest.id
+                      FROM qualification_runs latest
+                     WHERE latest.drive_id = qualification.drive_id
+                       AND latest.cartridge_id = qualification.cartridge_id
+                       AND latest.state IN ('passed', 'failed', 'interrupted')
+                       AND latest.attempt > 0
+                     ORDER BY latest.created_at DESC, latest.id DESC
+                     LIMIT 1)
+                AND qualification.expected_stable_id = drive.stable_id
+                AND qualification.expected_path IS NOT DISTINCT FROM drive.observed_path
+                AND qualification.expected_vendor IS NOT DISTINCT FROM drive.vendor
+                AND qualification.expected_model IS NOT DISTINCT FROM drive.model
+                AND qualification.expected_serial IS NOT DISTINCT FROM drive.serial
+                AND qualification.expected_wwn IS NOT DISTINCT FROM drive.wwn
+                AND qualification.expected_firmware IS NOT DISTINCT FROM drive.firmware
+                AND qualification.expected_cartridge_label = cartridge.internal_label
+                AND qualification.expected_media_generation
+                    IS NOT DISTINCT FROM cartridge.media_generation
+                AND qualification.expected_media_format
+                    IS NOT DISTINCT FROM cartridge.media_format
+                AND drive.reconciled
+                AND drive.expected_path IS NOT DISTINCT FROM drive.observed_path
+                AND drive.health->>'present' = 'true'
+                AND drive.health->>'accessible' = 'true'
+                AND drive.health->>'identity_verified' = 'true'
+                AND COALESCE(drive.health->>'identity_conflict', 'false') <> 'true'
+                AND COALESCE(drive.health->>'motion_position_uncertain', 'false') <> 'true'
+                AND drive.health->>'immediate_mode' = 'false'
+                AND drive.health->>'in_flight' = '0'
+                AND drive.health->>'ready' = 'true'
+                AND drive.health->>'medium_loaded' = 'true'
+                AND drive.last_observed_at >= now() - interval '2 minutes'
+                AND NOT cartridge.worm
+                AND cartridge.reserved_by IS NULL
+                AND cartridge.health_status = 'qualified_scratch'
+                AND NOT EXISTS (
+                    SELECT 1 FROM volume_records volume
+                     WHERE volume.cartridge_id = cartridge.id)
+                AND NOT EXISTS (
+                    SELECT 1 FROM holds active_hold
+                     WHERE active_hold.cartridge_id = cartridge.id
+                       AND active_hold.released_at IS NULL)
+         )",
+    )
+    .bind(BACULA_VERSION)
+    .fetch_one(pool)
+    .await
 }
 
 async fn qualification_runs(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -3829,9 +4029,9 @@ fn runtime_mode(state: &AppState) -> &'static str {
     if state.demo_mode {
         "simulation"
     } else if state.lab_file_roundtrip_enabled {
-        "attended_backup_and_recovery_preview"
+        "attended_backup_and_recovery_alpha"
     } else {
-        "unqualified_preview"
+        "alpha_control_plane"
     }
 }
 
@@ -4061,6 +4261,18 @@ fn preflight_check(id: &str, label: &str, status: &str, detail: &str) -> Value {
     json!({"id":id,"label":label,"status":status,"detail":detail})
 }
 
+fn derived_preflight_status(checks: &[Value]) -> &'static str {
+    if !checks.is_empty()
+        && checks
+            .iter()
+            .all(|check| check.get("status").and_then(Value::as_str) == Some("passed"))
+    {
+        "ready"
+    } else {
+        "blocked"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4073,6 +4285,71 @@ mod tests {
             media_format: None,
             worm: false,
         }
+    }
+
+    #[test]
+    fn preflight_status_is_derived_from_all_checks() {
+        let ready = vec![
+            preflight_check("database", "Database", "passed", "ready"),
+            preflight_check("source_mount", "Source", "passed", "ready"),
+            preflight_check("engine", "Engine", "passed", "ready"),
+        ];
+        assert_eq!(derived_preflight_status(&ready), "ready");
+
+        let mut blocked = ready;
+        blocked[1] = preflight_check("source_mount", "Source", "blocked", "not ready");
+        assert_eq!(derived_preflight_status(&blocked), "blocked");
+        assert_eq!(derived_preflight_status(&[]), "blocked");
+    }
+
+    #[tokio::test]
+    async fn operational_system_metadata_reports_the_attended_bacula_path() {
+        let state = AppState::new(
+            None,
+            false,
+            true,
+            true,
+            true,
+            PathBuf::from("/source"),
+            PathBuf::from("/restore"),
+        );
+        let Json(value) = system(State(state)).await.expect("system metadata");
+
+        assert_eq!(value["engine"]["adapter"], "tapescale-bacula-attended");
+        assert_eq!(value["engine"]["engine_name"], "Bacula Community");
+        assert_eq!(value["engine"]["engine_version"], BACULA_VERSION);
+        assert_eq!(value["engine"]["qualification"], "detected_unqualified");
+        assert_eq!(value["engine"]["format_selected"], false);
+        assert_eq!(value["capabilities"]["file_backup"], true);
+        assert_eq!(value["capabilities"]["native_stream"], false);
+        assert_eq!(value["capabilities"]["multi_volume"], true);
+        assert_eq!(value["capabilities"]["changer_control"], false);
+        assert_eq!(
+            value["operational_backup_data_path"]["production_eligible"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn demo_system_metadata_keeps_the_simulator_identity() {
+        let state = AppState::new(
+            None,
+            true,
+            false,
+            false,
+            false,
+            PathBuf::from("/source"),
+            PathBuf::from("/restore"),
+        );
+        let Json(value) = system(State(state)).await.expect("system metadata");
+
+        assert_eq!(value["engine"]["adapter"], "tapescale-simulator");
+        assert_eq!(value["engine"]["qualification"], "simulated");
+        assert_eq!(value["mode"], "simulation");
+        assert_eq!(
+            value["operational_backup_data_path"]["production_eligible"],
+            false
+        );
     }
 
     #[test]

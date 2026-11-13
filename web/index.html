@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#132522">
     <meta name="description" content="TapeScale storage operations console for TrueNAS and LTO protection.">
-    <title>TapeScale Operations</title>
-    <link rel="stylesheet" href="app.css?v=archive-backup-1">
-    <script src="app.js?v=archive-backup-1" defer></script>
+    <title>TapeScale Alpha Operations</title>
+    <link rel="stylesheet" href="app.css?v=tapescale-alpha-1">
+    <script src="app.js?v=tapescale-alpha-1" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Skip to main content</a>
@@ -15,14 +15,14 @@
     <div class="app-shell" id="app-shell">
       <aside class="sidebar" id="sidebar" aria-label="Primary navigation">
         <div class="brand">
-          <a class="brand-mark" href="#overview" aria-label="TapeScale overview">
+          <a class="brand-mark" href="#overview" aria-label="TapeScale Alpha overview">
             <svg viewBox="0 0 36 36" aria-hidden="true">
               <rect x="3" y="5" width="30" height="26" rx="5"></rect>
               <circle cx="12" cy="18" r="4"></circle>
               <circle cx="24" cy="18" r="4"></circle>
               <path d="M12 18h12M8 27h20"></path>
             </svg>
-            <span><strong>TapeScale</strong><small>Storage operations</small></span>
+            <span class="brand-copy"><span class="brand-title"><strong>TapeScale</strong><span class="release-badge">Alpha</span></span><small>Storage operations</small></span>
           </a>
           <button class="icon-button sidebar-close" type="button" data-action="close-nav" aria-label="Close navigation">
             <span aria-hidden="true">&times;</span>
@@ -45,7 +45,7 @@
           <section>
             <h2>Assurance</h2>
             <a class="nav-link" data-route="verification" href="#verification"><span class="nav-icon" aria-hidden="true">&#10003;</span><span>Verification</span></a>
-            <a class="nav-link" data-route="recovery-lab" href="#recovery-lab"><span class="nav-icon" aria-hidden="true">&#8634;</span><span>Recovery test</span><span class="nav-count" id="nav-recovery-count" hidden>0</span></a>
+            <a class="nav-link" data-route="recovery-lab" href="#recovery-lab"><span class="nav-icon" aria-hidden="true">&#8634;</span><span>Recovery exercise</span><span class="nav-count" id="nav-recovery-count" hidden>0</span></a>
             <a class="nav-link" data-route="settings" href="#settings"><span class="nav-icon" aria-hidden="true">&#9881;</span><span>System &amp; qualification</span></a>
           </section>
         </nav>
@@ -55,7 +55,7 @@
             <span class="health-dot" aria-hidden="true"></span>
             <span><strong>Connecting</strong><small>Waiting for API</small></span>
           </div>
-          <div class="version-line">TapeScale <span id="app-version">—</span></div>
+          <div class="version-line"><span class="version-channel">Alpha</span><span>TapeScale <span id="app-version">—</span></span></div>
         </div>
       </aside>
 
@@ -82,9 +82,9 @@
             <button class="icon-button notification-button" type="button" data-action="notifications" aria-label="Open notifications">
               <span aria-hidden="true">&#9679;</span><span class="notification-badge" id="notification-badge" hidden>0</span>
             </button>
-            <button class="user-menu" type="button" data-action="user-menu" aria-label="Open account status">
-              <span class="avatar" aria-hidden="true">--</span>
-              <span class="user-copy"><strong>Setup</strong><small>Authentication pending</small></span>
+            <button class="user-menu" type="button" data-action="user-menu" aria-label="Open local console access status">
+              <span class="avatar" aria-hidden="true">LC</span>
+              <span class="user-copy"><strong>Local console</strong><small>No application sign-in</small></span>
             </button>
           </div>
         </header>

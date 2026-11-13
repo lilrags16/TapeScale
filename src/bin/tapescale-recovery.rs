@@ -63,7 +63,7 @@ fn main() -> Result<()> {
                  5. Import or rebuild the catalog through the selected engine's supported path.\n\
                  6. Resolve the complete dependency chain and approved restore destination.\n\
                  7. Restore into an isolated destination, verify, then perform an explicit cutover.\n\n\
-                 See docs/RECOVERY.md. Physical recovery is NOT QUALIFIED in this preview."
+                 See docs/RECOVERY.md. Physical recovery is NOT QUALIFIED in this alpha."
             );
             Ok(())
         }

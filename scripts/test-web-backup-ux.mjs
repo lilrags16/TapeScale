@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+const index = readFileSync(new URL("../web/index.html", import.meta.url), "utf8");
+const css = readFileSync(new URL("../web/app.css", import.meta.url), "utf8");
 
 function section(start, end) {
   const from = app.indexOf(start);
@@ -11,6 +13,36 @@ function section(start, end) {
   assert.notEqual(to, -1, `missing ${end} after ${start}`);
   return app.slice(from, to);
 }
+
+test("the console presents an explicit alpha identity and truthful local access boundary", () => {
+  assert.match(index, /<title>TapeScale Alpha Operations<\/title>/);
+  assert.match(index, /class="release-badge">Alpha<\/span>/);
+  assert.match(index, /class="version-channel">Alpha<\/span>/);
+  assert.match(index, /id="app-version">—<\/span>/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-1/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-1/);
+  assert.match(css, /\.release-badge/);
+  assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
+  assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
+  assert.doesNotMatch(index, /Authentication pending/);
+  assert.match(app, /TapeScale Alpha does not provide application authentication for this local console/);
+  assert.match(app, /trusted management network/);
+  assert.match(app, /authenticating reverse proxy/);
+});
+
+test("operational chrome uses recovery exercise and manual motion language", () => {
+  assert.match(index, />Recovery exercise<\/span>/);
+  assert.doesNotMatch(index, /Recovery test/);
+  assert.doesNotMatch(app, /Recovery test/);
+  assert.match(app, /pageHead\("Recovery exercise"/);
+  assert.match(app, /Manual scratch-media motion enabled/);
+  assert.match(app, /Manual scratch-media motion is disabled/);
+  assert.match(app, /"Manual motion"/);
+  assert.match(app, /attended scratch-media motion request/);
+  assert.doesNotMatch(app, /Lab tape motion|lab-only motion|"Lab motion"/);
+  assert.match(app, /G0\.2 laboratory path—not a production backup policy/);
+  assert.match(app, /G0\.2 · full · single tape · no encryption/);
+});
 
 test("the start flow requires a currently eligible drive and tape", () => {
   const open = section("  async function openStartBackup(", "  function updateStartBackupTape(");

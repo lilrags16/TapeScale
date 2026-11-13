@@ -1,8 +1,8 @@
 # Operator guide
 
-This guide describes the intended TapeScale operating model. The current release is an engineering preview with SAS discovery, guided tape preparation, bounded graphical source/retained-manifest browsing, lab-only rewind/unload, a destructive Bacula `btape test` harness, an attended operational full-backup path, and a G0.2 Bacula restore-comparison exercise. It must not be represented as generally protecting production tape until G0/G1 qualification is complete.
+This guide describes the intended TapeScale operating model. The current release is an alpha with SAS discovery, guided tape preparation, bounded graphical source/retained-manifest browsing, guarded scratch-media rewind/unload, a destructive Bacula `btape test` harness, an attended operational full-backup path, and a G0.2 Bacula restore-comparison exercise. It must not be represented as generally protecting production tape until G0/G1 qualification is complete.
 
-Procedures below distinguish the implemented preview from the broader operator acceptance target. **Backups** saves one exact existing snapshot, obtains the server's current eligible drive/tape pairs, guides tape preparation when needed, and creates a durable request only after the operator selects a pair. Final destructive authorization remains attended. The worker writes one compressed or uncompressed Full job through Bacula, pauses for ordered operator-supplied continuation media when needed, and physically reads every recorded volume before retaining a recovery point. A fixed-source Saturday scheduler exists behind the API, but the console does not offer it because it does not yet create or select a newer TrueNAS snapshot. The G0.2 path additionally restores one single-volume capture and compares independent manifests. General-purpose restore execution, encryption recovery, catalog-loss recovery, incrementals, native ZFS, automatic changers, and production authorization remain incomplete or unqualified; compression and spanning have no physical qualification claim yet.
+Procedures below distinguish the implemented alpha from the broader operator acceptance target. **Backups** saves one exact existing snapshot, obtains the server's current eligible drive/tape pairs, guides tape preparation when needed, and creates a durable request only after the operator selects a pair. Final destructive authorization remains attended. The worker writes one compressed or uncompressed Full job through Bacula, pauses for ordered operator-supplied continuation media when needed, and physically reads every recorded volume before retaining a recovery point. A fixed-source Saturday scheduler exists behind the API, but the console does not offer it because it does not yet create or select a newer TrueNAS snapshot. The G0.2 path additionally restores one single-volume capture and compares independent manifests. General-purpose restore execution, encryption recovery, catalog-loss recovery, incrementals, native ZFS, automatic changers, and production authorization remain incomplete or unqualified; compression and spanning have no physical qualification claim yet.
 
 ## Daily overview
 
@@ -21,9 +21,9 @@ The latest successful backup, latest verified recovery point, and latest complet
 
 In **Backups**, choose **Choose snapshot** and use **Choose folder** to inspect one bounded directory level at a time beneath the configured read-only `/source` mount. The browser displays folders plus recorded file size/mtime, never file contents; symlinks and special objects are non-navigable. A directory with more than 2,000 direct children returns a clearly marked, deterministic partial view instead of failing. This display bound does not limit the backup inventory: the folder remains selectable, and manual relative-path entry remains available. Operational backups require a named `.zfs/snapshot/<name>` directory or one of its descendants as the recursive backup scope; plan creation validates either selection by the same rule.
 
-The browser is selection assistance, not safety authority. Saving independently resolves and contains the path, rejects traversal and symlink escape, and verifies the exact open directory's kernel mount flags. TapeScale repeats that verification before a manual request is queued and again in the worker. The saved item remains bound to this exact already-existing snapshot on every later **Start backup**. Prepare and retain snapshots outside TapeScale: this preview does not create, hold, advance, or replace them. Choose and save a newer named snapshot separately when it should be protected.
+The browser is selection assistance, not safety authority. Saving independently resolves and contains the path, rejects traversal and symlink escape, and verifies the exact open directory's kernel mount flags. TapeScale repeats that verification before a manual request is queued and again in the worker. The saved item remains bound to this exact already-existing snapshot on every later **Start backup**. Prepare and retain snapshots outside TapeScale: this alpha does not create, hold, advance, or replace them. Choose and save a newer named snapshot separately when it should be protected.
 
-The executable preview contract is deliberately fixed:
+The executable alpha contract is deliberately fixed:
 
 - representation: file;
 - level: full;
@@ -35,7 +35,7 @@ The executable preview contract is deliberately fixed:
 - schedule: manual in the console;
 - media: optional preferred scratch pool, with exact attended assignment for every request.
 
-Native ZFS, dual representation, incrementals, encryption, and unattended changer selection fail validation. The operational source inventory uses bounded-memory external sorting and does not enforce a TapeScale total file-count or logical-byte limit; host storage, source filesystem, Bacula, device, time, and available-media constraints remain real limits. The separate G0.2 harness still uses its bounded in-memory comparison contract. The existing API-level Saturday scheduler binds the exact same source path on every occurrence; it remains a preview mechanism rather than a rolling-backup control until TrueNAS snapshot creation/selection is implemented.
+Native ZFS, dual representation, incrementals, encryption, and unattended changer selection fail validation. The operational source inventory uses bounded-memory external sorting and does not enforce a TapeScale total file-count or logical-byte limit; host storage, source filesystem, Bacula, device, time, and available-media constraints remain real limits. The separate G0.2 harness still uses its bounded in-memory comparison contract. The existing API-level Saturday scheduler binds the exact same source path on every occurrence; it remains an alpha mechanism rather than a rolling-backup control until TrueNAS snapshot creation/selection is implemented.
 
 ## Run and monitor a backup
 
@@ -64,7 +64,7 @@ Before handling media, verify the intended drive under **Drives & libraries**. A
 
 ### Lab-only rewind and unload
 
-The disposable test Compose enables `TAPESCALE_LAB_TAPE_MOTION_ENABLED=true`. With a current reconciled drive and a reported loaded medium, **Rewind** and **Unload** create durable worker requests. Confirm that the loaded cartridge is designated scratch media, acknowledge the prior-write warning, then wait for the request to leave `queued`/`running` and verify the resulting drive status. Unload uses the device's rewind-and-offline operation; it puts the device offline and may physically eject the cartridge.
+The alpha TrueNAS Compose enables `TAPESCALE_LAB_TAPE_MOTION_ENABLED=true`. With a current reconciled drive and a reported loaded medium, **Rewind** and **Unload** create durable worker requests. Confirm that the loaded cartridge is designated scratch media, acknowledge the prior-write warning, then wait for the request to leave `queued`/`running` and verify the resulting drive status. Unload uses the device's rewind-and-offline operation; it puts the device offline and may physically eject the cartridge.
 
 Linux may write a filemark before rewind/offline when the previous tape operation was a write. TapeScale exposes no data-write or explicit filemark command here, but it cannot promise unchanged media after another controller wrote to the drive. Never use retained, production, unknown, or foreign media with this unqualified lab control.
 
@@ -108,9 +108,9 @@ The operational path does not perform the immediate isolated restore and manifes
 
 ### First recoverable tape (G0.2)
 
-Use **Recovery test** only after the exact loaded drive/cartridge combination has a passed G0.1 `btape` run. This attended exercise deliberately overwrites that cartridge again.
+Use **Recovery exercise** only after the exact loaded drive/cartridge combination has a passed G0.1 `btape` run. This attended exercise deliberately overwrites that cartridge again.
 
-1. Create an immutable TrueNAS snapshot below the read-only host source mount. In the test Compose, enter its path relative to `/mnt`, such as `pool/dataset/.zfs/snapshot/tapescale-g02`.
+1. Create an immutable TrueNAS snapshot below the read-only host source mount. In the alpha Compose, enter its path relative to `/mnt`, such as `pool/dataset/.zfs/snapshot/tapescale-g02`.
 2. Ensure `/mnt/tapescale-restores` is a dedicated isolated dataset with a Generic/POSIX-compatible ACL preset and no shares. An SMB/NFSv4 `aclmode=restricted` destination can reject required metadata restoration. Choose a relative restore subpath that is not used by another run.
 3. Create a recovery profile. TapeScale resolves the selected source beneath `/source`, confirms its container mount is read-only, and records an operator assertion that it is an immutable snapshot.
 4. Select the same trusted drive and registered scratch cartridge. Confirm scratch designation, destructive overwrite, and the G0.2 encryption-disabled deviation.
@@ -209,7 +209,7 @@ Manual, legal, and archive holds can be added from the dossier. Releasing one of
 
 Select a currently observed drive to evaluate reuse. The evaluation is read-only and denies on uncertainty. It reports identity/catalog reconciliation, retained and dependent recovery points, holds and archives, reservations and custody, WORM state, health and location certainty, actual format/generation compatibility, and affected recovery points. Correct the listed state and evaluate again; do not substitute a different drive merely to hide a protection blocker.
 
-Returning a tape from off site does not make it reusable. This release has no general erase, relabel, recycle, overwrite-execution, or policy-override control. Even when the read-only evaluation says `allowed`, an operator has not authorized destruction and TapeScale dispatches no tape command. The production target's exceptional-destruction workflow still requires administrator reauthentication and an unchanged affected-object preview, but that workflow is not implemented in this preview.
+Returning a tape from off site does not make it reusable. This release has no general erase, relabel, recycle, overwrite-execution, or policy-override control. Even when the read-only evaluation says `allowed`, an operator has not authorized destruction and TapeScale dispatches no tape command. The production target's exceptional-destruction workflow still requires administrator reauthentication and an unchanged affected-object preview, but that workflow is not implemented in this alpha.
 
 ## Scheduling behavior
 

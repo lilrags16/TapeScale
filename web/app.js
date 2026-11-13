@@ -1906,7 +1906,7 @@
   function renderRestore() {
     const points = orderedRecoveryPoints();
     let html = pageHead("Recovery vault", "Inspect durable recovery points, plan safely, and run attended physical restore rehearsals where the retained format is supported.", refreshButton()) + noticeFor("recoveryPoints") + noticeFor("restoreRehearsals");
-    if (!points.length) return html + empty("No recovery points", state.errors.recoveryPoints ? "Recovery points could not be loaded." : "A verified physical recovery test will create the first durable recovery point.", '<a class="button button-primary" href="#recovery-lab">Open recovery test</a>');
+    if (!points.length) return html + empty("No recovery points", state.errors.recoveryPoints ? "Recovery points could not be loaded." : "A verified physical recovery exercise will create the first durable recovery point.", '<a class="button button-primary" href="#recovery-lab">Open recovery exercise</a>');
     const selected = selectedRecoveryPoint();
     const verified = points.filter((point) => recoveryPointState(point) === "verified").length;
     const tapes = new Set(points.flatMap(recoveryPointMediaLabels));
@@ -2228,13 +2228,13 @@
     const media = eligibleRecoveryMedia(drives[0]);
     const selected = selectedRecoveryExercise();
     const enabled = recoveryLabEnabled();
-    const disabledReason = "The laboratory file roundtrip is disabled in this deployment.";
+    const disabledReason = "The G0.2 recovery exercise is disabled in this deployment.";
     const createProfile = '<button class="button button-primary" type="button" data-action="open-recovery-profile"' + (!enabled ? ' disabled title="' + esc(disabledReason) + '"' : "") + '>Add source profile</button>';
     const blocker = !enabled ? disabledReason : active ? "A recovery exercise is already active." : !profiles.length ? "Create a source and restore profile first." : !drives.length ? "No exact btape-qualified drive and scratch-cartridge pair is ready." : !media.length ? "No cartridge qualified with the selected ready drive is available." : null;
     const start = '<button class="button button-primary" type="button" data-action="open-recovery-run"' + (blocker ? ' disabled title="' + esc(blocker) + '"' : "") + '>Create recoverable tape</button>';
-    let html = pageHead("Recovery test", "One guided physical write, readback, isolated restore, and manifest comparison.", refreshButton() + createProfile + start);
+    let html = pageHead("Recovery exercise", "One guided physical write, readback, isolated restore, and manifest comparison.", refreshButton() + createProfile + start);
     html += noticeFor("recoveryProfiles") + noticeFor("recoveryExercises");
-    if (!enabled) html += '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Recovery test disabled</strong><span>Enable TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED on both the API and worker before creating profiles or destructive recovery exercises.</span></div></div>';
+    if (!enabled) html += '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Recovery exercise disabled</strong><span>Enable TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED on both the API and worker before creating profiles or destructive recovery exercises.</span></div></div>';
     html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>G0.2 laboratory path—not a production backup policy</strong><span>This workflow is full-only, one cartridge, prepared immutable fixture, and intentionally unencrypted. It destroys the selected scratch tape, then restores all captured content into the configured isolated destination. Incrementals, spanning, encryption, scheduling, and production qualification remain open.</span></div></div>';
     html += '<section class="recovery-hero section"><div class="recovery-hero-copy"><span class="lab-badge">Recoverability before convenience</span><h2>' + (exercises.length ? "Run another complete recovery proof" : "Create your first recoverable tape") + '</h2><p>TapeScale will not call a write successful until it can decode the physical tape, restore the fixture, and compare retained manifests.</p><div class="recovery-hero-actions">' + (profiles.length ? start : createProfile) + '</div></div><div class="recovery-constraints"><div><strong>1</strong><span>Prepared immutable source</span></div><div><strong>2</strong><span>Full write to one tape</span></div><div><strong>3</strong><span>Full isolated restore</span></div><div><strong>4</strong><span>Manifest match</span></div></div></section>';
     const profileSummary = profiles.length ? '<strong>' + esc(recoveryProfileName(profiles[0])) + '</strong><span>' + esc(label(pick(profiles[0], "source_subpath"))) + ' → ' + esc(label(pick(profiles[0], "restore_subpath"))) + "</span>" : '<strong>No profile</strong><span>Declare the prepared source and isolated restore subpaths.</span>';
@@ -2445,9 +2445,9 @@
       html += '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Destructive tape setup enabled</strong><span>Preparing a tape erases it, exercises the exact drive-and-tape pair, and verifies readback before backup use. Only empty, unprotected, non-WORM scratch media are eligible.</span></div></div>';
     }
     if (motionEnabled) {
-      html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Scratch-media lab motion enabled</strong><span>Rewind and unload physically move tape. Linux can finalize a prior write with a filemark before moving it. Use designated scratch media only; this does not qualify the drive for backup.</span></div></div>';
+      html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Manual scratch-media motion enabled</strong><span>Rewind and unload physically move tape. Linux can finalize a prior write with a filemark before moving it. Use designated scratch media only; this does not qualify the drive for backup.</span></div></div>';
     } else {
-      html += '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Lab tape motion is disabled</strong><span>Rewind and Unload remain visible for discovered drives, but cannot run until the API and worker use TAPESCALE_LAB_TAPE_MOTION_ENABLED=true.</span></div></div>';
+      html += '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Manual scratch-media motion is disabled</strong><span>Rewind and Unload remain visible for discovered drives, but cannot run until the API and worker use TAPESCALE_LAB_TAPE_MOTION_ENABLED=true.</span></div></div>';
     }
     if (!state.data.drives.length) {
       const noDriveDetail = state.errors.drives ? "Drive and slot inventory could not be loaded." : "No SAS tape drive has been reported. Rewind and Unload appear after the worker discovers the exact mapped /dev/nstN device.";
@@ -2475,7 +2475,7 @@
         const access = current ? pick(health, "status") || pick(drive, "qualification_status") : "stale";
         const motionBlocker = activeQualification ? "A destructive qualification run is already " + String(pick(activeQualification, "state") || "active") + "."
           : activeOperation ? "A tape motion request is already " + String(pick(activeOperation, "state") || "active") + "."
-          : !motionEnabled ? "Lab tape motion is disabled in this deployment."
+          : !motionEnabled ? "Manual scratch-media motion is disabled in this deployment."
             : !current ? "The drive observation is stale; refresh and wait for the worker."
               : health.present !== true ? "The configured tape device is not present."
                 : health.accessible !== true ? "The worker cannot access the configured tape device."
@@ -2513,7 +2513,7 @@
         qualification += '<small class="drive-motion-reason">Product gate: ' + esc(label(pick(drive, "qualification_status"))) + "." + (qualificationBlocker ? " " + esc(qualificationBlocker) : " This will destroy the selected tape.") + "</small>";
         return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="drives" data-id="' + esc(recordId(drive)) + '"><td class="primary-cell"><strong>' + esc(label(pick(drive, "stable_id", "name", "id", "device"))) + '</strong><small>' + esc(label(pick(drive, "model", "serial", "observed_path"))) + "</small></td>" + cell(pick(drive, "generation", "model")) + "<td>" + status(access) + "</td><td>" + qualification + "</td><td>" + action + "</td><td>" + motion + "</td></tr>";
       });
-      html += table(["Drive", "Generation / model", "Access", "G0 evidence", "Identity", "Lab motion"], rows);
+      html += table(["Drive", "Generation / model", "Access", "G0 evidence", "Identity", "Manual motion"], rows);
     }
     if (state.data.slots.length) {
       const rows = state.data.slots.map((slot) => "<tr>" + cell(pick(slot, "element_address", "name", "id", "slot")) + cell(pick(slot, "type", "kind")) + cell(pick(slot, "state", "status")) + cell(pick(slot, "observed_barcode", "media_label", "barcode", "cartridge")) + "</tr>");
@@ -2634,7 +2634,8 @@
       settings: renderSettings
     };
     main.innerHTML = renderers[state.route]();
-    document.title = (state.route === "jobs" ? "Backup Center" : human(state.route)) + " · TapeScale";
+    const routeTitle = state.route === "jobs" ? "Backup Center" : state.route === "recovery-lab" ? "Recovery exercise" : human(state.route);
+    document.title = routeTitle + " · TapeScale Alpha";
   }
 
   function findRecord(kind, id) {
@@ -3432,7 +3433,7 @@
 
   function openRecoveryProfile() {
     if (!recoveryLabEnabled()) {
-      toast("Recovery test is disabled", "Enable the file roundtrip on both the API and worker first.");
+      toast("Recovery exercise is disabled", "Enable the file roundtrip on both the API and worker first.");
       return;
     }
     const body = [
@@ -3493,7 +3494,7 @@
 
   function openRecoveryRun(profileId) {
     if (!recoveryLabEnabled()) {
-      toast("Recovery test is disabled", "Enable the file roundtrip on both the API and worker first.");
+      toast("Recovery exercise is disabled", "Enable the file roundtrip on both the API and worker first.");
       return;
     }
     const profiles = state.data.recoveryProfiles;
@@ -5378,7 +5379,7 @@
       await loadOne("drives");
       updateChrome();
       render();
-      toast(human(action) + " queued", "The worker will recheck the exact drive identity and execute this lab-only motion request.");
+      toast(human(action) + " queued", "The worker will recheck the exact drive identity and execute this attended scratch-media motion request.");
       window.setTimeout(async () => {
         await loadOne("drives");
         updateChrome();
@@ -5482,7 +5483,7 @@
     if (action === "notifications") showActions();
     if (action === "show-preflight") showPreflight();
     if (action === "site-menu") openModal("Protection site", "<p>" + esc(document.querySelector("#site-name").textContent) + "</p>");
-    if (action === "user-menu") openModal("Account status", "<p>Authentication is not configured in this interface.</p>");
+    if (action === "user-menu") openModal("Local console access", '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>No application sign-in</strong><span>TapeScale Alpha does not provide application authentication for this local console. Restrict it to a trusted management network or place it behind an authenticating reverse proxy.</span></div></div>');
     if (action === "close-toast") target.closest(".toast").remove();
   });
 

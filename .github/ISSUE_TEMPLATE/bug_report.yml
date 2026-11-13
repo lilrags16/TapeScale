@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        TapeScale is an engineering preview. Never include credentials, customer data, private paths, recovery keys, or unsanitized logs. Report security issues through the private link below instead.
+        TapeScale is alpha software. Never include credentials, customer data, private paths, recovery keys, or unsanitized logs. Report security issues through the private link below instead.
   - type: input
     id: version
     attributes:

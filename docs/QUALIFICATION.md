@@ -14,7 +14,7 @@ Do not change an item to Qualified without a dated report containing fixture, ex
 
 ## Current ledger
 
-This is an initial engineering ledger. Automated test references should be added as the corresponding code lands; physical columns remain Not run until laboratory execution.
+This is the alpha qualification ledger. Automated test references should be added as the corresponding code lands; physical columns remain Not run until laboratory execution.
 
 | ID | Acceptance case | Software status | Physical/operational evidence | Release note |
 |---|---|---|---|---|

@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-TapeScale is currently an engineering preview. No version is qualified for production tape protection, and no production support or response-time commitment is offered yet. Security fixes are applied to the current `main` branch.
+TapeScale is currently alpha software. No version is qualified for production tape protection, and no production support or response-time commitment is offered yet. Security fixes are applied to the current `main` branch and the newest alpha release line.
 
 ## Reporting a vulnerability
 

@@ -1,8 +1,8 @@
 # Independent recovery runbook
 
-Status: recovery contract for the engineering preview. A clean-host physical recovery has not been run. Do not treat this document as G2 evidence.
+Status: recovery contract for the alpha release. A clean-host physical recovery has not been run. Do not treat this document as G2 evidence.
 
-The preview CLI validates the documented recovery-bundle envelope and points operators to this runbook. The attended G0.2 lab path can restore its own exact Bacula full-file job while the original PostgreSQL/engine catalog is available. Media identification after catalog loss, catalog reconstruction, key-package decryption, and general recovery remain target behavior; the imperative steps below must not be read as claims that those paths are complete.
+The alpha CLI validates the documented recovery-bundle envelope and points operators to this runbook. The attended G0.2 lab path can restore its own exact Bacula full-file job while the original PostgreSQL/engine catalog is available. Media identification after catalog loss, catalog reconstruction, key-package decryption, and general recovery remain target behavior; the imperative steps below must not be read as claims that those paths are complete.
 
 TapeScale recovery must remain possible after loss of the original TrueNAS host, TapeScale PostgreSQL database, and application catalog. Successful disaster recovery depends on three separately protected sets:
 
@@ -28,7 +28,7 @@ For file-mode points, **Browse files** projects one directory level at a time fr
 
 The restore planner consumes that durable dossier and retains a 30-minute preview hash in PostgreSQL. A plan can become ready only when the complete chain is verified, required media is finalized/reconciled and has confirmed custody, the current drive matches the newest passed exact G0.1 drive/cartridge tuple, required keys are declared available, and the destination assessment has no blockers. A ready plan is still only prerequisite evidence until an execution run exists.
 
-The preview can execute one deliberately narrow online rehearsal: a passed G0.2 full-file point on one unencrypted cartridge, with no dependencies or keys, using its original Bacula catalog and exact qualified drive/media tuple. Execution requires the unexpired plan UUID, unchanged preview hash, explicit selected drive, and attended loaded-media confirmation. It fences the physical resources, restores the complete retained JobId into a new server-generated directory, and compares the result with the integrity-checked retained source manifest. A durable passing run appends a separate `restore_test` verification. It does not create a new recovery point, rebuild a lost catalog, recover a key, or establish general restore support.
+The alpha can execute one deliberately narrow online rehearsal: a passed G0.2 full-file point on one unencrypted cartridge, with no dependencies or keys, using its original Bacula catalog and exact qualified drive/media tuple. Execution requires the unexpired plan UUID, unchanged preview hash, explicit selected drive, and attended loaded-media confirmation. It fences the physical resources, restores the complete retained JobId into a new server-generated directory, and compares the result with the integrity-checked retained source manifest. A durable passing run appends a separate `restore_test` verification. It does not create a new recovery point, rebuild a lost catalog, recover a key, or establish general restore support.
 
 This rehearsal remains dependent on the original PostgreSQL/Bacula catalog and worker evidence volume. It therefore does not satisfy this runbook's independent-recovery objective. The restarted-runtime file-backed CI proof demonstrates software reconstruction with the source unavailable, but it retains the catalog and is not physical or clean-host G2 evidence.
 
@@ -72,7 +72,7 @@ Do not load or write unknown media. Do not initialize an empty catalog over reco
 
 Install the pinned TapeScale release, PostgreSQL 16, selected engine recovery tools, OpenZFS tools, and the exact codecs/dictionaries named by the bundle. Verify image and package digests against independently stored values.
 
-The engineering-preview CLI is `tapescale-recovery`. Inspect its local `--help` for the implemented commands; absent commands are a release-blocking gap, not permission to improvise destructive engine operations.
+The alpha CLI is `tapescale-recovery`. Inspect its local `--help` for the implemented commands; absent commands are a release-blocking gap, not permission to improvise destructive engine operations.
 
 ### 3. Inspect the bundle without importing
 
@@ -145,7 +145,7 @@ Use the recovery bundle, selected engine's supported tape scan/import path, inde
 
 ### Recovery bundle unavailable
 
-Follow the selected engine's documented catalog reconstruction path and scan media read-only. Expect slower identification and potentially missing product policy/custody history. This path must be demonstrated before any release claims catalog-independent recovery; the initial preview has not demonstrated it.
+Follow the selected engine's documented catalog reconstruction path and scan media read-only. Expect slower identification and potentially missing product policy/custody history. This path must be demonstrated before any release claims catalog-independent recovery; the alpha has not demonstrated it.
 
 ## Failure handling
 

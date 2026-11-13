@@ -180,10 +180,17 @@ svg {
   stroke-width: 1.7;
 }
 
-.brand-mark span {
+.brand-mark .brand-copy {
   display: flex;
   min-width: 0;
   flex-direction: column;
+}
+
+.brand-mark .brand-title {
+  display: flex;
+  align-items: center;
+  flex-direction: row;
+  gap: 6px;
 }
 
 .brand-mark strong {
@@ -195,6 +202,18 @@ svg {
   color: #9db5af;
   font-size: 10px;
   letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.release-badge {
+  display: inline-flex;
+  padding: 2px 5px;
+  border: 1px solid rgba(127, 210, 196, 0.42);
+  border-radius: 999px;
+  color: #a9e7dc;
+  background: rgba(127, 210, 196, 0.12);
+  font: 700 8px/1.2 var(--font-mono);
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
@@ -327,9 +346,22 @@ svg {
 }
 
 .version-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   margin: 12px 17px 0;
   color: #6f8982;
   font: 9px var(--font-mono);
+}
+
+.version-channel {
+  padding: 2px 5px;
+  border-radius: 999px;
+  color: #a9e7dc;
+  background: rgba(127, 210, 196, 0.12);
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
 }
 
 .workspace {

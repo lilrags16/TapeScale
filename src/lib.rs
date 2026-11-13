@@ -1,8 +1,8 @@
 //! `TapeScale` control-plane library.
 //!
-//! The crate intentionally keeps physical tape operations behind an engine adapter. The shipping
-//! engineering preview uses a deterministic simulator and never promotes simulated evidence to a
-//! hardware qualification claim.
+//! The crate intentionally keeps physical tape operations behind an engine adapter. The alpha
+//! release includes both an attended Bacula data path and a deterministic simulator, and it never
+//! promotes simulated evidence to a hardware qualification claim.
 
 pub mod api;
 pub mod backup_ops;
@@ -25,3 +25,4 @@ pub mod tool_runner;
 pub mod truenas;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const RELEASE_CHANNEL: &str = "alpha";
