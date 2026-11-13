@@ -520,49 +520,19 @@ label_volume() {
 }
 
 label_volume "$volume_name"
-
-wait_for_spanning_backup() {
-  local job_id=$1
-  local row=""
-  local continuation_labeled=false
-  for _attempt in $(seq 1 120); do
-    row="$(psql_catalog --command "SELECT jobstatus || '|' || joberrors FROM job WHERE jobid = ${job_id}")"
-    if [[ "$row" == "T|0" ]]; then
-      if [[ "$continuation_labeled" != true ]]; then
-        echo "Spanning fixture completed without requesting its second volume" >&2
-        return 1
-      fi
-      return 0
-    fi
-    case "$row" in
-      M\|*)
-        run_console 'mount storage=TS-LTO' >/dev/null
-        ;;
-      m\|*)
-        if [[ "$continuation_labeled" != true ]]; then
-          label_volume "$continuation_volume_name"
-          run_console 'mount storage=TS-LTO' >/dev/null
-          continuation_labeled=true
-        fi
-        ;;
-      A\|*|D\|*|E\|*|e\|*|f\|*|I\|*|W\|*)
-        echo "Spanning Full backup JobId $job_id ended unsuccessfully: $row" >&2
-        return 1
-        ;;
-    esac
-    sleep 1
-  done
-  echo "Spanning Full backup JobId $job_id did not complete in 120 seconds; last state: ${row:-missing}" >&2
-  return 1
-}
+if [[ "$ci_mode" == "spanning" ]]; then
+  # A random-access File device can remain in JobStatus R while it waits for an
+  # appendable volume, unlike an attended removable tape. Pre-label the exact
+  # two-volume authorization set, then release the device so Bacula selects the
+  # oldest/lower-MediaId volume first and rolls over without operator emulation.
+  run_console 'release storage=TS-LTO' >/dev/null
+  label_volume "$continuation_volume_name"
+  run_console 'release storage=TS-LTO' >/dev/null
+fi
 
 backup_output="$(run_console 'run job=TS-Full level=Full yes')"
 backup_job_id="$(extract_job_id "$backup_output")"
-if [[ "$ci_mode" == "spanning" ]]; then
-  wait_for_spanning_backup "$backup_job_id"
-else
-  wait_for_job "$backup_job_id" "Full backup"
-fi
+wait_for_job "$backup_job_id" "Full backup"
 
 if [[ "$ci_mode" == "spanning" ]]; then
   spanning_shape="$(psql_catalog --command "

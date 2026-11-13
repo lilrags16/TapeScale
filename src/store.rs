@@ -6528,12 +6528,6 @@ pub async fn mark_data_run_volume_write_started(
         transaction.rollback().await?;
         return Ok(false);
     };
-    if volume.state == "write_started"
-        && volume.engine_volume_name.as_deref() == Some(expected_engine_volume)
-    {
-        transaction.commit().await?;
-        return Ok(true);
-    }
     if volume.state != "authorized" || volume.engine_volume_name.is_some() {
         transaction.rollback().await?;
         return Ok(false);
