@@ -6,7 +6,7 @@
 TapeScale is a safety-first LTO backup control plane for TrueNAS. It is designed to manage file and native ZFS protection, media, restores, verification evidence, and confirmed off-site custody without making the application catalog a single point of recovery failure.
 
 > [!IMPORTANT]
-> This repository is a **G0 engineering preview**, not a production release. It now includes an attended G0.2 single-cartridge Bacula file roundtrip, but no tape generation, drive, changer, TrueNAS data path, ACL roundtrip, engine, or on-tape format is claimed as generally qualified. A pass applies only to the exact recorded source snapshot, drive, firmware, cartridge, and run. See the [qualification ledger](docs/QUALIFICATION.md).
+> This repository is a **G0 engineering preview**, not a production release. It includes an attended Backup Center for full-file writes and a narrower G0.2 restore-comparison exercise, both on one unencrypted cartridge through the pinned Bacula adapter. No tape generation, drive, changer, TrueNAS data path, ACL roundtrip, engine, or on-tape format is claimed as generally qualified. A verified result applies only to the exact recorded source snapshot, drive, firmware, cartridge, and run. See the [qualification ledger](docs/QUALIFICATION.md).
 
 ## What is here
 
@@ -18,6 +18,7 @@ TapeScale is a safety-first LTO backup control plane for TrueNAS. It is designed
 - A constrained external-tool runner with literal arguments, timeouts, cancellation, bounded output, and failure propagation
 - Worker-only SAS discovery/status plus durable, audited lab-only rewind and unload using explicitly mapped non-rewinding devices
 - An attended, destructive Bacula Community 15.0.3 `btape test` harness with exact drive/cartridge binding, fencing, retained evidence, and a required rewind-to-BOT postcondition
+- An operational Backup Center with durable full-file plans, manual and weekly schedule requests, explicit waiting-for-media state, exact attended drive/cartridge assignment, safe cancellation, Bacula write plus physical full readback, and atomically retained recovery points
 - An attended G0.2 recovery exercise that inventories an immutable mounted snapshot, writes one full file backup through Bacula, performs Bacula Data verification from tape, restores to an isolated destination, and compares independent SHA-256 manifests before creating a verified recovery point
 - A Recovery Vault that joins each recovery point to its ordered cartridges, locations, engine record boundaries, dependencies, holds, verification history, originating run, event trail, and content-addressed artifacts
 - Downloadable bounded recovery-evidence reports plus durable, audited restore-readiness plans with explicit media, drive, location, key, destination, capacity, and verification blockers
@@ -58,6 +59,17 @@ To run the first physical engine gate:
 5. Leave the app and drive running while the durable run is `queued` or `running`. TapeScale captures the bounded Bacula output and requires a final rewind with an observed ready-at-BOT postcondition.
 6. Review the result under **System & qualification → Qualification**. A pass is G0.1 drive/media evidence only; it is not a successful backup, restore, or completed G0 decision.
 
+After the exact drive/cartridge combination passes, use **Backup Center** for a durable attended full backup:
+
+1. Choose **Create backup plan**, name it, and enter a source path relative to the read-only `/source` mount. The path must resolve to the immutable snapshot you attest; traversal, writable mounts, and symlink escape are rejected.
+2. Optionally bind a preferred scratch-media pool, select retention, and enable the supported weekly schedule: Saturday at 02:00 in the plan timezone. This scheduler creates a durable request only; it never selects or overwrites a tape.
+3. Choose **Run now** or wait for the scheduled occurrence. The request remains **Waiting for media**, survives restarts, and has not written tape.
+4. Load an eligible scratch cartridge in the exact trusted and previously qualified drive. Choose **Assign media**, accept the destructive and single-volume/unencrypted boundaries, and type `OVERWRITE <cartridge label> FOR BACKUP <request id>` exactly.
+5. Keep the source snapshot, database, worker, drive, and cartridge available. The worker revalidates every safety gate, inventories and hashes the source, overwrites the assigned tape through the fenced Bacula adapter, and performs a Bacula Data verification that physically rereads the volume.
+6. Review the append-only activity, manifest and engine evidence, volume, and recovery-point identifier. **Verified** means the full physical readback completed; it does not claim a restore test. Use the Recovery Vault's attended rehearsal separately when restore proof is required.
+
+Cancellation before assignment is immediate. Cancellation after worker claim is a durable request observed at safe boundaries; it may not stop kernel tape I/O instantly. Partial or uncertain writes remain failed/cancelled evidence and never become a recovery point. Previously valid backups are not changed.
+
 After that exact drive/cartridge combination passes, run the first recoverable-tape exercise:
 
 1. Create or select an immutable TrueNAS snapshot below `/mnt`, for example `pool/dataset/.zfs/snapshot/tapescale-g02`, and keep the same qualified scratch cartridge loaded.
@@ -77,7 +89,7 @@ Use **Tapes & pools** as the media control center. Its inventory can be searched
 
 The dossier can evaluate reuse against one selected drive. This is a read-only, fail-closed decision: unknown or conflicting identity, catalog disagreement, retention/dependencies, holds, archives, reservations, pending custody, WORM state, health uncertainty, unknown location, or an incompatible drive keeps the cartridge blocked and lists the affected recovery points and corrective actions. TapeScale does **not** expose a general erase, relabel, recycle, reuse execution, or administrative override endpoint in this release. An `allowed` evaluation is information, not permission to destroy media.
 
-The closed G0.2 path starts the pinned Bacula Director, Storage Daemon, and File Daemon only on worker loopback under the singleton worker's fenced run. It does not expose an operator console or arbitrary engine commands. The current laboratory fixture limit is 100,000 manifest entries and 100 GiB logical data; larger datasets are rejected before tape writing. It is limited to one full file backup on one standalone drive and one cartridge. Spanning, incrementals, changers, native ZFS streams, encryption/key recovery, and clean-catalog recovery remain blocked.
+The operational Backup Center and G0.2 exercise share the closed physical adapter: the pinned Bacula Director, Storage Daemon, and File Daemon start only on worker loopback under a fenced run. No operator console or arbitrary engine command is exposed. The current laboratory limit is 100,000 manifest entries and 100 GiB logical data; larger datasets are rejected before tape writing. Both paths are limited to one full file backup on one standalone drive and one cartridge. Spanning, incrementals, changers, native ZFS streams, encryption/key recovery, and clean-catalog recovery are rejected rather than simulated.
 
 To update the TrueNAS custom app, open the installed `tapescale` app for editing, replace its YAML with the latest raw [`compose.truenas.yaml`](https://raw.githubusercontent.com/lilrags16/TapeScale/main/compose.truenas.yaml), and save. Each physical-test file pins its Git build context and OCI revision to a release tag; `pull_policy: build` rebuilds that exact source instead of silently moving with `main`.
 
@@ -98,18 +110,18 @@ cargo test --all-targets
 cargo build --release --locked
 ```
 
-The current suite exercises SAS VPD identity/status parsing, allowlisted motion commands, durable drive-operation and restore-rehearsal leases, device replacement, reset-position recovery, uncertain-motion gates, compatibility discontinuities, overwrite blockers, cartridge-version conflicts, pool/hold idempotency, retention graphs, incremental-base selection, job transitions, restore prerequisites, path/link containment, RBAC, custody confirmation, engine claim boundaries, cancellation, and safe process execution. Container CI also performs a second catalog-correlated restore after stopping every Bacula daemon and making the original source unavailable.
+The current suite exercises SAS VPD identity/status parsing, allowlisted motion commands, durable backup/media requests, scheduler occurrence idempotency, drive-operation and restore-rehearsal leases, device replacement, reset-position recovery, uncertain-motion gates, compatibility discontinuities, overwrite blockers, cartridge-version conflicts, pool/hold idempotency, retention graphs, job transitions, restore prerequisites, path/link containment, RBAC, custody confirmation, engine claim boundaries, cancellation, and safe process execution. Container CI also performs a second catalog-correlated restore after stopping every Bacula daemon and making the original source unavailable.
 
 ## Runtime boundaries
 
 | Component | Responsibility | Privilege boundary |
 |---|---|---|
 | `tapescale-api` | Web/API, restore planning, operator workflows | Read-only source/restore views and `DAC_READ_SEARCH` in the test stack; no devices, Docker socket, writable host path, or blanket privilege |
-| `tapescale-scheduler` | Timezone-aware occurrences, catch-up/coalescing, durable queue policy | No source, restore, or device access |
-| `tapescale-worker` | Durable orchestration, SAS discovery, rewind/unload, `btape`, the fenced G0.2 write/readback exercise, and attended verified-point recovery rehearsals | Exact tape node, read-only source tree, isolated writable restore root, and narrowly required metadata-preservation capabilities in the test stack |
+| `tapescale-scheduler` | Timezone-aware Saturday full occurrences, missed-occurrence coalescing, custody reconciliation, and durable waiting-for-media requests | No source, restore, or device access |
+| `tapescale-worker` | Durable orchestration, SAS discovery, rewind/unload, `btape`, attended operational full backup/write-readback, the fenced G0.2 exercise, and verified-point recovery rehearsals | Exact tape node, read-only source tree, isolated writable restore root, and narrowly required metadata-preservation capabilities in the test stack |
 | `tapescale-recovery` | Clean-host bundle inspection and recovery workflow | Runs independently of the original database |
 | PostgreSQL 16 | Product state, history, leases, evidence, audit/outbox | Private Compose network and persistent volume |
-| Engine adapter | Fixed Bacula 15.0.3 configuration, restricted console commands, physical write, Data verify, and restore correlation | G0.2 single-volume lab scope only; the general production engine/format gate remains open |
+| Engine adapter | Fixed Bacula 15.0.3 configuration, restricted console commands, physical write, Data verify, and restore correlation | Attended operational Full-backup and G0.2 single-volume lab scope only; the production engine/format gate remains open |
 
 The scheduler drops all Linux capabilities. The TrueNAS test API runs as container root with only `DAC_READ_SEARCH` so profile preflight can traverse restrictive dataset ACLs through read-only mounts. The worker runs as container root with only `CHOWN`, `DAC_OVERRIDE`, `DAC_READ_SEARCH`, `FOWNER`, and `FSETID`, which Bacula needs to read protected source metadata and restore recorded ownership/mode bits. Neither service is privileged; only the worker has the exact `/dev/nst0:rwm` mapping, `/mnt` remains read-only, and neither has a host-root or Docker-socket mount. A qualified deployment should move filesystem proof into the worker, narrow the source bind to selected snapshots, and use the host tape group where possible.
 
@@ -142,7 +154,7 @@ Please do not report vulnerabilities in a public issue. Follow the private proce
 
 ## Project status
 
-SAS discovery, narrowly allowlisted lab rewind/unload, the Bacula 15.0.3 destructive drive test, the G0.2 single-volume full-file roundtrip, Recovery Vault/evidence export, durable restore-readiness planning, attended verified-point recovery rehearsals, confirmed media-custody operations, and read-only fail-closed media reuse decisions are implemented. A G0.2 pass can create a verified recovery point only for its exact immutable source, physical tape readback, isolated restore, and manifest comparison. A later attended rehearsal can read that same point into a new isolated destination and retain another independent comparison, but it is not a general restore engine. A safe reuse decision does not erase, relabel, recycle, or overwrite a tape. This does not promote the product to production or prove TrueNAS NFSv4 ACL fidelity, multi-volume/EOM behavior, wrong-media handling, controlled physical interruption recovery, encryption, native ZFS, or clean-host catalog reconstruction.
+SAS discovery, narrowly allowlisted lab rewind/unload, the Bacula 15.0.3 destructive drive test, durable attended operational full backups with physical readback, the G0.2 single-volume restore-comparison exercise, Recovery Vault/evidence export, durable restore-readiness planning, attended verified-point recovery rehearsals, confirmed media-custody operations, and read-only fail-closed media reuse decisions are implemented. An operational backup can create a recovery point only for its exact immutable source, physical full readback, and fenced hardware tuple; it does not claim a restore test. G0.2 adds an isolated restore and manifest comparison, while a later attended rehearsal can independently reread a retained point. None is a general restore engine or a production-qualification claim. A safe reuse decision does not erase, relabel, recycle, or overwrite a tape. This release does not prove TrueNAS NFSv4 ACL fidelity, multi-volume/EOM behavior, wrong-media handling, controlled physical interruption recovery, encryption, native ZFS, or clean-host catalog reconstruction.
 
 ## License
 

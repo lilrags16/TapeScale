@@ -156,4 +156,4 @@ Follow the selected engine's documented catalog reconstruction path and scan med
 
 ## Current limitations
 
-The repository pins Bacula Community 15.0.3 for G0.1/G0.2 laboratory execution, while general workflows still use the simulator. Bacula is not yet selected or qualified as the production engine/format. No clean-host tape restoration, catalog reconstruction, physical multi-volume recovery, NFSv4 ACL roundtrip, native ZFS restore, or independent-key recovery has been evidenced. These remain explicit G0/G1/G2 blockers regardless of a successful online G0.2 run.
+The repository pins Bacula Community 15.0.3 for G0.1, attended operational full-backup, and G0.2 laboratory execution; broader unsupported workflows retain simulator coverage only. Bacula is not yet selected or qualified as the production engine/format. No clean-host tape restoration, catalog reconstruction, physical multi-volume recovery, NFSv4 ACL roundtrip, native ZFS restore, or independent-key recovery has been evidenced. These remain explicit G0/G1/G2 blockers regardless of a successful online backup or G0.2 run.

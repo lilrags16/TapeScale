@@ -78,6 +78,8 @@ The tool runner:
 
 Acceptance AT-30 includes shell metacharacters, failed producers, timeouts, cancellation, and missing dependencies.
 
+The preview's operational backup path is an isolated-lab exception to the production authorization and encryption contract. It accepts only an operator-attested read-only source, one Full file job, one exact G0.1-qualified drive/cartridge pair, and an eligible scratch tape. The operator must confirm the loaded identity, complete overwrite, and unencrypted deviation, then type a phrase bound to both cartridge label and request UUID. The worker independently rechecks identity, qualification, compatibility, pool, holds, content, WORM, reservation, and readiness before crossing the durable write boundary. The preview still has no authentication, so anyone who can reach its API can attempt these visible confirmations. Do not place sensitive production data in this unencrypted slice or expose it outside the isolated attended lab network.
+
 ## Restore containment
 
 Restored names and metadata are hostile. File restoration must anchor all resolution to an already approved destination and reject absolute paths, `..`, alternate separators, NULs, device paths, and platform-specific escape forms. Directory traversal checks alone are insufficient.
@@ -86,7 +88,7 @@ Creation uses descriptor-relative operations or an equivalent race-resistant mec
 
 Existing destinations default to skip conflicts. Rename and replace are explicit. Dataset replacement and deletion reconciliation are destructive administrator operations with preview and reauthentication.
 
-The preview's attended verified-point rehearsal is a narrow laboratory exception, not the production authorization model. It requires an unexpired blocker-free plan and unchanged preview hash, explicit exact-drive selection, three attended confirmations, and a typed phrase bound to the plan. The API cannot read worker evidence files or the restore destination. The worker independently revalidates the plan provenance, current drive/media reservation and fencing, original Bacula catalog/volume, and retained manifest artifact before dispatch. It creates a brand-new UUID destination and has no rehearsal code path for label, erase, BOT invalidation, backup, media reuse, existing-destination replacement, or publication. Internal artifact storage paths never enter public detail or evidence responses. The preview still has no authentication, so deploy this physical-read surface only on the isolated attended lab network described for G0.1/G0.2.
+The preview's attended verified-point rehearsal is a narrow laboratory exception, not the production authorization model. It requires an unexpired blocker-free plan and unchanged preview hash, explicit exact-drive selection, three attended confirmations, and a typed phrase bound to the plan. The API cannot read worker evidence files or the restore destination. The worker independently revalidates the plan provenance, current drive/media reservation and fencing, original Bacula catalog/volume, and retained manifest artifact before dispatch. It creates a brand-new UUID destination and has no rehearsal code path for label, erase, BOT invalidation, backup, media reuse, existing-destination replacement, or publication. Internal artifact storage paths never enter public detail or evidence responses. The preview still has no authentication, so deploy this physical-read surface only on the isolated attended lab network described for G0.1, operational backup, and G0.2.
 
 ## Encryption and keys
 
