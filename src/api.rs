@@ -2724,6 +2724,10 @@ impl RestorePlanningScope {
             Self::PlanningOnly(scope) => &scope.implicit_hard_link_paths,
         }
     }
+
+    const fn is_authenticated(&self) -> bool {
+        matches!(self, Self::AuthenticatedManifest(_))
+    }
 }
 
 fn planning_only_restore_scope(
@@ -2806,48 +2810,101 @@ async fn plan_restore(
         &aggregate.recovery_point.representation,
     )?;
     ensure_restore_mode_matches(mode, &aggregate.recovery_point.representation)?;
+    let source_manifest_artifact_id = aggregate
+        .recovery_point
+        .coverage
+        .get("source_manifest_artifact_id")
+        .and_then(Value::as_i64);
+    let source_manifest_artifact_size_bytes = source_manifest_artifact_id.and_then(|artifact_id| {
+        aggregate
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.id == artifact_id && artifact.artifact_kind == "source_manifest"
+            })
+            .map(|artifact| artifact.size_bytes)
+    });
+    let source_manifest_limit_applies = mode == RestoreMode::FileArchive
+        && matches!(
+            aggregate.origin.workflow_kind.as_deref(),
+            Some("recovery_exercise" | "backup")
+        );
+    let source_manifest_artifact_supported = !source_manifest_limit_applies
+        || source_manifest_artifact_size_bytes
+            .is_some_and(store::restore_manifest_artifact_size_supported);
     let restore_scope = if mode == RestoreMode::FileArchive {
-        let manifest_binding = store::recovery_point_manifest_binding(pool, recovery_point_id)
-            .await?
-            .ok_or(AppError::NotFound)?;
-        let manifest_reference = RetainedManifestReference {
-            storage_ref: manifest_binding.storage_ref.ok_or_else(|| {
-                AppError::Blocked("the recovery point has no retained source manifest".to_owned())
-            })?,
-            artifact_sha256: manifest_binding.artifact_sha256.ok_or_else(|| {
-                AppError::Blocked("the recovery point has no retained source manifest".to_owned())
-            })?,
-            artifact_size_bytes: manifest_binding.artifact_size_bytes.ok_or_else(|| {
-                AppError::Blocked("the recovery point has no retained source manifest".to_owned())
-            })?,
-            manifest_digest: manifest_binding.manifest_digest.ok_or_else(|| {
-                AppError::Blocked("the recovery point has no retained source manifest".to_owned())
-            })?,
+        let complete_point = match &request.selection {
+            ManifestSelectionRequest::CompletePoint { paths } if paths.is_empty() => true,
+            ManifestSelectionRequest::CompletePoint { .. } => {
+                return Err(AppError::Invalid(
+                    "complete_point does not accept paths".to_owned(),
+                ));
+            }
+            ManifestSelectionRequest::SelectedPaths { .. } => false,
         };
-        let permit = state
-            .retained_manifest_browser_slots
-            .clone()
-            .acquire_owned()
+        if complete_point && !source_manifest_artifact_supported {
+            // A complete-point intent needs no path expansion, so retain a
+            // truthful blocked plan even when the artifact cannot enter the
+            // bounded reader. Selected paths still require authenticated
+            // manifest resolution and therefore fail before plan creation.
+            planning_only_restore_scope(
+                &request.selection,
+                recovery_point_id,
+                mode,
+                &aggregate.recovery_point.representation,
+                request.estimated_required_bytes,
+            )?
+        } else {
+            let manifest_binding = store::recovery_point_manifest_binding(pool, recovery_point_id)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            let manifest_reference = RetainedManifestReference {
+                storage_ref: manifest_binding.storage_ref.ok_or_else(|| {
+                    AppError::Blocked(
+                        "the recovery point has no retained source manifest".to_owned(),
+                    )
+                })?,
+                artifact_sha256: manifest_binding.artifact_sha256.ok_or_else(|| {
+                    AppError::Blocked(
+                        "the recovery point has no retained source manifest".to_owned(),
+                    )
+                })?,
+                artifact_size_bytes: manifest_binding.artifact_size_bytes.ok_or_else(|| {
+                    AppError::Blocked(
+                        "the recovery point has no retained source manifest".to_owned(),
+                    )
+                })?,
+                manifest_digest: manifest_binding.manifest_digest.ok_or_else(|| {
+                    AppError::Blocked(
+                        "the recovery point has no retained source manifest".to_owned(),
+                    )
+                })?,
+            };
+            let permit = state
+                .retained_manifest_browser_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    AppError::Internal("manifest planning concurrency gate closed".to_owned())
+                })?;
+            let evidence_root = state.evidence_root.clone();
+            let requested_selection = request.selection.clone();
+            let resolved = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let manifest = source_browser::load_retained_manifest(
+                    &evidence_root,
+                    &manifest_reference,
+                    store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES,
+                )?;
+                resolve_manifest_selection(&manifest, &requested_selection)
+                    .map_err(SelectiveRestorePlanningError::Selection)
+            })
             .await
-            .map_err(|_| {
-                AppError::Internal("manifest planning concurrency gate closed".to_owned())
-            })?;
-        let evidence_root = state.evidence_root.clone();
-        let requested_selection = request.selection.clone();
-        let resolved = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let manifest = source_browser::load_retained_manifest(
-                &evidence_root,
-                &manifest_reference,
-                store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES,
-            )?;
-            resolve_manifest_selection(&manifest, &requested_selection)
-                .map_err(SelectiveRestorePlanningError::Selection)
-        })
-        .await
-        .map_err(|error| AppError::Internal(format!("restore selection task failed: {error}")))?
-        .map_err(map_selective_restore_planning_error)?;
-        RestorePlanningScope::AuthenticatedManifest(resolved)
+            .map_err(|error| AppError::Internal(format!("restore selection task failed: {error}")))?
+            .map_err(map_selective_restore_planning_error)?;
+            RestorePlanningScope::AuthenticatedManifest(resolved)
+        }
     } else {
         planning_only_restore_scope(
             &request.selection,
@@ -3048,28 +3105,6 @@ async fn plan_restore(
         "per_file_digests_available": restore_request.verification.per_file_digests_available
     });
     let preflight = preflight_restore(&restore_request);
-    let source_manifest_artifact_id = aggregate
-        .recovery_point
-        .coverage
-        .get("source_manifest_artifact_id")
-        .and_then(Value::as_i64);
-    let source_manifest_artifact_size_bytes = source_manifest_artifact_id.and_then(|artifact_id| {
-        aggregate
-            .artifacts
-            .iter()
-            .find(|artifact| {
-                artifact.id == artifact_id && artifact.artifact_kind == "source_manifest"
-            })
-            .map(|artifact| artifact.size_bytes)
-    });
-    let source_manifest_limit_applies = mode == RestoreMode::FileArchive
-        && matches!(
-            aggregate.origin.workflow_kind.as_deref(),
-            Some("recovery_exercise" | "backup")
-        );
-    let source_manifest_artifact_supported = !source_manifest_limit_applies
-        || source_manifest_artifact_size_bytes
-            .is_some_and(store::restore_manifest_artifact_size_supported);
     let source_manifest_artifact_blocker = if !source_manifest_limit_applies
         || source_manifest_artifact_supported
     {
@@ -3155,8 +3190,8 @@ async fn plan_restore(
         "client_estimated_required_bytes": request.estimated_required_bytes,
         "available_bytes": request.available_bytes,
         "required_free_reserve_bytes": request.required_free_reserve_bytes,
-        "estimate_only": mode != RestoreMode::FileArchive,
-        "authority": if mode == RestoreMode::FileArchive {
+        "estimate_only": !restore_scope.is_authenticated(),
+        "authority": if restore_scope.is_authenticated() {
             "authenticated retained manifest selection"
         } else {
             "operator planning estimate"
@@ -5137,6 +5172,7 @@ mod tests {
             Some(1_234),
         )
         .expect("identical native planning should be deterministic");
+        assert!(!first.is_authenticated());
         let value = serde_json::to_value(&first).expect("scope should serialize");
         let retry_value = serde_json::to_value(&retry).expect("scope should serialize");
 

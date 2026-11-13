@@ -539,16 +539,28 @@ pub async fn validate_restore_job(
 ) -> Result<BaculaRestoreCatalogEvidence, BaculaCatalogEvidenceError> {
     let job = load_job(database, restore_job_id).await?;
     validate_restore_job_record(&job)?;
-    let relationship = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-             SELECT 1 FROM log
-             WHERE jobid = $1 AND btrim(logtext, E'\\r\\n') = $2)",
+    let relationship_prefix = restore_relationship_prefix(restore_job_id);
+    let job_logs = sqlx::query_scalar::<_, String>(
+        "SELECT btrim(logtext, E'\\r\\n')
+         FROM log
+         WHERE jobid = $1
+           AND left(btrim(logtext, E'\\r\\n'), char_length($2)) = $2
+         LIMIT 2",
     )
     .bind(job_id_i32(restore_job_id)?)
-    .bind(restore_relationship_log(restore_job_id, backup_job_id))
-    .fetch_one(database)
+    .bind(&relationship_prefix)
+    .fetch_all(database)
     .await?;
-    if !relationship {
+    if job_logs.len() > 1 {
+        return Err(BaculaCatalogEvidenceError::Ambiguous {
+            kind: "restore source-relationship log",
+            actual: job_logs.len(),
+        });
+    }
+    let relationship = job_logs
+        .first()
+        .and_then(|log| restore_relationship_sources(log, restore_job_id));
+    if relationship.as_ref() != Some(&HashSet::from([backup_job_id.get()])) {
         return Err(BaculaCatalogEvidenceError::MissingRestoreRelationship {
             restore_job_id,
             backup_job_id,
@@ -594,12 +606,37 @@ fn validate_restore_job_record(
     )
 }
 
+#[cfg(test)]
 fn restore_relationship_log(restore_job_id: BaculaJobId, backup_job_id: BaculaJobId) -> String {
     format!(
-        "{DIRECTOR_NAME} JobId {}: Restoring files from JobId(s) {}",
-        restore_job_id.get(),
-        backup_job_id.get()
+        "{}{}",
+        restore_relationship_prefix(restore_job_id),
+        backup_job_id
     )
+}
+
+fn restore_relationship_prefix(restore_job_id: BaculaJobId) -> String {
+    format!(
+        "{DIRECTOR_NAME} JobId {}: Restoring files from JobId(s) ",
+        restore_job_id.get()
+    )
+}
+
+fn restore_relationship_sources(log: &str, restore_job_id: BaculaJobId) -> Option<HashSet<u64>> {
+    let values = log.strip_prefix(&restore_relationship_prefix(restore_job_id))?;
+    if values.is_empty() {
+        return None;
+    }
+    values
+        .split(',')
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|job_id| *job_id > 0)
+        })
+        .collect()
 }
 
 fn validate_authorized_volume_labels(
@@ -1233,6 +1270,27 @@ mod tests {
                 BaculaJobId::new(41).expect("backup id")
             ),
             "tapescale-dir JobId 43: Restoring files from JobId(s) 41"
+        );
+        assert_eq!(
+            restore_relationship_sources(
+                "tapescale-dir JobId 43: Restoring files from JobId(s) 41,41",
+                BaculaJobId::new(43).expect("restore id")
+            ),
+            Some(HashSet::from([41]))
+        );
+        assert_eq!(
+            restore_relationship_sources(
+                "tapescale-dir JobId 43: Restoring files from JobId(s) 41,42",
+                BaculaJobId::new(43).expect("restore id")
+            ),
+            Some(HashSet::from([41, 42]))
+        );
+        assert_eq!(
+            restore_relationship_sources(
+                "tapescale-dir JobId 43: Restoring files from JobId(s) invalid",
+                BaculaJobId::new(43).expect("restore id")
+            ),
+            None
         );
     }
 

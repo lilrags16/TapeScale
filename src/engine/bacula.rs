@@ -1365,16 +1365,20 @@ impl BaculaCommands {
     }
 
     /// Dispatch a restore from the already materialized BVFS table.
+    ///
+    /// The table rows already carry the pinned backup JobId. Repeating it as a
+    /// `jobid` argument makes Bacula append the same source twice to its
+    /// relationship evidence; the explicit backup client keeps selection
+    /// non-interactive without duplicating that identity.
     #[must_use]
     pub fn selected_restore(
-        backup_job_id: BaculaJobId,
         destination: &BaculaRestoreDestination,
         table: &BaculaBvfsRestoreTable,
     ) -> BconsoleScript {
         BconsoleScript::console_command(
             BaculaOperationKind::SelectedRestore,
             format_args!(
-                "restore jobid={backup_job_id} restorejob={RESTORE_JOB_NAME} restoreclient={FILE_DAEMON_NAME} where=\"{}\" file=\"?{}\" done yes",
+                "restore client={FILE_DAEMON_NAME} restorejob={RESTORE_JOB_NAME} restoreclient={FILE_DAEMON_NAME} where=\"{}\" file=\"?{}\" done yes",
                 destination.path().display(),
                 table.as_str()
             ),
@@ -2561,14 +2565,13 @@ mod tests {
 
         let restore_subpath = BaculaRestoreSubpath::parse("selected restores").expect("path");
         let destination = restore_subpath.destination(run_id);
-        let restored = String::from_utf8(
-            BaculaCommands::selected_restore(backup_job_id, &destination, &table).stdin,
-        )
-        .expect("utf8");
+        let restored =
+            String::from_utf8(BaculaCommands::selected_restore(&destination, &table).stdin)
+                .expect("utf8");
         assert_eq!(
             restored,
             format!(
-                ".api 2 api_opts=j\nrestore jobid=42 restorejob=TS-Restore restoreclient=tapescale-fd where=\"{}\" file=\"?{}\" done yes\n.quit\n",
+                ".api 2 api_opts=j\nrestore client=tapescale-fd restorejob=TS-Restore restoreclient=tapescale-fd where=\"{}\" file=\"?{}\" done yes\n.quit\n",
                 destination.path().display(),
                 table.as_str()
             )

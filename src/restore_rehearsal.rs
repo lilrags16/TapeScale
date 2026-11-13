@@ -520,7 +520,7 @@ async fn perform_rehearsal(
                 );
             }
             let restore_script = match &selected_table {
-                Some(table) => BaculaCommands::selected_restore(backup_job_id, &destination, table),
+                Some(table) => BaculaCommands::selected_restore(&destination, table),
                 None => BaculaCommands::full_restore(backup_job_id, &destination),
             };
             if cancellation.is_cancelled() {

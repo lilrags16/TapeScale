@@ -700,7 +700,10 @@ if [[ ! "$bvfs_restore_shape" =~ ^[1-9][0-9]*\|true$ ]]; then
   exit 1
 fi
 
-selected_restore_output="$(run_console "restore jobid=${backup_job_id} restorejob=TS-Restore restoreclient=tapescale-fd where=\"${selected_restore_destination}\" file=\"?${bvfs_restore_table}\" done yes")"
+# The authenticated BVFS rows already carry the source JobId. Supplying the
+# same jobid again makes Bacula record a redundant `1,1` relationship; the
+# explicit backup client keeps this table-driven form non-interactive.
+selected_restore_output="$(run_console "restore client=tapescale-fd restorejob=TS-Restore restoreclient=tapescale-fd where=\"${selected_restore_destination}\" file=\"?${bvfs_restore_table}\" done yes")"
 selected_restore_job_id="$(extract_job_id "$selected_restore_output")"
 
 # The Director consumes the restore table synchronously while dispatching the

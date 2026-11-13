@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf, time::Duration};
 
 use axum::{
     body::{to_bytes, Body},
@@ -9,6 +9,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tapescale::{
     api::{self, AppState},
+    data_path::{build_manifest, persist_manifest},
     device::{MissingSasDrive, SasDriveObservation, SasMotionOperation},
     store::{
         self, ClaimDriveOperationResult, ClaimQualificationRunResult,
@@ -931,15 +932,46 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         .await
         .expect("active physical paths should query")
         .contains(&"/dev/nst0".to_owned()));
-    let source_manifest_digest = "d".repeat(64);
+    let evidence_directory =
+        tempfile::tempdir().expect("temporary evidence directory should be created");
+    let manifest_source = tempfile::tempdir().expect("temporary manifest source should be created");
+    fs::write(manifest_source.path().join("first.bin"), vec![1_u8; 1_024])
+        .expect("first manifest payload should be written");
+    fs::write(manifest_source.path().join("second.bin"), vec![2_u8; 1_024])
+        .expect("second manifest payload should be written");
+    fs::write(manifest_source.path().join("third.bin"), vec![3_u8; 2_048])
+        .expect("third manifest payload should be written");
+    let source_manifest =
+        build_manifest(manifest_source.path()).expect("source manifest should build");
+    let source_manifest_artifact = persist_manifest(
+        &evidence_directory
+            .path()
+            .join(data_claim.run.id.to_string()),
+        "source-manifest",
+        &source_manifest,
+    )
+    .expect("source manifest artifact should persist");
+    let source_manifest_digest = source_manifest.digest_sha256.clone();
+    let source_manifest_artifact_sha256 = source_manifest_artifact.artifact_sha256.clone();
+    let supported_manifest_bytes = i64::try_from(source_manifest_artifact.size_bytes)
+        .expect("manifest artifact size should fit the catalog range");
     assert!(store::append_single_tape_data_artifact(
         &pool,
         &data_claim,
         "source_manifest",
-        "artifacts/source-manifest.json",
-        &"a".repeat(64),
-        1024,
-        json!({"manifest_digest":source_manifest_digest.clone(),"file_count":3}),
+        source_manifest_artifact
+            .storage_path
+            .to_str()
+            .expect("manifest artifact path should be UTF-8"),
+        &source_manifest_artifact_sha256,
+        source_manifest_artifact.size_bytes,
+        json!({
+            "manifest_digest": source_manifest_digest.clone(),
+            "entry_count": source_manifest.entry_count,
+            "file_count": source_manifest.file_count,
+            "logical_bytes": source_manifest.logical_bytes,
+            "coverage": {"complete": true}
+        }),
     )
     .await
     .expect("source manifest evidence should append"));
@@ -1078,9 +1110,14 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         &data_claim,
         "restored_manifest",
         "artifacts/restored-manifest.json",
-        &"a".repeat(64),
-        1024,
-        json!({"manifest_digest":source_manifest_digest.clone(),"file_count":3}),
+        &source_manifest_artifact_sha256,
+        source_manifest_artifact.size_bytes,
+        json!({
+            "manifest_digest": source_manifest_digest.clone(),
+            "entry_count": source_manifest.entry_count,
+            "file_count": source_manifest.file_count,
+            "logical_bytes": source_manifest.logical_bytes
+        }),
     )
     .await
     .expect("restored manifest evidence should append"));
@@ -1130,7 +1167,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     );
     assert_eq!(
         legacy_manifest_binding.artifact_sha256.as_deref(),
-        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        Some(source_manifest_artifact_sha256.as_str())
     );
     assert!(matches!(
         store::finalize_single_tape_data_pass(&pool, &data_claim, &pass_evidence)
@@ -1186,7 +1223,8 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             true,
             PathBuf::from("/source"),
             PathBuf::from("/restore"),
-        ),
+        )
+        .with_evidence_root(evidence_directory.path().to_path_buf()),
         web_directory.path().to_path_buf(),
     );
 
@@ -1737,9 +1775,10 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     .await;
     assert_eq!(
         sqlx::query(
-            "UPDATE single_tape_data_artifacts SET size_bytes = 1024
-             WHERE single_tape_data_run_id = $1 AND artifact_kind = 'source_manifest'",
+            "UPDATE single_tape_data_artifacts SET size_bytes = $1
+             WHERE single_tape_data_run_id = $2 AND artifact_kind = 'source_manifest'",
         )
+        .bind(supported_manifest_bytes)
         .bind(data_claim.run.id)
         .execute(&pool)
         .await
@@ -1763,6 +1802,12 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     let oversized_plan = response_json(oversized_plan_response).await;
     assert_eq!(oversized_plan["plan"]["ready"], false);
     assert_eq!(oversized_plan["plan"]["execution_supported"], false);
+    assert_eq!(oversized_plan["plan"]["selection"]["planning_only"], true);
+    assert_eq!(oversized_plan["plan"]["estimates"]["estimate_only"], true);
+    assert_eq!(
+        oversized_plan["plan"]["estimates"]["authority"],
+        "operator planning estimate"
+    );
     assert_eq!(
         oversized_plan["plan"]["execution"]["source_manifest_artifact"]["size_bytes"],
         oversized_manifest_bytes
