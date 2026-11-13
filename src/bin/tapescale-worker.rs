@@ -19,7 +19,7 @@ use tapescale::{
         QualificationStatus, TapeEngine,
     },
     qualification::{BtapeOutcomeKind, BtapeQualificationConfig},
-    store,
+    restore_rehearsal, store,
     tool_runner::ToolError,
 };
 use tokio_util::sync::CancellationToken;
@@ -252,6 +252,16 @@ async fn reconcile_once(
     reconcile_sas_devices(pool, sas_config).await?;
 
     if let Some(pool) = pool {
+        // Restore requests outrank queued writes at this safe, between-job boundary. A running
+        // Bacula operation is never preempted mid-stream.
+        restore_rehearsal::process_restore_rehearsal_runs(
+            pool,
+            sas_config,
+            config,
+            worker_id,
+            cancellation,
+        )
+        .await?;
         data_run::process_single_tape_data_runs(pool, sas_config, config, worker_id, cancellation)
             .await?;
         process_qualification_runs(pool, sas_config, btape_config, worker_id, cancellation).await?;
@@ -297,10 +307,14 @@ async fn reconcile_sas_devices(
         return Ok(());
     }
     let blocked_paths = match pool {
-        Some(pool) => store::running_drive_operation_paths(pool)
-            .await?
-            .into_iter()
-            .collect::<BTreeSet<_>>(),
+        Some(pool) => {
+            let mut paths = store::running_drive_operation_paths(pool)
+                .await?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            paths.extend(store::running_restore_rehearsal_paths(pool).await?);
+            paths
+        }
         None => BTreeSet::new(),
     };
     let mut discovery_config = config.clone();
