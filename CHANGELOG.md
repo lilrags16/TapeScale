@@ -2,6 +2,20 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.5] - 2026-11-13
+
+### Long-running backup lease reliability
+
+- Backup heartbeats now renew the exact first-cartridge lease as well as the drive and every continuation cartridge. A copy/paste regression had queried the unrelated Restore ledger, allowing volume one to expire 30 minutes after assignment during a long source inventory.
+- The worker renews its fenced drive and cartridge leases between every bounded pre-write rewind, scratch-header preparation, and final rewind, including continuation-tape preparation.
+- Database regression coverage shortens both initial leases and proves that one heartbeat extends both beyond the old failure window.
+
+### Truthful interruption evidence
+
+- A lease loss before the durable media-write boundary now records that no tape-motion or data-write command was dispatched, preserves the drive's reconciled position, and leaves cartridge health unchanged.
+- A lease loss after that boundary continues to fail closed: tape position becomes uncertain and every started cartridge is quarantined as write-unverified.
+- Backup details render the retained failure explanation instead of raw JSON and give operators tape-state-specific recovery guidance.
+
 ## [0.1.0-alpha.4] - 2026-11-13
 
 ### Path-selective Restore runs
@@ -85,6 +99,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.5]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.2

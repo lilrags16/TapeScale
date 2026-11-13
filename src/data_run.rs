@@ -488,6 +488,12 @@ async fn perform_exercise(
                 ExerciseFailure::failed(format!("pre-write rewind failed: {detail}"))
             }
         })?;
+        renew_claim(
+            pool,
+            claim,
+            "after the pre-write rewind and before scratch-header preparation",
+        )
+        .await?;
 
         let label_clear = clear_sas_scratch_label(
             sas_config,
@@ -526,6 +532,12 @@ async fn perform_exercise(
                 "the fenced run could not retain scratch-header preparation evidence",
             ));
         }
+        renew_claim(
+            pool,
+            claim,
+            "after scratch-header preparation and before the final pre-write rewind",
+        )
+        .await?;
 
         // `weof` leaves the non-rewinding device after the new file mark. Return to
         // BOT so the Bacula Storage Daemon begins label inspection deterministically.
@@ -548,6 +560,12 @@ async fn perform_exercise(
                 ))
             }
         })?;
+        renew_claim(
+            pool,
+            claim,
+            "after the final pre-write rewind and before Bacula startup",
+        )
+        .await?;
 
         let source_relative = Path::new(&claim.run.source_mount_path)
             .strip_prefix(&config.source_root)
@@ -2156,6 +2174,7 @@ async fn prepare_manual_media(
                     sas_command_error_detail(&error)
                 ))
             })?;
+            renew_claim(pool, claim, "after the continuation-tape pre-write rewind").await?;
             let label_clear = clear_sas_scratch_label(
                 sas_config,
                 Path::new(&claim.run.expected_path),
@@ -2190,6 +2209,7 @@ async fn prepare_manual_media(
                     "the fenced run could not retain continuation-media preparation evidence",
                 ));
             }
+            renew_claim(pool, claim, "after continuation scratch-header preparation").await?;
             execute_sas_motion(
                 sas_config,
                 Path::new(&claim.run.expected_path),
@@ -2203,6 +2223,12 @@ async fn prepare_manual_media(
                     sas_command_error_detail(&error)
                 ))
             })?;
+            renew_claim(
+                pool,
+                claim,
+                "after the continuation-tape final rewind and before Bacula labeling",
+            )
+            .await?;
 
             let bacula_pool = BaculaPoolName::for_run(claim.run.id);
             let label = adapter

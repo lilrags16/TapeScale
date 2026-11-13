@@ -6490,32 +6490,17 @@ pub async fn renew_single_tape_data_run_leases(
     .bind(claim.drive_fencing_token)
     .execute(&mut *transaction)
     .await?;
-    let loaded_media = sqlx::query_as::<_, (Uuid, i64)>(
-        "SELECT media_lease_id, media_fencing_token
-         FROM restore_rehearsal_volumes
-         WHERE restore_rehearsal_id = $1 AND active AND state = 'loaded'
-         FOR UPDATE",
+    let media = sqlx::query(
+        "UPDATE resource_leases SET expires_at = now() + interval '30 minutes'
+         WHERE id = $1 AND owner_id = $2 AND fencing_token = $3
+           AND released_at IS NULL AND expires_at > now()",
     )
-    .bind(claim.run.id)
-    .fetch_optional(&mut *transaction)
+    .bind(claim.media_lease_id)
+    .bind(claim.worker_id)
+    .bind(claim.media_fencing_token)
+    .execute(&mut *transaction)
     .await?;
-    let media_renewed = if let Some((lease_id, fencing_token)) = loaded_media {
-        sqlx::query(
-            "UPDATE resource_leases SET expires_at = now() + interval '30 minutes'
-             WHERE id = $1 AND owner_id = $2 AND fencing_token = $3
-               AND released_at IS NULL AND expires_at > now()",
-        )
-        .bind(lease_id)
-        .bind(claim.worker_id)
-        .bind(fencing_token)
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected()
-            == 1
-    } else {
-        true
-    };
-    if drive.rows_affected() != 1 || !media_renewed {
+    if drive.rows_affected() != 1 || media.rows_affected() != 1 {
         transaction.rollback().await?;
         return Ok(false);
     }
@@ -7855,14 +7840,21 @@ pub async fn recover_expired_single_tape_data_runs(pool: &PgPool) -> Result<u64,
     .fetch_all(&mut *transaction)
     .await?;
     for run in &expired {
-        let detail = if run.workflow_kind == "backup" {
-            "a drive or cartridge lease expired during the physical backup; no verified recovery point was created and tape position is uncertain"
+        let position_uncertain = run.media_write_started;
+        let detail = if !position_uncertain {
+            if run.workflow_kind == "backup" {
+                "a drive or cartridge lease expired before the physical backup entered its durable media-write boundary; no tape-motion or data-write command was dispatched and no verified recovery point was created"
+            } else {
+                "a drive or cartridge lease expired before the G0.2 recovery exercise entered its durable media-write boundary; no tape-motion or data-write command was dispatched and no verified recovery point was created"
+            }
+        } else if run.workflow_kind == "backup" {
+            "a drive or cartridge lease expired after the physical backup entered its durable media-write boundary; no verified recovery point was created and tape position is uncertain"
         } else {
-            "a drive or cartridge lease expired during the G0.2 physical recovery exercise; no verified recovery point was created and tape position is uncertain"
+            "a drive or cartridge lease expired after the G0.2 recovery exercise entered its durable media-write boundary; no verified recovery point was created and tape position is uncertain"
         };
         let result = json!({
             "detail": detail,
-            "position_uncertain": true,
+            "position_uncertain": position_uncertain,
             "media_write_started": run.media_write_started
         });
         let current =
@@ -7910,8 +7902,8 @@ pub async fn recover_expired_single_tape_data_runs(pool: &PgPool) -> Result<u64,
         )
         .await?;
         release_single_tape_data_resources(&mut transaction, run).await?;
-        mark_drive_motion_uncertain(&mut transaction, run.drive_id, detail).await?;
-        if run.media_write_started {
+        if position_uncertain {
+            mark_drive_motion_uncertain(&mut transaction, run.drive_id, detail).await?;
             sqlx::query(
                 "UPDATE cartridges cartridge
                     SET on_tape_identity = NULL, identity_status = 'unknown',

@@ -925,9 +925,34 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     let ClaimSingleTapeDataRunResult::Claimed(data_claim) = data_claim else {
         panic!("the queued physical recovery exercise should be claimable");
     };
+    let shortened_initial_leases = sqlx::query(
+        "UPDATE resource_leases
+            SET expires_at = now() + interval '1 minute'
+          WHERE id = ANY($1::uuid[])",
+    )
+    .bind(vec![data_claim.drive_lease_id, data_claim.media_lease_id])
+    .execute(&pool)
+    .await
+    .expect("both initial data-run leases should shorten for renewal coverage");
+    assert_eq!(shortened_initial_leases.rows_affected(), 2);
     assert!(store::renew_single_tape_data_run_leases(&pool, &data_claim)
         .await
         .expect("both data-run leases should renew"));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)
+               FROM resource_leases
+              WHERE id = ANY($1::uuid[])
+                AND released_at IS NULL
+                AND expires_at > now() + interval '29 minutes'",
+        )
+        .bind(vec![data_claim.drive_lease_id, data_claim.media_lease_id])
+        .fetch_one(&pool)
+        .await
+        .expect("both renewed initial data-run leases should reload"),
+        2,
+        "the drive and first cartridge lease must both be extended by each heartbeat"
+    );
     assert!(store::running_drive_operation_paths(&pool)
         .await
         .expect("active physical paths should query")
@@ -3150,6 +3175,83 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     .await
     .expect("quarantine fixture qualification should finish"));
 
+    let prewrite_health =
+        sqlx::query_scalar::<_, String>("SELECT health_status FROM cartridges WHERE id = $1")
+            .bind(quarantine_media.id)
+            .fetch_one(&pool)
+            .await
+            .expect("pre-write cartridge health should load");
+    let prewrite_run = store::queue_single_tape_data_run(
+        &pool,
+        created_profile.id,
+        drive_id,
+        "serial:IBM:ULTRIUM-HH9:DRIVE-001",
+        quarantine_media.id,
+        &quarantine_media.internal_label,
+        true,
+        true,
+        true,
+    )
+    .await
+    .expect("pre-write expiry fixture should queue");
+    assert!(matches!(
+        prewrite_run,
+        QueueSingleTapeDataRunResult::Queued(_)
+    ));
+    let prewrite_claim = store::claim_next_single_tape_data_run(&pool, uuid::Uuid::now_v7())
+        .await
+        .expect("pre-write expiry fixture should claim");
+    let ClaimSingleTapeDataRunResult::Claimed(prewrite_claim) = prewrite_claim else {
+        panic!("pre-write expiry fixture should be claimed");
+    };
+    let expired_prewrite_leases = sqlx::query(
+        "UPDATE resource_leases SET expires_at = now() - interval '1 second'
+         WHERE id = ANY($1::uuid[])",
+    )
+    .bind(vec![
+        prewrite_claim.drive_lease_id,
+        prewrite_claim.media_lease_id,
+    ])
+    .execute(&pool)
+    .await
+    .expect("both pre-write data-run leases should expire");
+    assert_eq!(expired_prewrite_leases.rows_affected(), 2);
+    assert_eq!(
+        store::recover_expired_single_tape_data_runs(&pool)
+            .await
+            .expect("pre-write lease expiry should recover"),
+        1
+    );
+    let (
+        prewrite_state,
+        prewrite_media_started,
+        prewrite_position_uncertain,
+        prewrite_health_after,
+        prewrite_drive_reconciled,
+        prewrite_drive_position_uncertain,
+    ) = sqlx::query_as::<_, (String, bool, bool, String, bool, bool)>(
+        "SELECT data_run.state,
+                data_run.media_write_started,
+                COALESCE((data_run.result ->> 'position_uncertain')::boolean, false),
+                cartridge.health_status,
+                drive.reconciled,
+                COALESCE((drive.health ->> 'motion_position_uncertain')::boolean, false)
+           FROM single_tape_data_runs data_run
+           JOIN cartridges cartridge ON cartridge.id = data_run.cartridge_id
+           JOIN drives drive ON drive.id = data_run.drive_id
+          WHERE data_run.id = $1",
+    )
+    .bind(prewrite_claim.run.id)
+    .fetch_one(&pool)
+    .await
+    .expect("pre-write expired run and resources should reload");
+    assert_eq!(prewrite_state, "interrupted");
+    assert!(!prewrite_media_started);
+    assert!(!prewrite_position_uncertain);
+    assert_eq!(prewrite_health_after, prewrite_health);
+    assert!(prewrite_drive_reconciled);
+    assert!(!prewrite_drive_position_uncertain);
+
     let fenced_run = store::queue_single_tape_data_run(
         &pool,
         created_profile.id,
@@ -3212,21 +3314,34 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             .expect("expired media write should recover"),
         1
     );
-    let (quarantined_health, interrupted_state, interrupted_marker) =
-        sqlx::query_as::<_, (String, String, bool)>(
-            "SELECT cartridge.health_status, data_run.state,
-                    (data_run.result ->> 'media_write_started')::boolean
+    let (
+        quarantined_health,
+        interrupted_state,
+        interrupted_marker,
+        interrupted_position_uncertain,
+        interrupted_drive_reconciled,
+        interrupted_drive_position_uncertain,
+    ) = sqlx::query_as::<_, (String, String, bool, bool, bool, bool)>(
+        "SELECT cartridge.health_status, data_run.state,
+                    (data_run.result ->> 'media_write_started')::boolean,
+                    (data_run.result ->> 'position_uncertain')::boolean,
+                    drive.reconciled,
+                    COALESCE((drive.health ->> 'motion_position_uncertain')::boolean, false)
              FROM single_tape_data_runs data_run
              JOIN cartridges cartridge ON cartridge.id = data_run.cartridge_id
+             JOIN drives drive ON drive.id = data_run.drive_id
              WHERE data_run.id = $1",
-        )
-        .bind(fenced_claim.run.id)
-        .fetch_one(&pool)
-        .await
-        .expect("quarantined run and cartridge should reload");
+    )
+    .bind(fenced_claim.run.id)
+    .fetch_one(&pool)
+    .await
+    .expect("quarantined run and cartridge should reload");
     assert_eq!(quarantined_health, "write_unverified");
     assert_eq!(interrupted_state, "interrupted");
     assert!(interrupted_marker);
+    assert!(interrupted_position_uncertain);
+    assert!(!interrupted_drive_reconciled);
+    assert!(interrupted_drive_position_uncertain);
     let fenced_events = store::single_tape_data_events(&pool, fenced_claim.run.id)
         .await
         .expect("fenced events should reload");

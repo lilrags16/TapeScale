@@ -767,7 +767,20 @@
 
   function backupFailureDetail(run) {
     const failure = pick(run, "failure_detail", "failure_class", "detail", "message") || backupEvidenceValue(run, "failure_detail", "detail", "message", "reason");
-    return failure && typeof failure === "object" ? JSON.stringify(failure) : failure ? String(failure) : null;
+    if (!failure) return null;
+    let evidence = failure;
+    if (typeof evidence === "string" && /^[\s]*\{/.test(evidence)) {
+      try {
+        evidence = JSON.parse(evidence);
+      } catch (_error) {
+        return evidence;
+      }
+    }
+    if (evidence && typeof evidence === "object") {
+      const detail = pick(evidence, "detail", "message", "reason", "error");
+      return detail && typeof detail !== "object" ? String(detail) : "Failure evidence was recorded without an operator-readable detail.";
+    }
+    return String(evidence);
   }
 
   function backupRunMatches(run) {
@@ -903,6 +916,21 @@
   function backupOperatorFailure(run) {
     const raw = String(backupFailureDetail(run) || "");
     if (!raw) return "TapeScale stopped before it could create a verified recovery point. Open technical details for the recorded cause.";
+    if (/\blease\b.*\b(?:expir|lost|fenc)|\b(?:expir|lost)\w*\b.*\blease\b|fencing token/i.test(raw)) {
+      const writeBoundary = backupEvidenceValue(run, "media_write_started");
+      const mediaWriteStarted = writeBoundary === true || String(writeBoundary).toLowerCase() === "true";
+      const mediaWriteNotStarted = writeBoundary === false || String(writeBoundary).toLowerCase() === "false";
+      if (mediaWriteNotStarted) {
+        const position = backupEvidenceValue(run, "position_uncertain");
+        const positionUncertain = position === true || String(position).toLowerCase() === "true";
+        const positionKnown = position === false || String(position).toLowerCase() === "false";
+        if (positionUncertain) return "The backup stopped before any tape-motion or data-write command was dispatched, so the loaded tape was not changed. This older record marked the drive uncertain; reconcile it once, then retry the backup.";
+        if (positionKnown) return "The backup stopped before any tape-motion or data-write command was dispatched. The loaded tape and known drive position were preserved; retry the backup.";
+        return "The backup stopped before any tape-motion or data-write command was dispatched, so the loaded tape was not changed. Confirm the drive is reconciled, then retry the backup.";
+      }
+      if (mediaWriteStarted) return "A drive or tape lease expired after tape work began. Treat tape position as uncertain: inspect the loaded tape and reconcile the drive before preparing media and retrying.";
+      return "A drive or tape lease expired while the backup was active. Inspect the loaded tape and reconcile the drive before retrying.";
+    }
     if (/snapshot|source|read.?only|mount/i.test(raw)) return "The selected snapshot is no longer available exactly as saved. Restore its read-only mount, then create a new backup request.";
     if (/qualif|btape/i.test(raw)) return "The loaded drive and tape no longer have a current setup test. Prepare the tape again before retrying.";
     if (/permission|access denied|os error 13/i.test(raw)) return "TapeScale could not read the source or write its persistent work area. Check the mounted paths and container permissions.";

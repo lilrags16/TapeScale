@@ -429,6 +429,46 @@ test("run summaries distinguish planned, active, complete, and failed readback",
   assert.match(app, /\{ name: "Starting", detail: "Waiting for the worker", aliases: \["queued", "media_assigned", "preparing"\] \}/);
 });
 
+test("lease failures explain tape state without exposing raw JSON", () => {
+  const testPick = (object, ...keys) => {
+    if (!object || typeof object !== "object") return null;
+    for (const key of keys) if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+    return null;
+  };
+  const evidenceValue = (run, ...keys) => {
+    for (const source of [run, run.result, run.result && run.result.evidence]) {
+      const value = testPick(source, ...keys);
+      if (value !== null) return value;
+    }
+    return null;
+  };
+  const detailSource = section("  function backupFailureDetail(", "  function backupRunMatches(");
+  const failureDetail = Function("pick", "backupEvidenceValue", '"use strict";\n' + detailSource + "\nreturn backupFailureDetail;")(testPick, evidenceValue);
+  const recorded = {
+    detail: "a drive or cartridge lease expired during the physical backup",
+    media_write_started: false,
+    position_uncertain: false
+  };
+
+  assert.equal(failureDetail({ failure_detail: recorded }), recorded.detail);
+  assert.equal(failureDetail({ failure_detail: JSON.stringify(recorded) }), recorded.detail);
+  assert.doesNotMatch(failureDetail({ failure_detail: JSON.stringify(recorded) }), /media_write_started|position_uncertain|\{/);
+
+  const operatorSource = section("  function backupOperatorFailure(", "  function renderBackupRunDetail(");
+  const operatorFailure = Function("backupFailureDetail", "backupEvidenceValue", '"use strict";\n' + operatorSource + "\nreturn backupOperatorFailure;")(failureDetail, evidenceValue);
+  const beforeWrite = operatorFailure({ failure_detail: JSON.stringify(recorded), result: { media_write_started: false, position_uncertain: false } });
+  const legacyBeforeWrite = operatorFailure({ failure_detail: JSON.stringify(recorded), result: { media_write_started: false, position_uncertain: true } });
+  const afterWrite = operatorFailure({ failure_detail: recorded.detail, result: { media_write_started: true } });
+
+  assert.match(beforeWrite, /before any tape-motion or data-write command was dispatched/);
+  assert.match(beforeWrite, /loaded tape and known drive position were preserved/);
+  assert.doesNotMatch(beforeWrite, /reconcile/i);
+  assert.match(legacyBeforeWrite, /older record marked the drive uncertain/);
+  assert.match(legacyBeforeWrite, /reconcile it once/);
+  assert.match(afterWrite, /Treat tape position as uncertain/);
+  assert.match(afterWrite, /reconcile the drive/);
+});
+
 test("multi-tape runs ask for each ordered continuation volume", () => {
   const helpers = section("  function backupNeedsNextMedia(", "  function backupRunRouteId(");
   const open = section("  async function openAssignBackupMedia(", "  function updateBackupMediaForDrive(");
