@@ -5131,7 +5131,7 @@ async fn queue_single_tape_data_run_inner(
              WHERE drive_id = $1 AND state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM qualification_runs
-             WHERE (drive_id = $1 OR cartridge_id = ANY($2::uuid[]))
+             WHERE (drive_id = $1 OR cartridge_id = $2)
                AND state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM single_tape_data_runs
@@ -5464,7 +5464,7 @@ pub async fn claim_next_single_tape_data_run(
              WHERE drive_id = $1 AND state IN ('queued', 'running')
              UNION ALL
              SELECT 1 FROM qualification_runs
-             WHERE (drive_id = $1 OR cartridge_id = ANY($2::uuid[]))
+             WHERE (drive_id = $1 OR cartridge_id = $2)
                AND state IN ('queued', 'running')
          )",
     )
