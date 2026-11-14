@@ -3367,6 +3367,14 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     let ClaimSingleTapeDataRunResult::Claimed(prewrite_claim) = prewrite_claim else {
         panic!("pre-write expiry fixture should be claimed");
     };
+    assert!(store::transition_single_tape_data_phase(
+        &pool,
+        &prewrite_claim,
+        SingleTapeDataPhase::Writing,
+        json!({"operation":"pre-write progress fixture"}),
+    )
+    .await
+    .expect("pre-write expiry fixture should enter writing without crossing the media boundary"));
     let prewrite_progress = store::SingleTapeLiveIoSample {
         phase: store::SingleTapeLiveIoPhase::BackupWrite,
         sampled_at: Utc::now(),
