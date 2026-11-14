@@ -211,6 +211,16 @@ impl RestoreLiveIoSampler {
             tape_counters_available,
             pipeline_basis: "bacula_job_bytes_delta",
             tape_basis: tape_counters_available.then_some("linux_scsi_tape_sysfs_counter_delta"),
+            engine_state: None,
+            activity: None,
+            progress_idle_ms: None,
+            no_progress_timeout_ms: None,
+            spool_bytes: None,
+            spool_capacity_bytes: None,
+            spool_file_count: None,
+            spool_fill_bytes_per_second: None,
+            spool_drain_bytes_per_second: None,
+            spool_basis: None,
         }
     }
 

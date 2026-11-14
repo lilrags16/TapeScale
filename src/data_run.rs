@@ -97,7 +97,29 @@ const PREPARATION_PROGRESS_STALE_AFTER_SECONDS: u64 = 20;
 struct LiveIoObservation {
     observed_at: Instant,
     pipeline_bytes: u64,
+    pipeline_basis: &'static str,
     tape_counters: Option<SasTapeIoCounters>,
+    spool_usage: Option<BaculaSpoolUsage>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BaculaSpoolUsage {
+    bytes: u64,
+    file_count: u64,
+}
+
+#[derive(Clone, Debug)]
+struct BaculaSpoolMonitor {
+    directory: PathBuf,
+    capacity_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BaculaRunningHints {
+    reported_bytes_per_second: Option<u64>,
+    spooling: Option<bool>,
+    despooling: Option<bool>,
+    despool_wait: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -157,9 +179,12 @@ impl ManifestProgressSampler {
 #[derive(Debug, Default)]
 struct LiveIoSampler {
     previous: Option<LiveIoObservation>,
+    maximum_files_processed: u64,
+    maximum_pipeline_bytes: u64,
 }
 
 impl LiveIoSampler {
+    #[cfg(test)]
     fn observe(
         &mut self,
         phase: store::SingleTapeLiveIoPhase,
@@ -167,14 +192,77 @@ impl LiveIoSampler {
         tape_counters: Option<SasTapeIoCounters>,
         observed_at: Instant,
     ) -> store::SingleTapeLiveIoSample {
+        self.observe_inner(
+            phase,
+            evidence,
+            "bacula_job_bytes_delta",
+            tape_counters,
+            None,
+            None,
+            None,
+            None,
+            observed_at,
+        )
+        .0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe_operational(
+        &mut self,
+        phase: store::SingleTapeLiveIoPhase,
+        evidence: &BaculaJobEvidence,
+        pipeline_basis: &'static str,
+        tape_counters: Option<SasTapeIoCounters>,
+        spool: Option<(BaculaSpoolUsage, u64)>,
+        running_hints: Option<BaculaRunningHints>,
+        last_progress_at: Instant,
+        no_progress_timeout: Duration,
+        observed_at: Instant,
+    ) -> (store::SingleTapeLiveIoSample, bool) {
+        self.observe_inner(
+            phase,
+            evidence,
+            pipeline_basis,
+            tape_counters,
+            spool,
+            running_hints,
+            Some(last_progress_at),
+            Some(no_progress_timeout),
+            observed_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe_inner(
+        &mut self,
+        phase: store::SingleTapeLiveIoPhase,
+        evidence: &BaculaJobEvidence,
+        pipeline_basis: &'static str,
+        tape_counters: Option<SasTapeIoCounters>,
+        spool: Option<(BaculaSpoolUsage, u64)>,
+        running_hints: Option<BaculaRunningHints>,
+        last_progress_at: Option<Instant>,
+        no_progress_timeout: Option<Duration>,
+        observed_at: Instant,
+    ) -> (store::SingleTapeLiveIoSample, bool) {
         let previous = self.previous;
         let elapsed =
             previous.map(|sample| observed_at.saturating_duration_since(sample.observed_at));
         let sample_window_ms = elapsed.map(duration_millis_u64);
-        let pipeline_bytes_per_second = previous.and_then(|sample| {
-            elapsed
-                .and_then(|window| bytes_per_second(sample.pipeline_bytes, evidence.bytes, window))
-        });
+        let measured_pipeline_bytes_per_second = previous
+            .filter(|sample| sample.pipeline_basis == pipeline_basis)
+            .and_then(|sample| {
+                elapsed.and_then(|window| {
+                    bytes_per_second(sample.pipeline_bytes, evidence.bytes, window)
+                })
+            });
+        let pipeline_bytes_per_second = if previous.is_none() {
+            running_hints
+                .and_then(|hints| hints.reported_bytes_per_second)
+                .or(measured_pipeline_bytes_per_second)
+        } else {
+            measured_pipeline_bytes_per_second
+        };
         let tape_read_bytes_per_second = previous.and_then(|sample| {
             elapsed.and_then(|window| {
                 counter_rate(
@@ -202,12 +290,74 @@ impl LiveIoSampler {
         let tape_write_counter_available =
             tape_counters.is_some_and(|counters| counters.write_bytes.is_some());
         let tape_counters_available = tape_read_counter_available || tape_write_counter_available;
+        let spool_usage = spool.map(|(usage, _)| usage);
+        let spool_fill_bytes_per_second = previous.and_then(|sample| {
+            let previous = sample.spool_usage?;
+            let current = spool_usage?;
+            (current.bytes > previous.bytes).then(|| {
+                bytes_per_second(
+                    previous.bytes,
+                    current.bytes,
+                    elapsed.expect("previous sample has an elapsed window"),
+                )
+            })?
+        });
+        let spool_drain_bytes_per_second = previous.and_then(|sample| {
+            let previous = sample.spool_usage?;
+            let current = spool_usage?;
+            (current.bytes < previous.bytes).then(|| {
+                bytes_per_second(
+                    current.bytes,
+                    previous.bytes,
+                    elapsed.expect("previous sample has an elapsed window"),
+                )
+            })?
+        });
+        let engine_counter_advanced = previous.is_some()
+            && (evidence.files > self.maximum_files_processed
+                || evidence.bytes > self.maximum_pipeline_bytes);
+        let measured_movement = previous.is_some_and(|sample| {
+            engine_counter_advanced
+                || tape_counter_advanced(sample.tape_counters, tape_counters)
+                || sample
+                    .spool_usage
+                    .zip(spool_usage)
+                    .is_some_and(|(before, after)| before != after)
+        });
+        self.maximum_files_processed = self.maximum_files_processed.max(evidence.files);
+        self.maximum_pipeline_bytes = self.maximum_pipeline_bytes.max(evidence.bytes);
+        let progress_idle_ms = last_progress_at.map(|last| {
+            if measured_movement {
+                0
+            } else {
+                duration_millis_u64(observed_at.saturating_duration_since(last))
+            }
+        });
+        let timeout_ms = no_progress_timeout.map(duration_millis_u64);
+        let activity = last_progress_at
+            .zip(no_progress_timeout)
+            .map(|(_, timeout)| {
+                live_activity(
+                    phase,
+                    evidence.state,
+                    pipeline_bytes_per_second,
+                    tape_read_bytes_per_second,
+                    tape_write_bytes_per_second,
+                    spool_fill_bytes_per_second,
+                    spool_drain_bytes_per_second,
+                    running_hints,
+                    Duration::from_millis(progress_idle_ms.unwrap_or(0)),
+                    timeout,
+                )
+            });
         self.previous = Some(LiveIoObservation {
             observed_at,
             pipeline_bytes: evidence.bytes,
+            pipeline_basis,
             tape_counters,
+            spool_usage,
         });
-        store::SingleTapeLiveIoSample {
+        let sample = store::SingleTapeLiveIoSample {
             phase,
             sampled_at: Utc::now(),
             sample_window_ms,
@@ -221,9 +371,118 @@ impl LiveIoSampler {
             tape_read_counter_available,
             tape_write_counter_available,
             tape_counters_available,
-            pipeline_basis: "bacula_job_bytes_delta",
+            pipeline_basis,
             tape_basis: tape_counters_available.then_some("linux_scsi_tape_sysfs_counter_delta"),
-        }
+            engine_state: activity.map(|_| bacula_job_state_name(evidence.state)),
+            activity,
+            progress_idle_ms,
+            no_progress_timeout_ms: timeout_ms,
+            spool_bytes: spool_usage.map(|usage| usage.bytes),
+            spool_capacity_bytes: spool.map(|(_, capacity)| capacity),
+            spool_file_count: spool_usage.map(|usage| usage.file_count),
+            spool_fill_bytes_per_second,
+            spool_drain_bytes_per_second,
+            spool_basis: spool_usage.map(|_| "run_scoped_bacula_spool_regular_file_bytes"),
+        };
+        (sample, measured_movement)
+    }
+}
+
+fn tape_counter_advanced(
+    previous: Option<SasTapeIoCounters>,
+    current: Option<SasTapeIoCounters>,
+) -> bool {
+    previous.zip(current).is_some_and(|(previous, current)| {
+        previous
+            .read_bytes
+            .zip(current.read_bytes)
+            .is_some_and(|(before, after)| after > before)
+            || previous
+                .write_bytes
+                .zip(current.write_bytes)
+                .is_some_and(|(before, after)| after > before)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn live_activity(
+    phase: store::SingleTapeLiveIoPhase,
+    engine_state: BaculaJobState,
+    pipeline_rate: Option<u64>,
+    tape_read_rate: Option<u64>,
+    tape_write_rate: Option<u64>,
+    spool_fill_rate: Option<u64>,
+    spool_drain_rate: Option<u64>,
+    running_hints: Option<BaculaRunningHints>,
+    idle: Duration,
+    timeout: Duration,
+) -> store::SingleTapeLiveActivity {
+    use store::SingleTapeLiveActivity as Activity;
+
+    if matches!(
+        engine_state,
+        BaculaJobState::WaitingForFileDaemon
+            | BaculaJobState::WaitingForStorageDaemon
+            | BaculaJobState::WaitingForMount
+            | BaculaJobState::WaitingForMedia
+            | BaculaJobState::WaitingForResource
+    ) {
+        return Activity::Waiting;
+    }
+    if tape_write_rate.is_some_and(|rate| rate > 0) {
+        return Activity::Streaming;
+    }
+    if tape_read_rate.is_some_and(|rate| rate > 0) {
+        return Activity::Reading;
+    }
+    if spool_drain_rate.is_some_and(|rate| rate > 0) {
+        return Activity::Despooling;
+    }
+    if spool_fill_rate.is_some_and(|rate| rate > 0) {
+        return Activity::Buffering;
+    }
+    if pipeline_rate.is_some_and(|rate| rate > 0) {
+        return match phase {
+            store::SingleTapeLiveIoPhase::BackupWrite => Activity::Buffering,
+            store::SingleTapeLiveIoPhase::FullReadback => Activity::Reading,
+            store::SingleTapeLiveIoPhase::Restore => Activity::Restoring,
+        };
+    }
+    if idle >= timeout {
+        Activity::Stalled
+    } else if idle >= Duration::from_secs(30) {
+        Activity::Idle
+    } else if running_hints.is_some_and(|hints| hints.despooling == Some(true)) {
+        Activity::Despooling
+    } else if running_hints.is_some_and(|hints| hints.spooling == Some(true)) {
+        Activity::Buffering
+    } else if running_hints.is_some_and(|hints| hints.despool_wait == Some(true)) {
+        Activity::Waiting
+    } else {
+        Activity::Starting
+    }
+}
+
+const fn bacula_job_state_name(state: BaculaJobState) -> &'static str {
+    match state {
+        BaculaJobState::Created => "created",
+        BaculaJobState::Blocked => "blocked",
+        BaculaJobState::WaitingForFileDaemon => "waiting_for_file_daemon",
+        BaculaJobState::WaitingForStorageDaemon => "waiting_for_storage_daemon",
+        BaculaJobState::WaitingForMount => "waiting_for_mount",
+        BaculaJobState::WaitingForMedia => "waiting_for_media",
+        BaculaJobState::WaitingForResource => "waiting_for_resource",
+        BaculaJobState::Running => "running",
+        BaculaJobState::RunningWithErrors => "running_with_errors",
+        BaculaJobState::Committing => "committing",
+        BaculaJobState::Succeeded => "succeeded",
+        BaculaJobState::CompletedWithErrors => "completed_with_errors",
+        BaculaJobState::CompletedWithWarnings => "completed_with_warnings",
+        BaculaJobState::VerifyDifferences => "verify_differences",
+        BaculaJobState::Cancelled => "cancelled",
+        BaculaJobState::Failed => "failed",
+        BaculaJobState::Incomplete => "incomplete",
+        BaculaJobState::Unknown => "unknown",
     }
 }
 
@@ -245,6 +504,59 @@ fn bytes_per_second(previous: u64, current: u64, elapsed: Duration) -> Option<u6
         .saturating_mul(1_000_000_000)
         .checked_div(elapsed_nanos)?;
     Some(u64::try_from(rate).unwrap_or(u64::MAX))
+}
+
+fn bacula_spool_usage(directory: &Path) -> Result<BaculaSpoolUsage, ExerciseFailure> {
+    let root = fs::symlink_metadata(directory).map_err(|error| {
+        ExerciseFailure::failed(format!(
+            "could not inspect the run-scoped Bacula spool: {error}"
+        ))
+    })?;
+    if !root.file_type().is_dir() || root.file_type().is_symlink() {
+        return Err(ExerciseFailure::failed(
+            "the run-scoped Bacula spool is no longer a real directory",
+        ));
+    }
+
+    let mut usage = BaculaSpoolUsage::default();
+    let entries = fs::read_dir(directory).map_err(|error| {
+        ExerciseFailure::failed(format!(
+            "could not enumerate the run-scoped Bacula spool: {error}"
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ExerciseFailure::failed(format!(
+                "could not enumerate a run-scoped Bacula spool entry: {error}"
+            ))
+        })?;
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Bacula can truncate and remove a completed segment while this bounded
+                // directory snapshot is being sampled. Its disappearance is itself normal
+                // despool activity; the next five-second sample observes the settled total.
+                continue;
+            }
+            Err(error) => {
+                return Err(ExerciseFailure::failed(format!(
+                    "could not inspect a run-scoped Bacula spool entry: {error}"
+                )))
+            }
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(ExerciseFailure::failed(
+                "the run-scoped Bacula spool contained an unexpected non-file entry",
+            ));
+        }
+        usage.bytes = usage.bytes.checked_add(metadata.len()).ok_or_else(|| {
+            ExerciseFailure::failed("the run-scoped Bacula spool size overflowed")
+        })?;
+        usage.file_count = usage.file_count.checked_add(1).ok_or_else(|| {
+            ExerciseFailure::failed("the run-scoped Bacula spool file count overflowed")
+        })?;
+    }
+    Ok(usage)
 }
 
 #[derive(Debug)]
@@ -762,6 +1074,15 @@ async fn perform_exercise(
             .await
             .map_err(|error| ExerciseFailure::failed(error.to_string()))?,
         );
+        let backup_spool = BaculaSpoolMonitor {
+            directory: runtime
+                .as_ref()
+                .expect("the Bacula runtime was just started")
+                .evidence()
+                .data_spool_directory
+                .clone(),
+            capacity_bytes: data_options.maximum_spool_size_bytes(),
+        };
 
         let adapter = BaculaAdapter::new(DirectBconsoleExecutor::default());
         // Operational inventory may legitimately run longer than the legacy
@@ -824,7 +1145,8 @@ async fn perform_exercise(
             "full backup",
             store::SingleTapeLiveIoPhase::BackupWrite,
             (claim.run.workflow_kind == "backup").then_some(BaculaMediaPhase::BackupWrite),
-            config.data_run_timeout,
+            config.transfer_stall_timeout,
+            Some(&backup_spool),
             cancellation,
         )
         .await?;
@@ -964,7 +1286,8 @@ async fn perform_exercise(
             "Data verify",
             store::SingleTapeLiveIoPhase::FullReadback,
             (claim.run.workflow_kind == "backup").then_some(BaculaMediaPhase::FullReadback),
-            config.data_run_timeout,
+            config.transfer_stall_timeout,
+            None,
             cancellation,
         )
         .await?;
@@ -1070,7 +1393,8 @@ async fn perform_exercise(
             "full restore",
             store::SingleTapeLiveIoPhase::Restore,
             None,
-            config.data_run_timeout,
+            config.transfer_stall_timeout,
+            None,
             cancellation,
         )
         .await?;
@@ -1887,15 +2211,21 @@ async fn wait_for_job(
     live_io_phase: store::SingleTapeLiveIoPhase,
     media_phase: Option<BaculaMediaPhase>,
     no_progress_timeout: Duration,
+    spool_monitor: Option<&BaculaSpoolMonitor>,
     cancellation: &CancellationToken,
 ) -> Result<BaculaJobEvidence, ExerciseFailure> {
     let mut consecutive_poll_failures = 0_u8;
-    let mut last_progress = None;
+    let mut last_catalog_progress = None;
+    let mut maximum_live_files = 0_u64;
+    let mut maximum_live_bytes = 0_u64;
+    let mut maximum_live_errors = 0_u64;
     let mut last_progress_at = Instant::now();
     let mut active_manual_media: Option<ActiveManualMedia> = None;
     let mut next_readback_volume = 1_i32;
     let mut live_io = LiveIoSampler::default();
     let mut tape_counter_error_reported = false;
+    let mut consecutive_running_status_failures = 0_u8;
+    let mut spool_monitor_error_reported = false;
     loop {
         if cancellation.is_cancelled() {
             let cancellation_result = cancel_and_observe(adapter, job_id).await;
@@ -1928,16 +2258,104 @@ async fn wait_for_job(
             }
         };
 
-        let progress = (
+        let (live_evidence, pipeline_basis, running_hints) = match adapter
+            .running_job_evidence(job_id)
+            .await
+        {
+            Ok(Some(running)) => {
+                consecutive_running_status_failures = 0;
+                let hints = BaculaRunningHints {
+                    reported_bytes_per_second: running
+                        .last_bytes_per_second
+                        .or(running.average_bytes_per_second),
+                    spooling: running.spooling,
+                    despooling: running.despooling,
+                    despool_wait: running.despool_wait,
+                };
+                (
+                    BaculaJobEvidence {
+                        job_id: running.job_id,
+                        resource_name: evidence.resource_name.clone(),
+                        unique_name: evidence.unique_name.clone(),
+                        raw_status: running.raw_status,
+                        state: running.state,
+                        files: running.files,
+                        bytes: running.bytes,
+                        errors: running.errors,
+                        start_time: evidence.start_time.clone(),
+                        end_time: evidence.end_time.clone(),
+                    },
+                    "bacula_storage_running_job_bytes_delta",
+                    Some(hints),
+                )
+            }
+            Ok(None) => {
+                consecutive_running_status_failures = 0;
+                (evidence.clone(), "bacula_job_bytes_delta", None)
+            }
+            Err(error) => {
+                consecutive_running_status_failures =
+                    consecutive_running_status_failures.saturating_add(1);
+                if consecutive_running_status_failures == 1
+                    || consecutive_running_status_failures % 12 == 0
+                {
+                    warn!(
+                        physical_data_run_id = %claim.run.id,
+                        engine_job_id = %job_id,
+                        failures = consecutive_running_status_failures,
+                        %error,
+                        "exact Bacula Storage progress is unavailable; continuing with catalog, spool, and tape measurements"
+                    );
+                }
+                (evidence.clone(), "bacula_job_bytes_delta", None)
+            }
+        };
+
+        let observed_at = Instant::now();
+        let catalog_progress = (
             evidence.state,
             evidence.files,
             evidence.bytes,
             evidence.errors,
         );
-        if last_progress.as_ref() != Some(&progress) {
-            last_progress = Some(progress);
-            last_progress_at = Instant::now();
+        let catalog_advanced = last_catalog_progress.is_none_or(|(state, files, bytes, errors)| {
+            evidence.state != state
+                || evidence.files > files
+                || evidence.bytes > bytes
+                || evidence.errors > errors
+        });
+        last_catalog_progress = Some(catalog_progress);
+        let live_advanced = live_evidence.files > maximum_live_files
+            || live_evidence.bytes > maximum_live_bytes
+            || live_evidence.errors > maximum_live_errors;
+        maximum_live_files = maximum_live_files.max(live_evidence.files);
+        maximum_live_bytes = maximum_live_bytes.max(live_evidence.bytes);
+        maximum_live_errors = maximum_live_errors.max(live_evidence.errors);
+        if catalog_advanced || live_advanced {
+            last_progress_at = observed_at;
         }
+
+        let spool = match spool_monitor.map(|monitor| {
+            bacula_spool_usage(&monitor.directory).map(|usage| (usage, monitor.capacity_bytes))
+        }) {
+            Some(Ok(spool)) => {
+                spool_monitor_error_reported = false;
+                Some(spool)
+            }
+            Some(Err(error)) => {
+                if !spool_monitor_error_reported {
+                    warn!(
+                        physical_data_run_id = %claim.run.id,
+                        engine_job_id = %job_id,
+                        detail = %error.detail,
+                        "live disk-spool measurement is unavailable; the Bacula job will continue"
+                    );
+                    spool_monitor_error_reported = true;
+                }
+                None
+            }
+            None => None,
+        };
 
         let tape_counters =
             match read_sas_tape_io_counters(sas_config, Path::new(&claim.run.expected_path)) {
@@ -1955,7 +2373,20 @@ async fn wait_for_job(
                     None
                 }
             };
-        let sample = live_io.observe(live_io_phase, &evidence, tape_counters, Instant::now());
+        let (sample, measured_movement) = live_io.observe_operational(
+            live_io_phase,
+            &live_evidence,
+            pipeline_basis,
+            tape_counters,
+            spool,
+            running_hints,
+            last_progress_at,
+            no_progress_timeout,
+            observed_at,
+        );
+        if measured_movement {
+            last_progress_at = observed_at;
+        }
         match store::record_single_tape_data_live_io(pool, claim, &sample).await {
             Ok(true) => {}
             Ok(false) => {
@@ -2612,12 +3043,15 @@ fn bacula_data_options(
     if claim.run.workflow_kind != "backup" {
         return Ok(BaculaDataOptions::single_volume(BaculaCompression::None));
     }
-    let compression =
-        BaculaCompression::from_policy_mode(&claim.run.compression_mode).map_err(|error| {
-            ExerciseFailure::blocked(format!(
-                "the persisted backup compression mode is not executable: {error}"
-            ))
-        })?;
+    let compression = BaculaCompression::from_persisted_policy(
+        &claim.run.compression_mode,
+        &claim.run.resolved_compression,
+    )
+    .map_err(|error| {
+        ExerciseFailure::blocked(format!(
+            "the persisted backup compression decision is not executable: {error}"
+        ))
+    })?;
     Ok(if claim.run.spanning_enabled {
         BaculaDataOptions::spanning(compression)
     } else {
@@ -3476,6 +3910,265 @@ mod tests {
         assert!(!reset.tape_read_counter_available);
         assert!(!reset.tape_write_counter_available);
         assert_eq!(reset.tape_basis, None);
+    }
+
+    #[test]
+    fn live_io_basis_fallback_does_not_invent_progress_when_exact_counters_return() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(1_800);
+        let mut sampler = LiveIoSampler::default();
+        let mut evidence = BaculaJobEvidence {
+            job_id: BaculaJobId::new(7).unwrap(),
+            resource_name: None,
+            unique_name: None,
+            raw_status: 'R',
+            state: BaculaJobState::Running,
+            files: 10,
+            bytes: 1_000,
+            errors: 0,
+            start_time: None,
+            end_time: None,
+        };
+
+        let (_, first_moved) = sampler.observe_operational(
+            store::SingleTapeLiveIoPhase::BackupWrite,
+            &evidence,
+            "bacula_storage_running_job_bytes_delta",
+            None,
+            None,
+            None,
+            started,
+            timeout,
+            started,
+        );
+        assert!(!first_moved);
+
+        evidence.files = 0;
+        evidence.bytes = 0;
+        let (fallback, fallback_moved) = sampler.observe_operational(
+            store::SingleTapeLiveIoPhase::BackupWrite,
+            &evidence,
+            "bacula_job_bytes_delta",
+            None,
+            None,
+            None,
+            started,
+            timeout,
+            started + Duration::from_secs(5),
+        );
+        assert!(!fallback_moved);
+        assert_eq!(fallback.pipeline_bytes_per_second, None);
+
+        evidence.files = 10;
+        evidence.bytes = 1_000;
+        let (returned, returned_moved) = sampler.observe_operational(
+            store::SingleTapeLiveIoPhase::BackupWrite,
+            &evidence,
+            "bacula_storage_running_job_bytes_delta",
+            None,
+            None,
+            None,
+            started,
+            timeout,
+            started + Duration::from_secs(10),
+        );
+        assert!(
+            !returned_moved,
+            "returning to a previously observed counter must not reset the stall timer"
+        );
+        assert_eq!(returned.pipeline_bytes_per_second, None);
+
+        evidence.files = 11;
+        evidence.bytes = 1_100;
+        let (advanced, advanced_moved) = sampler.observe_operational(
+            store::SingleTapeLiveIoPhase::BackupWrite,
+            &evidence,
+            "bacula_storage_running_job_bytes_delta",
+            None,
+            None,
+            None,
+            started,
+            timeout,
+            started + Duration::from_secs(15),
+        );
+        assert!(advanced_moved);
+        assert_eq!(advanced.pipeline_bytes_per_second, Some(20));
+    }
+
+    #[test]
+    fn live_io_reports_buffer_fill_tape_streaming_and_measured_stalls() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(1_800);
+        let mut sampler = LiveIoSampler::default();
+        let mut evidence = BaculaJobEvidence {
+            job_id: BaculaJobId::new(42).unwrap(),
+            resource_name: None,
+            unique_name: None,
+            raw_status: 'R',
+            state: BaculaJobState::Running,
+            files: 0,
+            bytes: 0,
+            errors: 0,
+            start_time: None,
+            end_time: None,
+        };
+        let tape = SasTapeIoCounters {
+            read_bytes: Some(0),
+            write_bytes: Some(0),
+        };
+        let (first, first_moved) = sampler.observe_operational(
+            store::SingleTapeLiveIoPhase::BackupWrite,
+            &evidence,
+            "bacula_storage_running_job_bytes_delta",
+            Some(tape),
+            Some((
+                BaculaSpoolUsage {
+                    bytes: 1_000,
+                    file_count: 2,
+                },
+                64_000,
+            )),
+            Some(BaculaRunningHints {
+                spooling: Some(true),
+                ..BaculaRunningHints::default()
+            }),
+            started,
+            timeout,
+            started,
+        );
+        assert!(!first_moved, "the first sample has no delta");
+        assert_eq!(
+            first.activity,
+            Some(store::SingleTapeLiveActivity::Buffering)
+        );
+        assert_eq!(first.spool_bytes, Some(1_000));
+        assert_eq!(first.spool_capacity_bytes, Some(64_000));
+
+        evidence.files = 1;
+        evidence.bytes = 6_000;
+        let (filling, filling_moved) = sampler.observe_operational(
+            store::SingleTapeLiveIoPhase::BackupWrite,
+            &evidence,
+            "bacula_storage_running_job_bytes_delta",
+            Some(tape),
+            Some((
+                BaculaSpoolUsage {
+                    bytes: 6_000,
+                    file_count: 2,
+                },
+                64_000,
+            )),
+            None,
+            started,
+            timeout,
+            started + Duration::from_secs(5),
+        );
+        assert!(filling_moved);
+        assert_eq!(
+            filling.activity,
+            Some(store::SingleTapeLiveActivity::Buffering)
+        );
+        assert_eq!(filling.spool_fill_bytes_per_second, Some(1_000));
+        assert_eq!(filling.progress_idle_ms, Some(0));
+
+        let (streaming, streaming_moved) = sampler.observe_operational(
+            store::SingleTapeLiveIoPhase::BackupWrite,
+            &evidence,
+            "bacula_storage_running_job_bytes_delta",
+            Some(SasTapeIoCounters {
+                read_bytes: Some(0),
+                write_bytes: Some(10_000),
+            }),
+            Some((
+                BaculaSpoolUsage {
+                    bytes: 2_000,
+                    file_count: 1,
+                },
+                64_000,
+            )),
+            Some(BaculaRunningHints {
+                despooling: Some(true),
+                ..BaculaRunningHints::default()
+            }),
+            started + Duration::from_secs(5),
+            timeout,
+            started + Duration::from_secs(10),
+        );
+        assert!(streaming_moved);
+        assert_eq!(
+            streaming.activity,
+            Some(store::SingleTapeLiveActivity::Streaming)
+        );
+        assert_eq!(streaming.spool_drain_bytes_per_second, Some(800));
+        assert_eq!(streaming.tape_write_bytes_per_second, Some(2_000));
+
+        let (idle, idle_moved) = sampler.observe_operational(
+            store::SingleTapeLiveIoPhase::BackupWrite,
+            &evidence,
+            "bacula_storage_running_job_bytes_delta",
+            Some(SasTapeIoCounters {
+                read_bytes: Some(0),
+                write_bytes: Some(10_000),
+            }),
+            Some((
+                BaculaSpoolUsage {
+                    bytes: 2_000,
+                    file_count: 1,
+                },
+                64_000,
+            )),
+            Some(BaculaRunningHints {
+                spooling: Some(true),
+                ..BaculaRunningHints::default()
+            }),
+            started + Duration::from_secs(10),
+            timeout,
+            started + Duration::from_secs(50),
+        );
+        assert!(!idle_moved);
+        assert_eq!(idle.activity, Some(store::SingleTapeLiveActivity::Idle));
+        assert_eq!(idle.progress_idle_ms, Some(40_000));
+
+        let (stalled, stalled_moved) = sampler.observe_operational(
+            store::SingleTapeLiveIoPhase::BackupWrite,
+            &evidence,
+            "bacula_storage_running_job_bytes_delta",
+            Some(SasTapeIoCounters {
+                read_bytes: Some(0),
+                write_bytes: Some(10_000),
+            }),
+            Some((
+                BaculaSpoolUsage {
+                    bytes: 2_000,
+                    file_count: 1,
+                },
+                64_000,
+            )),
+            None,
+            started + Duration::from_secs(10),
+            timeout,
+            started + Duration::from_secs(1_810),
+        );
+        assert!(!stalled_moved);
+        assert_eq!(
+            stalled.activity,
+            Some(store::SingleTapeLiveActivity::Stalled)
+        );
+        assert_eq!(stalled.progress_idle_ms, Some(1_800_000));
+    }
+
+    #[test]
+    fn spool_usage_is_path_free_and_rejects_non_files() {
+        let directory = tempfile::tempdir().expect("spool");
+        fs::write(directory.path().join("data.spool"), vec![0_u8; 17]).expect("data spool");
+        fs::write(directory.path().join("attributes.spool"), vec![0_u8; 9])
+            .expect("attribute spool");
+        let usage = bacula_spool_usage(directory.path()).expect("spool usage");
+        assert_eq!(usage.bytes, 26);
+        assert_eq!(usage.file_count, 2);
+
+        fs::create_dir(directory.path().join("unexpected")).expect("unexpected directory");
+        assert!(bacula_spool_usage(directory.path()).is_err());
     }
 
     #[test]

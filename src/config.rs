@@ -26,6 +26,7 @@ pub struct Config {
     pub restore_root: PathBuf,
     pub evidence_root: PathBuf,
     pub data_run_timeout: Duration,
+    pub transfer_stall_timeout: Duration,
     pub bacula_spool_dir: PathBuf,
     pub bacula_spool_max_bytes: u64,
     pub bacula_spool_reserve_bytes: u64,
@@ -62,6 +63,8 @@ impl Config {
         ));
         let data_run_timeout =
             Duration::from_secs(parse("TAPESCALE_DATA_RUN_TIMEOUT_SECS", 43_200)?);
+        let transfer_stall_timeout =
+            Duration::from_secs(parse("TAPESCALE_TRANSFER_STALL_TIMEOUT_SECS", 1_800)?);
         let bacula_spool_dir = PathBuf::from(DATA_SPOOL_DIRECTORY);
         let bacula_spool_max_bytes = parse(
             "TAPESCALE_BACULA_SPOOL_MAX_BYTES",
@@ -117,6 +120,11 @@ impl Config {
             "TAPESCALE_DATA_RUN_TIMEOUT_SECS must be between 300 and 86400"
         );
         anyhow::ensure!(
+            transfer_stall_timeout >= Duration::from_secs(300)
+                && transfer_stall_timeout <= Duration::from_secs(7_200),
+            "TAPESCALE_TRANSFER_STALL_TIMEOUT_SECS must be between 300 and 7200"
+        );
+        anyhow::ensure!(
             bacula_spool_dir.is_absolute(),
             "the pinned Bacula spool directory must be an absolute path"
         );
@@ -155,6 +163,7 @@ impl Config {
             restore_root,
             evidence_root,
             data_run_timeout,
+            transfer_stall_timeout,
             bacula_spool_dir,
             bacula_spool_max_bytes,
             bacula_spool_reserve_bytes,

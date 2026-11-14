@@ -1194,7 +1194,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(assignment.requested_level, "full");
     assert_eq!(assignment.retention_days, assignment_profile.retention_days);
     assert_eq!(assignment.compression_mode, "auto");
-    assert_eq!(assignment.resolved_compression, "gzip");
+    assert_eq!(assignment.resolved_compression, "lzo");
     assert!(assignment.spanning_enabled);
     let assignment_volumes = store::data_run_volumes(&pool, assignment.id)
         .await
@@ -1533,6 +1533,16 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         tape_counters_available: true,
         pipeline_basis: "bacula_job_bytes_delta",
         tape_basis: Some("linux_scsi_tape_sysfs_counter_delta"),
+        engine_state: Some("running"),
+        activity: Some(store::SingleTapeLiveActivity::Streaming),
+        progress_idle_ms: Some(0),
+        no_progress_timeout_ms: Some(1_800_000),
+        spool_bytes: Some(1_048_576),
+        spool_capacity_bytes: Some(68_719_476_736),
+        spool_file_count: Some(2),
+        spool_fill_bytes_per_second: None,
+        spool_drain_bytes_per_second: Some(256),
+        spool_basis: Some("run_scoped_bacula_spool_regular_file_bytes"),
     };
     assert!(
         store::record_single_tape_data_live_io(&pool, &claimed, &live_sample)
@@ -1569,6 +1579,21 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         live_view["run"]["result"]["live_io"]["tape_write_bytes_per_second"],
         180
     );
+    assert_eq!(
+        live_view["run"]["result"]["live_io"]["activity"],
+        "streaming"
+    );
+    assert_eq!(
+        live_view["run"]["result"]["live_io"]["spool_bytes"],
+        1_048_576
+    );
+    assert_eq!(live_view["run"]["result"]["live_io"]["spool_file_count"], 2);
+    let live_io = &live_view["run"]["result"]["live_io"];
+    assert!(live_io.get("path").is_none());
+    assert!(live_io.get("directory").is_none());
+    assert!(!serde_json::to_string(live_io)
+        .expect("live I/O should serialize")
+        .contains("/var/lib/tapescale/spool"));
     let engine_volume = "TS-INTEGRATION-FINAL";
     assert!(
         store::mark_single_tape_media_write_started(&pool, &claimed, engine_volume)
@@ -2020,6 +2045,16 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         tape_counters_available: true,
         pipeline_basis: "bacula_job_bytes_delta",
         tape_basis: Some("linux_scsi_tape_sysfs_counter_delta"),
+        engine_state: None,
+        activity: None,
+        progress_idle_ms: None,
+        no_progress_timeout_ms: None,
+        spool_bytes: None,
+        spool_capacity_bytes: None,
+        spool_file_count: None,
+        spool_fill_bytes_per_second: None,
+        spool_drain_bytes_per_second: None,
+        spool_basis: None,
     };
     assert!(
         store::record_restore_rehearsal_live_io(&pool, &restore_claim, &restore_live_sample)

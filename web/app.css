@@ -1911,6 +1911,18 @@ svg {
   background: var(--teal-soft);
 }
 
+.backup-live-io.activity-idle,
+.backup-live-io.activity-waiting {
+  border-color: #e3bd89;
+  background: var(--amber-soft);
+}
+
+.backup-live-io.activity-stalled {
+  border-color: #ca6f68;
+  background: #fff2f0;
+  box-shadow: inset 4px 0 #ad3731;
+}
+
 .backup-live-io-head {
   display: flex;
   align-items: center;
@@ -1950,8 +1962,14 @@ svg {
 }
 
 .backup-live-io.stale .backup-live-io-head > strong,
-.backup-live-io.waiting .backup-live-io-head > strong {
+.backup-live-io.waiting .backup-live-io-head > strong,
+.backup-live-io.activity-idle .backup-live-io-head > strong,
+.backup-live-io.activity-waiting .backup-live-io-head > strong {
   color: #855716;
+}
+
+.backup-live-io.activity-stalled .backup-live-io-head > strong {
+  color: #982d28;
 }
 
 .backup-live-rate-grid {
@@ -1961,6 +1979,14 @@ svg {
 
 .backup-preparation-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.backup-transfer-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.backup-transfer-grid .backup-spool-occupancy strong {
+  font-size: 14px;
 }
 
 .backup-live-rate-grid > div {
@@ -2004,6 +2030,15 @@ svg {
   border-top: 1px solid var(--line);
   color: var(--ink-soft);
   font-size: 10px;
+}
+
+.backup-live-io > p.backup-live-activity-detail {
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.backup-live-io.activity-stalled > p.backup-live-activity-detail {
+  color: #7e211d;
 }
 
 .backup-live-io:not(:has(.backup-live-rate-grid)) > p {

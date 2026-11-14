@@ -230,9 +230,10 @@ impl BaculaRuntime {
     ) -> Result<Self, BaculaRuntimeError> {
         let catalog = BaculaCatalogConnection::parse(database_url)?;
         let catalog_schema_version = ensure_catalog_schema(pool, &catalog, cancellation).await?;
-        prepare_runtime_directories(evidence_directory)?;
-
         let token = run_id.simple().to_string();
+        let run_spool_directory = Path::new(DATA_SPOOL_DIRECTORY).join(&token);
+        prepare_runtime_directories(evidence_directory, &run_spool_directory)?;
+
         let credentials = BaculaCredentials::new(
             format!("dir-{token}"),
             format!("sd-{token}"),
@@ -258,14 +259,15 @@ impl BaculaRuntime {
             BaculaPoolName::for_run(run_id),
         )
         .with_data_options(data_options)
+        .with_run_spool_directory(run_id)
         .render();
         let mut evidence = write_configs(&rendered)?;
         evidence.catalog_schema_version = catalog_schema_version;
         evidence.backup_data_spooling_enabled = true;
-        evidence.data_spool_directory = PathBuf::from(DATA_SPOOL_DIRECTORY);
+        evidence.data_spool_directory = run_spool_directory.clone();
         evidence.maximum_backup_data_spool_bytes = data_options.maximum_spool_size_bytes();
         evidence.backup_attribute_spooling_enabled = true;
-        evidence.attribute_spool_directory = PathBuf::from(DATA_SPOOL_DIRECTORY);
+        evidence.attribute_spool_directory = run_spool_directory;
         evidence.maximum_tape_file_bytes = MAXIMUM_TAPE_FILE_BYTES;
 
         for daemon in BaculaDaemon::STARTUP_ORDER {
@@ -295,6 +297,7 @@ impl BaculaRuntime {
 
     pub async fn stop(mut self) -> BaculaRuntimeEvidence {
         stop_daemons(&mut self.daemons).await;
+        remove_empty_run_spool_directory(&self.evidence.data_spool_directory);
         self.evidence
     }
 }
@@ -506,7 +509,10 @@ fn extract_catalog_schema_sql(script: &str) -> Option<&str> {
     .then_some(sql)
 }
 
-fn prepare_runtime_directories(evidence_directory: &Path) -> Result<(), BaculaRuntimeError> {
+fn prepare_runtime_directories(
+    evidence_directory: &Path,
+    run_spool_directory: &Path,
+) -> Result<(), BaculaRuntimeError> {
     let working_directory = Path::new(BACULA_WORKING_DIRECTORY);
     let bootstrap_directory = working_directory.join("bootstrap");
     for path in [
@@ -514,6 +520,7 @@ fn prepare_runtime_directories(evidence_directory: &Path) -> Result<(), BaculaRu
         working_directory,
         bootstrap_directory.as_path(),
         Path::new(DATA_SPOOL_DIRECTORY),
+        run_spool_directory,
         Path::new("/run/bacula"),
         evidence_directory,
     ] {
@@ -523,6 +530,15 @@ fn prepare_runtime_directories(evidence_directory: &Path) -> Result<(), BaculaRu
         })?;
     }
     Ok(())
+}
+
+fn remove_empty_run_spool_directory(path: &Path) {
+    // Never remove the shared spool root or an arbitrary configured path.
+    // `remove_dir` succeeds only when Bacula left the exact run directory
+    // empty; non-empty crash evidence remains available for diagnosis.
+    if path.parent() == Some(Path::new(DATA_SPOOL_DIRECTORY)) {
+        let _ = fs::remove_dir(path);
+    }
 }
 
 fn write_configs(

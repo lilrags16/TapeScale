@@ -71,16 +71,37 @@ pub enum BaculaCompression {
 
 impl BaculaCompression {
     /// Translate the stable policy/API names into an explicit Bacula codec.
-    /// `auto` intentionally selects fast, universally available gzip rather
-    /// than making the result depend on daemon build flags or host defaults.
+    /// The packaged Bacula build and container roundtrip tests explicitly
+    /// include LZO. Prefer it for `auto`: its low CPU cost is materially less
+    /// likely than gzip to starve a streaming tape drive.
     pub fn from_policy_mode(value: &str) -> Result<Self, BaculaValidationError> {
         match value {
             "none" => Ok(Self::None),
-            "auto" => Ok(Self::GzipFast),
+            "auto" => Ok(Self::Lzo),
             "gzip" => Ok(Self::GzipBalanced),
             "lzo" => Ok(Self::Lzo),
             _ => Err(BaculaValidationError::InvalidValue {
                 field: "compression_mode",
+            }),
+        }
+    }
+
+    /// Reconstruct the exact codec already committed to a durable run.
+    ///
+    /// Automatic policy changed from GZIP1 to LZO in alpha.9. Keeping the
+    /// resolved value in this decision prevents an older queued run from
+    /// silently changing its on-media format after an upgrade.
+    pub fn from_persisted_policy(
+        requested: &str,
+        resolved: &str,
+    ) -> Result<Self, BaculaValidationError> {
+        match (requested, resolved) {
+            ("auto", "gzip") => Ok(Self::GzipFast),
+            ("auto", "lzo") | ("lzo", "lzo") => Ok(Self::Lzo),
+            ("gzip", "gzip") => Ok(Self::GzipBalanced),
+            ("none", "none") => Ok(Self::None),
+            _ => Err(BaculaValidationError::InvalidValue {
+                field: "resolved_compression",
             }),
         }
     }
@@ -620,6 +641,7 @@ pub struct BaculaConfig {
     credentials: BaculaCredentials,
     pool_name: BaculaPoolName,
     data_options: BaculaDataOptions,
+    data_spool_directory: PathBuf,
 }
 
 impl BaculaConfig {
@@ -635,6 +657,7 @@ impl BaculaConfig {
             credentials,
             pool_name,
             data_options: BaculaDataOptions::default(),
+            data_spool_directory: PathBuf::from(DATA_SPOOL_DIRECTORY),
         }
     }
 
@@ -642,6 +665,15 @@ impl BaculaConfig {
     #[must_use]
     pub const fn with_data_options(mut self, data_options: BaculaDataOptions) -> Self {
         self.data_options = data_options;
+        self
+    }
+
+    /// Isolate one runtime's spool files so live occupancy can be attributed
+    /// to the exact fenced run without inspecting Bacula-generated names.
+    #[must_use]
+    pub fn with_run_spool_directory(mut self, run_id: Uuid) -> Self {
+        self.data_spool_directory =
+            Path::new(DATA_SPOOL_DIRECTORY).join(run_id.simple().to_string());
         self
     }
 
@@ -837,6 +869,7 @@ Messages {{
     fn render_storage_daemon(&self) -> String {
         let maximum_spool_size = self.data_options.maximum_spool_size_bytes();
         let maximum_tape_file_size = MAXIMUM_TAPE_FILE_BYTES;
+        let data_spool_directory = self.data_spool_directory.display();
         format!(
             r#"Storage {{
   Name = {STORAGE_DAEMON_NAME}
@@ -844,7 +877,7 @@ Messages {{
   SDAddress = 127.0.0.1
   # Attribute spool files always use the SD Working Directory. Co-locate them
   # with the data spool so TapeScale can measure and reserve this filesystem.
-  Working Directory = "{DATA_SPOOL_DIRECTORY}"
+  Working Directory = "{data_spool_directory}"
   Pid Directory = "/run/bacula"
   Plugin Directory = "/usr/lib/bacula"
   # One active data job plus one read-only status connection. The Device
@@ -873,7 +906,7 @@ Device {{
   Random Access = no
   Label Media = no
   Maximum File Size = {maximum_tape_file_size}
-  Spool Directory = "{DATA_SPOOL_DIRECTORY}"
+  Spool Directory = "{data_spool_directory}"
   Maximum Spool Size = {maximum_spool_size}
   Maximum Job Spool Size = {maximum_spool_size}
   Maximum Concurrent Jobs = 1
@@ -886,6 +919,7 @@ Messages {{
 "#,
             storage_password = self.credentials.storage_password,
             tape_device = self.paths.tape_device.display(),
+            data_spool_directory = data_spool_directory,
             maximum_spool_size = maximum_spool_size,
             maximum_tape_file_size = maximum_tape_file_size,
         )
@@ -1712,6 +1746,24 @@ impl BaculaJobEvidence {
     }
 }
 
+/// Exact in-memory counters reported by the Storage Daemon for one running
+/// JobId. Unlike catalog-backed `.jlist`, these counters advance while data is
+/// being staged in the disk spool.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BaculaRunningJobEvidence {
+    pub job_id: BaculaJobId,
+    pub raw_status: char,
+    pub state: BaculaJobState,
+    pub files: u64,
+    pub bytes: u64,
+    pub errors: u64,
+    pub average_bytes_per_second: Option<u64>,
+    pub last_bytes_per_second: Option<u64>,
+    pub spooling: Option<bool>,
+    pub despooling: Option<bool>,
+    pub despool_wait: Option<bool>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BaculaJsonError {
     #[error("bconsole output was not UTF-8")]
@@ -1754,6 +1806,171 @@ pub enum BaculaStatusError {
     InvalidRequestedVolume,
     #[error("Bacula Storage status wrote unexpected diagnostic output to stderr")]
     UnexpectedStderr,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BaculaRunningStatusError {
+    #[error("bconsole output was not UTF-8")]
+    InvalidUtf8,
+    #[error("Bacula Storage status did not contain a top-level running-job array")]
+    MissingRunningJobs,
+    #[error("Bacula Storage running-job status was malformed")]
+    MalformedRunningJobs,
+    #[error("Bacula Storage status contained {actual} records for JobId {job_id}")]
+    AmbiguousJob { job_id: BaculaJobId, actual: usize },
+    #[error("Bacula Storage running-job status is missing a valid {0}")]
+    MissingField(&'static str),
+    #[error("Bacula Storage running-job status returned an unsupported status value")]
+    InvalidStatus,
+    #[error("Bacula Storage status wrote unexpected diagnostic output to stderr")]
+    UnexpectedStderr,
+}
+
+/// Parse the fixed Storage resource's API-v2 running list for one exact JobId.
+///
+/// A missing record is normal while a job is being handed between daemons and
+/// returns `Ok(None)`. The parser accepts only the top-level `running` array,
+/// ignores connection records without JobIds, and rejects duplicate or
+/// malformed exact records rather than guessing across jobs.
+pub fn parse_running_job_evidence(
+    output: &[u8],
+    expected_job_id: BaculaJobId,
+) -> Result<Option<BaculaRunningJobEvidence>, BaculaRunningStatusError> {
+    let text = std::str::from_utf8(output).map_err(|_| BaculaRunningStatusError::InvalidUtf8)?;
+    let value = text
+        .char_indices()
+        .filter(|(_, character)| *character == '{')
+        .find_map(|(offset, _)| {
+            serde_json::Deserializer::from_str(&text[offset..])
+                .into_iter::<Value>()
+                .next()
+                .and_then(Result::ok)
+        })
+        .ok_or(BaculaRunningStatusError::MissingRunningJobs)?;
+    let root = value
+        .as_object()
+        .ok_or(BaculaRunningStatusError::MalformedRunningJobs)?;
+    let records = root
+        .get("running")
+        .ok_or(BaculaRunningStatusError::MissingRunningJobs)?
+        .as_array()
+        .ok_or(BaculaRunningStatusError::MalformedRunningJobs)?;
+    if records.iter().any(|record| !record.is_object()) {
+        return Err(BaculaRunningStatusError::MalformedRunningJobs);
+    }
+
+    let mut matching = Vec::new();
+    for record in records {
+        let object = record
+            .as_object()
+            .expect("the running-job object shape was checked");
+        let Some(job_id_value) = object.get("jobid") else {
+            continue;
+        };
+        let Some(job_id) = value_as_u64(job_id_value) else {
+            return Err(BaculaRunningStatusError::MalformedRunningJobs);
+        };
+        if job_id == expected_job_id.get() {
+            matching.push(object);
+        }
+    }
+    let object = match matching.as_slice() {
+        [] => return Ok(None),
+        [object] => *object,
+        records => {
+            return Err(BaculaRunningStatusError::AmbiguousJob {
+                job_id: expected_job_id,
+                actual: records.len(),
+            });
+        }
+    };
+
+    let raw_status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .and_then(single_status_character)
+        .ok_or(BaculaRunningStatusError::InvalidStatus)?;
+    let errors = required_running_u64(object, &["errors", "joberrors"], "errors")?;
+    let files = required_running_u64(object, &["jobfiles", "files"], "jobfiles")?;
+    let bytes = required_running_u64(object, &["jobbytes", "bytes"], "jobbytes")?;
+    Ok(Some(BaculaRunningJobEvidence {
+        job_id: expected_job_id,
+        raw_status,
+        state: map_job_status(raw_status, errors),
+        files,
+        bytes,
+        errors,
+        average_bytes_per_second: optional_running_u64(
+            object,
+            &["avebytes_sec", "average_bytes_per_second"],
+            "avebytes_sec",
+        )?,
+        last_bytes_per_second: optional_running_u64(
+            object,
+            &["lastbytes_sec", "last_bytes_per_second"],
+            "lastbytes_sec",
+        )?,
+        spooling: optional_running_bool(object, &["spooling"], "spooling")?,
+        despooling: optional_running_bool(object, &["despooling"], "despooling")?,
+        despool_wait: optional_running_bool(
+            object,
+            &["despool_wait", "despoolwait"],
+            "despool_wait",
+        )?,
+    }))
+}
+
+fn single_status_character(value: &str) -> Option<char> {
+    let mut characters = value.chars();
+    let first = characters.next()?;
+    characters.next().is_none().then_some(first)
+}
+
+fn required_running_u64(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+    field: &'static str,
+) -> Result<u64, BaculaRunningStatusError> {
+    object_value(object, keys)
+        .and_then(value_as_u64)
+        .ok_or(BaculaRunningStatusError::MissingField(field))
+}
+
+fn optional_running_u64(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+    field: &'static str,
+) -> Result<Option<u64>, BaculaRunningStatusError> {
+    object_value(object, keys)
+        .map(|value| value_as_u64(value).ok_or(BaculaRunningStatusError::MissingField(field)))
+        .transpose()
+}
+
+fn optional_running_bool(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+    field: &'static str,
+) -> Result<Option<bool>, BaculaRunningStatusError> {
+    object_value(object, keys)
+        .map(|value| value_as_bool(value).ok_or(BaculaRunningStatusError::MissingField(field)))
+        .transpose()
+}
+
+fn value_as_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::Number(value) => match value.as_u64()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        },
+        Value::String(value) => match value.as_str() {
+            "0" | "false" => Some(false),
+            "1" | "true" => Some(true),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Parse Bacula 15 API-v2 Storage-Daemon running-job status and return the
@@ -1939,6 +2156,8 @@ pub enum BaculaAdapterError {
     Json(#[from] BaculaJsonError),
     #[error(transparent)]
     Status(#[from] BaculaStatusError),
+    #[error(transparent)]
+    RunningStatus(#[from] BaculaRunningStatusError),
     #[error("Bacula returned {actual} records while exactly one job was required")]
     AmbiguousJob { actual: usize },
     #[error("Bacula returned JobId {actual} while JobId {expected} was requested")]
@@ -2017,6 +2236,21 @@ where
             });
         }
         Ok(record)
+    }
+
+    /// Read live Storage-Daemon counters for one exact correlated JobId.
+    /// The record may be temporarily absent while daemons hand off the job.
+    pub async fn running_job_evidence(
+        &self,
+        job_id: BaculaJobId,
+    ) -> Result<Option<BaculaRunningJobEvidence>, BaculaAdapterError> {
+        let output = self
+            .dispatch(&BaculaCommands::query_requested_volume())
+            .await?;
+        if !output.stderr.is_empty() {
+            return Err(BaculaRunningStatusError::UnexpectedStderr.into());
+        }
+        parse_running_job_evidence(&output.stdout, job_id).map_err(Into::into)
     }
 
     /// Return the exact volume currently requested by the fixed Storage
@@ -2250,13 +2484,37 @@ mod tests {
         assert!(rendered.director.contains("Auto Prune = no"));
         assert_eq!(
             BaculaCompression::from_policy_mode("auto").expect("auto"),
-            BaculaCompression::GzipFast
+            BaculaCompression::Lzo
         );
         assert_eq!(
             BaculaCompression::from_policy_mode("lzo").expect("lzo"),
             BaculaCompression::Lzo
         );
         assert!(BaculaCompression::from_policy_mode("zstd").is_err());
+        assert_eq!(
+            BaculaCompression::from_persisted_policy("auto", "gzip")
+                .expect("legacy automatic codec"),
+            BaculaCompression::GzipFast
+        );
+        assert_eq!(
+            BaculaCompression::from_persisted_policy("auto", "lzo")
+                .expect("current automatic codec"),
+            BaculaCompression::Lzo
+        );
+        assert!(BaculaCompression::from_persisted_policy("auto", "none").is_err());
+    }
+
+    #[test]
+    fn renderer_can_isolate_the_spool_for_one_run() {
+        let run_id = Uuid::parse_str("018f7cac-2e2a-7dc5-b70c-78a46a6f6f01").expect("run id");
+        let rendered = config().with_run_spool_directory(run_id).render();
+        let expected = "/var/lib/tapescale/spool/018f7cac2e2a7dc5b70c78a46a6f6f01";
+        assert!(rendered
+            .storage_daemon
+            .contains(&format!("Working Directory = \"{expected}\"")));
+        assert!(rendered
+            .storage_daemon
+            .contains(&format!("Spool Directory = \"{expected}\"")));
     }
 
     #[test]
@@ -2353,6 +2611,66 @@ mod tests {
                 .as_str(),
             "TS-LTO-002"
         );
+    }
+
+    #[test]
+    fn running_job_parser_reports_live_spool_counters_for_the_exact_job() {
+        let job_id = BaculaJobId::new(42).expect("job id");
+        let output = br#"Connecting to Storage daemon
+{"running":[
+  {"DirectorConnected":1700000000,"DirTLS":1},
+  {"jobid":41,"status":"R","jobbytes":999,"jobfiles":1,"errors":0},
+  {"jobid":"42","status":"R","jobbytes":"67108864","jobfiles":"12","errors":"0","avebytes_sec":"5242880","lastbytes_sec":6291456,"spooling":1,"despooling":"0","despool_wait":false}
+]}
+1000 OK: quit"#;
+        let evidence = parse_running_job_evidence(output, job_id)
+            .expect("valid running status")
+            .expect("exact running job");
+        assert_eq!(evidence.job_id, job_id);
+        assert_eq!(evidence.state, BaculaJobState::Running);
+        assert_eq!(evidence.bytes, 67_108_864);
+        assert_eq!(evidence.files, 12);
+        assert_eq!(evidence.average_bytes_per_second, Some(5_242_880));
+        assert_eq!(evidence.last_bytes_per_second, Some(6_291_456));
+        assert_eq!(evidence.spooling, Some(true));
+        assert_eq!(evidence.despooling, Some(false));
+        assert_eq!(evidence.despool_wait, Some(false));
+
+        assert_eq!(
+            parse_running_job_evidence(br#"{"running":[]}"#, job_id)
+                .expect("an absent exact job is not malformed"),
+            None
+        );
+    }
+
+    #[test]
+    fn running_job_parser_rejects_duplicates_and_malformed_exact_records() {
+        let job_id = BaculaJobId::new(42).expect("job id");
+        assert!(matches!(
+            parse_running_job_evidence(
+                br#"{"running":[{"jobid":42,"status":"R","jobbytes":1,"jobfiles":1,"errors":0},{"jobid":42,"status":"R","jobbytes":2,"jobfiles":2,"errors":0}]}"#,
+                job_id
+            ),
+            Err(BaculaRunningStatusError::AmbiguousJob { actual: 2, .. })
+        ));
+        assert!(matches!(
+            parse_running_job_evidence(
+                br#"{"running":[{"jobid":42,"status":"R","jobbytes":1,"jobfiles":1,"errors":0,"spooling":"maybe"}]}"#,
+                job_id
+            ),
+            Err(BaculaRunningStatusError::MissingField("spooling"))
+        ));
+        assert!(matches!(
+            parse_running_job_evidence(
+                br#"{"running":[{"jobid":42,"status":"RR","jobbytes":1,"jobfiles":1,"errors":0}]}"#,
+                job_id
+            ),
+            Err(BaculaRunningStatusError::InvalidStatus)
+        ));
+        assert!(matches!(
+            parse_running_job_evidence(br#"{"jobs":[]}"#, job_id),
+            Err(BaculaRunningStatusError::MissingRunningJobs)
+        ));
     }
 
     #[test]
@@ -2750,6 +3068,29 @@ mod tests {
                 BaculaStatusError::MissingRunningJobs
             ))
         ));
+        let scripts = scripts.lock().expect("scripts lock");
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].kind(), BaculaOperationKind::QueryRequestedVolume);
+    }
+
+    #[tokio::test]
+    async fn running_job_adapter_uses_the_fixed_structured_status_query() {
+        let scripts = Arc::new(Mutex::new(Vec::new()));
+        let adapter = BaculaAdapter::new(FakeExecutor {
+            scripts: Arc::clone(&scripts),
+            output: BconsoleOutput {
+                stdout: br#"{"running":[{"jobid":42,"status":"R","jobbytes":8192,"jobfiles":3,"errors":0,"spooling":true}]}"#.to_vec(),
+                stderr: Vec::new(),
+                exit_code: Some(0),
+            },
+        });
+        let evidence = adapter
+            .running_job_evidence(BaculaJobId::new(42).expect("job id"))
+            .await
+            .expect("running evidence")
+            .expect("exact job");
+        assert_eq!(evidence.bytes, 8192);
+        assert_eq!(evidence.spooling, Some(true));
         let scripts = scripts.lock().expect("scripts lock");
         assert_eq!(scripts.len(), 1);
         assert_eq!(scripts[0].kind(), BaculaOperationKind::QueryRequestedVolume);

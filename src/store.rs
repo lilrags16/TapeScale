@@ -1038,6 +1038,25 @@ pub enum SingleTapeLiveIoPhase {
     Restore,
 }
 
+/// Server-derived description of what the physical data path is doing now.
+///
+/// A worker heartbeat is deliberately not an activity: these values require measured engine,
+/// spool, or tape movement. `Idle` and `Stalled` keep a responsive worker distinct from an active
+/// transfer so the UI never presents polling itself as progress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SingleTapeLiveActivity {
+    Starting,
+    Buffering,
+    Streaming,
+    Despooling,
+    Reading,
+    Restoring,
+    Waiting,
+    Idle,
+    Stalled,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SingleTapeLiveIoSample {
     pub phase: SingleTapeLiveIoPhase,
@@ -1055,6 +1074,26 @@ pub struct SingleTapeLiveIoSample {
     pub tape_counters_available: bool,
     pub pipeline_basis: &'static str,
     pub tape_basis: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SingleTapeLiveActivity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_idle_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_progress_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_capacity_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_file_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_fill_bytes_per_second: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_drain_bytes_per_second: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_basis: Option<&'static str>,
 }
 
 /// Latest aggregate source-manifest scan measurement for a fenced data run.
@@ -5100,7 +5139,7 @@ async fn queue_single_tape_data_run_inner(
             ));
         };
         let resolved = match requested.as_str() {
-            "auto" => "gzip",
+            "auto" => "lzo",
             "none" => "none",
             "gzip" => "gzip",
             "lzo" => "lzo",
@@ -6623,13 +6662,68 @@ pub async fn record_single_tape_data_live_io(
 ) -> Result<bool, sqlx::Error> {
     if sample.engine_job_id == 0
         || !(5..=300).contains(&sample.stale_after_seconds)
-        || sample.pipeline_basis != "bacula_job_bytes_delta"
+        || !matches!(
+            sample.pipeline_basis,
+            "bacula_job_bytes_delta" | "bacula_storage_running_job_bytes_delta"
+        )
         || sample
             .tape_basis
             .is_some_and(|basis| basis != "linux_scsi_tape_sysfs_counter_delta")
         || sample.tape_counters_available
             != (sample.tape_read_counter_available || sample.tape_write_counter_available)
         || (sample.tape_counters_available != sample.tape_basis.is_some())
+        || sample
+            .spool_basis
+            .is_some_and(|basis| basis != "run_scoped_bacula_spool_regular_file_bytes")
+        || sample.spool_fill_bytes_per_second.is_some()
+            && sample.spool_drain_bytes_per_second.is_some()
+        || (sample.spool_fill_bytes_per_second.is_some()
+            || sample.spool_drain_bytes_per_second.is_some())
+            && sample.spool_basis.is_none()
+        || sample.spool_basis.is_some()
+            != (sample.spool_bytes.is_some()
+                && sample.spool_capacity_bytes.is_some()
+                && sample.spool_file_count.is_some())
+        || sample.spool_capacity_bytes == Some(0)
+        || sample.activity.is_some()
+            != (sample.engine_state.is_some()
+                && sample.progress_idle_ms.is_some()
+                && sample.no_progress_timeout_ms.is_some())
+        || sample.engine_state.is_some_and(|state| {
+            !matches!(
+                state,
+                "created"
+                    | "blocked"
+                    | "waiting_for_file_daemon"
+                    | "waiting_for_storage_daemon"
+                    | "waiting_for_mount"
+                    | "waiting_for_media"
+                    | "waiting_for_resource"
+                    | "running"
+                    | "running_with_errors"
+                    | "committing"
+                    | "succeeded"
+                    | "completed_with_errors"
+                    | "completed_with_warnings"
+                    | "verify_differences"
+                    | "cancelled"
+                    | "failed"
+                    | "incomplete"
+                    | "unknown"
+            )
+        })
+        || sample
+            .no_progress_timeout_ms
+            .is_some_and(|timeout| !(300_000..=86_400_000).contains(&timeout))
+        || sample
+            .progress_idle_ms
+            .zip(sample.no_progress_timeout_ms)
+            .is_some_and(|(idle, timeout)| idle > timeout.saturating_mul(2))
+        || matches!(sample.activity, Some(SingleTapeLiveActivity::Stalled))
+            && sample
+                .progress_idle_ms
+                .zip(sample.no_progress_timeout_ms)
+                .is_none_or(|(idle, timeout)| idle < timeout)
     {
         return Ok(false);
     }

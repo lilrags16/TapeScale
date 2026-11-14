@@ -196,6 +196,7 @@ async fn main() -> Result<()> {
             spool_reserve_bytes = config.bacula_spool_reserve_bytes,
             spool_minimum_bytes = config.bacula_spool_min_bytes,
             timeout_seconds = config.data_run_timeout.as_secs(),
+            transfer_stall_timeout_seconds = config.transfer_stall_timeout.as_secs(),
             "attended Bacula compressed multi-tape Full backup with bounded disk spooling, ordered physical readback, and recovery-exercise execution are enabled; they are not production-qualified"
         );
     }

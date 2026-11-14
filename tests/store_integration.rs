@@ -2066,6 +2066,16 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         tape_counters_available: true,
         pipeline_basis: "bacula_job_bytes_delta",
         tape_basis: Some("linux_scsi_tape_sysfs_counter_delta"),
+        engine_state: None,
+        activity: None,
+        progress_idle_ms: None,
+        no_progress_timeout_ms: None,
+        spool_bytes: None,
+        spool_capacity_bytes: None,
+        spool_file_count: None,
+        spool_fill_bytes_per_second: None,
+        spool_drain_bytes_per_second: None,
+        spool_basis: None,
     };
     assert!(
         store::record_restore_rehearsal_live_io(&pool, &rehearsal_claim, &restore_live_sample,)

@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-8/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-8/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-9/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-9/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -120,6 +120,9 @@ test("backup policy exposes compression and spanning without a one-tape ceiling"
   assert.match(open, /value="gzip"/);
   assert.match(open, /value="lzo"/);
   assert.match(open, /value="none"/);
+  assert.match(open, /Automatic · LZO \(recommended\)/);
+  assert.match(open, /prioritize source throughput and reduce tape starvation/);
+  assert.doesNotMatch(open, /Automatic · fast GZIP/);
   assert.match(open, /name="spanning_enabled" checked/);
   assert.match(open, /spans tapes as needed/);
   assert.match(submit, /compression_mode: String\(values\.get\("compression_mode"\) \|\| "auto"\)/);
@@ -140,6 +143,14 @@ test("unsupported legacy compression is shown and blocked instead of becoming au
     '"use strict";\n' + helpers + "\nreturn [backupCompressionMode, backupCompressionSupported, backupCompressionLabel];"
   )(testPick, () => null, () => null);
   const legacy = { compression_mode: "zstd" };
+  assert.equal(evaluate[2]({ compression_mode: "auto" }), "Automatic → LZO (fastest)");
+  const legacyAutomatic = Function(
+    "pick",
+    "backupProfileForRun",
+    "backupEvidenceValue",
+    '"use strict";\n' + helpers + "\nreturn backupCompressionLabel;"
+  )(testPick, () => null, () => "gzip");
+  assert.equal(legacyAutomatic({ compression_mode: "auto" }), "Automatic → GZIP1 (legacy)");
   assert.equal(evaluate[0](legacy), "zstd");
   assert.equal(evaluate[1](legacy), false);
   assert.equal(evaluate[2](legacy), "Unsupported (zstd)");
@@ -339,17 +350,17 @@ test("capacity planning is explicitly estimated and supports unknown archive siz
   assert.doesNotMatch(capacity, /will fit/);
 });
 
-test("writing progress explains bounded disk spooling without inventing a percentage", () => {
+test("writing progress explains segmented disk spooling without pretending the tape is continuous", () => {
   const cue = section("  function renderBackupSpoolingCue(", "  function backupPhaseIndex(");
   const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
 
   assert.match(cue, /backupRunState\(run\) !== "writing"/);
   assert.match(cue, /backupEvidenceValue\(run, "data_spooling"\)/);
   assert.match(cue, /"effective_maximum_bytes", "maximum_bytes"/);
-  assert.match(cue, /Buffering on disk, then streaming to tape/);
-  assert.match(cue, /drive may remain idle while the buffer initially fills/);
-  assert.match(cue, /once despooling begins, it should stream continuously for that buffered segment/);
-  assert.doesNotMatch(cue, /pause normally|switches between filling and writing/);
+  assert.match(cue, /Measured disk buffering protects the tape stream/);
+  assert.match(cue, /fills and drains a bounded disk buffer in segments/);
+  assert.match(cue, /tape can pause between segments when the source cannot refill at drive speed/);
+  assert.match(cue, /live panel reports the actual buffer and tape activity/);
   assert.match(cue, /This buffer does not limit the total archive size/);
   assert.doesNotMatch(cue, /%|percent|percentage/i);
   assert.match(detail, /notice \+ renderBackupSpoolingCue\(run\) \+ renderBackupPreparationProgress\(run\) \+ renderBackupLiveThroughput\(run\) \+ measuredProgress/);
@@ -384,6 +395,10 @@ test("backup preparation and transfer telemetry are live, directional, and hones
     sampled_at: new Date(now).toISOString(),
     sample_window_ms: 5000,
     phase: "tape_write",
+    activity: "buffering",
+    engine_state: "running",
+    progress_idle_ms: 0,
+    no_progress_timeout_ms: 1800000,
     pipeline_bytes_per_second: 1048576,
     tape_write_bytes_per_second: 0,
     tape_read_bytes_per_second: null,
@@ -391,22 +406,73 @@ test("backup preparation and transfer telemetry are live, directional, and hones
     tape_write_counter_available: true,
     tape_counters_available: true,
     stale_after_seconds: 20,
-    pipeline_basis: "bacula_job_bytes_delta",
-    tape_basis: "linux_scsi_tape_sysfs_counter_delta"
+    pipeline_basis: "bacula_storage_running_job_bytes_delta",
+    tape_basis: "linux_scsi_tape_sysfs_counter_delta",
+    spool_bytes: 16777216,
+    spool_capacity_bytes: 67108864,
+    spool_file_count: 2,
+    spool_fill_bytes_per_second: 2097152,
+    spool_drain_bytes_per_second: 0,
+    spool_basis: "run_scoped_bacula_spool_regular_file_bytes"
   };
 
   assert.equal(stale(freshSample, now), false);
   const live = render({ state: "writing", result: { live_io: freshSample } });
-  assert.match(live, /Streaming to tape/);
-  assert.match(live, /Logical backup pipeline/);
+  assert.match(live, /Filling the disk buffer/);
+  assert.match(live, /Buffering/);
+  assert.match(live, /Disk buffer/);
+  assert.match(live, /16\.0 MiB \/ 64\.0 MiB/);
+  assert.match(live, /25\.0% temporary occupancy/);
+  assert.match(live, /not archive completion/);
+  assert.match(live, /Filling<\/span><strong>2\.0 MiB\/s/);
+  assert.match(live, /Source data is moving into the temporary disk buffer/);
+  assert.match(live, /Bacula processed stream/);
+  assert.match(live, /After Bacula hashing\/compression · not raw ZFS throughput/);
+  assert.doesNotMatch(live, /Logical backup pipeline/);
   assert.match(live, /1\.0 MiB\/s/);
   assert.match(live, /Tape write/);
   assert.match(live, /0 B\/s/);
   assert.match(live, /Tape read/);
   assert.match(live, /Measuring…/);
   assert.match(live, /Rolling 5 second sample/);
-  assert.match(live, /Logical progress: Bacula Job Bytes Delta/);
+  assert.match(live, /Engine progress: Bacula Storage Running Job Bytes Delta/);
+  assert.match(live, /Disk buffer: Run Scoped Bacula Spool Regular File Bytes/);
   assert.match(live, /Linux Scsi Tape Sysfs Counter Delta/);
+  assert.match(live, /Bacula: Running/);
+
+  const firstSpoolSample = { ...freshSample, activity: "starting", sample_window_ms: null };
+  delete firstSpoolSample.spool_fill_bytes_per_second;
+  delete firstSpoolSample.spool_drain_bytes_per_second;
+  const firstSpool = render({ state: "writing", result: { live_io: firstSpoolSample } });
+  assert.match(firstSpool, /Net movement<\/span><strong>Measuring…/);
+  assert.doesNotMatch(firstSpool, /Net movement<\/span><strong>0 B\/s/);
+
+  const streaming = render({ state: "writing", result: { live_io: { ...freshSample, activity: "streaming", spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 4194304, tape_write_bytes_per_second: 4194304 } } });
+  assert.match(streaming, /Streaming buffered data to tape/);
+  assert.match(streaming, /Tape active/);
+  assert.match(streaming, /Draining<\/span><strong>4\.0 MiB\/s/);
+  assert.match(streaming, /physical tape-write counter is advancing/);
+
+  const despooling = render({ state: "writing", result: { live_io: { ...freshSample, activity: "despooling", spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 3145728, tape_write_counter_available: false, tape_write_bytes_per_second: null } } });
+  assert.match(despooling, /Draining the disk buffer to tape/);
+  assert.match(despooling, /temporary disk buffer is shrinking/);
+
+  const idle = render({ state: "writing", result: { live_io: { ...freshSample, activity: "idle", progress_idle_ms: 300000, pipeline_bytes_per_second: 0, spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 0 } } });
+  assert.match(idle, /No data movement/);
+  assert.match(idle, /worker is responding/i);
+  assert.match(idle, /no measured disk-buffer, logical, or tape bytes have moved for 5m 0s/i);
+  assert.match(idle, /Automatic cancellation in 25m 0s/);
+  assert.match(idle, /heartbeat is not counted as progress/);
+
+  const stalled = render({ state: "writing", result: { live_io: { ...freshSample, activity: "stalled", progress_idle_ms: 1800000, pipeline_bytes_per_second: 0, spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 0 } } });
+  assert.match(stalled, /activity-stalled/);
+  assert.match(stalled, /Transfer stalled/);
+  assert.match(stalled, /Action required/);
+  assert.match(stalled, /no-progress safety threshold has been reached/i);
+
+  const legacyIdle = render({ state: "writing", result: { live_io: { sampled_at: new Date(now).toISOString(), sample_window_ms: 5000, phase: "backup_write", pipeline_bytes_per_second: 0, tape_write_bytes_per_second: 0, tape_read_bytes_per_second: 0, tape_counters_available: true, stale_after_seconds: 20 } } });
+  assert.match(legacyIdle, /No data movement/);
+  assert.doesNotMatch(legacyIdle, /Disk buffer<\/span>/);
 
   const unavailable = render({ state: "writing", result: { live_io: { ...freshSample, tape_read_counter_available: false, tape_write_counter_available: false, tape_counters_available: false } } });
   assert.equal((unavailable.match(/Unavailable/g) || []).length, 2);
@@ -478,6 +544,8 @@ test("backup preparation and transfer telemetry are live, directional, and hones
   assert.match(css, /\.backup-live-rate-grid/);
   assert.match(css, /\.backup-preparation-grid/);
   assert.match(css, /\.backup-live-io\.stale/);
+  assert.match(css, /\.backup-live-io\.activity-stalled/);
+  assert.match(css, /\.backup-live-io\.activity-idle/);
   assert.match(app, /outcome \+ liveTransfer \+ renderRestoreVolumeSequence/);
   assert.match(app, /outcome \+ renderBackupPreparationProgress\(\{ state: stateValue/);
 });

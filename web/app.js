@@ -542,7 +542,11 @@
     const mode = backupCompressionMode(source);
     const resolved = String(backupEvidenceValue(source, "resolved_compression") || "").toLowerCase();
     if (!backupCompressionSupported(source)) return "Unsupported (" + mode + ")";
-    if (mode === "auto") return resolved && resolved !== "gzip" ? "Automatic → " + resolved.toUpperCase() : "Automatic → GZIP1 (fast)";
+    if (mode === "auto") {
+      if (resolved === "gzip") return "Automatic → GZIP1 (legacy)";
+      if (resolved && resolved !== "lzo") return "Automatic → " + resolved.toUpperCase();
+      return "Automatic → LZO (fastest)";
+    }
     if (mode === "gzip") return "GZIP6 (balanced)";
     return mode === "none" ? "No compression" : "LZO (fastest)";
   }
@@ -731,15 +735,72 @@
     return sampledAt > now + 5000 || now - sampledAt > staleAfter;
   }
 
+  function backupDurationLabel(milliseconds) {
+    const value = Number(milliseconds);
+    if (!Number.isFinite(value) || value < 0) return "Unavailable";
+    const seconds = Math.floor(value / 1000);
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainder = seconds % 60;
+    if (hours) return hours + "h " + minutes + "m";
+    if (minutes) return minutes + "m " + remainder + "s";
+    return remainder + "s";
+  }
+
+  function backupLiveActivity(liveIo, livePhase) {
+    const aliases = {
+      filling_disk_buffer: "buffering",
+      spooling: "buffering",
+      despooling_to_tape: "despooling",
+      no_data_movement: "idle",
+      waiting_for_resource: "waiting"
+    };
+    const reported = String(pick(liveIo, "activity") || "").toLowerCase();
+    const normalized = aliases[reported] || reported;
+    if (["starting", "buffering", "streaming", "despooling", "idle", "stalled", "waiting", "reading", "restoring"].includes(normalized)) return normalized;
+    const numeric = (key) => {
+      const value = pick(liveIo, key);
+      return value === null || value === undefined || value === "" ? Number.NaN : Number(value);
+    };
+    if (numeric("tape_write_bytes_per_second") > 0) return "streaming";
+    if (numeric("tape_read_bytes_per_second") > 0) return livePhase === "restore" ? "restoring" : "reading";
+    if (numeric("spool_drain_bytes_per_second") > 0) return "despooling";
+    if (numeric("spool_fill_bytes_per_second") > 0) return "buffering";
+    const measuredRates = [
+      numeric("pipeline_bytes_per_second"),
+      numeric("tape_write_bytes_per_second"),
+      numeric("tape_read_bytes_per_second"),
+      numeric("spool_fill_bytes_per_second"),
+      numeric("spool_drain_bytes_per_second")
+    ].filter(Number.isFinite);
+    if (Number(pick(liveIo, "sample_window_ms")) > 0 && measuredRates.length && measuredRates.every((value) => value === 0)) return "idle";
+    return "starting";
+  }
+
+  function backupLiveActivityLabel(activity, livePhase) {
+    const labels = {
+      starting: "Starting the data pipeline",
+      buffering: "Filling the disk buffer",
+      streaming: "Streaming buffered data to tape",
+      despooling: "Draining the disk buffer to tape",
+      idle: "No data movement",
+      stalled: "Transfer stalled",
+      waiting: "Waiting for the backup engine",
+      reading: "Reading tape",
+      restoring: "Writing restored data to disk"
+    };
+    return labels[activity] || backupLivePhaseLabel(livePhase);
+  }
+
   function backupLivePhaseLabel(value) {
     const labels = {
       inventory: "Scanning source storage",
       inventorying: "Scanning source storage",
       source_inventory: "Scanning source storage",
       spooling: "Buffering on disk",
-      backup_write: "Streaming to tape",
-      tape_write: "Streaming to tape",
-      writing: "Streaming to tape",
+      backup_write: "Backup data pipeline",
+      tape_write: "Backup data pipeline",
+      writing: "Backup data pipeline",
       tape_read: "Reading tape",
       tape_readback: "Reading tape for verification",
       full_readback: "Reading tape for verification",
@@ -844,12 +905,18 @@
     const tapeWriteAvailable = tapeWriteCounterAvailable == null ? tapeCountersAvailable : tapeWriteCounterAvailable;
     const pipelineBasis = pick(liveIo, "pipeline_basis");
     const tapeBasis = pick(liveIo, "tape_basis", "tape_counters_basis", "basis");
+    const spoolBasis = pick(liveIo, "spool_basis");
     const livePhase = String(pick(liveIo, "phase") || runState).toLowerCase();
-    const pipelineLabel = ["backup_write", "tape_write", "writing", "spooling"].includes(livePhase)
-      ? "Logical backup pipeline"
+    const activity = backupLiveActivity(liveIo, livePhase);
+    const backupPipeline = ["backup_write", "tape_write", "writing", "spooling"].includes(livePhase);
+    const pipelineLabel = backupPipeline
+      ? "Bacula processed stream"
       : ["full_readback", "tape_read", "tape_readback", "verifying"].includes(livePhase)
         ? "Logical verify pipeline"
         : livePhase === "restore" ? "Logical restore pipeline" : "Logical data pipeline";
+    const pipelineDetail = backupPipeline
+      ? "After Bacula hashing/compression · not raw ZFS throughput"
+      : "Measured engine job-byte movement";
     const rate = (value, available) => {
       if (available === false) return "Unavailable";
       if (value === null || value === undefined || value === "") return "Measuring…";
@@ -859,11 +926,72 @@
     const pipelineRate = pick(liveIo, "pipeline_bytes_per_second");
     const tapeWriteRate = pick(liveIo, "tape_write_bytes_per_second");
     const tapeReadRate = pick(liveIo, "tape_read_bytes_per_second");
+    const spoolBytesValue = pick(liveIo, "spool_bytes");
+    const spoolCapacityValue = pick(liveIo, "spool_capacity_bytes");
+    const spoolFilesValue = pick(liveIo, "spool_file_count");
+    const spoolFillRate = pick(liveIo, "spool_fill_bytes_per_second");
+    const spoolDrainRate = pick(liveIo, "spool_drain_bytes_per_second");
+    const spoolBytes = spoolBytesValue === null ? Number.NaN : Number(spoolBytesValue);
+    const spoolCapacity = spoolCapacityValue === null ? Number.NaN : Number(spoolCapacityValue);
+    const spoolFiles = spoolFilesValue === null ? Number.NaN : Number(spoolFilesValue);
+    const spoolMeasured = Boolean(spoolBasis) || Number.isFinite(spoolBytes) || Number.isFinite(spoolCapacity);
+    const occupancy = Number.isFinite(spoolBytes) && Number.isFinite(spoolCapacity) && spoolBytes >= 0 && spoolCapacity > 0
+      ? Math.min(100, spoolBytes / spoolCapacity * 100)
+      : Number.NaN;
+    const spoolAmount = Number.isFinite(spoolBytes) && spoolBytes >= 0
+      ? bytes(spoolBytes) + (Number.isFinite(spoolCapacity) && spoolCapacity > 0 ? " / " + bytes(spoolCapacity) : "")
+      : "Measuring…";
+    const spoolDirection = Number(spoolDrainRate) > 0 ? "Draining" : Number(spoolFillRate) > 0 ? "Filling" : "Net movement";
+    const spoolRate = Number(spoolDrainRate) > 0
+      ? rate(spoolDrainRate, true)
+      : Number(spoolFillRate) > 0
+        ? rate(spoolFillRate, true)
+        : spoolFillRate != null || spoolDrainRate != null ? "0 B/s" : "Measuring…";
+    const spoolCards = spoolMeasured
+      ? '<div class="backup-spool-occupancy"><span>Disk buffer</span><strong>' + esc(spoolAmount) + '</strong><small>' + (Number.isFinite(occupancy) ? esc(occupancy.toFixed(1) + "% temporary occupancy") : "Temporary occupancy") + ' · not archive completion' + (Number.isFinite(spoolFiles) && spoolFiles >= 0 ? " · " + esc(Math.trunc(spoolFiles).toLocaleString()) + " spool files" : "") + '</small></div><div><span>' + esc(spoolDirection) + '</span><strong>' + esc(spoolRate) + '</strong><small>Measured from the run-specific disk spool</small></div>'
+      : "";
+    const idleMillisecondsValue = pick(liveIo, "progress_idle_ms");
+    const timeoutMillisecondsValue = pick(liveIo, "no_progress_timeout_ms");
+    const idleMilliseconds = idleMillisecondsValue === null ? Number.NaN : Number(idleMillisecondsValue);
+    const timeoutMilliseconds = timeoutMillisecondsValue === null ? Number.NaN : Number(timeoutMillisecondsValue);
+    const idleLabel = Number.isFinite(idleMilliseconds) && idleMilliseconds >= 0 ? backupDurationLabel(idleMilliseconds) : "an unknown interval";
+    const remainingMilliseconds = Number.isFinite(idleMilliseconds) && Number.isFinite(timeoutMilliseconds)
+      ? Math.max(0, timeoutMilliseconds - idleMilliseconds)
+      : Number.NaN;
+    const safety = Number.isFinite(remainingMilliseconds)
+      ? remainingMilliseconds > 0
+        ? " Automatic cancellation in " + backupDurationLabel(remainingMilliseconds) + " if every measured signal remains flat."
+        : " The no-progress safety threshold has been reached."
+      : "";
+    const activityDetail = {
+      starting: "The worker is connected and waiting for the first measured byte movement.",
+      buffering: "Source data is moving into the temporary disk buffer. Tape can remain idle until Bacula drains a buffered segment.",
+      streaming: "The physical tape-write counter is advancing.",
+      despooling: "The temporary disk buffer is shrinking as Bacula sends its contents to tape.",
+      idle: "The worker is responding, but no measured disk-buffer, logical, or tape bytes have moved for " + idleLabel + ". This heartbeat is not counted as progress." + safety,
+      stalled: "No measured disk-buffer, logical, or tape bytes have moved for " + idleLabel + "." + safety,
+      waiting: "Bacula is waiting for an engine resource; no transfer is being claimed as active." + safety,
+      reading: "The physical tape-read counter is advancing.",
+      restoring: "Recovered bytes are moving through the restore pipeline."
+    }[activity];
+    const activityBadge = {
+      starting: "Starting…",
+      buffering: "Buffering",
+      streaming: "Tape active",
+      despooling: "Tape handoff",
+      idle: "No movement",
+      stalled: "Action required",
+      waiting: "Engine wait",
+      reading: "Tape active",
+      restoring: "Restoring"
+    }[activity] || "Updated";
     const basis = [
-      pipelineBasis ? "Logical progress: " + human(pipelineBasis) : null,
-      tapeBasis ? "Physical tape I/O: " + human(tapeBasis) : tapeCountersAvailable === false ? "Physical tape counters unavailable on this host or drive" : "Physical tape counters measuring"
+      pipelineBasis ? "Engine progress: " + human(pipelineBasis) : null,
+      spoolBasis ? "Disk buffer: " + human(spoolBasis) : null,
+      tapeBasis ? "Physical tape I/O: " + human(tapeBasis) : tapeCountersAvailable === false ? "Physical tape counters unavailable on this host or drive" : "Physical tape counters measuring",
+      pick(liveIo, "engine_state") ? "Bacula: " + human(pick(liveIo, "engine_state")) : null
     ].filter(Boolean).join(" · ");
-    return '<section class="backup-live-io" role="status"><div class="backup-live-io-head"><div><span>Live transfer</span><h3>' + esc(backupLivePhaseLabel(livePhase)) + '</h3></div><strong>Updated ' + esc(date(sampledAt)) + '</strong></div><div class="backup-live-rate-grid"><div><span>' + esc(pipelineLabel) + '</span><strong>' + esc(rate(pipelineRate, true)) + '</strong></div><div><span>Tape write</span><strong>' + esc(rate(tapeWriteRate, tapeWriteAvailable)) + '</strong></div><div><span>Tape read</span><strong>' + esc(rate(tapeReadRate, tapeReadAvailable)) + '</strong></div></div><p>' + esc(windowLabel + " · " + basis) + "</p></section>";
+    return '<section class="backup-live-io activity-' + esc(activity) + '" role="status"><div class="backup-live-io-head"><div><span>Live transfer</span><h3>' + esc(backupLiveActivityLabel(activity, livePhase)) + '</h3></div><strong>' + esc(activityBadge) + ' · ' + esc(date(sampledAt)) + '</strong></div><div class="backup-live-rate-grid backup-transfer-grid">' + spoolCards + '<div><span>' + esc(pipelineLabel) + '</span><strong>' + esc(rate(pipelineRate, true)) + '</strong><small>' + esc(pipelineDetail) + '</small></div><div><span>Tape write</span><strong>' + esc(rate(tapeWriteRate, tapeWriteAvailable)) + '</strong></div><div><span>Tape read</span><strong>' + esc(rate(tapeReadRate, tapeReadAvailable)) + '</strong></div></div><p class="backup-live-activity-detail">' + esc(activityDetail || "The worker is reporting a current transfer sample.") + '</p><p>' + esc(windowLabel + (basis ? " · " + basis : "")) + "</p></section>";
   }
 
   function renderBackupSpoolingCue(run) {
@@ -874,7 +1002,7 @@
     const limit = Number.isFinite(effectiveMaximum) && effectiveMaximum > 0
       ? " Effective disk-buffer maximum for this run: " + bytes(effectiveMaximum) + "."
       : "";
-    return '<div class="notice info backup-spooling-cue"><span class="notice-icon" aria-hidden="true">⇄</span><div class="notice-copy"><strong>Buffering on disk, then streaming to tape</strong><span>Bacula is using a bounded disk buffer to sustain the tape stream. The drive may remain idle while the buffer initially fills; once despooling begins, it should stream continuously for that buffered segment.' + esc(limit) + ' This buffer does not limit the total archive size.</span></div></div>';
+    return '<div class="notice info backup-spooling-cue"><span class="notice-icon" aria-hidden="true">⇄</span><div class="notice-copy"><strong>Measured disk buffering protects the tape stream</strong><span>Bacula fills and drains a bounded disk buffer in segments.' + esc(limit) + ' The tape can pause between segments when the source cannot refill at drive speed; the live panel reports the actual buffer and tape activity. This buffer does not limit the total archive size.</span></div></div>';
   }
 
   function backupPhaseIndex(run) {
@@ -4725,9 +4853,9 @@
       '<section class="backup-source-browser" id="backup-source-browser" aria-label="Source file browser" hidden></section>',
       '<div class="form-field"><label for="backup-retention-days">Keep completed backups for</label><div class="input-suffix"><input class="input" id="backup-retention-days" name="retention_days" type="number" min="1" max="36500" value="28" required><span>days</span></div></div>',
       '<div class="form-field"><label for="backup-media-pool">Tape pool <small>(optional)</small></label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div>',
-      '<div class="form-field"><label for="backup-compression">Compression</label><select class="select" id="backup-compression" name="compression_mode"><option value="auto" selected>Automatic · fast GZIP</option><option value="gzip">GZIP · balanced</option><option value="lzo">LZO · fastest</option><option value="none">None</option></select><small>Automatic explicitly uses fast GZIP for a predictable on-tape format. Already-compressed files may not shrink.</small></div>',
+      '<div class="form-field"><label for="backup-compression">Compression</label><select class="select" id="backup-compression" name="compression_mode"><option value="auto" selected>Automatic · LZO (recommended)</option><option value="gzip">GZIP · balanced</option><option value="lzo">LZO · fastest</option><option value="none">None</option></select><small>Automatic uses LZO to prioritize source throughput and reduce tape starvation. Balanced GZIP may compress more but is substantially slower; already-compressed files may not shrink.</small></div>',
       '<div class="form-field"><label>Archive size</label><label class="check-option backup-span-option"><input type="checkbox" id="backup-media-spanning" name="spanning_enabled" checked> Continue onto additional prepared tapes when this archive fills a cartridge.</label></div>',
-      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · fast GZIP · spans tapes as needed</strong><small>Next, TapeScale shows the tapes prepared now, then requests each additional tape only if the running archive needs it. Automatic rolling snapshots are not enabled yet.</small></div></div></div>',
+      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · LZO · spans tapes as needed</strong><small>Next, TapeScale shows the tapes prepared now, then requests each additional tape only if the running archive needs it. Automatic rolling snapshots are not enabled yet.</small></div></div></div>',
       '</div>',
       '<p class="notice danger" id="backup-profile-error" role="alert" aria-live="assertive" hidden></p>',
       '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Continue to tape</button></div>',

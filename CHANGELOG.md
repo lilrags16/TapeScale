@@ -2,6 +2,21 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.9] - 2026-11-14
+
+### Sustained-transfer visibility and defaults
+
+- New backups using **Automatic** compression now resolve to Bacula LZO instead of GZIP1. Explicit balanced GZIP, LZO, and uncompressed choices remain available and recorded; the codec of an active job cannot be changed in place.
+- Every Bacula job receives an isolated run-scoped spool directory. The live backup page reports that directory's aggregate regular-file occupancy, configured ceiling, fill/drain rate, and file count without exposing a host path or filename.
+- Bacula Storage Daemon running-job evidence now supplies exact JobId-scoped bytes, files, state, average/current throughput, and spooling/despooling flags. The UI keeps that logical engine flow separate from physical SCSI tape counters and no longer presents either metric as a raw ZFS read rate.
+- Running backups identify starting, buffering, streaming, despooling, reading, waiting, idle, and stalled activity. A heartbeat does not count as movement: the page shows the age of the last measured byte/state change and the remaining automatic-cancel window.
+- The transfer watchdog now resets only for measured engine, spool, or tape progress. A configurable 30-minute default replaces the previous 12-hour catalog-only wait; `TAPESCALE_TRANSFER_STALL_TIMEOUT_SECS` accepts 300 through 7,200 seconds.
+
+### Truthful spool behavior
+
+- Operator guidance now describes Bacula's spool as segmented fill-and-drain buffering, not a continuously refilling ring. A 64 GiB segment can take hours to produce when traversal or compression is slow and can then drain to LTO much faster than it refills.
+- Reaching the spool ceiling still continues the same archive and is not an archive-size limit. A larger segment reduces transition frequency but cannot make a producer sustain a tape drive when its long-term throughput is below the drive's minimum streaming rate; the live metrics now expose that condition directly.
+
 ## [0.1.0-alpha.8] - 2026-11-13
 
 ### Visible backup preparation
@@ -133,6 +148,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.9]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.9
 [0.1.0-alpha.8]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.8
 [0.1.0-alpha.7]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.7
 [0.1.0-alpha.6]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.6
