@@ -117,7 +117,18 @@ impl BaculaCompression {
     }
 }
 
-/// Data-plane settings that change the physical representation of a backup.
+/// How Bacula moves file data from the File Daemon to tape.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaculaDataDelivery {
+    /// Stage bounded segments on disk before writing them to tape.
+    #[default]
+    DiskSpool,
+    /// Send the File Daemon stream directly to the Storage Daemon and tape.
+    Direct,
+}
+
+/// Data-plane settings that control delivery and physical representation.
 /// `maximum_volumes = None` deliberately renders Bacula's value `0`, meaning
 /// no configured volume-count ceiling; the finite set of TapeScale-authorized
 /// cartridges remains the safety boundary for each run.
@@ -125,6 +136,7 @@ impl BaculaCompression {
 pub struct BaculaDataOptions {
     pub compression: BaculaCompression,
     pub maximum_volumes: Option<NonZeroU32>,
+    pub delivery: BaculaDataDelivery,
     maximum_spool_size: NonZeroU64,
 }
 
@@ -134,6 +146,7 @@ impl BaculaDataOptions {
         Self {
             compression,
             maximum_volumes: NonZeroU32::new(1),
+            delivery: BaculaDataDelivery::DiskSpool,
             maximum_spool_size: NonZeroU64::new(DEFAULT_DATA_SPOOL_MAX_BYTES)
                 .expect("the fixed spool limit is non-zero"),
         }
@@ -144,9 +157,21 @@ impl BaculaDataOptions {
         Self {
             compression,
             maximum_volumes: None,
+            delivery: BaculaDataDelivery::DiskSpool,
             maximum_spool_size: NonZeroU64::new(DEFAULT_DATA_SPOOL_MAX_BYTES)
                 .expect("the fixed spool limit is non-zero"),
         }
+    }
+
+    #[must_use]
+    pub const fn with_delivery(mut self, delivery: BaculaDataDelivery) -> Self {
+        self.delivery = delivery;
+        self
+    }
+
+    #[must_use]
+    pub const fn data_spooling_enabled(self) -> bool {
+        matches!(self.delivery, BaculaDataDelivery::DiskSpool)
     }
 
     /// Bound Bacula's disk buffer without limiting the backup itself. Once
@@ -692,6 +717,11 @@ impl BaculaConfig {
         let credentials = &self.credentials;
         let pool_name = self.pool_name.as_str();
         let maximum_volumes = self.data_options.rendered_maximum_volumes();
+        let spool_data = if self.data_options.data_spooling_enabled() {
+            "yes"
+        } else {
+            "no"
+        };
         let compression_directive = self
             .data_options
             .compression
@@ -781,10 +811,11 @@ Job {{
   Storage = {STORAGE_NAME}
   Pool = {pool_name}
   Messages = Standard
-  Spool Data = yes
-  # Bacula automatically enables attribute spooling with data spooling. Keep
-  # the effective behavior explicit; the SD Working Directory is deliberately
-  # placed on the same capacity-checked spool filesystem below.
+  # Data delivery is selected explicitly for every run. Direct mode bypasses
+  # the batch data spool while retaining the small catalog-attribute spool.
+  Spool Data = {spool_data}
+  # Keep attribute spooling explicit in both delivery modes so an incomplete
+  # tape job cannot publish catalog entries for data that was never finalized.
   Spool Attributes = yes
   Write Bootstrap = "/var/lib/bacula/bootstrap/%i.bsr"
 }}
@@ -863,6 +894,7 @@ Messages {{
             source_selection = self.paths.source_selection.as_path().display(),
             maximum_volumes = maximum_volumes,
             compression_directive = compression_directive,
+            spool_data = spool_data,
         )
     }
 
@@ -906,6 +938,9 @@ Device {{
   Random Access = no
   Label Media = no
   Maximum File Size = {maximum_tape_file_size}
+  # Keep the local File/Storage stream on Bacula's documented high-throughput
+  # buffer size. Both ends use the same value.
+  Maximum Network Buffer Size = 65536
   Spool Directory = "{data_spool_directory}"
   Maximum Spool Size = {maximum_spool_size}
   Maximum Job Spool Size = {maximum_spool_size}
@@ -945,6 +980,7 @@ FileDaemon {{
   Pid Directory = "/run/bacula"
   Plugin Directory = "/usr/lib/bacula"
   Maximum Concurrent Jobs = 1
+  Maximum Network Buffer Size = 65536
   TLS Enable = no
   TLS Require = yes
   TLS PSK Enable = yes
@@ -2502,6 +2538,41 @@ mod tests {
             BaculaCompression::Lzo
         );
         assert!(BaculaCompression::from_persisted_policy("auto", "none").is_err());
+    }
+
+    #[test]
+    fn renderer_supports_direct_streaming_without_disabling_attribute_spooling() {
+        let options = BaculaDataOptions::spanning(BaculaCompression::Lzo)
+            .with_delivery(BaculaDataDelivery::Direct);
+        assert!(!options.data_spooling_enabled());
+        assert_eq!(
+            serde_json::to_value(options.delivery).expect("delivery JSON"),
+            serde_json::json!("direct")
+        );
+
+        let rendered = config().with_data_options(options).render();
+        assert!(rendered.director.contains("Spool Data = no"));
+        assert!(rendered.director.contains("Spool Attributes = yes"));
+        assert!(rendered
+            .storage_daemon
+            .contains("Maximum Network Buffer Size = 65536"));
+        assert!(rendered
+            .file_daemon
+            .contains("Maximum Network Buffer Size = 65536"));
+        assert!(rendered
+            .storage_daemon
+            .contains("Working Directory = \"/var/lib/tapescale/spool\""));
+        assert!(rendered
+            .storage_daemon
+            .contains("Spool Directory = \"/var/lib/tapescale/spool\""));
+
+        let default_options = BaculaDataOptions::default();
+        assert!(default_options.data_spooling_enabled());
+        assert_eq!(default_options.delivery, BaculaDataDelivery::DiskSpool);
+        assert_eq!(
+            serde_json::to_value(default_options.delivery).expect("delivery JSON"),
+            serde_json::json!("disk_spool")
+        );
     }
 
     #[test]

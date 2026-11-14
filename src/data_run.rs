@@ -50,9 +50,10 @@ use crate::{
         SasProbeResult, SasTapeIoCounters,
     },
     engine::bacula::{
-        BaculaAdapter, BaculaCommands, BaculaCompression, BaculaDataOptions, BaculaJobEvidence,
-        BaculaJobId, BaculaJobResource, BaculaJobState, BaculaPaths, BaculaPoolName,
-        BaculaRestoreSubpath, CorrelatedJobDispatch, DirectBconsoleExecutor, VolumeLabel,
+        BaculaAdapter, BaculaCommands, BaculaCompression, BaculaDataDelivery, BaculaDataOptions,
+        BaculaJobEvidence, BaculaJobId, BaculaJobResource, BaculaJobState, BaculaPaths,
+        BaculaPoolName, BaculaRestoreSubpath, CorrelatedJobDispatch, DirectBconsoleExecutor,
+        VolumeLabel,
     },
     store,
     tool_runner::ToolError,
@@ -443,7 +444,15 @@ fn live_activity(
     }
     if pipeline_rate.is_some_and(|rate| rate > 0) {
         return match phase {
-            store::SingleTapeLiveIoPhase::BackupWrite => Activity::Buffering,
+            store::SingleTapeLiveIoPhase::BackupWrite
+                if running_hints.is_some_and(|hints| hints.spooling == Some(true)) =>
+            {
+                Activity::Buffering
+            }
+            // Job bytes can advance before the kernel tape counter produces a
+            // usable delta. Without spool evidence, call this startup rather
+            // than inventing either disk buffering or physical tape motion.
+            store::SingleTapeLiveIoPhase::BackupWrite => Activity::Starting,
             store::SingleTapeLiveIoPhase::FullReadback => Activity::Reading,
             store::SingleTapeLiveIoPhase::Restore => Activity::Restoring,
         };
@@ -914,19 +923,28 @@ async fn perform_exercise(
                 "worker shutdown was requested before any tape command",
             ));
         }
-        let (spool_limit, spool_capacity) =
-            bacula_spool_capacity(config, source_manifest.artifact())?;
-        let data_options =
-            bacula_data_options(claim)?.with_maximum_spool_size(spool_limit);
+        let mut data_options = bacula_data_options(claim)?;
+        let (spool_limit, spool_capacity) = bacula_delivery_capacity(
+            config,
+            source_manifest.artifact(),
+            data_options.delivery,
+        )?;
+        if let Some(spool_limit) = spool_limit {
+            data_options = data_options.with_maximum_spool_size(spool_limit);
+        }
         transition(
             pool,
             claim,
             store::SingleTapeDataPhase::Writing,
             json!({
-                "detail": if claim.run.spanning_enabled {
-                    "source manifest retained; Bacula will stage data in the disk spool before sustained multi-tape streaming"
+                "detail": if data_options.data_spooling_enabled() && claim.run.spanning_enabled {
+                    "source manifest retained; Bacula will stage bounded segments on disk before writing the authorized tape set"
+                } else if data_options.data_spooling_enabled() {
+                    "source manifest retained; Bacula will stage bounded segments on disk before writing tape"
+                } else if claim.run.spanning_enabled {
+                    "source manifest retained; Bacula will stream continuously from the source through the File and Storage Daemons to the authorized tape set"
                 } else {
-                    "source manifest retained; Bacula will stage data in the disk spool before sustained tape streaming"
+                    "source manifest retained; Bacula will stream continuously from the source through the File and Storage Daemons to tape"
                 },
                 "source_manifest_sha256": source_manifest.artifact().manifest_digest,
                 "file_count": source_manifest.artifact().file_count,
@@ -934,6 +952,7 @@ async fn perform_exercise(
                 "compression_mode": claim.run.compression_mode,
                 "resolved_compression": claim.run.resolved_compression,
                 "spanning_enabled": claim.run.spanning_enabled,
+                "data_delivery": claim.run.data_delivery,
                 "data_spooling": &spool_capacity,
                 "production_eligible": false
             }),
@@ -1074,7 +1093,7 @@ async fn perform_exercise(
             .await
             .map_err(|error| ExerciseFailure::failed(error.to_string()))?,
         );
-        let backup_spool = BaculaSpoolMonitor {
+        let backup_spool = data_options.data_spooling_enabled().then(|| BaculaSpoolMonitor {
             directory: runtime
                 .as_ref()
                 .expect("the Bacula runtime was just started")
@@ -1082,7 +1101,7 @@ async fn perform_exercise(
                 .data_spool_directory
                 .clone(),
             capacity_bytes: data_options.maximum_spool_size_bytes(),
-        };
+        });
 
         let adapter = BaculaAdapter::new(DirectBconsoleExecutor::default());
         // Operational inventory may legitimately run longer than the legacy
@@ -1146,7 +1165,7 @@ async fn perform_exercise(
             store::SingleTapeLiveIoPhase::BackupWrite,
             (claim.run.workflow_kind == "backup").then_some(BaculaMediaPhase::BackupWrite),
             config.transfer_stall_timeout,
-            Some(&backup_spool),
+            backup_spool.as_ref(),
             cancellation,
         )
         .await?;
@@ -1197,15 +1216,20 @@ async fn perform_exercise(
                 "resolved": claim.run.resolved_compression
             },
             "spanning_enabled": claim.run.spanning_enabled,
+            "data_delivery": claim.run.data_delivery,
             "data_spooling": {
-                "enabled": true,
-                "directory": config.bacula_spool_dir.display().to_string(),
-                "maximum_bytes": data_options.maximum_spool_size_bytes(),
-                "purpose": "disk buffer for sustained tape streaming; this does not limit archive size"
+                "enabled": data_options.data_spooling_enabled(),
+                "directory": runtime.as_ref().expect("runtime is active").evidence().data_spool_directory,
+                "maximum_bytes": if data_options.data_spooling_enabled() { data_options.maximum_spool_size_bytes() } else { 0 },
+                "purpose": if data_options.data_spooling_enabled() {
+                    "bounded disk staging; Bacula fills and drains segments and this does not limit archive size"
+                } else {
+                    "disabled; the processed source stream is delivered continuously to tape"
+                }
             },
             "attribute_spooling": {
                 "enabled": true,
-                "directory": config.bacula_spool_dir.display().to_string(),
+                "directory": runtime.as_ref().expect("runtime is active").evidence().attribute_spool_directory,
                 "capacity_policy": "estimated per-entry and manifest allowance plus configured filesystem reserve"
             },
             "tape_file_boundaries": {
@@ -1241,7 +1265,8 @@ async fn perform_exercise(
                 "job_bytes": backup.bytes,
                 "volume_bytes": backup_catalog.volumes.iter().map(|volume| volume.volume_bytes).sum::<u64>(),
                 "compression": claim.run.resolved_compression,
-                "spanning_enabled": claim.run.spanning_enabled
+                "spanning_enabled": claim.run.spanning_enabled,
+                "data_delivery": claim.run.data_delivery
             }),
         )
         .await?;
@@ -1801,6 +1826,7 @@ async fn complete_backup(
             "requested": claim.run.compression_mode,
             "resolved": claim.run.resolved_compression
         },
+        "data_delivery": claim.run.data_delivery,
         "media": {
             "spanning_enabled": claim.run.spanning_enabled,
             "volume_count": volume_count,
@@ -3052,22 +3078,32 @@ fn bacula_data_options(
             "the persisted backup compression decision is not executable: {error}"
         ))
     })?;
+    let delivery = match claim.run.data_delivery.as_str() {
+        "direct" => BaculaDataDelivery::Direct,
+        "disk_spool" => BaculaDataDelivery::DiskSpool,
+        value => {
+            return Err(ExerciseFailure::blocked(format!(
+                "the persisted backup data delivery mode {value:?} is not executable"
+            )))
+        }
+    };
     Ok(if claim.run.spanning_enabled {
         BaculaDataOptions::spanning(compression)
     } else {
         BaculaDataOptions::single_volume(compression)
-    })
+    }
+    .with_delivery(delivery))
 }
 
-/// Select a run-scoped spool ceiling from the configured policy and the
-/// filesystem's current free space. Keeping a reserve prevents the data spool
-/// from exhausting its filesystem. The ceiling is a buffer size, not an
-/// archive-size limit: Bacula despools a full buffer and continues the same
-/// job.
-fn bacula_spool_capacity(
+/// Validate the run-scoped Storage Daemon working directory and select the
+/// optional data-spool ceiling. Direct delivery retains only Bacula's small
+/// attribute spool, so it deliberately bypasses the configured minimum data
+/// spool while still reserving capacity for attributes and the filesystem.
+fn bacula_delivery_capacity(
     config: &Config,
     manifest: &ManifestArtifactSummary,
-) -> Result<(NonZeroU64, Value), ExerciseFailure> {
+    delivery: BaculaDataDelivery,
+) -> Result<(Option<NonZeroU64>, Value), ExerciseFailure> {
     let metadata = fs::symlink_metadata(&config.bacula_spool_dir).map_err(|error| {
         ExerciseFailure::blocked(format!(
             "the Bacula spool directory {} is unavailable: {error}",
@@ -3128,6 +3164,43 @@ fn bacula_spool_capacity(
         .bacula_spool_reserve_bytes
         .checked_add(attribute_spool_reserve_bytes)
         .ok_or_else(|| ExerciseFailure::blocked("the combined Bacula spool reserve overflowed"))?;
+    if delivery == BaculaDataDelivery::Direct {
+        if available_bytes < total_reserved_bytes {
+            return Err(ExerciseFailure::blocked(format!(
+                "Bacula direct delivery still needs {} attribute-spool bytes plus a {} byte filesystem reserve, but {} has only {} bytes available",
+                attribute_spool_reserve_bytes,
+                config.bacula_spool_reserve_bytes,
+                config.bacula_spool_dir.display(),
+                available_bytes
+            )));
+        }
+        return Ok((
+            None,
+            json!({
+                "enabled": false,
+                "mode": "direct",
+                "directory": config.bacula_spool_dir.display().to_string(),
+                "filesystem_bytes": filesystem_bytes,
+                "available_bytes_at_preflight": available_bytes,
+                "configured_filesystem_reserve_bytes": config.bacula_spool_reserve_bytes,
+                "estimated_attribute_spool_reserve_bytes": attribute_spool_reserve_bytes,
+                "total_reserved_bytes": total_reserved_bytes,
+                "effective_maximum_bytes": 0,
+                "minimum_required_bytes": 0,
+                "archive_size_limited": false,
+                "behavior": "continuous_file_daemon_to_storage_daemon_to_tape",
+                "attribute_spooling_enabled": true,
+                "attribute_spool_estimate": {
+                    "manifest_entries": manifest.entry_count,
+                    "manifest_size_bytes": manifest.size_bytes,
+                    "bytes_per_entry": ATTRIBUTE_SPOOL_BYTES_PER_ENTRY,
+                    "manifest_multiplier": ATTRIBUTE_SPOOL_MANIFEST_MULTIPLIER,
+                    "base_bytes": ATTRIBUTE_SPOOL_BASE_BYTES
+                },
+                "storage_daemon_working_directory": config.bacula_spool_dir.display().to_string()
+            }),
+        ));
+    }
     let Some(limit) = effective_spool_limit(
         available_bytes,
         total_reserved_bytes,
@@ -3145,9 +3218,10 @@ fn bacula_spool_capacity(
     };
     let effective_maximum_bytes = limit.get();
     Ok((
-        limit,
+        Some(limit),
         json!({
             "enabled": true,
+            "mode": "disk_spool",
             "directory": config.bacula_spool_dir.display().to_string(),
             "filesystem_bytes": filesystem_bytes,
             "available_bytes_at_preflight": available_bytes,
@@ -3699,6 +3773,47 @@ fn concise_text(value: &str, limit: usize) -> String {
 mod tests {
     use super::*;
 
+    fn capacity_test_config(spool_directory: &Path) -> Config {
+        Config {
+            bind: "127.0.0.1:0".parse().expect("test bind"),
+            database_url: None,
+            demo_mode: false,
+            web_dir: PathBuf::from("web"),
+            database_connect_timeout: Duration::from_secs(1),
+            worker_poll_interval: Duration::from_secs(1),
+            lab_tape_motion_enabled: true,
+            lab_tape_qualification_enabled: true,
+            lab_file_roundtrip_enabled: true,
+            btape_path: PathBuf::from("/usr/sbin/btape"),
+            bconsole_path: PathBuf::from("/usr/sbin/bconsole"),
+            bacula_state_dir: PathBuf::from("/var/lib/tapescale/bacula"),
+            qualification_timeout: Duration::from_secs(60),
+            source_root: PathBuf::from("/source"),
+            restore_root: PathBuf::from("/restore"),
+            evidence_root: PathBuf::from("/var/lib/tapescale/recovery"),
+            data_run_timeout: Duration::from_secs(300),
+            transfer_stall_timeout: Duration::from_secs(300),
+            bacula_spool_dir: spool_directory.to_owned(),
+            bacula_spool_max_bytes: u64::MAX,
+            bacula_spool_reserve_bytes: 0,
+            bacula_spool_min_bytes: u64::MAX,
+        }
+    }
+
+    fn capacity_test_manifest(spool_directory: &Path) -> ManifestArtifactSummary {
+        ManifestArtifactSummary {
+            storage_path: spool_directory.join("manifest.json"),
+            artifact_sha256: "a".repeat(64),
+            size_bytes: 0,
+            manifest_digest: "b".repeat(64),
+            source_stability_digest_sha256: "c".repeat(64),
+            entry_count: 0,
+            file_count: 0,
+            logical_bytes: 0,
+            coverage: crate::data_path::ManifestCoverage::default(),
+        }
+    }
+
     #[test]
     fn label_validation_rejects_existing_media_and_sql_failures() {
         for output in [
@@ -4158,6 +4273,44 @@ mod tests {
     }
 
     #[test]
+    fn direct_pipeline_progress_never_claims_disk_buffering() {
+        let timeout = Duration::from_secs(300);
+        assert_eq!(
+            live_activity(
+                store::SingleTapeLiveIoPhase::BackupWrite,
+                BaculaJobState::Running,
+                Some(128 * 1024 * 1024),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Duration::ZERO,
+                timeout,
+            ),
+            store::SingleTapeLiveActivity::Starting
+        );
+        assert_eq!(
+            live_activity(
+                store::SingleTapeLiveIoPhase::BackupWrite,
+                BaculaJobState::Running,
+                Some(128 * 1024 * 1024),
+                None,
+                None,
+                None,
+                None,
+                Some(BaculaRunningHints {
+                    spooling: Some(true),
+                    ..BaculaRunningHints::default()
+                }),
+                Duration::ZERO,
+                timeout,
+            ),
+            store::SingleTapeLiveActivity::Buffering
+        );
+    }
+
+    #[test]
     fn spool_usage_is_path_free_and_rejects_non_files() {
         let directory = tempfile::tempdir().expect("spool");
         fs::write(directory.path().join("data.spool"), vec![0_u8; 17]).expect("data spool");
@@ -4198,6 +4351,32 @@ mod tests {
             40 * gib
         );
         assert!(effective_spool_limit(15 * gib, 8 * gib, 64 * gib, 8 * gib).is_none());
+    }
+
+    #[test]
+    fn direct_delivery_bypasses_only_the_data_spool_minimum() {
+        let spool = tempfile::tempdir().expect("spool");
+        let manifest = capacity_test_manifest(spool.path());
+        let mut config = capacity_test_config(spool.path());
+
+        let (limit, evidence) =
+            bacula_delivery_capacity(&config, &manifest, BaculaDataDelivery::Direct)
+                .expect("direct delivery should not require the configured data-spool minimum");
+        assert_eq!(limit, None);
+        assert_eq!(evidence["enabled"], false);
+        assert_eq!(evidence["mode"], "direct");
+        assert_eq!(evidence["effective_maximum_bytes"], 0);
+        assert!(
+            bacula_delivery_capacity(&config, &manifest, BaculaDataDelivery::DiskSpool).is_err(),
+            "the same impossible data minimum must still block disk staging"
+        );
+
+        let status = statvfs(spool.path()).expect("spool filesystem capacity");
+        config.bacula_spool_reserve_bytes = status.f_bavail.saturating_mul(status.f_frsize);
+        let failure = bacula_delivery_capacity(&config, &manifest, BaculaDataDelivery::Direct)
+            .expect_err("direct delivery must retain the attribute and filesystem reserve");
+        assert!(failure.detail.contains("attribute-spool bytes"));
+        assert!(failure.detail.contains("filesystem reserve"));
     }
 
     #[test]

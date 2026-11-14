@@ -6,7 +6,8 @@
 # This alpha stack exposes status, rewind, unload, an attended Bacula btape
 # qualification run with a guided tape-initialization flow, an attended Backup
 # Center with graphical source browsing, operator-attended multi-cartridge
-# full-file writes, selectable Bacula compression, physical readback, retained
+# full-file writes, selectable Bacula compression and direct/disk-staged
+# delivery, physical readback, retained
 # manifest browsing, the narrower G0.2 recovery exercise,
 # recovery evidence/planning, attended multi-volume complete-point or
 # single-volume selected-path read-only verified-point rehearsal,
@@ -24,11 +25,11 @@ name: tapescale
 
 x-tapescale-common: &tapescale-common
   build:
-    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-alpha.9
+    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-alpha.10
     args:
-      TAPESCALE_VERSION: 0.1.0-alpha.9
-      TAPESCALE_REVISION: v0.1.0-alpha.9
-  image: tapescale:0.1.0-alpha.9
+      TAPESCALE_VERSION: 0.1.0-alpha.10
+      TAPESCALE_REVISION: v0.1.0-alpha.10
+  image: tapescale:0.1.0-alpha.10
   pull_policy: build
   restart: unless-stopped
   read_only: true

@@ -212,7 +212,24 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(manual_profile.verification_mode, "full_readback");
     assert_eq!(manual_profile.compression_mode, "auto");
     assert!(manual_profile.spanning_enabled);
+    assert_eq!(manual_profile.data_delivery, "direct");
     assert!(!manual_profile.production_eligible);
+
+    let invalid_delivery_source = create_source_profile(
+        &pool,
+        "Invalid delivery integration",
+        "invalid-delivery-source",
+    )
+    .await;
+    let mut invalid_delivery = NewBackupProfile::attended_full_file(invalid_delivery_source.id);
+    invalid_delivery.data_delivery = "ram_ring".to_owned();
+    let invalid_delivery = backup_ops::create_backup_profile(&pool, &invalid_delivery)
+        .await
+        .expect_err("an invented data delivery mode must fail closed");
+    assert!(matches!(
+        invalid_delivery,
+        backup_ops::BackupOpsError::Invalid(_)
+    ));
 
     let empty_pool_id = Uuid::now_v7();
     sqlx::query(
@@ -227,10 +244,12 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         create_source_profile(&pool, "Empty pool backup integration", "empty-pool-source").await;
     let mut empty_pool_request = NewBackupProfile::attended_full_file(empty_pool_source.id);
     empty_pool_request.media_pool_id = Some(empty_pool_id);
+    empty_pool_request.data_delivery = "disk_spool".to_owned();
     empty_pool_request.actor_label = "Backup integration operator".to_owned();
     let empty_pool_profile = backup_ops::create_backup_profile(&pool, &empty_pool_request)
         .await
         .expect("fixed-pool backup profile should persist");
+    assert_eq!(empty_pool_profile.data_delivery, "disk_spool");
     let empty_pool_readiness = store::backup_media_readiness(&pool, empty_pool_profile.id, None)
         .await
         .expect("fixed-pool readiness should be queryable");
@@ -615,6 +634,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     let QueueSingleTapeDataRunResult::Queued(continuation_run) = continuation_run else {
         panic!("the spanning integration run should queue");
     };
+    assert_eq!(continuation_run.data_delivery, "direct");
     let continuation_claim = store::claim_next_single_tape_data_run(&pool, Uuid::now_v7())
         .await
         .expect("spanning integration run should be claimable");
@@ -1196,6 +1216,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(assignment.compression_mode, "auto");
     assert_eq!(assignment.resolved_compression, "lzo");
     assert!(assignment.spanning_enabled);
+    assert_eq!(assignment.data_delivery, "direct");
     let assignment_volumes = store::data_run_volumes(&pool, assignment.id)
         .await
         .expect("the ordered initial tape assignment should reload");
@@ -1392,6 +1413,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     let QueueSingleTapeDataRunResult::Queued(final_run) = final_run else {
         panic!("the finalization fixture should queue");
     };
+    assert_eq!(final_run.data_delivery, "direct");
     let claimed = store::claim_next_single_tape_data_run(&pool, Uuid::now_v7())
         .await
         .expect("backup worker claim should succeed");

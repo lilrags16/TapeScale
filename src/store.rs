@@ -915,6 +915,7 @@ pub struct SingleTapeDataRunRecord {
     pub compression_mode: String,
     pub resolved_compression: String,
     pub spanning_enabled: bool,
+    pub data_delivery: String,
     pub cancel_requested_at: Option<DateTime<Utc>>,
     pub cancel_requested_by_label: Option<String>,
     pub state: String,
@@ -3486,6 +3487,7 @@ const SINGLE_TAPE_DATA_RUN_SELECT: &str = "SELECT id, profile_id, job_run_id,
             media_write_started, media_write_started_at,
             workflow_kind, trigger_kind, requested_level, scheduled_occurrence,
             retention_days, compression_mode, resolved_compression, spanning_enabled,
+            data_delivery,
             cancel_requested_at, cancel_requested_by_label,
             state, requested_by_label, correlation_id,
             drive_lease_id, drive_fencing_token, media_lease_id, media_fencing_token,
@@ -5118,21 +5120,21 @@ async fn queue_single_tape_data_run_inner(
     };
 
     let is_backup = backup_request.is_some();
-    let (compression_mode, resolved_compression, spanning_enabled) = if is_backup {
+    let (compression_mode, resolved_compression, spanning_enabled, data_delivery) = if is_backup {
         let Some(policy_id) = profile.policy_id else {
             transaction.rollback().await?;
             return Ok(QueueSingleTapeDataRunResult::Blocked(
                 "the backup profile has no protection policy".to_owned(),
             ));
         };
-        let settings = sqlx::query_as::<_, (String, bool)>(
-            "SELECT compression_mode, spanning_enabled
+        let settings = sqlx::query_as::<_, (String, bool, String)>(
+            "SELECT compression_mode, spanning_enabled, data_delivery
                FROM protection_policies WHERE id = $1 FOR SHARE",
         )
         .bind(policy_id)
         .fetch_optional(&mut *transaction)
         .await?;
-        let Some((requested, spanning)) = settings else {
+        let Some((requested, spanning, data_delivery)) = settings else {
             transaction.rollback().await?;
             return Ok(QueueSingleTapeDataRunResult::Blocked(
                 "the backup protection policy is unavailable".to_owned(),
@@ -5150,9 +5152,20 @@ async fn queue_single_tape_data_run_inner(
                 ));
             }
         };
-        (requested, resolved.to_owned(), spanning)
+        if !matches!(data_delivery.as_str(), "direct" | "disk_spool") {
+            transaction.rollback().await?;
+            return Ok(QueueSingleTapeDataRunResult::Blocked(
+                "the configured data delivery mode is unsupported".to_owned(),
+            ));
+        }
+        (requested, resolved.to_owned(), spanning, data_delivery)
     } else {
-        ("none".to_owned(), "none".to_owned(), false)
+        (
+            "none".to_owned(),
+            "none".to_owned(),
+            false,
+            "disk_spool".to_owned(),
+        )
     };
     if let Some(request) = &backup_request {
         let valid_request = sqlx::query_scalar::<_, bool>(
@@ -5356,12 +5369,12 @@ async fn queue_single_tape_data_run_inner(
              scratch_media_confirmed, destructive_overwrite_confirmed,
              encryption_deviation_confirmed, workflow_kind, trigger_kind,
              requested_level, scheduled_occurrence, retention_days,
-             compression_mode, resolved_compression, spanning_enabled,
+             compression_mode, resolved_compression, spanning_enabled, data_delivery,
              requested_by_label, correlation_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                  $11, $12, $13, $14, $15, $16, $17, $18, $19,
                  $20, $21, $22, $23, $24, $25, $26, $27, $28,
-                 'full', $29, $30, $31, $32, $33, 'local-api', $34)",
+                 'full', $29, $30, $31, $32, $33, $34, 'local-api', $35)",
     )
     .bind(id)
     .bind(profile_id)
@@ -5396,6 +5409,7 @@ async fn queue_single_tape_data_run_inner(
     .bind(&compression_mode)
     .bind(&resolved_compression)
     .bind(spanning_enabled)
+    .bind(&data_delivery)
     .bind(correlation_id)
     .execute(&mut *transaction)
     .await?;
@@ -5512,6 +5526,7 @@ async fn queue_single_tape_data_run_inner(
             "compression_mode": &compression_mode,
             "resolved_compression": &resolved_compression,
             "spanning_enabled": spanning_enabled,
+            "data_delivery": &data_delivery,
             "workflow_kind": &workflow_kind,
             "trigger_kind": &trigger_kind,
             "scheduled_occurrence": &scheduled_occurrence,
@@ -7834,6 +7849,7 @@ pub async fn finalize_single_tape_backup_pass(
         "limitations": limitations,
         "volume_count": finalized_volumes.len(),
         "spanning_enabled": claim.run.spanning_enabled,
+        "data_delivery": claim.run.data_delivery,
         "compression": {
             "requested": claim.run.compression_mode,
             "resolved": claim.run.resolved_compression
@@ -7965,6 +7981,7 @@ pub async fn finalize_single_tape_backup_pass(
         "media_ids": media_ids,
         "volumes": ordered_volume_evidence,
         "spanning_enabled": claim.run.spanning_enabled,
+        "data_delivery": claim.run.data_delivery,
         "compression": {
             "requested": claim.run.compression_mode,
             "resolved": claim.run.resolved_compression

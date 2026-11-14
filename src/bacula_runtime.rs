@@ -28,9 +28,10 @@ use uuid::Uuid;
 
 use crate::{
     engine::bacula::{
-        BaculaConfig, BaculaCredentials, BaculaDaemon, BaculaDataOptions, BaculaEndpoints,
-        BaculaPaths, BaculaPoolName, RenderedBaculaConfigs, BCONSOLE_CONFIG, DATA_SPOOL_DIRECTORY,
-        DIRECTOR_CONFIG, FILE_DAEMON_CONFIG, MAXIMUM_TAPE_FILE_BYTES, STORAGE_DAEMON_CONFIG,
+        BaculaConfig, BaculaCredentials, BaculaDaemon, BaculaDataDelivery, BaculaDataOptions,
+        BaculaEndpoints, BaculaPaths, BaculaPoolName, RenderedBaculaConfigs, BCONSOLE_CONFIG,
+        DATA_SPOOL_DIRECTORY, DIRECTOR_CONFIG, FILE_DAEMON_CONFIG, MAXIMUM_TAPE_FILE_BYTES,
+        STORAGE_DAEMON_CONFIG,
     },
     tool_runner::{self, ToolCommand},
 };
@@ -165,6 +166,7 @@ pub struct BaculaRuntimeEvidence {
     pub bconsole_config_sha256: String,
     pub daemon_logs: Vec<PathBuf>,
     pub catalog_schema_version: i32,
+    pub backup_data_delivery: BaculaDataDelivery,
     pub backup_data_spooling_enabled: bool,
     pub data_spool_directory: PathBuf,
     pub maximum_backup_data_spool_bytes: u64,
@@ -263,9 +265,10 @@ impl BaculaRuntime {
         .render();
         let mut evidence = write_configs(&rendered)?;
         evidence.catalog_schema_version = catalog_schema_version;
-        evidence.backup_data_spooling_enabled = true;
+        evidence.backup_data_delivery = data_options.delivery;
+        evidence.backup_data_spooling_enabled = data_options.data_spooling_enabled();
         evidence.data_spool_directory = run_spool_directory.clone();
-        evidence.maximum_backup_data_spool_bytes = data_options.maximum_spool_size_bytes();
+        evidence.maximum_backup_data_spool_bytes = runtime_data_spool_limit(data_options);
         evidence.backup_attribute_spooling_enabled = true;
         evidence.attribute_spool_directory = run_spool_directory;
         evidence.maximum_tape_file_bytes = MAXIMUM_TAPE_FILE_BYTES;
@@ -299,6 +302,14 @@ impl BaculaRuntime {
         stop_daemons(&mut self.daemons).await;
         remove_empty_run_spool_directory(&self.evidence.data_spool_directory);
         self.evidence
+    }
+}
+
+const fn runtime_data_spool_limit(options: BaculaDataOptions) -> u64 {
+    if options.data_spooling_enabled() {
+        options.maximum_spool_size_bytes()
+    } else {
+        0
     }
 }
 
@@ -566,6 +577,7 @@ fn write_configs(
         bconsole_config_sha256: digest(rendered.bconsole.as_bytes()),
         daemon_logs: Vec::new(),
         catalog_schema_version: 0,
+        backup_data_delivery: BaculaDataDelivery::DiskSpool,
         backup_data_spooling_enabled: false,
         data_spool_directory: PathBuf::new(),
         maximum_backup_data_spool_bytes: 0,
@@ -807,5 +819,18 @@ mod tests {
     fn rejects_a_schema_heredoc_without_the_pinned_version_declaration() {
         let script = "#!/bin/sh\npsql -f - <<END-OF-DATA\nBEGIN;\nCREATE TABLE other (id integer);\nINSERT INTO Version (VersionId) VALUES (1026);\nCOMMIT;\nEND-OF-DATA\n";
         assert!(extract_catalog_schema_sql(script).is_none());
+    }
+
+    #[test]
+    fn direct_delivery_records_no_data_spool_capacity() {
+        let direct = BaculaDataOptions::spanning(crate::engine::bacula::BaculaCompression::Lzo)
+            .with_delivery(BaculaDataDelivery::Direct);
+        assert_eq!(runtime_data_spool_limit(direct), 0);
+
+        let spooled = BaculaDataOptions::spanning(crate::engine::bacula::BaculaCompression::Lzo);
+        assert_eq!(
+            runtime_data_spool_limit(spooled),
+            spooled.maximum_spool_size_bytes()
+        );
     }
 }

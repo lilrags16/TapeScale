@@ -37,7 +37,7 @@
   const RECOVERY_TERMINAL_STATES = new Set(["passed", "verified", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
   const BACKUP_PHASES = [
     { name: "Confirm first tape", detail: "Choose the first archive volume", aliases: ["waiting_for_media"] },
-    { name: "Preflight", detail: "Validate source, catalog, drive, tape, and spool", aliases: ["queued", "media_assigned", "preparing"] },
+    { name: "Preflight", detail: "Validate source, catalog, drive, tape, and delivery path", aliases: ["queued", "media_assigned", "preparing"] },
     { name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: ["inventorying", "manifesting", "source_manifest"] },
     { name: "Write archive", detail: "Copy across tapes as needed", aliases: ["writing", "media_write_started", "engine_dispatched", "waiting_for_next_media", "next_media", "media_required"] },
     { name: "Close archive", detail: "Finish the complete backup set", aliases: ["written", "finalizing"] },
@@ -551,6 +551,26 @@
     return mode === "none" ? "No compression" : "LZO (fastest)";
   }
 
+  function backupDataDeliveryExplicit(source) {
+    const profile = source && pick(source, "profile_id", "backup_profile_id") ? backupProfileForRun(source) : null;
+    return pick(source, "data_delivery") || backupEvidenceValue(source, "data_delivery") || pick(profile, "data_delivery");
+  }
+
+  function backupDataDelivery(source) {
+    return String(backupDataDeliveryExplicit(source) || "disk_spool").toLowerCase();
+  }
+
+  function backupDataDeliverySupported(source) {
+    return ["direct", "disk_spool"].includes(backupDataDelivery(source));
+  }
+
+  function backupDataDeliveryLabel(source) {
+    const mode = backupDataDelivery(source);
+    if (!backupDataDeliverySupported(source)) return "Unsupported (" + mode + ")";
+    if (mode === "direct") return "Continuous streaming";
+    return backupDataDeliveryExplicit(source) ? "Disk staged" : "Disk staged (legacy)";
+  }
+
   function backupSpanningEnabled(source) {
     const profile = source && pick(source, "profile_id", "backup_profile_id") ? backupProfileForRun(source) : null;
     const explicit = pick(source, "spanning_enabled", "allow_media_spanning", "multi_volume") ?? pick(profile, "spanning_enabled", "allow_media_spanning", "multi_volume");
@@ -777,12 +797,12 @@
     return "starting";
   }
 
-  function backupLiveActivityLabel(activity, livePhase) {
+  function backupLiveActivityLabel(activity, livePhase, directDelivery) {
     const labels = {
       starting: "Starting the data pipeline",
-      buffering: "Filling the disk buffer",
-      streaming: "Streaming buffered data to tape",
-      despooling: "Draining the disk buffer to tape",
+      buffering: directDelivery ? "Starting the tape stream" : "Filling the disk buffer",
+      streaming: directDelivery ? "Streaming directly to tape" : "Streaming staged data to tape",
+      despooling: directDelivery ? "Streaming directly to tape" : "Draining the disk buffer to tape",
       idle: "No data movement",
       stalled: "Transfer stalled",
       waiting: "Waiting for the backup engine",
@@ -825,7 +845,7 @@
       const preflight = runState === "preparing";
       const heading = preflight ? "Validating backup inputs" : "Starting source inventory";
       const detail = preflight
-        ? "Checking the immutable snapshot, Bacula catalog, drive, tape, and disk spool before the source scan begins. Tape writing has not started."
+        ? "Checking the immutable snapshot, Bacula catalog, drive, tape, and selected delivery path before the source scan begins. Tape writing has not started."
         : "Waiting for the worker's first source-scan sample. Tape writing has not started.";
       return '<section class="backup-live-io backup-preparation measuring" role="status"><div class="backup-live-io-head"><div><span>Backup preparation</span><h3>' + esc(heading) + '</h3></div><strong>' + (preflight ? "Preflight" : "Starting…") + '</strong></div><p>' + esc(detail) + "</p></section>";
     }
@@ -907,6 +927,7 @@
     const tapeBasis = pick(liveIo, "tape_basis", "tape_counters_basis", "basis");
     const spoolBasis = pick(liveIo, "spool_basis");
     const livePhase = String(pick(liveIo, "phase") || runState).toLowerCase();
+    const directDelivery = backupDataDelivery(run) === "direct";
     const activity = backupLiveActivity(liveIo, livePhase);
     const backupPipeline = ["backup_write", "tape_write", "writing", "spooling"].includes(livePhase);
     const pipelineLabel = backupPipeline
@@ -934,7 +955,7 @@
     const spoolBytes = spoolBytesValue === null ? Number.NaN : Number(spoolBytesValue);
     const spoolCapacity = spoolCapacityValue === null ? Number.NaN : Number(spoolCapacityValue);
     const spoolFiles = spoolFilesValue === null ? Number.NaN : Number(spoolFilesValue);
-    const spoolMeasured = Boolean(spoolBasis) || Number.isFinite(spoolBytes) || Number.isFinite(spoolCapacity);
+    const spoolMeasured = !directDelivery && (Boolean(spoolBasis) || Number.isFinite(spoolBytes) || Number.isFinite(spoolCapacity));
     const occupancy = Number.isFinite(spoolBytes) && Number.isFinite(spoolCapacity) && spoolBytes >= 0 && spoolCapacity > 0
       ? Math.min(100, spoolBytes / spoolCapacity * 100)
       : Number.NaN;
@@ -965,11 +986,11 @@
       : "";
     const activityDetail = {
       starting: "The worker is connected and waiting for the first measured byte movement.",
-      buffering: "Source data is moving into the temporary disk buffer. Tape can remain idle until Bacula drains a buffered segment.",
+      buffering: directDelivery ? "Bacula is starting the continuous source-to-tape stream; no disk data spool is in this path." : "Source data is moving into the temporary disk buffer. Tape can remain idle until Bacula drains a buffered segment.",
       streaming: "The physical tape-write counter is advancing.",
-      despooling: "The temporary disk buffer is shrinking as Bacula sends its contents to tape.",
-      idle: "The worker is responding, but no measured disk-buffer, logical, or tape bytes have moved for " + idleLabel + ". This heartbeat is not counted as progress." + safety,
-      stalled: "No measured disk-buffer, logical, or tape bytes have moved for " + idleLabel + "." + safety,
+      despooling: directDelivery ? "The physical tape-write path is active without a disk data spool." : "The temporary disk buffer is shrinking as Bacula sends its contents to tape.",
+      idle: "The worker is responding, but no measured " + (directDelivery ? "logical or tape" : "disk-buffer, logical, or tape") + " bytes have moved for " + idleLabel + ". This heartbeat is not counted as progress." + safety,
+      stalled: "No measured " + (directDelivery ? "logical or tape" : "disk-buffer, logical, or tape") + " bytes have moved for " + idleLabel + "." + safety,
       waiting: "Bacula is waiting for an engine resource; no transfer is being claimed as active." + safety,
       reading: "The physical tape-read counter is advancing.",
       restoring: "Recovered bytes are moving through the restore pipeline."
@@ -987,22 +1008,25 @@
     }[activity] || "Updated";
     const basis = [
       pipelineBasis ? "Engine progress: " + human(pipelineBasis) : null,
-      spoolBasis ? "Disk buffer: " + human(spoolBasis) : null,
+      !directDelivery && spoolBasis ? "Disk buffer: " + human(spoolBasis) : null,
       tapeBasis ? "Physical tape I/O: " + human(tapeBasis) : tapeCountersAvailable === false ? "Physical tape counters unavailable on this host or drive" : "Physical tape counters measuring",
       pick(liveIo, "engine_state") ? "Bacula: " + human(pick(liveIo, "engine_state")) : null
     ].filter(Boolean).join(" · ");
-    return '<section class="backup-live-io activity-' + esc(activity) + '" role="status"><div class="backup-live-io-head"><div><span>Live transfer</span><h3>' + esc(backupLiveActivityLabel(activity, livePhase)) + '</h3></div><strong>' + esc(activityBadge) + ' · ' + esc(date(sampledAt)) + '</strong></div><div class="backup-live-rate-grid backup-transfer-grid">' + spoolCards + '<div><span>' + esc(pipelineLabel) + '</span><strong>' + esc(rate(pipelineRate, true)) + '</strong><small>' + esc(pipelineDetail) + '</small></div><div><span>Tape write</span><strong>' + esc(rate(tapeWriteRate, tapeWriteAvailable)) + '</strong></div><div><span>Tape read</span><strong>' + esc(rate(tapeReadRate, tapeReadAvailable)) + '</strong></div></div><p class="backup-live-activity-detail">' + esc(activityDetail || "The worker is reporting a current transfer sample.") + '</p><p>' + esc(windowLabel + (basis ? " · " + basis : "")) + "</p></section>";
+    return '<section class="backup-live-io activity-' + esc(activity) + '" role="status"><div class="backup-live-io-head"><div><span>Live transfer</span><h3>' + esc(backupLiveActivityLabel(activity, livePhase, directDelivery)) + '</h3></div><strong>' + esc(activityBadge) + ' · ' + esc(date(sampledAt)) + '</strong></div><div class="backup-live-rate-grid backup-transfer-grid">' + spoolCards + '<div><span>' + esc(pipelineLabel) + '</span><strong>' + esc(rate(pipelineRate, true)) + '</strong><small>' + esc(pipelineDetail) + '</small></div><div><span>Tape write</span><strong>' + esc(rate(tapeWriteRate, tapeWriteAvailable)) + '</strong></div><div><span>Tape read</span><strong>' + esc(rate(tapeReadRate, tapeReadAvailable)) + '</strong></div></div><p class="backup-live-activity-detail">' + esc(activityDetail || "The worker is reporting a current transfer sample.") + '</p><p>' + esc(windowLabel + (basis ? " · " + basis : "")) + "</p></section>";
   }
 
   function renderBackupSpoolingCue(run) {
     if (backupRunState(run) !== "writing") return "";
+    if (backupDataDelivery(run) === "direct") {
+      return '<div class="notice info backup-spooling-cue"><span class="notice-icon" aria-hidden="true">→</span><div class="notice-copy"><strong>Continuous tape delivery</strong><span>Bacula is sending the processed stream directly to tape; no disk data spool is in this path. The tape can still pause if sustained source or compression throughput falls below the drive minimum.</span></div></div>';
+    }
     const spooling = backupEvidenceValue(run, "data_spooling");
     const details = spooling && typeof spooling === "object" && !Array.isArray(spooling) ? spooling : {};
     const effectiveMaximum = Number(pick(details, "effective_maximum_bytes", "maximum_bytes"));
     const limit = Number.isFinite(effectiveMaximum) && effectiveMaximum > 0
       ? " Effective disk-buffer maximum for this run: " + bytes(effectiveMaximum) + "."
       : "";
-    return '<div class="notice info backup-spooling-cue"><span class="notice-icon" aria-hidden="true">⇄</span><div class="notice-copy"><strong>Measured disk buffering protects the tape stream</strong><span>Bacula fills and drains a bounded disk buffer in segments.' + esc(limit) + ' The tape can pause between segments when the source cannot refill at drive speed; the live panel reports the actual buffer and tape activity. This buffer does not limit the total archive size.</span></div></div>';
+    return '<div class="notice info backup-spooling-cue"><span class="notice-icon" aria-hidden="true">⇄</span><div class="notice-copy"><strong>Disk-staged tape delivery</strong><span>Bacula fills and drains a bounded disk spool in segments.' + esc(limit) + ' The tape can pause between segments when the source cannot refill at drive speed; the live panel reports the actual spool and tape activity. This staging space does not limit the total archive size.</span></div></div>';
   }
 
   function backupPhaseIndex(run) {
@@ -1109,12 +1133,13 @@
       const retention = count(pick(profile, "retention_days")) || 28;
       const pool = pick(profile, "media_pool_name") || "any eligible scratch pool";
       const compressionSupported = backupCompressionSupported(profile);
-      const archivePolicy = backupCompressionLabel(profile) + " · " + (backupSpanningEnabled(profile) ? "spans tapes as needed" : "one tape maximum");
+      const deliverySupported = backupDataDeliverySupported(profile);
+      const archivePolicy = backupCompressionLabel(profile) + " · " + backupDataDeliveryLabel(profile) + " · " + (backupSpanningEnabled(profile) ? "spans tapes as needed" : "one tape maximum");
       const action = active
         ? '<button class="button button-small button-primary" type="button" data-action="select-backup-run" data-id="' + esc(recordId(active)) + '">' + (backupWaitingForOperator(active) ? "Continue backup" : "View progress") + '</button>'
-        : '<button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(id) + '"' + (pick(profile, "enabled") === false || !compressionSupported ? ' disabled title="Create a new backup plan with a supported compression mode."' : "") + '>' + (latest ? "Back up again" : "Start backup") + '</button>';
-      const compatibility = compressionSupported ? "" : '<small class="backup-profile-warning">This saved plan uses an unsupported legacy compression mode. Create a new snapshot backup plan before starting it.</small>';
-      return '<article class="backup-profile-card"><div class="backup-profile-mark" aria-hidden="true">◆</div><div class="backup-profile-copy"><span><strong>' + esc(backupProfileName(profile)) + '</strong>' + status(human(pick(profile, "enabled") === false ? "disabled" : compressionSupported ? "snapshot saved" : "needs new plan")) + '</span><code>' + esc(source) + '</code><small>Keep verified backup ' + retention + " days · " + esc(pool) + '</small><small>' + esc(archivePolicy) + '</small>' + compatibility + '</div><div class="backup-profile-actions"><span>' + (latest ? esc(backupRunStateLabel(latest)) + " · " + esc(date(pick(latest, "finished_at", "created_at", "started_at"))) : "Not backed up yet") + "</span>" + action + "</div></article>";
+        : '<button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(id) + '"' + (pick(profile, "enabled") === false || !compressionSupported || !deliverySupported ? ' disabled title="Create a new backup plan with supported compression and delivery settings."' : "") + '>' + (latest ? "Back up again" : "Start backup") + '</button>';
+      const compatibility = compressionSupported && deliverySupported ? "" : '<small class="backup-profile-warning">This saved plan uses an unsupported legacy setting. Create a new snapshot backup plan before starting it.</small>';
+      return '<article class="backup-profile-card"><div class="backup-profile-mark" aria-hidden="true">◆</div><div class="backup-profile-copy"><span><strong>' + esc(backupProfileName(profile)) + '</strong>' + status(human(pick(profile, "enabled") === false ? "disabled" : compressionSupported && deliverySupported ? "snapshot saved" : "needs new plan")) + '</span><code>' + esc(source) + '</code><small>Keep verified backup ' + retention + " days · " + esc(pool) + '</small><small>' + esc(archivePolicy) + '</small>' + compatibility + '</div><div class="backup-profile-actions"><span>' + (latest ? esc(backupRunStateLabel(latest)) + " · " + esc(date(pick(latest, "finished_at", "created_at", "started_at"))) : "Not backed up yet") + "</span>" + action + "</div></article>";
     }).join("");
     return '<section class="panel backup-profiles"><div class="panel-head"><div><h2>Saved snapshot backups</h2><p>Availability and read-only state are checked again before every new request.</p></div><button class="button button-small" type="button" data-action="create-backup-profile">Choose snapshot</button></div><div class="backup-profile-list">' + (cards || '<div class="media-inline-empty">No snapshot has been selected yet. Choose a named ZFS snapshot folder to begin.</div>') + "</div></section>";
   }
@@ -1153,6 +1178,7 @@
       ["Source manifest", backupEvidenceValue(run, "source_manifest_sha256", "source_manifest_digest", "manifest_sha256")],
       ["Bacula JobId", backupEvidenceValue(run, "backup_job_id", "engine_job_id", "bacula_job_id", "engine_operation_id")],
       ["Compression", backupCompressionLabel(run)],
+      ["Delivery", backupDataDeliveryLabel(run)],
       ["Tapes used", volumes.length || null],
       ["Archive volumes", volumes.length ? volumes.map((volume) => volume.sequence + ". " + volume.label).join(" · ") : null],
       ["Recovery point", backupEvidenceValue(run, "recovery_point_id") || pick(run, "recovery_point_id")]
@@ -1176,6 +1202,7 @@
       ["Data", measurement(logical, bytes)],
       [volumes.length === 1 ? "Tape" : "Archive tapes", tape || "Not selected"],
       ["Compression", backupCompressionLabel(run)],
+      ["Delivery", backupDataDeliveryLabel(run)],
       ["Physical readback", readback]
     ];
     return '<div class="backup-evidence-grid backup-outcome-grid">' + values.map(([name, value]) => '<div><span>' + esc(name) + '</span><strong>' + esc(value) + "</strong></div>").join("") + "</div>";
@@ -1252,7 +1279,7 @@
     else if (successful) notice = '<div class="notice success backup-run-notice"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Backup verified and cataloged for recovery</strong><span>Every tape in the archive was written, completely read back, and retained as one recovery point. Restore testing remains a separate assurance step.</span></div>' + (recoveryPointId ? '<div class="backup-complete-actions"><button class="button button-primary button-small" type="button" data-action="browse-backup-files" data-id="' + esc(recoveryPointId) + '">Browse backed-up files</button><button class="button button-small" type="button" data-action="select-recovery-point" data-id="' + esc(recoveryPointId) + '">Recovery options</button></div>' : "") + "</div>";
     else if (failed) notice = '<div class="notice danger backup-run-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>' + esc(backupRunStateLabel(run)) + '</strong><span>' + esc(failure) + "</span></div></div>";
     else if (["cancelled", "canceled"].includes(runState)) notice = '<div class="notice warning backup-run-notice"><span class="notice-icon" aria-hidden="true">×</span><div class="notice-copy"><strong>Backup cancelled</strong><span>' + esc(failure || "The attempt did not establish a recovery point. Previously valid backups remain unchanged.") + "</span></div></div>";
-    else if (runState === "preparing") notice = '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>Validating backup inputs</strong><span>The worker is checking the snapshot, catalog, drive, tape, and spool. It will publish live source-scan counters as soon as inventory begins.</span></div></div>';
+    else if (runState === "preparing") notice = '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>Validating backup inputs</strong><span>The worker is checking the snapshot, catalog, drive, tape, and selected delivery path. It will publish live source-scan counters as soon as inventory begins.</span></div></div>';
     else if (runState === "inventorying") notice = '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>Building the recovery manifest</strong><span>TapeScale is reading every source file to retain its SHA-256 identity before tape writing starts.</span></div></div>';
     else notice = '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>' + esc(backupRunStateLabel(run)) + '</strong><span>Keep the snapshot, worker, drive, and requested archive tapes available while this stage finishes.</span></div></div>';
     const cancel = canCancel ? '<button class="button button-danger button-small" type="button" data-action="cancel-backup-run" data-id="' + esc(id) + '">Cancel run</button>' : "";
@@ -1263,7 +1290,7 @@
     const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="retry-backup-run" data-id="' + esc(id) + '">Retry</button></div>' : "";
     const measuredProgress = progress == null ? "" : '<div class="progress backup-progress"><div class="progress-track"><div class="progress-value" style="width:' + progress + '%"></div></div><div class="progress-meta"><span>Measured progress</span><span>' + progress + "%</span></div></div>";
     const technical = '<details class="backup-technical"><summary><span><strong>Technical details</strong><small>Request identity, engine evidence, and complete activity history</small></span></summary><div class="backup-technical-body"><dl class="vault-facts"><dt>Request ID</dt><dd class="mono">' + esc(id) + '</dd><dt>Created</dt><dd>' + esc(date(pick(run, "created_at", "started_at"))) + '</dd><dt>Raw state</dt><dd>' + esc(runState) + '</dd>' + (backupFailureDetail(run) ? '<dt>Recorded failure</dt><dd>' + esc(backupFailureDetail(run)) + "</dd>" : "") + '</dl><section class="backup-detail-section"><div class="backup-section-head"><div><span>Engine evidence</span><h3>Recorded facts</h3></div></div>' + renderBackupEvidence(run) + '</section><section class="backup-detail-section"><div class="backup-section-head"><div><span>Complete history</span><h3>Activity</h3></div></div>' + renderBackupTimeline(run) + "</section>" + renderBackupArtifacts(run) + "</div></details>";
-    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>Started ' + esc(date(pick(run, "created_at", "started_at"))) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header>' + renderBackupPhaseTrack(run) + '<div class="backup-run-actions">' + cancel + '<button class="button button-quiet button-small" type="button" data-action="refresh">Refresh status</button></div><div class="panel-body">' + detailFailure + notice + renderBackupSpoolingCue(run) + renderBackupPreparationProgress(run) + renderBackupLiveThroughput(run) + measuredProgress + '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>Backup result</h3></div></div>' + renderBackupOutcome(run) + "</section>" + technical + "</div></article>";
+    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span><span class="backup-kind-badge secondary">' + esc(backupDataDeliveryLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>Started ' + esc(date(pick(run, "created_at", "started_at"))) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header>' + renderBackupPhaseTrack(run) + '<div class="backup-run-actions">' + cancel + '<button class="button button-quiet button-small" type="button" data-action="refresh">Refresh status</button></div><div class="panel-body">' + detailFailure + notice + renderBackupSpoolingCue(run) + renderBackupPreparationProgress(run) + renderBackupLiveThroughput(run) + measuredProgress + '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>Backup result</h3></div></div>' + renderBackupOutcome(run) + "</section>" + technical + "</div></article>";
   }
 
   function renderJobs() {
@@ -4854,8 +4881,9 @@
       '<div class="form-field"><label for="backup-retention-days">Keep completed backups for</label><div class="input-suffix"><input class="input" id="backup-retention-days" name="retention_days" type="number" min="1" max="36500" value="28" required><span>days</span></div></div>',
       '<div class="form-field"><label for="backup-media-pool">Tape pool <small>(optional)</small></label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div>',
       '<div class="form-field"><label for="backup-compression">Compression</label><select class="select" id="backup-compression" name="compression_mode"><option value="auto" selected>Automatic · LZO (recommended)</option><option value="gzip">GZIP · balanced</option><option value="lzo">LZO · fastest</option><option value="none">None</option></select><small>Automatic uses LZO to prioritize source throughput and reduce tape starvation. Balanced GZIP may compress more but is substantially slower; already-compressed files may not shrink.</small></div>',
+      '<fieldset class="form-field full backup-delivery-options"><legend>Tape delivery</legend><label class="backup-delivery-option"><input type="radio" id="backup-delivery-direct" name="data_delivery" value="direct" checked><span><strong>Continuous streaming <em>Recommended</em></strong><small>Send Bacula\'s processed stream directly to tape. Best for fast local ZFS; avoids writing and rereading a disk data spool.</small><small>If sustained source or compression throughput falls below the drive minimum, the tape can still pause.</small></span></label><label class="backup-delivery-option"><input type="radio" id="backup-delivery-disk-spool" name="data_delivery" value="disk_spool"><span><strong>Disk staged</strong><small>Fill and drain a bounded disk spool. Use for slow or bursty sources, ideally with dedicated SSD/NVMe staging. This is disk staging, not a RAM ring.</small></span></label></fieldset>',
       '<div class="form-field"><label>Archive size</label><label class="check-option backup-span-option"><input type="checkbox" id="backup-media-spanning" name="spanning_enabled" checked> Continue onto additional prepared tapes when this archive fills a cartridge.</label></div>',
-      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · LZO · spans tapes as needed</strong><small>Next, TapeScale shows the tapes prepared now, then requests each additional tape only if the running archive needs it. Automatic rolling snapshots are not enabled yet.</small></div></div></div>',
+      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · LZO · continuous streaming · spans tapes as needed</strong><small>Data goes directly to tape; source and compression throughput must sustain the drive. TapeScale requests each additional tape only if the archive needs it.</small></div></div></div>',
       '</div>',
       '<p class="notice danger" id="backup-profile-error" role="alert" aria-live="assertive" hidden></p>',
       '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Continue to tape</button></div>',
@@ -4874,9 +4902,14 @@
   function updateBackupProfileOptions(form) {
     if (!form) return;
     const compression = backupCompressionLabel({ compression_mode: String(form.elements.compression_mode && form.elements.compression_mode.value || "auto") });
+    const delivery = backupDataDeliveryLabel({ data_delivery: String(form.elements.data_delivery && form.elements.data_delivery.value || "direct") });
     const spanning = Boolean(form.elements.spanning_enabled && form.elements.spanning_enabled.checked);
     const summary = form.querySelector("#backup-plan-summary strong");
-    if (summary) summary.textContent = "Full backup · " + compression + " · " + (spanning ? "spans tapes as needed" : "one tape maximum");
+    const detail = form.querySelector("#backup-plan-summary small");
+    if (summary) summary.textContent = "Full backup · " + compression + " · " + delivery.toLowerCase() + " · " + (spanning ? "spans tapes as needed" : "one tape maximum");
+    if (detail) detail.textContent = delivery === "Continuous streaming"
+      ? "Data goes directly to tape; source and compression throughput must sustain the drive. TapeScale requests additional tapes only if needed."
+      : "Bacula fills and drains a bounded disk spool; use fast dedicated spool storage. TapeScale requests additional tapes only if needed.";
   }
 
   async function submitBackupProfile(form) {
@@ -4903,6 +4936,7 @@
           source_subpath: source,
           media_pool_id: String(values.get("media_pool_id") || "") || null,
           compression_mode: String(values.get("compression_mode") || "auto"),
+          data_delivery: String(values.get("data_delivery") || "direct"),
           spanning_enabled: values.get("spanning_enabled") === "on",
           schedule_timezone: form.dataset.timezone || "UTC",
           schedule_enabled: false,
@@ -4981,6 +5015,7 @@
     const initialPair = readiness.recommended_candidate || (pairs.length === 1 ? pairs[0] : null);
     const readyTapeCount = new Set(pairs.map((candidate) => String(pick(candidate, "cartridge_id") || "")).filter(Boolean)).size;
     const compression = backupCompressionLabel(profile);
+    const delivery = backupDataDeliveryLabel(profile);
     const spanning = backupSpanningEnabled(profile);
     const capacityPlan = backupCapacityPlan(readiness);
     const estimatedTapes = capacityPlan.estimatedTapes ? capacityPlan.estimatedTapes + " estimated" : "As needed";
@@ -4998,7 +5033,7 @@
       '<form id="start-backup-form" data-profile-id="' + esc(profileId) + '" data-readiness-key="' + esc(readinessKey) + '" data-required-pool-id="' + esc(requiredPoolId) + '" data-idempotency-key="' + esc(idempotencyKey) + '">',
       '<ol class="backup-start-steps" aria-label="Start backup steps"><li class="done"><span>✓</span><strong>Snapshot</strong></li><li class="active"><span>2</span><strong>Tape</strong></li><li><span>3</span><strong>Confirm & start</strong></li></ol>',
       '<div class="backup-boundary"><span aria-hidden="true">◆</span><div><strong>' + esc(backupProfileName(profile)) + '</strong><p><code>' + esc(label(source)) + '</code></p></div></div>',
-      '<div class="backup-start-facts"><div><span>Backup</span><strong>Full</strong></div><div><span>Compression</span><strong>' + esc(compression) + '</strong></div><div><span>Estimated tapes</span><strong>' + esc(spanning ? estimatedTapes : "One maximum") + '</strong></div><div><span>Verification</span><strong>Complete readback</strong></div><div><span>Retention</span><strong>' + esc(count(pick(profile, "retention_days")) || 28) + ' days</strong></div></div>',
+      '<div class="backup-start-facts"><div><span>Backup</span><strong>Full</strong></div><div><span>Compression</span><strong>' + esc(compression) + '</strong></div><div><span>Delivery</span><strong>' + esc(delivery) + '</strong></div><div><span>Estimated tapes</span><strong>' + esc(spanning ? estimatedTapes : "One maximum") + '</strong></div><div><span>Verification</span><strong>Complete readback</strong></div><div><span>Retention</span><strong>' + esc(count(pick(profile, "retention_days")) || 28) + ' days</strong></div></div>',
       renderBackupCapacityPlan(readiness, readyTapeCount, spanning),
       readinessPanel,
       '<div class="form-grid backup-tape-choice"' + (blocked ? " hidden" : "") + '><div class="form-field full"><label for="start-backup-drive">Loaded tape drive</label><select class="select" id="start-backup-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select></div><div class="form-field full"><label for="start-backup-cartridge">Loaded scratch tape</label><select class="select" id="start-backup-cartridge" name="cartridge_id" required><option value="">Choose tape</option>' + mediaOptions + '</select></div></div>',
@@ -6535,7 +6570,7 @@
     if (event.target.id === "backup-media-cartridge") updateBackupMediaConfirmation(event.target.form);
     if (event.target.id === "start-backup-drive") updateStartBackupTape(event.target.form);
     if (event.target.id === "start-backup-cartridge") updateStartBackupTape(event.target.form);
-    if (["backup-compression", "backup-media-spanning"].includes(event.target.id)) updateBackupProfileOptions(event.target.form);
+    if (["backup-compression", "backup-delivery-direct", "backup-delivery-disk-spool", "backup-media-spanning"].includes(event.target.id)) updateBackupProfileOptions(event.target.form);
     if (event.target.id === "backup-state-filter") {
       state.backupStateFilter = event.target.value;
       applyBackupFilters();

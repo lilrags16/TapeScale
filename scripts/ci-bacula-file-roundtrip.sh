@@ -10,8 +10,9 @@ set -euo pipefail
 # mechanism test, not evidence that TapeScale currently permits a multi-volume
 # selected run; the product gate requires exactly one retained volume until it
 # can record authenticated path-to-volume and truthful per-volume read evidence.
-# LZO mode proves the other public compression choice with an actual write,
-# Data verify, and source-independent complete plus selective restores.
+# LZO mode proves the default direct-delivery path (no disk data spool) with
+# an actual write, Data verify, and source-independent complete plus selective
+# restores. The single and spanning modes retain disk-spool coverage.
 
 : "${DATABASE_URL:?DATABASE_URL is required}"
 : "${BACULA_CATALOG_HOST:?BACULA_CATALOG_HOST is required}"
@@ -42,6 +43,7 @@ case "$ci_mode" in
     maximum_volumes=1
     maximum_volume_bytes_directive=""
     compression_directive=""
+    spool_data="yes"
     fixture_name="fixture.txt"
     ;;
   spanning)
@@ -52,6 +54,7 @@ case "$ci_mode" in
     maximum_volumes=0
     maximum_volume_bytes_directive="Maximum Volume Bytes = 1M"
     compression_directive="Compression = GZIP6"
+    spool_data="yes"
     fixture_name="spanning-fixture.bin"
     ;;
   lzo)
@@ -62,6 +65,7 @@ case "$ci_mode" in
     maximum_volumes=1
     maximum_volume_bytes_directive=""
     compression_directive="Compression = LZO"
+    spool_data="no"
     fixture_name="lzo-fixture.bin"
     ;;
   *)
@@ -70,7 +74,7 @@ case "$ci_mode" in
     ;;
 esac
 readonly ci_mode run_id run_token volume_name continuation_volume_name
-readonly maximum_volumes maximum_volume_bytes_directive compression_directive fixture_name
+readonly maximum_volumes maximum_volume_bytes_directive compression_directive spool_data fixture_name
 readonly pool_name="TS-LTO-${run_token}"
 readonly config_root="/etc/tapescale"
 readonly work_root="/var/lib/bacula"
@@ -246,7 +250,7 @@ Job {
   Storage = TS-LTO
   Pool = $pool_name
   Messages = Standard
-  Spool Data = yes
+  Spool Data = $spool_data
   Spool Attributes = yes
   Write Bootstrap = "$work_root/bootstrap/%i.bsr"
 }
@@ -341,6 +345,7 @@ Device {
   Random Access = yes
   Label Media = yes
   Maximum File Size = 32G
+  Maximum Network Buffer Size = 65536
   Spool Directory = "$spool_root"
   Maximum Spool Size = 64M
   Maximum Job Spool Size = 64M
@@ -372,6 +377,7 @@ FileDaemon {
   Pid Directory = "$runtime_root"
   Plugin Directory = "/usr/lib/bacula"
   Maximum Concurrent Jobs = 1
+  Maximum Network Buffer Size = 65536
   TLS Enable = no
   TLS Require = yes
   TLS PSK Enable = yes

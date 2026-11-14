@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-9/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-9/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-10/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-10/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -111,7 +111,7 @@ test("creating a request continues directly into final tape authorization", () =
   assert.doesNotMatch(submit, /toast\("Full backup queued"/);
 });
 
-test("backup policy exposes compression and spanning without a one-tape ceiling", () => {
+test("backup policy exposes compression, continuous delivery, and spanning without a one-tape ceiling", () => {
   const open = section("  function openBackupProfile(", "  async function submitBackupProfile(");
   const submit = section("  async function submitBackupProfile(", "  function backupCapacityPlan(");
 
@@ -125,8 +125,33 @@ test("backup policy exposes compression and spanning without a one-tape ceiling"
   assert.doesNotMatch(open, /Automatic · fast GZIP/);
   assert.match(open, /name="spanning_enabled" checked/);
   assert.match(open, /spans tapes as needed/);
+  assert.match(open, /name="data_delivery" value="direct" checked/);
+  assert.match(open, /name="data_delivery" value="disk_spool"/);
+  assert.match(open, /Continuous streaming/);
+  assert.match(open, /avoids writing and rereading a disk data spool/);
+  assert.match(open, /This is disk staging, not a RAM ring/);
   assert.match(submit, /compression_mode: String\(values\.get\("compression_mode"\) \|\| "auto"\)/);
+  assert.match(submit, /data_delivery: String\(values\.get\("data_delivery"\) \|\| "direct"\)/);
   assert.match(submit, /spanning_enabled: values\.get\("spanning_enabled"\) === "on"/);
+});
+
+test("delivery labels distinguish direct, staged, legacy, and unsupported plans", () => {
+  const helpers = section("  function backupDataDeliveryExplicit(", "  function backupSpanningEnabled(");
+  const testPick = (object, ...keys) => {
+    if (!object || typeof object !== "object") return null;
+    for (const key of keys) if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+    return null;
+  };
+  const values = Function(
+    "pick", "backupProfileForRun", "backupEvidenceValue",
+    '"use strict";\n' + helpers + "\nreturn [backupDataDelivery, backupDataDeliverySupported, backupDataDeliveryLabel];"
+  )(testPick, () => null, () => null);
+  assert.equal(values[0]({ data_delivery: "direct" }), "direct");
+  assert.equal(values[2]({ data_delivery: "direct" }), "Continuous streaming");
+  assert.equal(values[2]({ data_delivery: "disk_spool" }), "Disk staged");
+  assert.equal(values[2]({}), "Disk staged (legacy)");
+  assert.equal(values[1]({ data_delivery: "ram_ring" }), false);
+  assert.equal(values[2]({ data_delivery: "ram_ring" }), "Unsupported (ram_ring)");
 });
 
 test("unsupported legacy compression is shown and blocked instead of becoming auto", () => {
@@ -157,8 +182,8 @@ test("unsupported legacy compression is shown and blocked instead of becoming au
 
   const profiles = section("  function renderBackupProfiles(", "  function renderBackupRunTable(");
   assert.match(profiles, /!compressionSupported/);
-  assert.match(profiles, /disabled title="Create a new backup plan with a supported compression mode\./);
-  assert.match(profiles, /unsupported legacy compression mode/);
+  assert.match(profiles, /disabled title="Create a new backup plan with supported compression and delivery settings\./);
+  assert.match(profiles, /unsupported legacy setting/);
 });
 
 test("the separate G0.2 phase track remains single-tape and uncompressed", () => {
@@ -350,18 +375,22 @@ test("capacity planning is explicitly estimated and supports unknown archive siz
   assert.doesNotMatch(capacity, /will fit/);
 });
 
-test("writing progress explains segmented disk spooling without pretending the tape is continuous", () => {
+test("writing progress truthfully distinguishes continuous and disk-staged delivery", () => {
   const cue = section("  function renderBackupSpoolingCue(", "  function backupPhaseIndex(");
   const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
 
   assert.match(cue, /backupRunState\(run\) !== "writing"/);
+  assert.match(cue, /backupDataDelivery\(run\) === "direct"/);
+  assert.match(cue, /Continuous tape delivery/);
+  assert.match(cue, /no disk data spool is in this path/);
+  assert.match(cue, /throughput falls below the drive minimum/);
   assert.match(cue, /backupEvidenceValue\(run, "data_spooling"\)/);
   assert.match(cue, /"effective_maximum_bytes", "maximum_bytes"/);
-  assert.match(cue, /Measured disk buffering protects the tape stream/);
-  assert.match(cue, /fills and drains a bounded disk buffer in segments/);
+  assert.match(cue, /Disk-staged tape delivery/);
+  assert.match(cue, /fills and drains a bounded disk spool in segments/);
   assert.match(cue, /tape can pause between segments when the source cannot refill at drive speed/);
-  assert.match(cue, /live panel reports the actual buffer and tape activity/);
-  assert.match(cue, /This buffer does not limit the total archive size/);
+  assert.match(cue, /live panel reports the actual spool and tape activity/);
+  assert.match(cue, /staging space does not limit the total archive size/);
   assert.doesNotMatch(cue, /%|percent|percentage/i);
   assert.match(detail, /notice \+ renderBackupSpoolingCue\(run\) \+ renderBackupPreparationProgress\(run\) \+ renderBackupLiveThroughput\(run\) \+ measuredProgress/);
 });
@@ -369,7 +398,7 @@ test("writing progress explains segmented disk spooling without pretending the t
 test("backup preparation and transfer telemetry are live, directional, and honest about stale or missing samples", () => {
   const helpers = section("  function backupLiveIo(", "  function renderBackupSpoolingCue(");
   const values = Function(
-    "objectValue", "pick", "backupRunState", "BACKUP_TERMINAL_STATES", "human", "date", "bytes", "esc",
+    "objectValue", "pick", "backupRunState", "BACKUP_TERMINAL_STATES", "human", "date", "bytes", "esc", "backupDataDelivery",
     '"use strict";\n' + helpers + "\nreturn [backupLiveIoStale, renderBackupPreparationProgress, renderBackupLiveThroughput];"
   )(
     (object, key) => object && object[key] && typeof object[key] === "object" && !Array.isArray(object[key]) ? object[key] : {},
@@ -387,7 +416,8 @@ test("backup preparation and transfer telemetry are live, directional, and hones
       if (amount === 0) return "0 B";
       return (amount / 1048576).toFixed(1) + " MiB";
     },
-    (value) => String(value)
+    (value) => String(value),
+    (run) => run && run.data_delivery || "disk_spool"
   );
   const [stale, renderPreparation, render] = values;
   const now = Date.now();
@@ -448,7 +478,7 @@ test("backup preparation and transfer telemetry are live, directional, and hones
   assert.doesNotMatch(firstSpool, /Net movement<\/span><strong>0 B\/s/);
 
   const streaming = render({ state: "writing", result: { live_io: { ...freshSample, activity: "streaming", spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 4194304, tape_write_bytes_per_second: 4194304 } } });
-  assert.match(streaming, /Streaming buffered data to tape/);
+  assert.match(streaming, /Streaming staged data to tape/);
   assert.match(streaming, /Tape active/);
   assert.match(streaming, /Draining<\/span><strong>4\.0 MiB\/s/);
   assert.match(streaming, /physical tape-write counter is advancing/);
@@ -531,12 +561,20 @@ test("backup preparation and transfer telemetry are live, directional, and hones
   assert.match(stalePreparation, /Rate hidden until next update/);
   assert.doesNotMatch(stalePreparation, /953\.7 MiB\/s/);
 
-  assert.match(renderPreparation({ state: "preparing", result: {} }), /Checking the immutable snapshot, Bacula catalog, drive, tape, and disk spool/);
+  assert.match(renderPreparation({ state: "preparing", result: {} }), /Checking the immutable snapshot, Bacula catalog, drive, tape, and selected delivery path/);
   assert.match(renderPreparation({ state: "inventorying", result: {} }), /Waiting for the worker's first source-scan sample/);
   const stability = renderPreparation({ state: "verifying", result: { preparation_progress: { ...preparationSample, stage: "source_stability_check", step: "sorting" } } });
   assert.match(stability, /Sorting manifest entries/);
   assert.match(stability, /Tape readback is complete/);
   assert.equal(render({ state: "verifying", result: { live_io: freshSample, preparation_progress: preparationSample } }), "");
+
+  const direct = render({ state: "writing", data_delivery: "direct", result: { live_io: { ...freshSample, activity: "streaming", tape_write_bytes_per_second: 4194304 } } });
+  assert.match(direct, /Streaming directly to tape/);
+  assert.doesNotMatch(direct, /Disk buffer|Filling the disk buffer|Streaming staged data/);
+  const directStarting = render({ state: "writing", data_delivery: "direct", result: { live_io: { ...freshSample, activity: "buffering" } } });
+  assert.match(directStarting, /Starting the tape stream/);
+  assert.match(directStarting, /no disk data spool is in this path/);
+  assert.doesNotMatch(directStarting, /temporary disk buffer/);
 
   const evidence = section("  function renderBackupEvidence(", "  function renderBackupOutcome(");
   assert.match(evidence, /\["Recorded average", throughput == null \? null/);
@@ -657,7 +695,7 @@ test("run summaries distinguish planned, active, complete, and failed readback",
   assert.doesNotMatch(detail, /Full backup · complete readback/);
   assert.match(detail, /backupReadbackSummary\(run\)/);
   assert.match(app, /\{ name: "Confirm first tape", detail: "Choose the first archive volume"/);
-  assert.match(app, /\{ name: "Preflight", detail: "Validate source, catalog, drive, tape, and spool", aliases: \["queued", "media_assigned", "preparing"\] \}/);
+  assert.match(app, /\{ name: "Preflight", detail: "Validate source, catalog, drive, tape, and delivery path", aliases: \["queued", "media_assigned", "preparing"\] \}/);
   assert.match(app, /\{ name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: \["inventorying", "manifesting", "source_manifest"\] \}/);
   assert.match(app, /\{ name: "Finalize", detail: "Confirm the source snapshot and seal evidence", aliases: \["source_stability_check", "final_source_check"\] \}/);
 });

@@ -55,6 +55,7 @@ pub struct BackupProfileRecord {
     pub encryption_enabled: bool,
     pub compression_mode: String,
     pub spanning_enabled: bool,
+    pub data_delivery: String,
     pub verification_mode: String,
     pub engine_name: String,
     pub engine_version: String,
@@ -87,6 +88,7 @@ const BACKUP_PROFILE_SELECT: &str = r#"
            policy.encryption_enabled,
            policy.compression_mode,
            policy.spanning_enabled,
+           policy.data_delivery,
            policy.verification_mode,
            data_profile.engine_name,
            data_profile.engine_version,
@@ -127,6 +129,8 @@ pub struct NewBackupProfile {
     pub compression_mode: String,
     #[serde(default = "default_spanning_enabled")]
     pub spanning_enabled: bool,
+    #[serde(default = "default_data_delivery")]
+    pub data_delivery: String,
     #[serde(default = "default_actor")]
     pub actor_label: String,
 }
@@ -147,6 +151,7 @@ impl NewBackupProfile {
             encryption_enabled: false,
             compression_mode: default_compression_mode(),
             spanning_enabled: default_spanning_enabled(),
+            data_delivery: default_data_delivery(),
             actor_label: default_actor(),
         }
     }
@@ -181,6 +186,11 @@ impl NewBackupProfile {
         ) {
             return Err(BackupOpsError::Invalid(
                 "compression_mode must be auto, none, gzip, or lzo".to_owned(),
+            ));
+        }
+        if !matches!(self.data_delivery.as_str(), "direct" | "disk_spool") {
+            return Err(BackupOpsError::Invalid(
+                "data_delivery must be direct or disk_spool".to_owned(),
             ));
         }
         if !(1..=36_500).contains(&self.retention_days) {
@@ -230,6 +240,10 @@ fn default_compression_mode() -> String {
 
 const fn default_spanning_enabled() -> bool {
     true
+}
+
+fn default_data_delivery() -> String {
+    "direct".to_owned()
 }
 
 fn default_actor() -> String {
@@ -326,9 +340,9 @@ pub async fn create_backup_profile(
             (id, name, source_id, representation, schedule_timezone,
              full_schedule, incremental_schedule, retention_days,
              encryption_enabled, compression_mode, spanning_enabled,
-             verification_mode, config, enabled)
+             data_delivery, verification_mode, config, enabled)
          VALUES ($1, $2, $3, 'file', $4, $5, 'disabled', $6,
-                 false, $7, $8, 'full_readback', $9, true)",
+                 false, $7, $8, $9, 'full_readback', $10, true)",
     )
     .bind(policy_id)
     .bind(&source.name)
@@ -338,6 +352,7 @@ pub async fn create_backup_profile(
     .bind(request.retention_days)
     .bind(&request.compression_mode)
     .bind(request.spanning_enabled)
+    .bind(&request.data_delivery)
     .bind(json!({
         "workflow": "attended_full_file_backup",
         "requested_level": "full",
@@ -345,6 +360,7 @@ pub async fn create_backup_profile(
         "compression_mode": request.compression_mode,
         "spanning_supported": true,
         "spanning_enabled": request.spanning_enabled,
+        "data_delivery": request.data_delivery,
         "encryption_supported": false,
         "production_eligible": false,
         "schedule_enabled": request.schedule_enabled
@@ -389,6 +405,7 @@ pub async fn create_backup_profile(
             "encryption_enabled": false,
             "compression_mode": request.compression_mode,
             "spanning_enabled": request.spanning_enabled,
+            "data_delivery": request.data_delivery,
             "production_eligible": false
         }),
         "created",
@@ -594,6 +611,7 @@ async fn create_backup_request(
         encryption_enabled: bool,
         compression_mode: String,
         spanning_enabled: bool,
+        data_delivery: String,
         verification_mode: String,
     }
     let profile = sqlx::query_as::<_, RequestProfile>(
@@ -601,7 +619,8 @@ async fn create_backup_request(
                 data_profile.schedule_enabled, data_profile.enabled,
                 data_profile.production_eligible, policy.representation,
                 policy.encryption_enabled, policy.compression_mode,
-                policy.spanning_enabled, policy.verification_mode
+                policy.spanning_enabled, policy.data_delivery,
+                policy.verification_mode
            FROM single_tape_data_profiles data_profile
            JOIN protection_policies policy ON policy.id = data_profile.policy_id
           WHERE data_profile.id = $1 AND data_profile.workflow_kind = 'backup'
@@ -619,6 +638,7 @@ async fn create_backup_request(
             profile.compression_mode.as_str(),
             "auto" | "none" | "gzip" | "lzo"
         )
+        || !matches!(profile.data_delivery.as_str(), "direct" | "disk_spool")
         || profile.verification_mode != "full_readback"
     {
         transaction.rollback().await?;
@@ -715,6 +735,7 @@ async fn create_backup_request(
             "requested_level": "full",
             "compression_mode": profile.compression_mode,
             "spanning_enabled": profile.spanning_enabled,
+            "data_delivery": profile.data_delivery,
             "production_eligible": false
         }),
         correlation_id,
@@ -731,6 +752,7 @@ async fn create_backup_request(
             "requested_level": "full",
             "compression_mode": profile.compression_mode,
             "spanning_enabled": profile.spanning_enabled,
+            "data_delivery": profile.data_delivery,
             "production_eligible": false
         }),
         requested_by_label,
@@ -1398,6 +1420,7 @@ mod tests {
         assert!(!profile.encryption_enabled);
         assert!(profile.spanning_enabled);
         assert_eq!(profile.compression_mode, "auto");
+        assert_eq!(profile.data_delivery, "direct");
         profile.validate().expect("safe defaults should validate");
     }
 

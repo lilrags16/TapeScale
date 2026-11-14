@@ -2,6 +2,16 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.10] - 2026-11-14
+
+### Continuous tape delivery
+
+- Backup plans now select either **Continuous streaming** or **Disk staged** delivery. Continuous streaming is the default for fast local storage: Bacula sends the processed File Daemon stream directly to the Storage Daemon and tape instead of first writing and then rereading a disk data spool.
+- Direct delivery keeps Bacula attribute spooling and the run-scoped working directory, but it does not require the 8 GiB minimum data spool, collect misleading data-spool occupancy, or wait for a segment to fill before tape writing can begin.
+- Disk-staged delivery remains available for slow, bursty, or remote sources when the spool is on storage fast enough to drain at the tape's streaming rate. It retains the existing bounded fill-and-drain behavior; it is disk staging, not a continuously consumed RAM ring.
+- The selected delivery mode is copied into each physical run and retained with its engine and recovery evidence. An already-running job cannot change modes; a new media assignment uses the current plan choice.
+- Live status distinguishes direct source-to-tape streaming from disk fill/despool activity. Direct mode removes spool double I/O and batch pauses, but it cannot prevent shoe-shining if source traversal plus compression remains below the drive's minimum sustained speed.
+
 ## [0.1.0-alpha.9] - 2026-11-14
 
 ### Sustained-transfer visibility and defaults
@@ -148,6 +158,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.10]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.10
 [0.1.0-alpha.9]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.9
 [0.1.0-alpha.8]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.8
 [0.1.0-alpha.7]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.7

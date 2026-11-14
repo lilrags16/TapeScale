@@ -278,7 +278,9 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
             "adapter_version": BACULA_ADAPTER_VERSION,
             "format_version": BACULA_FORMAT_VERSION,
             "backup_level": "full",
-            "compression_modes": ["auto_gzip1", "gzip6", "lzo", "none"],
+            "compression_modes": ["auto_lzo", "gzip6", "lzo", "none"],
+            "data_delivery_modes": ["direct", "disk_spool"],
+            "default_data_delivery": "direct",
             "manual_media_spanning": true,
             "complete_physical_readback": true,
             "production_eligible": false
@@ -477,6 +479,8 @@ struct CreateBackupProfileRequest {
     compression_mode: String,
     #[serde(default = "default_backup_spanning", alias = "allow_media_spanning")]
     spanning_enabled: bool,
+    #[serde(default = "default_backup_data_delivery")]
+    data_delivery: String,
     // Kept as optional, ignored compatibility fields for clients released
     // before the server made its read-only mount check authoritative. Plan
     // creation must not require an operator to restate a property the API can
@@ -503,6 +507,10 @@ fn default_backup_compression() -> String {
 
 const fn default_backup_spanning() -> bool {
     true
+}
+
+fn default_backup_data_delivery() -> String {
+    "direct".to_owned()
 }
 
 fn backup_actor_label(value: Option<&str>) -> Result<String, AppError> {
@@ -542,6 +550,11 @@ async fn create_backup_profile(
     ) {
         return Err(AppError::Invalid(
             "compression_mode must be auto, none, gzip, or lzo".to_owned(),
+        ));
+    }
+    if !matches!(request.data_delivery.as_str(), "direct" | "disk_spool") {
+        return Err(AppError::Invalid(
+            "data_delivery must be direct or disk_spool".to_owned(),
         ));
     }
     let actor_label = backup_actor_label(request.requested_by_label.as_deref())?;
@@ -620,6 +633,7 @@ async fn create_backup_profile(
             encryption_enabled: false,
             compression_mode: request.compression_mode,
             spanning_enabled: request.spanning_enabled,
+            data_delivery: request.data_delivery,
             actor_label,
         },
     )
@@ -1447,6 +1461,7 @@ async fn build_backup_run_view(
                     "compression_mode",
                     "resolved_compression",
                     "spanning_enabled",
+                    "data_delivery",
                 ] {
                     if let Some(item) = data.get(key) {
                         object.insert(key.to_owned(), item.clone());
@@ -5022,6 +5037,7 @@ mod tests {
             None
         );
         assert_eq!(without_legacy_fields._legacy_limitations_acknowledged, None);
+        assert_eq!(without_legacy_fields.data_delivery, "direct");
 
         let old_client_payload: CreateBackupProfileRequest = serde_json::from_value(json!({
             "name": "Radio archive",
@@ -5038,6 +5054,7 @@ mod tests {
             old_client_payload._legacy_limitations_acknowledged,
             Some(true)
         );
+        assert_eq!(old_client_payload.data_delivery, "direct");
 
         let run_without_attestation: CreateBackupRunRequest =
             serde_json::from_value(json!({"idempotency_key": "manual-radio-001"}))
