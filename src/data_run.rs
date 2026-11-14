@@ -50,10 +50,10 @@ use crate::{
         SasProbeResult, SasTapeIoCounters,
     },
     engine::bacula::{
-        BaculaAdapter, BaculaCommands, BaculaCompression, BaculaDataDelivery, BaculaDataOptions,
-        BaculaJobEvidence, BaculaJobId, BaculaJobResource, BaculaJobState, BaculaPaths,
-        BaculaPoolName, BaculaRestoreSubpath, CorrelatedJobDispatch, DirectBconsoleExecutor,
-        VolumeLabel,
+        source_relative_current_file, BaculaAdapter, BaculaCommands, BaculaCompression,
+        BaculaDataDelivery, BaculaDataOptions, BaculaJobEvidence, BaculaJobId, BaculaJobResource,
+        BaculaJobState, BaculaPaths, BaculaPoolName, BaculaRestoreSubpath, CorrelatedJobDispatch,
+        DirectBconsoleExecutor, VolumeLabel,
     },
     store,
     tool_runner::ToolError,
@@ -97,8 +97,10 @@ const PREPARATION_PROGRESS_STALE_AFTER_SECONDS: u64 = 20;
 #[derive(Clone, Copy, Debug)]
 struct LiveIoObservation {
     observed_at: Instant,
+    files: u64,
     pipeline_bytes: u64,
     pipeline_basis: &'static str,
+    file_daemon_read_bytes: Option<u64>,
     tape_counters: Option<SasTapeIoCounters>,
     spool_usage: Option<BaculaSpoolUsage>,
 }
@@ -121,6 +123,14 @@ struct BaculaRunningHints {
     spooling: Option<bool>,
     despooling: Option<bool>,
     despool_wait: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+struct BaculaFileDaemonHints {
+    files: u64,
+    read_bytes: u64,
+    reported_read_bytes_per_second: Option<u64>,
+    current_file: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -182,9 +192,25 @@ struct LiveIoSampler {
     previous: Option<LiveIoObservation>,
     maximum_files_processed: u64,
     maximum_pipeline_bytes: u64,
+    files_total: Option<u64>,
+    progress_basis: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LiveIoTotals {
+    files: u64,
+    progress_basis: &'static str,
 }
 
 impl LiveIoSampler {
+    fn with_totals(files_total: u64, progress_basis: &'static str) -> Self {
+        Self {
+            files_total: Some(files_total),
+            progress_basis: Some(progress_basis),
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     fn observe(
         &mut self,
@@ -193,6 +219,12 @@ impl LiveIoSampler {
         tape_counters: Option<SasTapeIoCounters>,
         observed_at: Instant,
     ) -> store::SingleTapeLiveIoSample {
+        let file_daemon_hints = BaculaFileDaemonHints {
+            files: evidence.files,
+            read_bytes: evidence.bytes,
+            reported_read_bytes_per_second: None,
+            current_file: None,
+        };
         self.observe_inner(
             phase,
             evidence,
@@ -200,6 +232,7 @@ impl LiveIoSampler {
             tape_counters,
             None,
             None,
+            Some(&file_daemon_hints),
             None,
             None,
             observed_at,
@@ -216,6 +249,7 @@ impl LiveIoSampler {
         tape_counters: Option<SasTapeIoCounters>,
         spool: Option<(BaculaSpoolUsage, u64)>,
         running_hints: Option<BaculaRunningHints>,
+        file_daemon_hints: Option<&BaculaFileDaemonHints>,
         last_progress_at: Instant,
         no_progress_timeout: Duration,
         observed_at: Instant,
@@ -227,6 +261,7 @@ impl LiveIoSampler {
             tape_counters,
             spool,
             running_hints,
+            file_daemon_hints,
             Some(last_progress_at),
             Some(no_progress_timeout),
             observed_at,
@@ -242,6 +277,7 @@ impl LiveIoSampler {
         tape_counters: Option<SasTapeIoCounters>,
         spool: Option<(BaculaSpoolUsage, u64)>,
         running_hints: Option<BaculaRunningHints>,
+        file_daemon_hints: Option<&BaculaFileDaemonHints>,
         last_progress_at: Option<Instant>,
         no_progress_timeout: Option<Duration>,
         observed_at: Instant,
@@ -250,6 +286,22 @@ impl LiveIoSampler {
         let elapsed =
             previous.map(|sample| observed_at.saturating_duration_since(sample.observed_at));
         let sample_window_ms = elapsed.map(duration_millis_u64);
+        // During a backup the File Daemon is the authoritative source-side
+        // archive-entry counter. Storage-Daemon JobFiles can advance on a
+        // different boundary and must not be divided by manifest entries.
+        // Freeze the record numerator across a transient FD status gap rather
+        // than substituting an incompatible counter.
+        let files_processed = if phase == store::SingleTapeLiveIoPhase::BackupWrite {
+            file_daemon_hints
+                .map(|hints| hints.files)
+                .or_else(|| previous.map(|sample| sample.files))
+                .unwrap_or(0)
+        } else {
+            evidence.files
+        };
+        let archive_entries_per_second = previous.and_then(|sample| {
+            elapsed.and_then(|window| entries_per_second(sample.files, files_processed, window))
+        });
         let measured_pipeline_bytes_per_second = previous
             .filter(|sample| sample.pipeline_basis == pipeline_basis)
             .and_then(|sample| {
@@ -263,6 +315,23 @@ impl LiveIoSampler {
                 .or(measured_pipeline_bytes_per_second)
         } else {
             measured_pipeline_bytes_per_second
+        };
+        let file_daemon_read_bytes = file_daemon_hints.map(|hints| hints.read_bytes);
+        let measured_file_daemon_read_bytes_per_second = previous.and_then(|sample| {
+            elapsed.and_then(|window| {
+                counter_rate(
+                    sample.file_daemon_read_bytes,
+                    file_daemon_read_bytes,
+                    window,
+                )
+            })
+        });
+        let file_daemon_read_bytes_per_second = if previous.is_none() {
+            file_daemon_hints
+                .and_then(|hints| hints.reported_read_bytes_per_second)
+                .or(measured_file_daemon_read_bytes_per_second)
+        } else {
+            measured_file_daemon_read_bytes_per_second
         };
         let tape_read_bytes_per_second = previous.and_then(|sample| {
             elapsed.and_then(|window| {
@@ -315,17 +384,21 @@ impl LiveIoSampler {
             })?
         });
         let engine_counter_advanced = previous.is_some()
-            && (evidence.files > self.maximum_files_processed
+            && (files_processed > self.maximum_files_processed
                 || evidence.bytes > self.maximum_pipeline_bytes);
         let measured_movement = previous.is_some_and(|sample| {
             engine_counter_advanced
+                || sample
+                    .file_daemon_read_bytes
+                    .zip(file_daemon_read_bytes)
+                    .is_some_and(|(before, after)| after > before)
                 || tape_counter_advanced(sample.tape_counters, tape_counters)
                 || sample
                     .spool_usage
                     .zip(spool_usage)
                     .is_some_and(|(before, after)| before != after)
         });
-        self.maximum_files_processed = self.maximum_files_processed.max(evidence.files);
+        self.maximum_files_processed = self.maximum_files_processed.max(files_processed);
         self.maximum_pipeline_bytes = self.maximum_pipeline_bytes.max(evidence.bytes);
         let progress_idle_ms = last_progress_at.map(|last| {
             if measured_movement {
@@ -353,8 +426,10 @@ impl LiveIoSampler {
             });
         self.previous = Some(LiveIoObservation {
             observed_at,
+            files: files_processed,
             pipeline_bytes: evidence.bytes,
             pipeline_basis,
+            file_daemon_read_bytes,
             tape_counters,
             spool_usage,
         });
@@ -364,9 +439,18 @@ impl LiveIoSampler {
             sample_window_ms,
             stale_after_seconds: LIVE_IO_STALE_AFTER_SECONDS,
             engine_job_id: evidence.job_id.get(),
-            files_processed: evidence.files,
-            logical_bytes_processed: evidence.bytes,
+            files_processed: self.maximum_files_processed,
+            files_total: self.files_total,
+            progress_basis: self
+                .progress_basis
+                .expect("live transfer totals always carry an authoritative basis"),
+            archive_entries_per_second,
+            pipeline_bytes_processed: self.maximum_pipeline_bytes,
             pipeline_bytes_per_second,
+            file_daemon_read_bytes_processed: file_daemon_read_bytes,
+            file_daemon_read_bytes_per_second,
+            current_file: file_daemon_hints.and_then(|hints| hints.current_file.clone()),
+            file_daemon_basis: file_daemon_hints.map(|_| "bacula_file_daemon_read_bytes_delta"),
             tape_read_bytes_per_second,
             tape_write_bytes_per_second,
             tape_read_counter_available,
@@ -501,6 +585,16 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 
 fn counter_rate(previous: Option<u64>, current: Option<u64>, elapsed: Duration) -> Option<u64> {
     bytes_per_second(previous?, current?, elapsed)
+}
+
+fn entries_per_second(previous: u64, current: u64, elapsed: Duration) -> Option<f64> {
+    let elapsed_seconds = elapsed.as_secs_f64();
+    if elapsed_seconds == 0.0 {
+        return None;
+    }
+    let delta = current.checked_sub(previous)?;
+    let rate = delta as f64 / elapsed_seconds;
+    rate.is_finite().then_some(rate)
 }
 
 fn bytes_per_second(previous: u64, current: u64, elapsed: Duration) -> Option<u64> {
@@ -1163,6 +1257,10 @@ async fn perform_exercise(
             backup_dispatch.job_id,
             "full backup",
             store::SingleTapeLiveIoPhase::BackupWrite,
+            LiveIoTotals {
+                files: source_manifest.artifact().entry_count,
+                progress_basis: "bacula_job_files_over_manifest_entries",
+            },
             (claim.run.workflow_kind == "backup").then_some(BaculaMediaPhase::BackupWrite),
             config.transfer_stall_timeout,
             backup_spool.as_ref(),
@@ -1310,6 +1408,10 @@ async fn perform_exercise(
             verify_dispatch.job_id,
             "Data verify",
             store::SingleTapeLiveIoPhase::FullReadback,
+            LiveIoTotals {
+                files: backup.files,
+                progress_basis: "bacula_job_files_over_backup_job_files",
+            },
             (claim.run.workflow_kind == "backup").then_some(BaculaMediaPhase::FullReadback),
             config.transfer_stall_timeout,
             None,
@@ -1417,6 +1519,10 @@ async fn perform_exercise(
             restore_dispatch.job_id,
             "full restore",
             store::SingleTapeLiveIoPhase::Restore,
+            LiveIoTotals {
+                files: backup.files,
+                progress_basis: "bacula_job_files_over_backup_job_files",
+            },
             None,
             config.transfer_stall_timeout,
             None,
@@ -2235,6 +2341,7 @@ async fn wait_for_job(
     job_id: BaculaJobId,
     operation: &str,
     live_io_phase: store::SingleTapeLiveIoPhase,
+    live_io_totals: LiveIoTotals,
     media_phase: Option<BaculaMediaPhase>,
     no_progress_timeout: Duration,
     spool_monitor: Option<&BaculaSpoolMonitor>,
@@ -2248,9 +2355,11 @@ async fn wait_for_job(
     let mut last_progress_at = Instant::now();
     let mut active_manual_media: Option<ActiveManualMedia> = None;
     let mut next_readback_volume = 1_i32;
-    let mut live_io = LiveIoSampler::default();
+    let mut live_io =
+        LiveIoSampler::with_totals(live_io_totals.files, live_io_totals.progress_basis);
     let mut tape_counter_error_reported = false;
     let mut consecutive_running_status_failures = 0_u8;
+    let mut consecutive_file_daemon_status_failures = 0_u8;
     let mut spool_monitor_error_reported = false;
     loop {
         if cancellation.is_cancelled() {
@@ -2336,6 +2445,40 @@ async fn wait_for_job(
                 (evidence.clone(), "bacula_job_bytes_delta", None)
             }
         };
+        let file_daemon_hints = match adapter.file_daemon_running_job_evidence(job_id).await {
+            Ok(Some(running)) => {
+                consecutive_file_daemon_status_failures = 0;
+                Some(BaculaFileDaemonHints {
+                    files: running.files,
+                    read_bytes: running.read_bytes,
+                    reported_read_bytes_per_second: running.read_bytes_per_second,
+                    current_file: source_relative_current_file(
+                        running.current_file.as_deref(),
+                        Path::new(&claim.run.source_mount_path),
+                    ),
+                })
+            }
+            Ok(None) => {
+                consecutive_file_daemon_status_failures = 0;
+                None
+            }
+            Err(error) => {
+                consecutive_file_daemon_status_failures =
+                    consecutive_file_daemon_status_failures.saturating_add(1);
+                if consecutive_file_daemon_status_failures == 1
+                    || consecutive_file_daemon_status_failures % 12 == 0
+                {
+                    warn!(
+                        physical_data_run_id = %claim.run.id,
+                        engine_job_id = %job_id,
+                        failures = consecutive_file_daemon_status_failures,
+                        %error,
+                        "exact Bacula File Daemon progress is unavailable; continuing with catalog, spool, and tape measurements"
+                    );
+                }
+                None
+            }
+        };
 
         let observed_at = Instant::now();
         let catalog_progress = (
@@ -2406,6 +2549,7 @@ async fn wait_for_job(
             tape_counters,
             spool,
             running_hints,
+            file_daemon_hints.as_ref(),
             last_progress_at,
             no_progress_timeout,
             observed_at,
@@ -3922,7 +4066,7 @@ mod tests {
     #[test]
     fn live_io_uses_deltas_and_keeps_pipeline_and_physical_tape_rates_distinct() {
         let started = Instant::now();
-        let mut sampler = LiveIoSampler::default();
+        let mut sampler = LiveIoSampler::with_totals(20, "bacula_job_files_over_manifest_entries");
         let mut evidence = BaculaJobEvidence {
             job_id: BaculaJobId::new(42).unwrap(),
             resource_name: None,
@@ -3951,6 +4095,11 @@ mod tests {
         assert!(first.tape_counters_available);
         assert!(first.tape_read_counter_available);
         assert!(first.tape_write_counter_available);
+        assert_eq!(first.files_total, Some(20));
+        assert_eq!(
+            first.progress_basis,
+            "bacula_job_files_over_manifest_entries"
+        );
 
         evidence.files = 20;
         evidence.bytes = 2_000;
@@ -3964,6 +4113,7 @@ mod tests {
             started + Duration::from_secs(5),
         );
         assert_eq!(second.sample_window_ms, Some(5_000));
+        assert_eq!(second.archive_entries_per_second, Some(2.0));
         assert_eq!(second.pipeline_bytes_per_second, Some(200));
         assert_eq!(second.tape_read_bytes_per_second, Some(100));
         assert_eq!(second.tape_write_bytes_per_second, Some(300));
@@ -3984,12 +4134,20 @@ mod tests {
 
     #[test]
     fn live_io_does_not_invent_rates_after_counter_reset_or_without_stats() {
+        assert_eq!(entries_per_second(100, 99, Duration::from_secs(1)), None);
+        assert_eq!(entries_per_second(0, 1, Duration::ZERO), None);
+        assert!(
+            (entries_per_second(0, 1, Duration::from_secs(5)).expect("fractional entry rate")
+                - 0.2)
+                .abs()
+                < f64::EPSILON
+        );
         assert_eq!(bytes_per_second(100, 99, Duration::from_secs(1)), None);
         assert_eq!(bytes_per_second(0, 1, Duration::ZERO), None);
         assert_eq!(counter_rate(None, Some(1), Duration::from_secs(1)), None);
 
         let started = Instant::now();
-        let mut sampler = LiveIoSampler::default();
+        let mut sampler = LiveIoSampler::with_totals(10, "bacula_job_files_over_backup_job_files");
         let mut evidence = BaculaJobEvidence {
             job_id: BaculaJobId::new(7).unwrap(),
             resource_name: None,
@@ -4025,13 +4183,15 @@ mod tests {
         assert!(!reset.tape_read_counter_available);
         assert!(!reset.tape_write_counter_available);
         assert_eq!(reset.tape_basis, None);
+        assert_eq!(reset.files_processed, 1);
+        assert_eq!(reset.pipeline_bytes_processed, 100);
     }
 
     #[test]
     fn live_io_basis_fallback_does_not_invent_progress_when_exact_counters_return() {
         let started = Instant::now();
         let timeout = Duration::from_secs(1_800);
-        let mut sampler = LiveIoSampler::default();
+        let mut sampler = LiveIoSampler::with_totals(20, "bacula_job_files_over_manifest_entries");
         let mut evidence = BaculaJobEvidence {
             job_id: BaculaJobId::new(7).unwrap(),
             resource_name: None,
@@ -4052,6 +4212,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             started,
             timeout,
             started,
@@ -4064,6 +4225,7 @@ mod tests {
             store::SingleTapeLiveIoPhase::BackupWrite,
             &evidence,
             "bacula_job_bytes_delta",
+            None,
             None,
             None,
             None,
@@ -4080,6 +4242,7 @@ mod tests {
             store::SingleTapeLiveIoPhase::BackupWrite,
             &evidence,
             "bacula_storage_running_job_bytes_delta",
+            None,
             None,
             None,
             None,
@@ -4102,6 +4265,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             started,
             timeout,
             started + Duration::from_secs(15),
@@ -4114,7 +4278,7 @@ mod tests {
     fn live_io_reports_buffer_fill_tape_streaming_and_measured_stalls() {
         let started = Instant::now();
         let timeout = Duration::from_secs(1_800);
-        let mut sampler = LiveIoSampler::default();
+        let mut sampler = LiveIoSampler::with_totals(20, "bacula_job_files_over_manifest_entries");
         let mut evidence = BaculaJobEvidence {
             job_id: BaculaJobId::new(42).unwrap(),
             resource_name: None,
@@ -4147,6 +4311,7 @@ mod tests {
                 spooling: Some(true),
                 ..BaculaRunningHints::default()
             }),
+            None,
             started,
             timeout,
             started,
@@ -4173,6 +4338,7 @@ mod tests {
                 },
                 64_000,
             )),
+            None,
             None,
             started,
             timeout,
@@ -4205,6 +4371,7 @@ mod tests {
                 despooling: Some(true),
                 ..BaculaRunningHints::default()
             }),
+            None,
             started + Duration::from_secs(5),
             timeout,
             started + Duration::from_secs(10),
@@ -4236,6 +4403,7 @@ mod tests {
                 spooling: Some(true),
                 ..BaculaRunningHints::default()
             }),
+            None,
             started + Duration::from_secs(10),
             timeout,
             started + Duration::from_secs(50),
@@ -4259,6 +4427,7 @@ mod tests {
                 },
                 64_000,
             )),
+            None,
             None,
             started + Duration::from_secs(10),
             timeout,

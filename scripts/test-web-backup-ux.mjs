@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-10/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-10/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-11/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-11/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -375,28 +375,459 @@ test("capacity planning is explicitly estimated and supports unknown archive siz
   assert.doesNotMatch(capacity, /will fit/);
 });
 
-test("writing progress truthfully distinguishes continuous and disk-staged delivery", () => {
-  const cue = section("  function renderBackupSpoolingCue(", "  function backupPhaseIndex(");
+test("running backup detail is organized around one phase-specific operation", () => {
   const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
 
-  assert.match(cue, /backupRunState\(run\) !== "writing"/);
-  assert.match(cue, /backupDataDelivery\(run\) === "direct"/);
-  assert.match(cue, /Continuous tape delivery/);
-  assert.match(cue, /no disk data spool is in this path/);
-  assert.match(cue, /throughput falls below the drive minimum/);
-  assert.match(cue, /backupEvidenceValue\(run, "data_spooling"\)/);
-  assert.match(cue, /"effective_maximum_bytes", "maximum_bytes"/);
-  assert.match(cue, /Disk-staged tape delivery/);
-  assert.match(cue, /fills and drains a bounded disk spool in segments/);
-  assert.match(cue, /tape can pause between segments when the source cannot refill at drive speed/);
-  assert.match(cue, /live panel reports the actual spool and tape activity/);
-  assert.match(cue, /staging space does not limit the total archive size/);
-  assert.doesNotMatch(cue, /%|percent|percentage/i);
-  assert.match(detail, /notice \+ renderBackupSpoolingCue\(run\) \+ renderBackupPreparationProgress\(run\) \+ renderBackupLiveThroughput\(run\) \+ measuredProgress/);
+  assert.match(detail, /renderBackupCurrentOperation\(run/);
+  assert.doesNotMatch(detail, /renderBackupSpoolingCue\(run\)/);
+  assert.doesNotMatch(detail, /renderBackupLiveThroughput\(run\)/);
+  assert.doesNotMatch(detail, /measuredProgress|Measured progress/);
+  assert.doesNotMatch(detail, /<h3>Backup result<\/h3>.*renderBackupOutcome\(run\)/s);
+  assert.doesNotMatch(app, /function renderBackupSpoolingCue\(/);
+  assert.doesNotMatch(app, /function backupProgressPercent\(/);
+  assert.match(detail, /backupRunActive\(run\) && !pick\(run, "cancel_requested_at"\)/, "a retained cancellation request must hide the duplicate action");
+  assert.match(css, /\.backup-current-file/);
+  assert.match(css, /\.backup-current-file code\s*\{[^}]*overflow-wrap:\s*anywhere;[^}]*white-space:\s*normal;/s);
+  assert.doesNotMatch(css, /\.backup-current-file code\s*\{[^}]*white-space:\s*nowrap;/s);
+  assert.match(css, /\.backup-current-operation\.cancellation-requested/);
+  assert.match(css, /\.backup-current-operation\.activity-waiting/);
 });
 
-test("backup preparation and transfer telemetry are live, directional, and honest about stale or missing samples", () => {
-  const helpers = section("  function backupLiveIo(", "  function renderBackupSpoolingCue(");
+test("transfer progress uses the current phase's cumulative counters without inventing completion", () => {
+  const helpers = section("  function backupTransferPhase(", "  function backupDurationLabel(");
+  const testPick = (object, ...keys) => {
+    if (!object || typeof object !== "object") return null;
+    for (const key of keys) if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+    return null;
+  };
+  const objectValue = (object, key) => object && object[key] && typeof object[key] === "object" && !Array.isArray(object[key]) ? object[key] : {};
+  const evidenceValue = (run, ...keys) => {
+    for (const source of [run, run && run.result, run && run.manifest]) {
+      const value = testPick(source, ...keys);
+      if (value !== null) return value;
+    }
+    return null;
+  };
+  const progress = Function(
+    "pick", "objectValue", "backupPreparationProgress", "backupMediaRequestPhase", "backupRunState", "backupNeedsNextMedia", "backupEvidenceValue", "BACKUP_RECORD_PROGRESS_BASES", "backupRunActive",
+    '"use strict";\n' + helpers + "\nreturn backupTransferProgress;"
+  )(
+    testPick,
+    objectValue,
+    (run) => objectValue(objectValue(run, "result"), "preparation_progress"),
+    (run) => String(testPick(objectValue(run, "media_request"), "phase") || "").toLowerCase(),
+    (run) => String(testPick(run, "state") || "queued").toLowerCase(),
+    (run) => Boolean(run && run.needsNextMedia),
+    evidenceValue,
+    new Set([
+      "bacula_job_files_over_manifest_entries",
+      "bacula_job_files_over_backup_job_files",
+      "bacula_job_files_over_selected_manifest_entries"
+    ]),
+    (run) => !["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"].includes(run.state)
+  );
+
+  const now = Date.parse("2026-11-14T12:00:00Z");
+  const sample = (overrides = {}) => ({
+    phase: "backup_write",
+    sampled_at: "2026-11-14T11:59:58Z",
+    sample_window_ms: 5000,
+    stale_after_seconds: 20,
+    progress_basis: "bacula_job_files_over_manifest_entries",
+    pipeline_bytes_processed: 400,
+    files_processed: 4,
+    files_total: 10,
+    pipeline_bytes_per_second: 100,
+    archive_entries_per_second: 2,
+    ...overrides
+  });
+
+  const fresh = progress({
+    state: "writing",
+    result: {
+      live_io: sample(),
+      transfer_progress: sample({ pipeline_bytes_processed: 350, files_processed: 3 })
+    },
+    manifest: { logical_bytes: 800, file_count: 8 }
+  }, now);
+  assert.equal(fresh.phase, "backup_write");
+  assert.equal(fresh.processedBytes, 400, "fresh live I/O must beat an older retained sample");
+  assert.equal(fresh.totalBytes, null, "pipeline bytes are never treated as a completion denominator");
+  assert.equal(fresh.processedFiles, 4);
+  assert.equal(fresh.totalFiles, 10);
+  assert.equal(fresh.percent, 40);
+  assert.equal(fresh.percentBasis, "records");
+  assert.equal(fresh.rate, 100);
+  assert.equal(fresh.entryRate, 2);
+  assert.equal(fresh.etaSeconds, null, "uneven archive entries must not produce a countdown");
+  assert.equal(fresh.sampleFresh, true);
+  assert.equal(fresh.paused, false);
+
+  const paused = progress({
+    state: "waiting_for_media",
+    media_request: { phase: "backup_write", volume_order: 2 },
+    result: {
+      live_io: sample({ pipeline_bytes_processed: 650, files_processed: 7 }),
+      transfer_progress: sample({ pipeline_bytes_processed: 600, files_processed: 6 })
+    }
+  }, now);
+  assert.equal(paused.paused, true);
+  assert.equal(paused.processedBytes, 600, "media waits must retain the durable cumulative position");
+  assert.equal(paused.percent, 60);
+  assert.equal(paused.sampleFresh, false);
+  assert.equal(paused.rate, null, "media waits must never present a live rate");
+  assert.equal(paused.etaSeconds, null, "media waits must never present a countdown");
+
+  const stale = progress({
+    state: "writing",
+    result: {
+      live_io: sample({ sampled_at: "2026-11-14T11:00:00Z", pipeline_bytes_processed: 450, files_processed: 4, pipeline_bytes_per_second: 999999 }),
+      transfer_progress: sample({ sampled_at: "2026-11-14T11:59:40Z", pipeline_bytes_processed: 500, files_processed: 5, pipeline_bytes_per_second: 999999 })
+    }
+  }, now);
+  assert.equal(stale.processedBytes, 500);
+  assert.equal(stale.sampleFresh, false);
+  assert.equal(stale.stale, false, "a retained cumulative position is not mislabeled as a live stale rate");
+  assert.equal(stale.rate, null);
+  assert.equal(stale.etaSeconds, null);
+
+  const readback = progress({
+    state: "verifying",
+    result: {
+      live_io: sample({ phase: "full_readback", progress_basis: "bacula_job_files_over_backup_job_files", pipeline_bytes_processed: 100, files_processed: 1 }),
+      transfer_progress: sample({ phase: "backup_write", pipeline_bytes_processed: 1000, files_processed: 10 })
+    }
+  }, now);
+  assert.equal(readback.phase, "full_readback");
+  assert.equal(readback.processedBytes, 100, "write counters must not leak across the readback reset");
+  assert.equal(readback.percent, 10);
+
+  const inventory = progress({
+    state: "inventorying",
+    result: { preparation_progress: sample({ phase: undefined, stage: "source_inventory", bytes_hashed: 250, files_hashed: 3, logical_bytes_discovered: 1000, hash_bytes_per_second: 50 }) },
+    manifest: { logical_bytes: 1000, file_count: 10 }
+  }, now);
+  assert.equal(inventory.phase, "source_inventory");
+  assert.equal(inventory.processedBytes, 250);
+  assert.equal(inventory.totalBytes, null, "the growing inventory total is not a completion denominator");
+  assert.equal(inventory.percent, null);
+  assert.equal(inventory.etaSeconds, null);
+
+  const stability = progress({
+    state: "verifying",
+    result: { preparation_progress: sample({ phase: undefined, stage: "source_stability_check", bytes_hashed: 250, files_hashed: 3, hash_bytes_per_second: 50 }) },
+    manifest: { logical_bytes: 1000, file_count: 10 }
+  }, now);
+  assert.equal(stability.phase, "source_stability_check");
+  assert.equal(stability.percent, 25);
+  assert.equal(stability.rate, 50);
+  assert.equal(stability.etaSeconds, 15);
+
+  const unknown = progress({ state: "writing", result: { live_io: sample({ progress_basis: "pipeline_bytes_only" }) } }, now);
+  assert.equal(unknown.totalBytes, null);
+  assert.equal(unknown.percent, null);
+  assert.equal(unknown.etaSeconds, null);
+  assert.equal(unknown.processedBytes, 400, "pipeline bytes remain useful as a stream position");
+
+  const exceeded = progress({ state: "writing", result: { live_io: sample({ files_processed: 12 }) } }, now);
+  assert.equal(exceeded.rawPercent, 100, "counter overshoot must be clamped");
+  assert.equal(exceeded.percent, 99, "active phase finalization must not look complete");
+  assert.equal(exceeded.phaseComplete, true);
+  assert.equal(exceeded.etaSeconds, null);
+
+  const zero = progress({ state: "writing", result: { live_io: sample({ pipeline_bytes_processed: 0, files_processed: 0, files_total: 0 }) } }, now);
+  assert.equal(zero.rawPercent, 100, "a manifest-proven empty source is explicitly complete");
+  assert.equal(zero.percent, 99, "the active phase still waits for finalization");
+  assert.equal(zero.etaSeconds, null);
+
+  const inconsistentZero = progress({ state: "writing", result: { live_io: sample({ pipeline_bytes_processed: 10, files_processed: 1, files_total: 0 }) } }, now);
+  assert.equal(inconsistentZero.percent, null, "a nonzero counter cannot be presented as complete against an empty entry set");
+  assert.equal(inconsistentZero.etaSeconds, null);
+
+  const failed = progress({ state: "failed", result: { transfer_progress: sample({ pipeline_bytes_processed: 300, files_processed: 3 }) } }, now);
+  assert.equal(failed.percent, 30, "failure preserves its last confirmed phase position rather than becoming complete");
+
+  const terminalComplete = progress({ state: "failed", result: { transfer_progress: sample({ files_processed: 10 }) } }, now);
+  assert.equal(terminalComplete.percent, 100, "a terminal run may show the complete retained phase position");
+
+  for (const progressBasis of [
+    "bacula_job_files_over_manifest_entries",
+    "bacula_job_files_over_backup_job_files",
+    "bacula_job_files_over_selected_manifest_entries"
+  ]) {
+    const recognized = progress({ state: "writing", result: { live_io: sample({ progress_basis: progressBasis }) } }, now);
+    assert.equal(recognized.percentBasis, "records", `${progressBasis} must use its record denominator`);
+  }
+});
+
+test("the operation hero renders phase-specific progress, rates, and tape actions", () => {
+  const helpers = section("  function backupApproximateDuration(", "  function backupPhaseIndex(");
+  const testPick = (object, ...keys) => {
+    if (!object || typeof object !== "object") return null;
+    for (const key of keys) if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+    return null;
+  };
+  const objectValue = (object, key) => object && object[key] && typeof object[key] === "object" && !Array.isArray(object[key]) ? object[key] : {};
+  const [operation, render] = Function(
+    "pick", "objectValue", "backupRunState", "backupTransferProgress", "BACKUP_TERMINAL_STATES", "backupMediaRequestState", "backupDataDelivery", "backupTransferPhase", "backupLiveActivity", "backupPhaseIndex", "backupRunStateLabel", "backupNeedsNextMedia", "backupMediaIsReadback", "backupNextVolumeSequence", "recordId", "esc", "backupRunVolumes", "bytes", "backupDurationLabel", "date", "BACKUP_PHASES",
+    '"use strict";\n' + helpers + "\nreturn [backupCurrentOperation, renderBackupCurrentOperation];"
+  )(
+    testPick,
+    objectValue,
+    (run) => run.state,
+    (run) => run._progress,
+    new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]),
+    (run) => String(testPick(objectValue(run, "media_request"), "state") || "").toLowerCase(),
+    (run) => run.data_delivery || "disk_spool",
+    (value) => ({ tape_write: "backup_write", writing: "backup_write", tape_read: "full_readback", verifying: "full_readback" })[String(value || "")] || String(value || ""),
+    (liveIo) => liveIo.activity || "starting",
+    (run) => Number.isInteger(run.step) ? run.step : 3,
+    (run) => ({ writing: "Writing tape", verifying: "Reading tape back", failed: "Failed", queued: "Waiting to start" })[run.state] || run.state,
+    (run) => Boolean(run.needsNextMedia),
+    (run) => testPick(objectValue(run, "media_request"), "phase") === "full_readback",
+    (run) => Number(testPick(objectValue(run, "media_request"), "volume_order") || 1),
+    (run) => run.id || "run-1",
+    (value) => String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;"),
+    (run) => run.volumes || [],
+    (value) => Number(value).toLocaleString() + " B",
+    (milliseconds) => Math.floor(Number(milliseconds) / 1000) + "s",
+    String,
+    Array.from({ length: 8 }, (_, index) => ({ name: "Phase " + (index + 1) }))
+  );
+
+  const progress = (overrides = {}) => ({
+    phase: "backup_write",
+    processedBytes: 400,
+    totalBytes: null,
+    processedFiles: 4,
+    totalFiles: 10,
+    percent: 40,
+    rawPercent: 40,
+    percentBasis: "records",
+    progressBasis: "bacula_job_files_over_manifest_entries",
+    phaseComplete: false,
+    sampleFresh: true,
+    stale: false,
+    paused: false,
+    rate: 100,
+    entryRate: 2,
+    etaSeconds: null,
+    sampledAt: "2026-11-14T12:00:00Z",
+    sample: {},
+    liveIo: {
+      phase: "backup_write",
+      activity: "streaming",
+      current_file: 'Radio Stuff/session <final>&".wav',
+      file_daemon_read_bytes_per_second: 80,
+      tape_write_counter_available: true,
+      tape_write_bytes_per_second: 200,
+      tape_read_counter_available: true,
+      tape_read_bytes_per_second: 300
+    },
+    preparation: {},
+    ...overrides
+  });
+
+  const directRun = {
+    id: "run-1",
+    state: "writing",
+    data_delivery: "direct",
+    expected_cartridge_label: "AA0315",
+    volumes: [{ sequence: 1, label: "AA0315" }],
+    _progress: progress()
+  };
+  const direct = render(directRun);
+  assert.match(direct, /Step 4 of 8/);
+  assert.match(direct, /Streaming directly to tape/);
+  assert.match(direct, /Archive entries reached/);
+  assert.match(direct, /4 of 10 entries/);
+  assert.match(direct, /400 B in the Bacula phase stream/);
+  assert.match(direct, /40%/);
+  assert.match(direct, /Bacula write stream/);
+  assert.match(direct, /100 B\/s/);
+  assert.match(direct, /Source read/);
+  assert.match(direct, /80 B\/s/);
+  assert.match(direct, /Tape write/);
+  assert.match(direct, /200 B\/s/);
+  assert.match(direct, /Archive entry rate/);
+  assert.match(direct, /2 entries\/s/);
+  assert.doesNotMatch(direct, /Tape read/);
+  assert.doesNotMatch(direct, /Estimated remaining/);
+  assert.match(direct, /Current file/);
+  assert.match(direct, /Radio Stuff\/session &lt;final&gt;&amp;&quot;\.wav/);
+  assert.doesNotMatch(direct, /<final>/, "the source-relative filename must be HTML escaped");
+  assert.match(direct, /not retained after this phase/);
+  assert.match(direct, /Continuous streaming · no disk data spool/);
+
+  const readbackRun = {
+    ...directRun,
+    state: "verifying",
+    step: 5,
+    _progress: progress({
+      phase: "full_readback",
+      processedBytes: 100,
+      processedFiles: 1,
+      percent: 10,
+      rawPercent: 10,
+      progressBasis: "bacula_job_files_over_backup_job_files",
+      liveIo: { phase: "full_readback", activity: "reading", tape_read_counter_available: true, tape_read_bytes_per_second: 175 }
+    })
+  };
+  const readback = render(readbackRun);
+  assert.match(readback, /Step 6 of 8/);
+  assert.match(readback, /Reading archive back/);
+  assert.match(readback, /Archive entries read back/);
+  assert.match(readback, /1 of 10 entries/);
+  assert.match(readback, /Tape read/);
+  assert.match(readback, /175 B\/s/);
+  assert.doesNotMatch(readback, /Tape write/);
+
+  const stagedRun = {
+    ...directRun,
+    data_delivery: "disk_spool",
+    _progress: progress({
+      liveIo: {
+        phase: "backup_write",
+        activity: "buffering",
+        tape_write_counter_available: true,
+        tape_write_bytes_per_second: 0,
+        spool_bytes: 250,
+        spool_capacity_bytes: 1000
+      }
+    })
+  };
+  const staged = render(stagedRun);
+  assert.match(staged, /Filling the disk buffer/);
+  assert.match(staged, /Disk buffer/);
+  assert.match(staged, /250 B \/ 1,000 B/);
+  assert.match(staged, /25% occupied · not archive progress/);
+  assert.doesNotMatch(staged, /Tape read/);
+
+  const pausedRun = {
+    ...directRun,
+    state: "waiting_for_media",
+    needsNextMedia: true,
+    media_request: { phase: "backup_write", state: "pending", volume_order: 2 },
+    allowed_actions: { assign_next_media: true },
+    _progress: progress({ processedBytes: 600, processedFiles: 6, percent: 60, rawPercent: 60, paused: true, sampleFresh: false, rate: 999, entryRate: null, etaSeconds: null, liveIo: {} })
+  };
+  const paused = render(pausedRun);
+  assert.match(paused, /Load tape 2 to continue/);
+  assert.match(paused, /6 of 10 entries/);
+  assert.match(paused, /600 B in the Bacula phase stream/);
+  assert.match(paused, /60%/);
+  assert.match(paused, /Paused at the last confirmed position/);
+  assert.match(paused, /Load next tape/);
+  assert.doesNotMatch(paused, /999 B\/s|Estimated remaining/);
+
+  const stale = render({
+    ...directRun,
+    _progress: progress({ processedBytes: 500, processedFiles: 5, percent: 50, rawPercent: 50, sampleFresh: false, stale: true, rate: null, entryRate: null, etaSeconds: null, liveIo: {} })
+  });
+  assert.match(stale, /Update delayed/);
+  assert.match(stale, /5 of 10 entries/);
+  assert.doesNotMatch(stale, /Estimated remaining|100 B\/s|200 B\/s/);
+
+  const inventory = render({
+    ...directRun,
+    state: "inventorying",
+    step: 2,
+    _progress: progress({
+      phase: "source_inventory",
+      processedBytes: 250,
+      totalBytes: null,
+      processedFiles: 3,
+      totalFiles: null,
+      percent: null,
+      rawPercent: null,
+      percentBasis: null,
+      rate: 50,
+      entryRate: null,
+      etaSeconds: null,
+      preparation: { files_discovered: 5, logical_bytes_discovered: 700, elapsed_ms: 5000 }
+    })
+  });
+  assert.match(inventory, /Scanning and hashing source/);
+  assert.match(inventory, /Total grows while scanning/);
+  assert.match(inventory, /Bytes hashed/);
+  assert.doesNotMatch(inventory, /Tape write|Tape read|aria-valuenow/);
+
+  const finalCheck = render({
+    ...readbackRun,
+    step: 6,
+    _progress: progress({ phase: "source_stability_check", processedBytes: 250, totalBytes: 1000, percent: 25, rawPercent: 25, percentBasis: "bytes", progressBasis: "sha256_source_bytes_over_manifest_logical_bytes", rate: 50, entryRate: null, etaSeconds: 15, liveIo: {}, preparation: { stage: "source_stability_check" } })
+  });
+  assert.match(finalCheck, /Confirming source snapshot/);
+  assert.match(finalCheck, /Source snapshot checked/);
+  assert.match(finalCheck, /Source check/);
+  assert.doesNotMatch(finalCheck, /<span>Tape write<\/span>|<span>Tape read<\/span>/);
+
+  const unknownTotal = render({ ...directRun, _progress: progress({ totalBytes: null, totalFiles: null, percent: null, rawPercent: null, percentBasis: null, progressBasis: "pipeline_bytes_only", entryRate: null, etaSeconds: null }) });
+  assert.match(unknownTotal, /Engine stream position · not archive completion/);
+  assert.doesNotMatch(unknownTotal, /aria-valuenow/);
+
+  const empty = render({ ...directRun, _progress: progress({ processedBytes: 0, processedFiles: 0, totalFiles: 0, percent: 99, rawPercent: 100, phaseComplete: true, entryRate: 0, etaSeconds: null }) });
+  assert.match(empty, /Empty source confirmed/);
+  assert.match(empty, /Phase finalization is still in progress/);
+
+  const inconsistentZero = render({ ...directRun, _progress: progress({ processedBytes: 10, processedFiles: 1, totalFiles: 0, percent: null, rawPercent: null, entryRate: null, etaSeconds: null }) });
+  assert.match(inconsistentZero, /10 B/);
+  assert.match(inconsistentZero, /Engine stream position · not archive completion/);
+  assert.doesNotMatch(inconsistentZero, /100%|Empty source confirmed/);
+
+  const activeComplete = render({ ...directRun, _progress: progress({ processedFiles: 10, percent: 99, rawPercent: 100, phaseComplete: true }) });
+  assert.match(activeComplete, /aria-valuenow="99\.0"/);
+  assert.match(activeComplete, /All entries reached · phase finalization pending/);
+  assert.doesNotMatch(activeComplete, />100%<|aria-valuenow="100/);
+
+  const overshoot = render({ ...directRun, _progress: progress({ processedFiles: 12, percent: 99, rawPercent: 100, phaseComplete: true }) });
+  assert.match(overshoot, /10 of 10 entries/);
+  assert.doesNotMatch(overshoot, /12 of 10 entries/);
+
+  const waitingForFirstSample = render({
+    ...directRun,
+    state: "waiting_for_media",
+    media_request: { phase: "backup_write", state: "pending", volume_order: 1 },
+    _progress: progress({ processedBytes: null, processedFiles: null, totalFiles: null, percent: null, rawPercent: null, percentBasis: null, sampleFresh: false, paused: true, rate: null, entryRate: null, sampledAt: null, liveIo: {} })
+  });
+  assert.match(waitingForFirstSample, /No transfer is active until the requested tape is confirmed/);
+  assert.doesNotMatch(waitingForFirstSample, /backup-operation-progress|backup-operation-position|B\/s|entries\/s/);
+
+  const cancellation = render({ ...directRun, cancel_requested_at: "2026-11-14T12:01:00Z", allowed_actions: { cancel: true } });
+  assert.match(cancellation, /Cancellation requested/);
+  assert.match(cancellation, /Stopping safely/);
+  assert.match(cancellation, /cancellation-requested/);
+  assert.doesNotMatch(cancellation, /backup-operation-action/);
+
+  const legacyIdle = render({
+    ...directRun,
+    _progress: progress({ liveIo: { phase: "backup_write", activity: "idle" } })
+  });
+  assert.match(legacyIdle, /No data movement/);
+  assert.doesNotMatch(legacyIdle, /safety threshold|Automatic cancellation|for 0s/);
+
+  const failedRun = { ...directRun, state: "failed", _progress: progress({ processedBytes: 300, processedFiles: 3, percent: 30, rawPercent: 30, sampleFresh: false, rate: null, entryRate: null, etaSeconds: null, liveIo: {} }) };
+  const failed = render(failedRun);
+  assert.match(failed, /Last confirmed progress/);
+  assert.match(failed, /3 of 10 entries/);
+  assert.match(failed, /30%/);
+  assert.doesNotMatch(failed, /Estimated remaining/);
+
+  const failedBeforeTransfer = render({ ...directRun, state: "failed", _progress: progress({ processedBytes: null, totalBytes: null, processedFiles: null, totalFiles: null, percent: null, rawPercent: null, percentBasis: null, sampleFresh: false, rate: null, entryRate: null, etaSeconds: null, liveIo: {} }) });
+  assert.match(failedBeforeTransfer, /No transfer progress was recorded before this attempt stopped/);
+  assert.doesNotMatch(failedBeforeTransfer, /Last confirmed progress/);
+
+  assert.equal(render({ ...directRun, state: "verified" }), "", "terminal success uses the verified outcome instead of a live operation hero");
+  assert.equal(operation(pausedRun).action.heading, "Load tape 2 to continue");
+});
+
+test("shared preparation and engine telemetry remain honest about stale or missing samples", () => {
+  const helpers = section("  function backupLiveIo(", "  function backupApproximateDuration(");
   const values = Function(
     "objectValue", "pick", "backupRunState", "BACKUP_TERMINAL_STATES", "human", "date", "bytes", "esc", "backupDataDelivery",
     '"use strict";\n' + helpers + "\nreturn [backupLiveIoStale, renderBackupPreparationProgress, renderBackupLiveThroughput];"
@@ -456,14 +887,13 @@ test("backup preparation and transfer telemetry are live, directional, and hones
   assert.match(live, /not archive completion/);
   assert.match(live, /Filling<\/span><strong>2\.0 MiB\/s/);
   assert.match(live, /Source data is moving into the temporary disk buffer/);
-  assert.match(live, /Bacula processed stream/);
+  assert.match(live, /Bacula write stream/);
   assert.match(live, /After Bacula hashing\/compression · not raw ZFS throughput/);
   assert.doesNotMatch(live, /Logical backup pipeline/);
   assert.match(live, /1\.0 MiB\/s/);
   assert.match(live, /Tape write/);
   assert.match(live, /0 B\/s/);
-  assert.match(live, /Tape read/);
-  assert.match(live, /Measuring…/);
+  assert.doesNotMatch(live, /Tape read/);
   assert.match(live, /Rolling 5 second sample/);
   assert.match(live, /Engine progress: Bacula Storage Running Job Bytes Delta/);
   assert.match(live, /Disk buffer: Run Scoped Bacula Spool Regular File Bytes/);
@@ -490,7 +920,7 @@ test("backup preparation and transfer telemetry are live, directional, and hones
   const idle = render({ state: "writing", result: { live_io: { ...freshSample, activity: "idle", progress_idle_ms: 300000, pipeline_bytes_per_second: 0, spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 0 } } });
   assert.match(idle, /No data movement/);
   assert.match(idle, /worker is responding/i);
-  assert.match(idle, /no measured disk-buffer, logical, or tape bytes have moved for 5m 0s/i);
+  assert.match(idle, /no measured disk-buffer, engine, or tape bytes have moved for 5m 0s/i);
   assert.match(idle, /Automatic cancellation in 25m 0s/);
   assert.match(idle, /heartbeat is not counted as progress/);
 
@@ -505,11 +935,21 @@ test("backup preparation and transfer telemetry are live, directional, and hones
   assert.doesNotMatch(legacyIdle, /Disk buffer<\/span>/);
 
   const unavailable = render({ state: "writing", result: { live_io: { ...freshSample, tape_read_counter_available: false, tape_write_counter_available: false, tape_counters_available: false } } });
-  assert.equal((unavailable.match(/Unavailable/g) || []).length, 2);
+  assert.equal((unavailable.match(/Unavailable/g) || []).length, 1);
 
   const partial = render({ state: "writing", result: { live_io: { ...freshSample, tape_read_counter_available: false } } });
   assert.match(partial, /Tape write<\/span><strong>0 B\/s/);
-  assert.match(partial, /Tape read<\/span><strong>Unavailable/);
+  assert.doesNotMatch(partial, /Tape read/);
+
+  const verifying = render({ state: "verifying", result: { live_io: { ...freshSample, phase: "full_readback", activity: "reading", tape_read_bytes_per_second: 1048576 } } });
+  assert.match(verifying, /Bacula verify stream/);
+  assert.match(verifying, /Bacula JobBytes · not source logical bytes/);
+  assert.doesNotMatch(verifying, /Logical verify pipeline|logical readback pipeline/);
+
+  const restoring = render({ state: "restoring", result: { live_io: { ...freshSample, phase: "restore", activity: "restoring", tape_read_bytes_per_second: 1048576 } } });
+  assert.match(restoring, /Bacula restore stream/);
+  assert.match(restoring, /Recovered data is moving through the Bacula restore stream/);
+  assert.doesNotMatch(restoring, /Logical restore pipeline/);
 
   const oldSample = { ...freshSample, sampled_at: "2000-01-01T00:00:00Z", pipeline_bytes_per_second: 999999999 };
   assert.equal(stale(oldSample, now), true);
@@ -566,7 +1006,7 @@ test("backup preparation and transfer telemetry are live, directional, and hones
   const stability = renderPreparation({ state: "verifying", result: { preparation_progress: { ...preparationSample, stage: "source_stability_check", step: "sorting" } } });
   assert.match(stability, /Sorting manifest entries/);
   assert.match(stability, /Tape readback is complete/);
-  assert.equal(render({ state: "verifying", result: { live_io: freshSample, preparation_progress: preparationSample } }), "");
+  assert.match(render({ state: "writing", result: { live_io: freshSample, preparation_progress: preparationSample } }), /Filling the disk buffer/, "a retained inventory sample must not hide active write telemetry");
 
   const direct = render({ state: "writing", data_delivery: "direct", result: { live_io: { ...freshSample, activity: "streaming", tape_write_bytes_per_second: 4194304 } } });
   assert.match(direct, /Streaming directly to tape/);
@@ -662,30 +1102,214 @@ test("server blocker actions lead to the correct recovery surface", () => {
 });
 
 test("a run URL renders a dedicated progress page", () => {
+  const load = section("  async function loadAll(", "  function setBadge(");
   const render = section("  function renderJobs(", "  function mediaName(");
   const routeBranch = render.indexOf("if (routeId)");
   const overviewMetrics = render.indexOf("const active =");
 
+  assert.match(load, /const requestedId = backupRunRouteId\(\)/);
+  assert.match(load, /const id = requestedId \|\| recordId\(run\)/);
+  assert.match(load, /if \(id\) await loadBackupRunDetail\(id, !initial\)/);
   assert.ok(routeBranch >= 0 && routeBranch < overviewMetrics, "the dedicated route must return before dashboard composition");
   assert.match(render, /href="#jobs">← Back to Backup Center/);
   assert.match(render, /renderBackupRunDetail/);
+  assert.match(app, /function backupTransferProgress\(/);
+  assert.doesNotMatch(section("  function backupTransferPhase(", "  function backupFailureDetail("), /progress_percent|percent_complete/);
+});
 
-  const progress = section("  function backupProgressPercent(", "  function backupFailureDetail(");
-  assert.match(progress, /reported !== null && reported !== ""/);
-  assert.match(progress, /return null/);
-  assert.doesNotMatch(progress, /backupPhaseIndex\(run\).*100/);
+test("backup polling preserves disclosure, focus, and scroll state while refreshing detail once", () => {
+  const uiStateHelpers = section("  function captureBackupRouteUiState(", "  function scheduleBackupRunPoll(");
+  const technicalBefore = { open: true };
+  const phasesBefore = { open: true };
+  const focusedBefore = { id: "cancel-control", dataset: { action: "cancel-backup-run", id: "run-1" }, matches: () => false, selectionStart: 2, selectionEnd: 6 };
+  const technicalAfter = { open: false, querySelector: () => null };
+  const phasesAfter = { open: false };
+  const focusCalls = [];
+  const selectionCalls = [];
+  const focusedAfter = { focus: (options) => focusCalls.push(options), setSelectionRange: (...range) => selectionCalls.push(range) };
+  let restored = false;
+  const main = {
+    contains: (element) => element === focusedBefore,
+    querySelector: (selector) => restored
+      ? selector === ".backup-technical" ? technicalAfter : selector === ".backup-phase-mobile" ? phasesAfter : null
+      : selector === ".backup-technical" ? technicalBefore : selector === ".backup-phase-mobile" ? phasesBefore : null,
+    querySelectorAll: () => []
+  };
+  const document = { activeElement: focusedBefore, getElementById: (id) => id === "cancel-control" ? focusedAfter : null };
+  const scrollCalls = [];
+  const window = { scrollX: 12, scrollY: 345, scrollTo: (...coordinates) => scrollCalls.push(coordinates) };
+  const [capture, restore] = Function(
+    "state", "backupRunRouteId", "main", "document", "window",
+    '"use strict";\n' + uiStateHelpers + "\nreturn [captureBackupRouteUiState, restoreBackupRouteUiState];"
+  )({ route: "jobs" }, () => "run-1", main, document, window);
+
+  const snapshot = capture();
+  assert.deepEqual(snapshot, {
+    technicalOpen: true,
+    phasesOpen: true,
+    focusId: "cancel-control",
+    focusAction: "cancel-backup-run",
+    focusRecordId: "run-1",
+    focusTechnical: false,
+    selectionStart: 2,
+    selectionEnd: 6,
+    scrollX: 12,
+    scrollY: 345
+  });
+  restored = true;
+  restore(snapshot);
+  assert.equal(technicalAfter.open, true);
+  assert.equal(phasesAfter.open, true);
+  assert.deepEqual(focusCalls, [{ preventScroll: true }]);
+  assert.deepEqual(selectionCalls, [[2, 6]]);
+  assert.deepEqual(scrollCalls, [[12, 345]]);
+
+  const [captureElsewhere] = Function(
+    "state", "backupRunRouteId", "main", "document", "window",
+    '"use strict";\n' + uiStateHelpers + "\nreturn [captureBackupRouteUiState, restoreBackupRouteUiState];"
+  )({ route: "restore" }, () => null, main, document, window);
+  assert.equal(captureElsewhere(), null, "unrelated routes are not treated as backup polling surfaces");
+
+  const poll = section("  function scheduleBackupRunPoll(", "  function openAddMedia(");
+  assert.match(poll, /const routeUi = captureBackupRouteUiState\(\)/);
+  assert.match(poll, /await loadBackupRunDetail\(recordId\(selected\), true, false\)/);
+  const captureIndex = poll.indexOf("captureBackupRouteUiState()");
+  const renderIndex = poll.indexOf("render();");
+  const restoreIndex = poll.indexOf("restoreBackupRouteUiState(routeUi)");
+  assert.ok(captureIndex >= 0 && captureIndex < renderIndex && renderIndex < restoreIndex, "route UI state must wrap the poll-driven render");
+  assert.match(poll, /if \(\["jobs", "overview"\]\.includes\(state\.route\)\) \{\s*render\(\);/s, "polling must not destroy focus on an unrelated route");
+});
+
+test("a late active detail response cannot overwrite a newer terminal list record", async () => {
+  const helper = section("  async function loadBackupRunDetail(", "  async function selectBackupRun(");
+  const terminal = { id: "run1", state: "failed", result: { transfer_progress: { files_processed: 7 } } };
+  const state = {
+    route: "jobs",
+    errors: {},
+    backupRunDetailLoading: new Set(),
+    data: { backupRuns: [terminal], backupRunDetails: {} }
+  };
+  const load = Function(
+    "state", "request", "endpoints", "recordId", "rememberBackupRun", "selectedBackupRun", "render",
+    '"use strict";\n' + helper + "\nreturn loadBackupRunDetail;"
+  )(
+    state,
+    async () => ({ run: { id: "run1", state: "writing", result: { transfer_progress: { files_processed: 6 } } } }),
+    { backupRuns: "/api/v1/backup-runs" },
+    (run) => run && run.id || "",
+    (run) => { state.data.backupRuns = [run]; },
+    () => terminal,
+    () => {}
+  );
+
+  await load("run1", true, false);
+  assert.equal(state.data.backupRuns[0], terminal, "detail caching must not replace the authoritative list snapshot");
+  assert.equal(state.data.backupRunDetails.run1.run.state, "writing", "the response remains available for guarded detail merging");
+});
+
+test("fresh selected detail wins without resurrecting deleted result fields", () => {
+  const helper = section("  function backupRunRecord(", "  function orderedBackupRuns(");
+  const state = {
+    selectedBackupRunId: "run1",
+    errors: {},
+    data: {
+      backupRunDetails: {
+        run1: {
+          run: {
+            id: "run1",
+            state: "verifying",
+            result: {
+              live_io: { phase: "full_readback", pipeline_bytes_processed: 600 },
+              transfer_progress: { phase: "full_readback", pipeline_bytes_processed: 600 }
+            }
+          }
+        }
+      }
+    }
+  };
+  const record = Function(
+    "state", "recordId", "objectValue", "BACKUP_TERMINAL_STATES", "backupRunState",
+    '"use strict";\n' + helper + "\nreturn backupRunRecord;"
+  )(
+    state,
+    (value) => value && value.id || "",
+    (object, key) => object && object[key] && typeof object[key] === "object" && !Array.isArray(object[key]) ? object[key] : {},
+    new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]),
+    (run) => run.state
+  );
+  const merged = record({
+    id: "run1",
+    state: "writing",
+    result: {
+      logical_bytes: 1000,
+      preparation_progress: { stage: "source_inventory" },
+      live_io: { phase: "backup_write", pipeline_bytes_processed: 100 }
+    }
+  });
+
+  assert.equal(merged.state, "verifying");
+  assert.equal(merged.result.logical_bytes, undefined, "the detailed result replaces a stale summary result as one coherent snapshot");
+  assert.equal(merged.result.live_io.phase, "full_readback");
+  assert.equal(merged.result.preparation_progress, undefined, "keys deliberately absent from detail must stay absent");
+  assert.equal(merged.result.live_io.pipeline_bytes_processed, 600);
+  assert.equal(merged.result.transfer_progress.pipeline_bytes_processed, 600);
+
+  const terminalList = record({ id: "run1", state: "failed", result: { transfer_progress: { phase: "backup_write", files_processed: 3 } } });
+  assert.equal(terminalList.state, "failed", "a terminal list refresh must beat an older active detail");
+  assert.equal(terminalList.result.transfer_progress.phase, "backup_write");
+
+  state.errors["backupRun:run1"] = new Error("detail refresh failed");
+  const listAfterDetailError = record({ id: "run1", state: "writing", result: { transfer_progress: { files_processed: 5 } } });
+  assert.equal(listAfterDetailError.state, "writing");
+  assert.equal(listAfterDetailError.result.transfer_progress.files_processed, 5);
+
+  delete state.errors["backupRun:run1"];
+  state.selectedBackupRunId = "another-run";
+  const unselected = record({ id: "run1", state: "writing", result: { transfer_progress: { files_processed: 7 } } });
+  assert.equal(unselected.result.transfer_progress.files_processed, 7, "cached detail must not overwrite a fresh unselected list row");
+});
+
+test("backup detail distinguishes the requested time from the actual start time", () => {
+  const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
+  assert.match(detail, /const requestedAt = pick\(run, "created_at"\)/);
+  assert.match(detail, /const startedAt = pick\(run, "started_at"\)/);
+  assert.match(detail, /const timing = startedAt \? "Started " \+ date\(startedAt\) : "Requested " \+ date\(requestedAt\)/);
+  assert.match(detail, /<dt>Requested<\/dt>/);
+  assert.match(detail, /startedAt \? '<dt>Started<\/dt>/);
+  assert.doesNotMatch(detail, /Started .*pick\(run, "created_at", "started_at"\)/s);
+});
+
+test("backup history labels percentages with their phase", () => {
+  const helper = section("  function backupTableProgressLabel(", "  function backupReadbackSummary(");
+  const label = Function(
+    "BACKUP_TERMINAL_STATES", "backupRunState", "backupTransferProgress", "backupPercentLabel",
+    '"use strict";\n' + helper + "\nreturn backupTableProgressLabel;"
+  )(
+    new Set(["verified", "failed", "cancelled"]),
+    (run) => run.state,
+    (run) => run.progress,
+    (value) => Math.round(value) + "%"
+  );
+
+  assert.equal(label({ state: "writing", progress: { phase: "backup_write", percent: 42.4 } }), "Write 42%");
+  assert.equal(label({ state: "verifying", progress: { phase: "full_readback", percent: 17.2 } }), "Readback 17%");
+  assert.equal(label({ state: "verifying", progress: { phase: "source_stability_check", percent: 9.8 } }), "Final check 10%");
+  assert.equal(label({ state: "writing", progress: { phase: "backup_write", percent: null } }), null);
+  assert.equal(label({ state: "failed", progress: { phase: "backup_write", percent: 42.4 } }), null);
 });
 
 test("run summaries distinguish planned, active, complete, and failed readback", () => {
   const helperSource = section("  function backupReadbackSummary(", "  function backupFailureDetail(");
-  const summary = Function("backupRunState", "BACKUP_TERMINAL_STATES", "pick", "backupPreparationProgress", '"use strict";\n' + helperSource + "\nreturn backupReadbackSummary;")(
+  const summary = Function("backupRunState", "BACKUP_TERMINAL_STATES", "pick", "backupPreparationProgress", "backupMediaIsReadback", '"use strict";\n' + helperSource + "\nreturn backupReadbackSummary;")(
     (run) => run.state,
     new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]),
     (object, key) => object && object[key] !== undefined ? object[key] : null,
-    (run) => run.result && run.result.preparation_progress || {}
+    (run) => run.result && run.result.preparation_progress || {},
+    (run) => run.media_request && run.media_request.phase === "full_readback"
   );
 
   assert.equal(summary({ state: "waiting_for_media" }), "Complete readback planned");
+  assert.equal(summary({ state: "waiting_for_media", media_request: { phase: "full_readback" } }), "Readback tape needed");
   assert.equal(summary({ state: "verifying" }), "Readback in progress");
   assert.equal(summary({ state: "verifying", result: { preparation_progress: { stage: "source_stability_check" } } }), "Readback complete; final source check");
   assert.equal(summary({ state: "verified" }), "Readback complete");
@@ -696,8 +1320,66 @@ test("run summaries distinguish planned, active, complete, and failed readback",
   assert.match(detail, /backupReadbackSummary\(run\)/);
   assert.match(app, /\{ name: "Confirm first tape", detail: "Choose the first archive volume"/);
   assert.match(app, /\{ name: "Preflight", detail: "Validate source, catalog, drive, tape, and delivery path", aliases: \["queued", "media_assigned", "preparing"\] \}/);
-  assert.match(app, /\{ name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: \["inventorying", "manifesting", "source_manifest"\] \}/);
+  assert.match(app, /\{ name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: \["inventorying", "manifesting", "source_manifest", "source_inventory"\] \}/);
+  assert.match(app, /\{ name: "Write archive", detail: "Copy across tapes as needed", aliases: \[[^\]]*"backup_write"/);
+  assert.match(app, /\{ name: "Read back", detail: "Verify every physical tape", aliases: \[[^\]]*"full_readback"/);
   assert.match(app, /\{ name: "Finalize", detail: "Confirm the source snapshot and seal evidence", aliases: \["source_stability_check", "final_source_check"\] \}/);
+});
+
+test("the eight-stage journey is complete on desktop and compact on mobile", () => {
+  const phases = section("  const BACKUP_PHASES = [", "  const BACKUP_TERMINAL_STATES");
+  const phaseList = Function('"use strict";\n' + phases + "\nreturn BACKUP_PHASES;")();
+  const phaseIndexSource = section("  function backupPhaseIndex(", "  function renderBackupPhaseTrack(");
+  const phaseIndex = Function(
+    "BACKUP_PHASES", "backupRunState", "backupPreparationProgress", "pick", "backupMediaIsReadback", "backupNeedsNextMedia", "backupEvidenceValue", "backupRunEvents", "backupTransferPhase", "backupExpectedTransferPhase", "objectValue",
+    '"use strict";\n' + phaseIndexSource + "\nreturn backupPhaseIndex;"
+  )(
+    phaseList,
+    (run) => run.state,
+    (run) => run.preparation || {},
+    (object, ...keys) => {
+      if (!object) return null;
+      for (const key of keys) if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+      return null;
+    },
+    (run) => Boolean(run.readback_media),
+    (run) => Boolean(run.next_media),
+    (run, ...keys) => {
+      for (const key of keys) if (run[key] !== undefined && run[key] !== null && run[key] !== "") return run[key];
+      return null;
+    },
+    (run) => run.events || [],
+    (value) => {
+      const phase = String(value || "").toLowerCase();
+      if (["backup_write", "tape_write", "writing", "spooling"].includes(phase)) return "backup_write";
+      if (["full_readback", "tape_read", "tape_readback", "verifying", "reading"].includes(phase)) return "full_readback";
+      if (["source_stability_check", "final_source_check"].includes(phase)) return "source_stability_check";
+      if (["source_inventory", "inventory", "inventorying"].includes(phase)) return "source_inventory";
+      return phase;
+    },
+    (run) => run.expected_phase || run.result && run.result.transfer_progress && run.result.transfer_progress.phase || "",
+    (object, key) => object && object[key] && typeof object[key] === "object" && !Array.isArray(object[key]) ? object[key] : {}
+  );
+  const renderer = section("  function renderBackupPhaseTrack(", "  function backupTableProgressLabel(");
+  assert.equal((phases.match(/\{ name:/g) || []).length, 8);
+  assert.equal(phaseIndex({ state: "preparing" }), 1);
+  assert.equal(phaseIndex({ state: "inventorying" }), 2);
+  assert.equal(phaseIndex({ state: "writing" }), 3);
+  assert.equal(phaseIndex({ state: "written" }), 4);
+  assert.equal(phaseIndex({ state: "verifying" }), 5);
+  assert.equal(phaseIndex({ state: "verifying", readback_media: true, preparation: { stage: "final_source_check" } }), 6, "the final-check alias supersedes retained readback media state");
+  assert.equal(phaseIndex({ state: "failed", result: { transfer_progress: { phase: "full_readback" } } }), 5, "a terminal detail stays on its retained canonical transfer phase");
+  assert.equal(phaseIndex({ state: "failed", events: [{ event_type: "engine_dispatched", evidence: { phase: "full_readback" } }] }), 5, "canonical event evidence drives the journey");
+  assert.equal(phaseIndex({ state: "failed", events: [{ event_type: "engine_dispatched", evidence: { phase: "source_inventory" } }] }), 2);
+  assert.equal(phaseIndex({ state: "writing", phase_index: 0 }), 0, "an explicit phase index remains authoritative");
+  assert.match(css, /\.phase-track\.backup-phase-track\s*\{[^}]*grid-template-columns:\s*repeat\(8,/s);
+  assert.match(renderer, /class="phase-track backup-phase-track backup-phase-desktop"/);
+  assert.match(renderer, /<details class="backup-phase-mobile">/);
+  assert.match(renderer, /Step .* of .*BACKUP_PHASES\.length/);
+  assert.match(css, /\.backup-phase-mobile\s*\{\s*display:\s*none;/s);
+  assert.match(css, /\.backup-phase-desktop\s*\{\s*display:\s*none !important;/s);
+  assert.match(css, /\.backup-phase-mobile\s*\{\s*display:\s*block;/s);
+  assert.match(css, /\.job-kicker\s*\{[^}]*flex-wrap:\s*wrap;/s);
 });
 
 test("lease failures explain tape state without exposing raw JSON", () => {
@@ -744,6 +1426,7 @@ test("multi-tape runs ask for each ordered continuation volume", () => {
   const helpers = section("  function backupNeedsNextMedia(", "  function backupRunRouteId(");
   const open = section("  async function openAssignBackupMedia(", "  function updateBackupMediaForDrive(");
   const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
+  const action = section("  function backupOperatorAction(", "  function backupCurrentOperation(");
 
   assert.match(helpers, /waiting_for_next_media/);
   assert.match(helpers, /next_volume_sequence/);
@@ -751,14 +1434,15 @@ test("multi-tape runs ask for each ordered continuation volume", () => {
   assert.match(open, /"volume_order", "volume_sequence", "media_sequence"/);
   assert.match(open, /data-volume-sequence/);
   assert.match(open, /Erase tape and continue archive/);
-  assert.match(detail, /Load next tape/);
-  assert.match(detail, /Unload and remove it, then insert and confirm a different prepared scratch tape/);
+  assert.match(action, /Load next tape/);
+  assert.match(action, /Unload and remove it, then insert a different prepared scratch tape/);
   assert.match(open, /Unload and remove the previous archive tape before inserting this one/);
   assert.match(detail, /Every tape in the archive was written, completely read back/);
-  assert.match(detail, /pick\(allowedActions, readbackMedia \? "assign_media" : nextMedia \? "assign_next_media" : "assign_media"\) === true/);
-  assert.doesNotMatch(detail, /assign_next_media" : "assign_media"\) !== false/);
-  assert.match(detail, /Tape accepted; worker is rechecking it/);
-  assert.match(detail, /No further tape selection is needed for this request/);
+  assert.match(action, /pick\(allowed, readback \? "assign_media" : next \? "assign_next_media" : "assign_media"\) === true/);
+  assert.doesNotMatch(action, /assign_next_media" : "assign_media"\) !== false/);
+  assert.match(app, /Tape accepted; resuming/);
+  assert.match(app, /This tape handoff is complete\. The worker is rechecking the drive and may request another archive tape later if the job requires one\./);
+  assert.doesNotMatch(app, /No further tape selection is needed for this request/);
   assert.match(app, /runs\.filter\(backupWaitingForOperator\)\.length/);
   assert.match(app, /backupWaitingForOperator\(active\) \? "Continue backup" : "View progress"/);
 });
@@ -769,12 +1453,13 @@ test("readback media handoffs load exact ordered tapes without destructive copy"
   const open = section("  async function openAssignBackupMedia(", "  function updateBackupMediaForDrive(");
   const submit = section("  async function submitBackupMedia(", "  function prepareBackupTape(");
   const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
+  const action = section("  function backupOperatorAction(", "  function backupCurrentOperation(");
 
   assert.match(helpers, /backupMediaRequestPhase\(source\) === "full_readback"/);
   assert.match(helpers, /if \(backupMediaIsReadback\(run\)\) return false/);
   assert.match(phase, /backupMediaIsReadback\(run\).*aliases\.includes\("readback"\)/s);
   assert.ok(
-    phase.indexOf('pick(backupPreparationProgress(run), "stage") === "source_stability_check"') < phase.indexOf("if (backupMediaIsReadback(run))"),
+    phase.indexOf('backupTransferPhase(pick(backupPreparationProgress(run), "stage")) === "source_stability_check"') < phase.indexOf("if (backupMediaIsReadback(run))"),
     "the final source check must supersede a retained readback-media marker"
   );
   assert.match(open, /data-media-phase=/);
@@ -793,8 +1478,8 @@ test("readback media handoffs load exact ordered tapes without destructive copy"
   assert.match(submit, /accepted your physical-label attestation/);
   assert.match(submit, /validate the on-tape volume label after rewind/);
   assert.doesNotMatch(submit, /reading the exact ordered archive tape/);
-  assert.match(detail, /Load tape .* for readback/);
-  assert.match(detail, /without erasing or relabeling it/);
+  assert.match(action, /Load tape .* for readback/);
+  assert.match(action, /will not erase or relabel it/);
 });
 
 test("ordered archive evidence uses durable volume order and cartridge labels", () => {

@@ -2,6 +2,25 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.11] - 2026-11-14
+
+### Honest live backup progress
+
+- Active write and physical-readback phases now retain monotonic archive-entry progress instead of comparing Bacula's encoded stream bytes with source logical bytes. Write progress uses the correlated Bacula `JobFiles` count against the immutable manifest entry count; readback progress uses the verification job's `JobFiles` count against the completed backup job's entry count.
+- The running-job page presents that value as **archive entries reached/read back**, reports fractional entry rates for slow metadata-heavy workloads, caps an active phase below 100% until the correlated engine job actually completes, and keeps Bacula stream bytes plus physical tape rates as separate telemetry. It does not derive a byte ETA from counters with incompatible compression, sparse-file, or hard-link semantics.
+- The exact correlated File Daemon status supplies the currently processed source-relative filename while a sample is fresh. The complete path wraps on narrow screens instead of hiding the basename. It is bounded, lease-fenced, and live-only: it is not copied into terminal evidence, audit history, or the retained recovery point.
+- Transfer position survives UI refreshes through a durable monotonic snapshot, while stale samples, operator media waits, cancellation requests, and completed phases retain their honest state instead of appearing active or regressing to an earlier step.
+
+### Complete running-job experience
+
+- The backup page now distinguishes source scanning, manifest sorting/writing/digesting, writing, ordered media waits, physical readback, and cooperative cancellation. Phase aliases and event evidence resolve to the same canonical timeline, including terminal readback failures.
+- Live metrics identify Bacula write/read streams, physical tape direction, disk-buffer occupancy when staging is enabled, current tape, entry position, and current filename without labeling any of them as raw ZFS throughput or logical-byte completion.
+- Automatic refresh preserves the selected run, expanded controls, focused input, and cursor position. A terminal list result supersedes an older cached detail response, and cancellation controls disappear once a cancellation is already pending.
+
+### Small-file boundary
+
+- This release makes per-file traversal visible but does not introduce a packed-object archive format. Bacula still walks and records the selected filesystem entries individually, preserving manifest browsing, metadata, hard links, ordered multi-tape restore, and physical readback semantics. Workloads dominated by tiny files can therefore remain source-metadata/engine limited; a future packed-stream mode requires an explicit restore-format and recovery-browser design rather than an unverified throughput shortcut.
+
 ## [0.1.0-alpha.10] - 2026-11-14
 
 ### Continuous tape delivery
@@ -158,6 +177,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.11]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.11
 [0.1.0-alpha.10]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.10
 [0.1.0-alpha.9]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.9
 [0.1.0-alpha.8]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.8

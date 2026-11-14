@@ -660,6 +660,47 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     )
     .await
     .expect("first spanning write boundary should persist"));
+    let continuation_live_sample = store::SingleTapeLiveIoSample {
+        phase: store::SingleTapeLiveIoPhase::BackupWrite,
+        sampled_at: Utc::now(),
+        sample_window_ms: Some(5_000),
+        stale_after_seconds: 20,
+        engine_job_id: 8_001,
+        files_processed: 2,
+        files_total: Some(10),
+        progress_basis: "bacula_job_files_over_manifest_entries",
+        archive_entries_per_second: Some(1.0),
+        pipeline_bytes_processed: 2_048,
+        pipeline_bytes_per_second: Some(400),
+        file_daemon_read_bytes_processed: None,
+        file_daemon_read_bytes_per_second: None,
+        current_file: None,
+        file_daemon_basis: None,
+        tape_read_bytes_per_second: None,
+        tape_write_bytes_per_second: None,
+        tape_read_counter_available: false,
+        tape_write_counter_available: false,
+        tape_counters_available: false,
+        pipeline_basis: "bacula_job_bytes_delta",
+        tape_basis: None,
+        engine_state: None,
+        activity: None,
+        progress_idle_ms: None,
+        no_progress_timeout_ms: None,
+        spool_bytes: None,
+        spool_capacity_bytes: None,
+        spool_file_count: None,
+        spool_fill_bytes_per_second: None,
+        spool_drain_bytes_per_second: None,
+        spool_basis: None,
+    };
+    assert!(store::record_single_tape_data_live_io(
+        &pool,
+        &continuation_claim,
+        &continuation_live_sample,
+    )
+    .await
+    .expect("spanning write progress should persist before the media wait"));
     let pending_write = store::ensure_data_run_media_request(
         &pool,
         &continuation_claim,
@@ -695,6 +736,15 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(
         pending_write_view["run"]["media_request"]["state"],
         "pending"
+    );
+    assert!(pending_write_view["run"]["result"]["live_io"].is_null());
+    assert_eq!(
+        pending_write_view["run"]["result"]["transfer_progress"]["pipeline_bytes_processed"],
+        2_048
+    );
+    assert_eq!(
+        pending_write_view["run"]["result"]["transfer_progress"]["files_total"],
+        10
     );
 
     let continuation_confirmation = format!(
@@ -1068,6 +1118,21 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     )
     .await
     .expect("integration spanning run should release its resources"));
+    let terminal_continuation_result =
+        sqlx::query_scalar::<_, Value>("SELECT result FROM single_tape_data_runs WHERE id = $1")
+            .bind(continuation_run.id)
+            .fetch_one(&pool)
+            .await
+            .expect("terminal spanning progress should remain queryable");
+    assert_eq!(
+        terminal_continuation_result["transfer_progress"]["phase"],
+        "backup_write"
+    );
+    assert_eq!(
+        terminal_continuation_result["transfer_progress"]["pipeline_bytes_processed"],
+        2_048
+    );
+    assert!(terminal_continuation_result["live_io"].is_null());
 
     sqlx::query(
         "INSERT INTO cartridges
@@ -1546,8 +1611,15 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         stale_after_seconds: 20,
         engine_job_id: 9_001,
         files_processed: 1,
-        logical_bytes_processed: 1_024,
+        files_total: Some(1),
+        progress_basis: "bacula_job_files_over_manifest_entries",
+        archive_entries_per_second: Some(1.0),
+        pipeline_bytes_processed: 1_024,
         pipeline_bytes_per_second: Some(200),
+        file_daemon_read_bytes_processed: Some(1_024),
+        file_daemon_read_bytes_per_second: Some(200),
+        current_file: Some("fixture.bin".to_owned()),
+        file_daemon_basis: Some("bacula_file_daemon_read_bytes_delta"),
         tape_read_bytes_per_second: Some(0),
         tape_write_bytes_per_second: Some(180),
         tape_read_counter_available: true,
@@ -1571,6 +1643,25 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
             .await
             .expect("the fenced live I/O sample should persist")
     );
+    let regressed_sample = store::SingleTapeLiveIoSample {
+        files_processed: 0,
+        pipeline_bytes_processed: 128,
+        ..live_sample.clone()
+    };
+    assert!(
+        store::record_single_tape_data_live_io(&pool, &claimed, &regressed_sample)
+            .await
+            .expect("a transient engine-counter regression should be clamped")
+    );
+    let out_of_order_sample = store::SingleTapeLiveIoSample {
+        sampled_at: live_sampled_at - chrono::Duration::seconds(1),
+        ..live_sample.clone()
+    };
+    assert!(
+        !store::record_single_tape_data_live_io(&pool, &claimed, &out_of_order_sample)
+            .await
+            .expect("an out-of-order sample should be rejected")
+    );
     let invalid_sample = store::SingleTapeLiveIoSample {
         pipeline_basis: "untrusted_integration_fixture",
         ..live_sample.clone()
@@ -1579,6 +1670,15 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         !store::record_single_tape_data_live_io(&pool, &claimed, &invalid_sample)
             .await
             .expect("an untrusted live I/O basis should be rejected")
+    );
+    let missing_total = store::SingleTapeLiveIoSample {
+        files_total: None,
+        ..live_sample.clone()
+    };
+    assert!(
+        !store::record_single_tape_data_live_io(&pool, &claimed, &missing_total)
+            .await
+            .expect("a missing authoritative record total should be rejected")
     );
     let live_view = api_request(
         &replay_application,
@@ -1610,12 +1710,35 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         1_048_576
     );
     assert_eq!(live_view["run"]["result"]["live_io"]["spool_file_count"], 2);
+    assert_eq!(
+        live_view["run"]["result"]["live_io"]["pipeline_bytes_processed"],
+        1_024
+    );
+    assert_eq!(live_view["run"]["result"]["live_io"]["files_total"], 1);
+    assert_eq!(
+        live_view["run"]["result"]["transfer_progress"]["phase"],
+        "backup_write"
+    );
+    assert_eq!(
+        live_view["run"]["result"]["transfer_progress"]["files_total"],
+        1
+    );
     let live_io = &live_view["run"]["result"]["live_io"];
     assert!(live_io.get("path").is_none());
     assert!(live_io.get("directory").is_none());
     assert!(!serde_json::to_string(live_io)
         .expect("live I/O should serialize")
         .contains("/var/lib/tapescale/spool"));
+    let overrun_sample = store::SingleTapeLiveIoSample {
+        files_processed: 2,
+        pipeline_bytes_processed: 2_048,
+        ..live_sample.clone()
+    };
+    assert!(
+        store::record_single_tape_data_live_io(&pool, &claimed, &overrun_sample,)
+            .await
+            .expect("engine counters may legitimately exceed manifest totals")
+    );
     let engine_volume = "TS-INTEGRATION-FINAL";
     assert!(
         store::mark_single_tape_media_write_started(&pool, &claimed, engine_volume)
@@ -1651,6 +1774,19 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(transitioned_view.status(), StatusCode::OK);
     let transitioned_view = response_json(transitioned_view).await;
     assert!(transitioned_view["run"]["result"]["live_io"].is_null());
+    assert_eq!(
+        transitioned_view["run"]["result"]["transfer_progress"]["pipeline_bytes_processed"],
+        2_048
+    );
+    assert_eq!(
+        transitioned_view["run"]["result"]["transfer_progress"]["files_total"],
+        1
+    );
+    assert!(
+        !store::record_single_tape_data_live_io(&pool, &claimed, &live_sample)
+            .await
+            .expect("a stale write-phase sample should be rejected after transition")
+    );
     assert!(store::transition_single_tape_data_phase(
         &pool,
         &claimed,
@@ -1695,6 +1831,24 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         .expect("finalized request should reload")
         .expect("finalized request remains durable");
     assert_eq!(finalized_request.state, "verified");
+    let finalized_view = api_request(
+        &replay_application,
+        Method::GET,
+        format!("/api/v1/backup-runs/{}", final_request.id),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(finalized_view.status(), StatusCode::OK);
+    let finalized_view = response_json(finalized_view).await;
+    assert!(finalized_view["run"]["result"]["live_io"].is_null());
+    assert_eq!(
+        finalized_view["run"]["result"]["transfer_progress"]["phase"],
+        "backup_write"
+    );
+    assert_eq!(
+        finalized_view["run"]["result"]["transfer_progress"]["pipeline_bytes_processed"],
+        2_048
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM recovery_points WHERE id = $1 AND run_id = $2
@@ -2058,8 +2212,15 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         stale_after_seconds: 20,
         engine_job_id: 9_101,
         files_processed: 1,
-        logical_bytes_processed: 1_024,
+        files_total: Some(1),
+        progress_basis: "bacula_job_files_over_backup_job_files",
+        archive_entries_per_second: Some(1.0),
+        pipeline_bytes_processed: 1_024,
         pipeline_bytes_per_second: Some(200),
+        file_daemon_read_bytes_processed: Some(1_024),
+        file_daemon_read_bytes_per_second: Some(200),
+        current_file: Some("fixture.bin".to_owned()),
+        file_daemon_basis: Some("bacula_file_daemon_read_bytes_delta"),
         tape_read_bytes_per_second: Some(180),
         tape_write_bytes_per_second: Some(0),
         tape_read_counter_available: true,
@@ -2078,6 +2239,19 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         spool_drain_bytes_per_second: None,
         spool_basis: None,
     };
+    let mut invalid_restore_rate = restore_live_sample.clone();
+    invalid_restore_rate.archive_entries_per_second = Some(f64::NAN);
+    assert!(
+        !store::record_restore_rehearsal_live_io(&pool, &restore_claim, &invalid_restore_rate)
+            .await
+            .expect("a non-finite Restore entry rate should be rejected")
+    );
+    invalid_restore_rate.archive_entries_per_second = Some(-0.5);
+    assert!(
+        !store::record_restore_rehearsal_live_io(&pool, &restore_claim, &invalid_restore_rate)
+            .await
+            .expect("a negative Restore entry rate should be rejected")
+    );
     assert!(
         store::record_restore_rehearsal_live_io(&pool, &restore_claim, &restore_live_sample)
             .await
@@ -2121,6 +2295,11 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
             .await
             .expect("waiting Restore result should be queryable");
     assert!(waiting_result["live_io"].is_null());
+    assert_eq!(waiting_result["transfer_progress"]["phase"], "restore");
+    assert_eq!(
+        waiting_result["transfer_progress"]["pipeline_bytes_processed"],
+        1_024
+    );
     sqlx::query(
         "UPDATE restore_rehearsals
          SET cancel_requested_at = now(), cancel_requested_by_label = 'integration cancellation race'

@@ -1039,6 +1039,17 @@ pub enum SingleTapeLiveIoPhase {
     Restore,
 }
 
+impl SingleTapeLiveIoPhase {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BackupWrite => "backup_write",
+            Self::FullReadback => "full_readback",
+            Self::Restore => "restore",
+        }
+    }
+}
+
 /// Server-derived description of what the physical data path is doing now.
 ///
 /// A worker heartbeat is deliberately not an activity: these values require measured engine,
@@ -1058,7 +1069,7 @@ pub enum SingleTapeLiveActivity {
     Stalled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SingleTapeLiveIoSample {
     pub phase: SingleTapeLiveIoPhase,
     pub sampled_at: DateTime<Utc>,
@@ -1066,8 +1077,18 @@ pub struct SingleTapeLiveIoSample {
     pub stale_after_seconds: u64,
     pub engine_job_id: u64,
     pub files_processed: u64,
-    pub logical_bytes_processed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_total: Option<u64>,
+    pub progress_basis: &'static str,
+    pub archive_entries_per_second: Option<f64>,
+    pub pipeline_bytes_processed: u64,
     pub pipeline_bytes_per_second: Option<u64>,
+    pub file_daemon_read_bytes_processed: Option<u64>,
+    pub file_daemon_read_bytes_per_second: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_daemon_basis: Option<&'static str>,
     pub tape_read_bytes_per_second: Option<u64>,
     pub tape_write_bytes_per_second: Option<u64>,
     pub tape_read_counter_available: bool,
@@ -1095,6 +1116,40 @@ pub struct SingleTapeLiveIoSample {
     pub spool_drain_bytes_per_second: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spool_basis: Option<&'static str>,
+}
+
+/// Last confirmed engine position for an active physical-data phase.
+///
+/// Unlike `SingleTapeLiveIoSample`, this snapshot deliberately contains no rates, spool
+/// occupancy, activity inference, or staleness promise. It survives phase and terminal-state
+/// cleanup so an operator can still see the last monotonically confirmed engine counters after
+/// live telemetry is no longer meaningful.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SingleTapeTransferProgress {
+    pub phase: SingleTapeLiveIoPhase,
+    pub sampled_at: DateTime<Utc>,
+    pub engine_job_id: u64,
+    pub files_processed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_total: Option<u64>,
+    pub progress_basis: &'static str,
+    pub pipeline_bytes_processed: u64,
+    pub pipeline_basis: &'static str,
+}
+
+impl From<&SingleTapeLiveIoSample> for SingleTapeTransferProgress {
+    fn from(sample: &SingleTapeLiveIoSample) -> Self {
+        Self {
+            phase: sample.phase,
+            sampled_at: sample.sampled_at,
+            engine_job_id: sample.engine_job_id,
+            files_processed: sample.files_processed,
+            files_total: sample.files_total,
+            progress_basis: sample.progress_basis,
+            pipeline_bytes_processed: sample.pipeline_bytes_processed,
+            pipeline_basis: sample.pipeline_basis,
+        }
+    }
 }
 
 /// Latest aggregate source-manifest scan measurement for a fenced data run.
@@ -5987,6 +6042,14 @@ pub async fn ensure_data_run_media_request(
     .bind(expected_engine_volume_name)
     .execute(&mut *transaction)
     .await?;
+    sqlx::query(
+        "UPDATE single_tape_data_runs
+            SET result = result - 'live_io' - 'preparation_progress'
+          WHERE id = $1 AND state = 'running'",
+    )
+    .bind(claim.run.id)
+    .execute(&mut *transaction)
+    .await?;
     sqlx::query("UPDATE job_runs SET state = 'waiting_for_media' WHERE id = $1")
         .bind(claim.run.job_run_id)
         .execute(&mut *transaction)
@@ -6670,12 +6733,106 @@ pub async fn renew_single_tape_data_run_leases(
 ///
 /// Live samples deliberately do not create audit events. The terminal result replaces this
 /// ephemeral value, while phase transitions and safety evidence remain append-only elsewhere.
+fn monotonic_single_tape_live_sample(
+    current_result: &Value,
+    sample: &SingleTapeLiveIoSample,
+) -> Option<SingleTapeLiveIoSample> {
+    let mut monotonic = sample.clone();
+    let Some(previous) = current_result
+        .get("transfer_progress")
+        .and_then(Value::as_object)
+    else {
+        if let Some(total) = monotonic.files_total {
+            monotonic.files_processed = monotonic.files_processed.min(total);
+        }
+        return Some(monotonic);
+    };
+    if previous.get("phase").and_then(Value::as_str) != Some(sample.phase.as_str()) {
+        if let Some(total) = monotonic.files_total {
+            monotonic.files_processed = monotonic.files_processed.min(total);
+        }
+        return Some(monotonic);
+    }
+    if previous.get("engine_job_id").and_then(Value::as_u64) != Some(sample.engine_job_id) {
+        return None;
+    }
+    if previous
+        .get("sampled_at")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|previous| sample.sampled_at < previous.with_timezone(&Utc))
+    {
+        return None;
+    }
+    if previous
+        .get("progress_basis")
+        .and_then(Value::as_str)
+        .is_some_and(|basis| basis != sample.progress_basis)
+    {
+        return None;
+    }
+
+    monotonic.files_processed = monotonic.files_processed.max(
+        previous
+            .get("files_processed")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
+    monotonic.pipeline_bytes_processed = monotonic.pipeline_bytes_processed.max(
+        previous
+            .get("pipeline_bytes_processed")
+            // Alpha.10 and earlier named the same Bacula JobBytes counter as
+            // logical bytes. Retain monotonicity for an in-flight upgraded
+            // record without perpetuating that misleading serialized name.
+            .or_else(|| previous.get("logical_bytes_processed"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
+
+    match (
+        previous.get("files_total").and_then(Value::as_u64),
+        sample.files_total,
+    ) {
+        (Some(files), Some(sample_files)) if files != sample_files => return None,
+        (Some(files), None) => monotonic.files_total = Some(files),
+        _ => {}
+    }
+    if let Some(total) = monotonic.files_total {
+        monotonic.files_processed = monotonic.files_processed.min(total);
+    }
+    Some(monotonic)
+}
+
+fn valid_single_tape_progress_basis(basis: &str) -> bool {
+    matches!(
+        basis,
+        "bacula_job_files_over_manifest_entries"
+            | "bacula_job_files_over_backup_job_files"
+            | "bacula_job_files_over_selected_manifest_entries"
+    )
+}
+
+fn valid_live_current_file(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= crate::engine::bacula::MAX_LIVE_CURRENT_FILE_BYTES
+        && !value.chars().any(char::is_control)
+        && !Path::new(value).is_absolute()
+        && Path::new(value)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+}
+
 pub async fn record_single_tape_data_live_io(
     pool: &PgPool,
     claim: &ClaimedSingleTapeDataRun,
     sample: &SingleTapeLiveIoSample,
 ) -> Result<bool, sqlx::Error> {
     if sample.engine_job_id == 0
+        || sample.files_total.is_none()
+        || !valid_single_tape_progress_basis(sample.progress_basis)
+        || sample
+            .archive_entries_per_second
+            .is_some_and(|rate| !rate.is_finite() || rate < 0.0)
         || !(5..=300).contains(&sample.stale_after_seconds)
         || !matches!(
             sample.pipeline_basis,
@@ -6690,6 +6847,16 @@ pub async fn record_single_tape_data_live_io(
         || sample
             .spool_basis
             .is_some_and(|basis| basis != "run_scoped_bacula_spool_regular_file_bytes")
+        || sample
+            .file_daemon_basis
+            .is_some_and(|basis| basis != "bacula_file_daemon_read_bytes_delta")
+        || sample.file_daemon_basis.is_some() != sample.file_daemon_read_bytes_processed.is_some()
+        || sample.file_daemon_read_bytes_per_second.is_some()
+            && sample.file_daemon_read_bytes_processed.is_none()
+        || sample
+            .current_file
+            .as_deref()
+            .is_some_and(|value| !valid_live_current_file(value))
         || sample.spool_fill_bytes_per_second.is_some()
             && sample.spool_drain_bytes_per_second.is_some()
         || (sample.spool_fill_bytes_per_second.is_some()
@@ -6748,15 +6915,70 @@ pub async fn record_single_tape_data_live_io(
         transaction.rollback().await?;
         return Ok(false);
     }
-    let updated = sqlx::query(
-        "UPDATE single_tape_data_runs
-            SET result = jsonb_set(result - 'preparation_progress', '{live_io}', $1::jsonb, true)
-          WHERE id = $2 AND state = 'running'",
-    )
-    .bind(json!(sample))
-    .bind(claim.run.id)
-    .execute(&mut *transaction)
-    .await?;
+    let (job_state, current_result, media_phase) =
+        sqlx::query_as::<_, (String, Value, Option<String>)>(
+            "SELECT job.state, data_run.result,
+                (SELECT request.phase
+                   FROM single_tape_data_media_requests request
+                  WHERE request.single_tape_data_run_id = data_run.id
+                    AND request.state IN ('pending', 'authorized', 'loaded')
+                  ORDER BY request.request_sequence DESC LIMIT 1)
+           FROM job_runs job
+           JOIN single_tape_data_runs data_run ON data_run.job_run_id = job.id
+          WHERE job.id = $1 AND data_run.id = $2
+          FOR UPDATE OF job, data_run",
+        )
+        .bind(claim.run.job_run_id)
+        .bind(claim.run.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+    let phase_matches = match job_state.as_str() {
+        "writing" => sample.phase == SingleTapeLiveIoPhase::BackupWrite,
+        "verifying" => sample.phase == SingleTapeLiveIoPhase::FullReadback,
+        "restoring" => sample.phase == SingleTapeLiveIoPhase::Restore,
+        "waiting_for_media" => media_phase.as_deref() == Some(sample.phase.as_str()),
+        _ => false,
+    };
+    if !phase_matches {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let sample = match monotonic_single_tape_live_sample(&current_result, sample) {
+        Some(sample) => sample,
+        None => {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+    };
+    let progress = SingleTapeTransferProgress::from(&sample);
+    let updated = if job_state == "waiting_for_media" {
+        sqlx::query(
+            "UPDATE single_tape_data_runs
+                SET result = jsonb_set(
+                    result - 'live_io' - 'preparation_progress',
+                    '{transfer_progress}', $1::jsonb, true)
+              WHERE id = $2 AND state = 'running'",
+        )
+        .bind(json!(progress))
+        .bind(claim.run.id)
+        .execute(&mut *transaction)
+        .await?
+    } else {
+        sqlx::query(
+            "UPDATE single_tape_data_runs
+                SET result = jsonb_set(
+                    jsonb_set(
+                        result - 'preparation_progress',
+                        '{live_io}', $1::jsonb, true),
+                    '{transfer_progress}', $2::jsonb, true)
+              WHERE id = $3 AND state = 'running'",
+        )
+        .bind(json!(sample))
+        .bind(json!(progress))
+        .bind(claim.run.id)
+        .execute(&mut *transaction)
+        .await?
+    };
     if updated.rows_affected() != 1 {
         transaction.rollback().await?;
         return Ok(false);
@@ -7240,6 +7462,15 @@ pub async fn append_single_tape_data_artifact(
     Ok(true)
 }
 
+fn preserve_single_tape_transfer_progress(result: &mut Value, current_result: &Value) {
+    let Some(progress) = current_result.get("transfer_progress") else {
+        return;
+    };
+    if let Some(object) = result.as_object_mut() {
+        object.insert("transfer_progress".to_owned(), progress.clone());
+    }
+}
+
 pub async fn finish_single_tape_data_run(
     pool: &PgPool,
     claim: &ClaimedSingleTapeDataRun,
@@ -7256,9 +7487,9 @@ pub async fn finish_single_tape_data_run(
             .bind(claim.run.job_run_id)
             .fetch_one(&mut *transaction)
             .await?;
-    let (media_write_started, cancel_requested_by_label) =
-        sqlx::query_as::<_, (bool, Option<String>)>(
-            "SELECT media_write_started, cancel_requested_by_label
+    let (media_write_started, cancel_requested_by_label, current_result) =
+        sqlx::query_as::<_, (bool, Option<String>, Value)>(
+            "SELECT media_write_started, cancel_requested_by_label, result
              FROM single_tape_data_runs WHERE id = $1",
         )
         .bind(claim.run.id)
@@ -7269,6 +7500,7 @@ pub async fn finish_single_tape_data_run(
             object.insert("media_write_started".to_owned(), Value::Bool(true));
         }
     }
+    preserve_single_tape_transfer_progress(&mut result, &current_result);
     sqlx::query(
         "UPDATE single_tape_data_runs
          SET state = $1, result = $2, finished_at = now()
@@ -7414,15 +7646,16 @@ pub async fn finalize_single_tape_data_pass(
         transaction.rollback().await?;
         return Ok(FinalizeSingleTapeDataResult::FencedOut);
     }
-    let (current, media_write_started) = sqlx::query_as::<_, (String, bool)>(
-        "SELECT job.state, data_run.media_write_started
+    let (current, media_write_started, current_result) =
+        sqlx::query_as::<_, (String, bool, Value)>(
+            "SELECT job.state, data_run.media_write_started, data_run.result
          FROM job_runs job
          JOIN single_tape_data_runs data_run ON data_run.job_run_id = job.id
-         WHERE job.id = $1 FOR UPDATE OF job",
-    )
-    .bind(claim.run.job_run_id)
-    .fetch_one(&mut *transaction)
-    .await?;
+         WHERE job.id = $1 FOR UPDATE OF job, data_run",
+        )
+        .bind(claim.run.job_run_id)
+        .fetch_one(&mut *transaction)
+        .await?;
     if current != "comparing" {
         transaction.rollback().await?;
         return Ok(FinalizeSingleTapeDataResult::Rejected(
@@ -7601,7 +7834,7 @@ pub async fn finalize_single_tape_data_pass(
         .await?;
     }
 
-    let result = json!({
+    let mut result = json!({
         "detail": "one exact full-file source snapshot was written through Bacula, read from physical tape, restored into an isolated destination, and compared successfully",
         "production_eligible": false,
         "g0_gate": "still_open",
@@ -7616,6 +7849,7 @@ pub async fn finalize_single_tape_data_pass(
         "file_count": evidence.file_count,
         "evidence": evidence.result
     });
+    preserve_single_tape_transfer_progress(&mut result, &current_result);
     let data_run_updated = sqlx::query(
         "UPDATE single_tape_data_runs
          SET state = 'passed', result = $1, finished_at = now()
@@ -7697,11 +7931,11 @@ pub async fn finalize_single_tape_backup_pass(
         transaction.rollback().await?;
         return Ok(FinalizeSingleTapeDataResult::FencedOut);
     }
-    let (current, media_write_started, cancel_requested, workflow_kind) =
-        sqlx::query_as::<_, (String, bool, bool, String)>(
+    let (current, media_write_started, cancel_requested, workflow_kind, current_result) =
+        sqlx::query_as::<_, (String, bool, bool, String, Value)>(
             "SELECT job.state, data_run.media_write_started,
                     data_run.cancel_requested_at IS NOT NULL,
-                    data_run.workflow_kind
+                    data_run.workflow_kind, data_run.result
              FROM job_runs job
              JOIN single_tape_data_runs data_run ON data_run.job_run_id = job.id
              WHERE job.id = $1 FOR UPDATE OF job, data_run",
@@ -7963,7 +8197,7 @@ pub async fn finalize_single_tape_backup_pass(
         .await?;
     }
 
-    let result = json!({
+    let mut result = json!({
         "detail": if finalized_volumes.len() > 1 {
             "the full-file source was written through Bacula across an ordered tape set and read back completely from physical media"
         } else {
@@ -7994,6 +8228,7 @@ pub async fn finalize_single_tape_backup_pass(
         "retention_days": claim.run.retention_days,
         "evidence": evidence.result
     });
+    preserve_single_tape_transfer_progress(&mut result, &current_result);
     let data_run_updated = sqlx::query(
         "UPDATE single_tape_data_runs
          SET state = 'passed', result = $1, finished_at = now()
@@ -8156,11 +8391,12 @@ pub async fn recover_expired_single_tape_data_runs(pool: &PgPool) -> Result<u64,
         } else {
             "a drive or cartridge lease expired after the G0.2 recovery exercise entered its durable media-write boundary; no verified recovery point was created and tape position is uncertain"
         };
-        let result = json!({
+        let mut result = json!({
             "detail": detail,
             "position_uncertain": position_uncertain,
             "media_write_started": run.media_write_started
         });
+        preserve_single_tape_transfer_progress(&mut result, &run.result);
         let current =
             sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
                 .bind(run.job_run_id)
@@ -10806,6 +11042,15 @@ pub async fn record_restore_rehearsal_live_io(
 ) -> Result<bool, sqlx::Error> {
     if sample.phase != SingleTapeLiveIoPhase::Restore
         || sample.engine_job_id == 0
+        || sample.files_total.is_none()
+        || !matches!(
+            sample.progress_basis,
+            "bacula_job_files_over_backup_job_files"
+                | "bacula_job_files_over_selected_manifest_entries"
+        )
+        || sample
+            .archive_entries_per_second
+            .is_some_and(|rate| !rate.is_finite() || rate < 0.0)
         || !(5..=300).contains(&sample.stale_after_seconds)
         || sample.pipeline_basis != "bacula_job_bytes_delta"
         || sample
@@ -10814,6 +11059,22 @@ pub async fn record_restore_rehearsal_live_io(
         || sample.tape_counters_available
             != (sample.tape_read_counter_available || sample.tape_write_counter_available)
         || (sample.tape_counters_available != sample.tape_basis.is_some())
+        || sample
+            .file_daemon_basis
+            .is_some_and(|basis| basis != "bacula_file_daemon_read_bytes_delta")
+        || sample.file_daemon_basis.is_some() != sample.file_daemon_read_bytes_processed.is_some()
+        || sample.file_daemon_read_bytes_per_second.is_some()
+            && sample.file_daemon_read_bytes_processed.is_none()
+        || sample
+            .current_file
+            .as_deref()
+            .is_some_and(|value| !valid_live_current_file(value))
+        || sample.spool_bytes.is_some()
+        || sample.spool_capacity_bytes.is_some()
+        || sample.spool_file_count.is_some()
+        || sample.spool_fill_bytes_per_second.is_some()
+        || sample.spool_drain_bytes_per_second.is_some()
+        || sample.spool_basis.is_some()
     {
         return Ok(false);
     }
@@ -10823,12 +11084,33 @@ pub async fn record_restore_rehearsal_live_io(
         transaction.rollback().await?;
         return Ok(false);
     }
+    let (phase, current_result) = sqlx::query_as::<_, (String, Value)>(
+        "SELECT phase, result FROM restore_rehearsals WHERE id = $1 FOR UPDATE",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if phase != "restoring" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let sample = match monotonic_single_tape_live_sample(&current_result, sample) {
+        Some(sample) => sample,
+        None => {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+    };
+    let progress = SingleTapeTransferProgress::from(&sample);
     let updated = sqlx::query(
         "UPDATE restore_rehearsals
-            SET result = jsonb_set(result, '{live_io}', $1::jsonb, true)
-          WHERE id = $2 AND state = 'running' AND phase = 'restoring'",
+            SET result = jsonb_set(
+                jsonb_set(result, '{live_io}', $1::jsonb, true),
+                '{transfer_progress}', $2::jsonb, true)
+          WHERE id = $3 AND state = 'running' AND phase = 'restoring'",
     )
     .bind(json!(sample))
+    .bind(json!(progress))
     .bind(claim.run.id)
     .execute(&mut *transaction)
     .await?;
@@ -12041,7 +12323,7 @@ pub async fn finish_restore_rehearsal_run(
     pool: &PgPool,
     claim: &ClaimedRestoreRehearsalRun,
     state: RestoreRehearsalTerminalState,
-    result: Value,
+    mut result: Value,
 ) -> Result<bool, sqlx::Error> {
     if !result.is_object() {
         return Ok(false);
@@ -12051,6 +12333,13 @@ pub async fn finish_restore_rehearsal_run(
         transaction.rollback().await?;
         return Ok(false);
     }
+    let current_result = sqlx::query_scalar::<_, Value>(
+        "SELECT result FROM restore_rehearsals WHERE id = $1 FOR UPDATE",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    preserve_single_tape_transfer_progress(&mut result, &current_result);
     let current =
         sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
             .bind(claim.run.job_run_id)
@@ -12506,7 +12795,7 @@ pub async fn finalize_restore_rehearsal_pass(
     .bind(started_at)
     .execute(&mut *transaction)
     .await?;
-    let pass_result = json!({
+    let mut pass_result = json!({
         "detail": if selective {
             "selected paths were restored from physical tape into isolation and matched their authenticated manifest scope"
         } else {
@@ -12530,6 +12819,13 @@ pub async fn finalize_restore_rehearsal_pass(
         "ordered_media_ids": ordered_media_ids,
         "evidence": result
     });
+    let current_result = sqlx::query_scalar::<_, Value>(
+        "SELECT result FROM restore_rehearsals WHERE id = $1 FOR UPDATE",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    preserve_single_tape_transfer_progress(&mut pass_result, &current_result);
     let updated = sqlx::query(
         "UPDATE restore_rehearsals
          SET state = 'passed', phase = 'passed', result = $1, finished_at = now()
@@ -12624,12 +12920,13 @@ pub async fn recover_expired_restore_rehearsal_runs(pool: &PgPool) -> Result<u64
     .await?;
     for run in &expired {
         let detail = "a drive or cartridge lease expired during the physical tape read; the rehearsal is interrupted and drive position requires reconciliation";
-        let result = json!({
+        let mut result = json!({
             "detail": detail,
             "position_uncertain": true,
             "restore_test_passed": false,
             "reconciliation_required": true
         });
+        preserve_single_tape_transfer_progress(&mut result, &run.result);
         let current =
             sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
                 .bind(run.job_run_id)

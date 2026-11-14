@@ -8,7 +8,7 @@
 use std::{
     fmt,
     num::{NonZeroU32, NonZeroU64},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
@@ -54,6 +54,14 @@ pub const DEFAULT_DATA_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// guidance but still requires generation-specific physical qualification; it
 /// changes positioning granularity, not archive capacity.
 pub const MAXIMUM_TAPE_FILE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// Maximum source-relative path exposed in an ephemeral live-I/O sample.
+///
+/// Bacula's raw File Daemon status reports the absolute source path.  The
+/// adapter never persists or returns that value directly: callers must first
+/// reduce it to a contained relative path with
+/// [`source_relative_current_file`].
+pub const MAX_LIVE_CURRENT_FILE_BYTES: usize = 1_024;
+const MAX_RAW_FILE_DAEMON_CURRENT_FILE_BYTES: usize = 16 * 1_024;
 
 /// File-level compression performed by the Bacula File Daemon before data is
 /// sent to the tape drive.  The explicit levels keep the on-media format
@@ -1246,6 +1254,7 @@ pub enum BaculaOperationKind {
     QueryLatestRestore,
     QueryStorage,
     QueryRequestedVolume,
+    QueryFileDaemonRunning,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1531,6 +1540,17 @@ impl BaculaCommands {
             true,
         )
     }
+
+    /// Query the one fixed File Daemon for live source/read counters and its
+    /// current file.  The command contains no operator or source input.
+    #[must_use]
+    pub fn query_file_daemon_running() -> BconsoleScript {
+        BconsoleScript::console_command(
+            BaculaOperationKind::QueryFileDaemonRunning,
+            format_args!(".status client={FILE_DAEMON_NAME} running"),
+            true,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1800,6 +1820,26 @@ pub struct BaculaRunningJobEvidence {
     pub despool_wait: Option<bool>,
 }
 
+/// Exact in-memory counters reported by the fixed File Daemon for one running
+/// JobId.
+///
+/// `job_bytes` is the encoded Bacula stream and is deliberately not a logical
+/// source-size counter. `read_bytes` is useful as live File Daemon movement,
+/// while `current_file` remains the daemon's raw absolute path until a caller
+/// reduces it with [`source_relative_current_file`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BaculaFileDaemonRunningEvidence {
+    pub job_id: BaculaJobId,
+    pub raw_status: char,
+    pub state: BaculaJobState,
+    pub files: u64,
+    pub job_bytes: u64,
+    pub read_bytes: u64,
+    pub errors: u64,
+    pub read_bytes_per_second: Option<u64>,
+    pub current_file: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BaculaJsonError {
     #[error("bconsole output was not UTF-8")]
@@ -1859,6 +1899,26 @@ pub enum BaculaRunningStatusError {
     #[error("Bacula Storage running-job status returned an unsupported status value")]
     InvalidStatus,
     #[error("Bacula Storage status wrote unexpected diagnostic output to stderr")]
+    UnexpectedStderr,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BaculaFileDaemonStatusError {
+    #[error("bconsole output was not UTF-8")]
+    InvalidUtf8,
+    #[error("Bacula File Daemon status did not contain a top-level running-job array")]
+    MissingRunningJobs,
+    #[error("Bacula File Daemon running-job status was malformed")]
+    MalformedRunningJobs,
+    #[error("Bacula File Daemon status contained {actual} records for JobId {job_id}")]
+    AmbiguousJob { job_id: BaculaJobId, actual: usize },
+    #[error("Bacula File Daemon running-job status is missing a valid {0}")]
+    MissingField(&'static str),
+    #[error("Bacula File Daemon running-job status returned an unsupported status value")]
+    InvalidStatus,
+    #[error("Bacula File Daemon current-file value is malformed or unbounded")]
+    InvalidCurrentFile,
+    #[error("Bacula File Daemon status wrote unexpected diagnostic output to stderr")]
     UnexpectedStderr,
 }
 
@@ -1954,6 +2014,138 @@ pub fn parse_running_job_evidence(
             "despool_wait",
         )?,
     }))
+}
+
+/// Parse the fixed File Daemon's API-v2 running list for one exact JobId.
+///
+/// Bacula 15 emits `readbytes` and `processing_file` only from the File
+/// Daemon status path.  A missing exact record is expected while the job is
+/// moving between daemons and therefore returns `Ok(None)`.
+pub fn parse_file_daemon_running_evidence(
+    output: &[u8],
+    expected_job_id: BaculaJobId,
+) -> Result<Option<BaculaFileDaemonRunningEvidence>, BaculaFileDaemonStatusError> {
+    let text = std::str::from_utf8(output).map_err(|_| BaculaFileDaemonStatusError::InvalidUtf8)?;
+    let value = text
+        .char_indices()
+        .filter(|(_, character)| *character == '{')
+        .find_map(|(offset, _)| {
+            serde_json::Deserializer::from_str(&text[offset..])
+                .into_iter::<Value>()
+                .next()
+                .and_then(Result::ok)
+        })
+        .ok_or(BaculaFileDaemonStatusError::MissingRunningJobs)?;
+    let root = value
+        .as_object()
+        .ok_or(BaculaFileDaemonStatusError::MalformedRunningJobs)?;
+    let records = root
+        .get("running")
+        .ok_or(BaculaFileDaemonStatusError::MissingRunningJobs)?
+        .as_array()
+        .ok_or(BaculaFileDaemonStatusError::MalformedRunningJobs)?;
+    if records.iter().any(|record| !record.is_object()) {
+        return Err(BaculaFileDaemonStatusError::MalformedRunningJobs);
+    }
+
+    let mut matching = Vec::new();
+    for record in records {
+        let object = record
+            .as_object()
+            .expect("the running-job object shape was checked");
+        let Some(job_id_value) = object.get("jobid") else {
+            continue;
+        };
+        let Some(job_id) = value_as_u64(job_id_value) else {
+            return Err(BaculaFileDaemonStatusError::MalformedRunningJobs);
+        };
+        if job_id == expected_job_id.get() {
+            matching.push(object);
+        }
+    }
+    let object = match matching.as_slice() {
+        [] => return Ok(None),
+        [object] => *object,
+        records => {
+            return Err(BaculaFileDaemonStatusError::AmbiguousJob {
+                job_id: expected_job_id,
+                actual: records.len(),
+            });
+        }
+    };
+
+    let raw_status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .and_then(single_status_character)
+        .ok_or(BaculaFileDaemonStatusError::InvalidStatus)?;
+    let required = |keys: &[&str], field: &'static str| {
+        object_value(object, keys)
+            .and_then(value_as_u64)
+            .ok_or(BaculaFileDaemonStatusError::MissingField(field))
+    };
+    let errors = required(&["errors", "joberrors"], "errors")?;
+    let current_file = match object_value(object, &["processing_file", "current_file"]) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value))
+            if !value.is_empty()
+                && value.len() <= MAX_RAW_FILE_DAEMON_CURRENT_FILE_BYTES
+                && !value.chars().any(char::is_control) =>
+        {
+            Some(value.clone())
+        }
+        Some(_) => return Err(BaculaFileDaemonStatusError::InvalidCurrentFile),
+    };
+    let read_bytes_per_second = object_value(object, &["readbytes_sec", "read_bytes_per_second"])
+        .map(|value| {
+            value_as_u64(value).ok_or(BaculaFileDaemonStatusError::MissingField("readbytes_sec"))
+        })
+        .transpose()?;
+    Ok(Some(BaculaFileDaemonRunningEvidence {
+        job_id: expected_job_id,
+        raw_status,
+        state: map_job_status(raw_status, errors),
+        files: required(&["jobfiles", "files"], "jobfiles")?,
+        job_bytes: required(&["jobbytes", "bytes"], "jobbytes")?,
+        read_bytes: required(&["readbytes", "read_bytes"], "readbytes")?,
+        errors,
+        read_bytes_per_second,
+        current_file,
+    }))
+}
+
+/// Reduce Bacula's raw absolute `Processing file` value to a bounded path
+/// relative to the pinned source mount.  Values outside that mount, paths with
+/// traversal components, control characters, and overlong paths are omitted
+/// instead of exposing host/container topology.
+#[must_use]
+pub fn source_relative_current_file(
+    current_file: Option<&str>,
+    source_mount: &Path,
+) -> Option<String> {
+    let current_file = current_file?;
+    if !source_mount.is_absolute()
+        || source_mount == Path::new("/")
+        || current_file.is_empty()
+        || current_file.len() > MAX_RAW_FILE_DAEMON_CURRENT_FILE_BYTES
+        || current_file.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let relative = Path::new(current_file).strip_prefix(source_mount).ok()?;
+    let mut segments = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(segment) => segments.push(segment.to_str()?),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    let relative = segments.join("/");
+    (!relative.is_empty() && relative.len() <= MAX_LIVE_CURRENT_FILE_BYTES).then_some(relative)
 }
 
 fn single_status_character(value: &str) -> Option<char> {
@@ -2194,6 +2386,8 @@ pub enum BaculaAdapterError {
     Status(#[from] BaculaStatusError),
     #[error(transparent)]
     RunningStatus(#[from] BaculaRunningStatusError),
+    #[error(transparent)]
+    FileDaemonStatus(#[from] BaculaFileDaemonStatusError),
     #[error("Bacula returned {actual} records while exactly one job was required")]
     AmbiguousJob { actual: usize },
     #[error("Bacula returned JobId {actual} while JobId {expected} was requested")]
@@ -2287,6 +2481,22 @@ where
             return Err(BaculaRunningStatusError::UnexpectedStderr.into());
         }
         parse_running_job_evidence(&output.stdout, job_id).map_err(Into::into)
+    }
+
+    /// Read live File Daemon counters and its current source file for one
+    /// exact correlated JobId. The raw absolute current-file value must be
+    /// reduced with [`source_relative_current_file`] before publication.
+    pub async fn file_daemon_running_job_evidence(
+        &self,
+        job_id: BaculaJobId,
+    ) -> Result<Option<BaculaFileDaemonRunningEvidence>, BaculaAdapterError> {
+        let output = self
+            .dispatch(&BaculaCommands::query_file_daemon_running())
+            .await?;
+        if !output.stderr.is_empty() {
+            return Err(BaculaFileDaemonStatusError::UnexpectedStderr.into());
+        }
+        parse_file_daemon_running_evidence(&output.stdout, job_id).map_err(Into::into)
     }
 
     /// Return the exact volume currently requested by the fixed Storage
@@ -2658,6 +2868,17 @@ mod tests {
             ".api 2 api_opts=j\n.status storage=TS-LTO running\n.quit\n"
         );
         assert!(requested.expects_json());
+
+        let file_daemon = BaculaCommands::query_file_daemon_running();
+        assert_eq!(
+            file_daemon.kind(),
+            BaculaOperationKind::QueryFileDaemonRunning
+        );
+        assert_eq!(
+            std::str::from_utf8(file_daemon.stdin()).expect("utf8"),
+            ".api 2 api_opts=j\n.status client=tapescale-fd running\n.quit\n"
+        );
+        assert!(file_daemon.expects_json());
     }
 
     #[test]
@@ -2742,6 +2963,66 @@ mod tests {
             parse_running_job_evidence(br#"{"jobs":[]}"#, job_id),
             Err(BaculaRunningStatusError::MissingRunningJobs)
         ));
+    }
+
+    #[test]
+    fn file_daemon_parser_reports_exact_live_source_counters_and_file() {
+        let job_id = BaculaJobId::new(42).expect("job id");
+        let output = br#"Connecting to Client
+{"running":[
+  {"jobid":41,"status":"R","jobfiles":1,"jobbytes":64,"readbytes":128,"errors":0},
+  {"jobid":"42","status":"R","jobfiles":"73","jobbytes":"4096","readbytes":"8192","readbytes_sec":"2048","errors":"0","processing_file":"/source/archive/video.mov"}
+]}
+1000 OK: quit"#;
+        let evidence = parse_file_daemon_running_evidence(output, job_id)
+            .expect("valid File Daemon status")
+            .expect("exact running job");
+        assert_eq!(evidence.job_id, job_id);
+        assert_eq!(evidence.state, BaculaJobState::Running);
+        assert_eq!(evidence.files, 73);
+        assert_eq!(evidence.job_bytes, 4_096);
+        assert_eq!(evidence.read_bytes, 8_192);
+        assert_eq!(evidence.read_bytes_per_second, Some(2_048));
+        assert_eq!(
+            evidence.current_file.as_deref(),
+            Some("/source/archive/video.mov")
+        );
+        assert_eq!(
+            source_relative_current_file(evidence.current_file.as_deref(), Path::new("/source"))
+                .as_deref(),
+            Some("archive/video.mov")
+        );
+    }
+
+    #[test]
+    fn file_daemon_parser_and_current_file_reject_ambiguous_or_unsafe_values() {
+        let job_id = BaculaJobId::new(42).expect("job id");
+        assert!(matches!(
+            parse_file_daemon_running_evidence(
+                br#"{"running":[{"jobid":42,"status":"R","jobfiles":1,"jobbytes":2,"readbytes":3,"errors":0},{"jobid":42,"status":"R","jobfiles":1,"jobbytes":2,"readbytes":3,"errors":0}]}"#,
+                job_id
+            ),
+            Err(BaculaFileDaemonStatusError::AmbiguousJob { actual: 2, .. })
+        ));
+        assert!(matches!(
+            parse_file_daemon_running_evidence(
+                br#"{"running":[{"jobid":42,"status":"R","jobfiles":1,"jobbytes":2,"readbytes":3,"errors":0,"processing_file":"/source/bad\npath"}]}"#,
+                job_id
+            ),
+            Err(BaculaFileDaemonStatusError::InvalidCurrentFile)
+        ));
+        assert_eq!(
+            source_relative_current_file(Some("/source/../etc/passwd"), Path::new("/source")),
+            None
+        );
+        assert_eq!(
+            source_relative_current_file(Some("/source-other/file"), Path::new("/source")),
+            None
+        );
+        assert_eq!(
+            source_relative_current_file(Some("/source/file"), Path::new("/")),
+            None
+        );
     }
 
     #[test]
@@ -3165,6 +3446,32 @@ mod tests {
         let scripts = scripts.lock().expect("scripts lock");
         assert_eq!(scripts.len(), 1);
         assert_eq!(scripts[0].kind(), BaculaOperationKind::QueryRequestedVolume);
+    }
+
+    #[tokio::test]
+    async fn file_daemon_adapter_uses_the_fixed_structured_status_query() {
+        let scripts = Arc::new(Mutex::new(Vec::new()));
+        let adapter = BaculaAdapter::new(FakeExecutor {
+            scripts: Arc::clone(&scripts),
+            output: BconsoleOutput {
+                stdout: br#"{"running":[{"jobid":42,"status":"R","jobfiles":3,"jobbytes":8192,"readbytes":16384,"errors":0,"processing_file":"/source/a"}]}"#.to_vec(),
+                stderr: Vec::new(),
+                exit_code: Some(0),
+            },
+        });
+        let evidence = adapter
+            .file_daemon_running_job_evidence(BaculaJobId::new(42).expect("job id"))
+            .await
+            .expect("running evidence")
+            .expect("exact job");
+        assert_eq!(evidence.files, 3);
+        assert_eq!(evidence.read_bytes, 16_384);
+        let scripts = scripts.lock().expect("scripts lock");
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(
+            scripts[0].kind(),
+            BaculaOperationKind::QueryFileDaemonRunning
+        );
     }
 
     #[tokio::test]

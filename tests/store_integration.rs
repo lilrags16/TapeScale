@@ -1097,6 +1097,45 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     )
     .await
     .expect("correlated engine dispatch should append"));
+    let write_progress = store::SingleTapeLiveIoSample {
+        phase: store::SingleTapeLiveIoPhase::BackupWrite,
+        sampled_at: Utc::now(),
+        sample_window_ms: Some(5_000),
+        stale_after_seconds: 20,
+        engine_job_id: 1_001,
+        files_processed: source_manifest.entry_count,
+        files_total: Some(source_manifest.entry_count),
+        progress_basis: "bacula_job_files_over_manifest_entries",
+        archive_entries_per_second: Some(1.0),
+        pipeline_bytes_processed: 8_192,
+        pipeline_bytes_per_second: Some(1_024),
+        file_daemon_read_bytes_processed: None,
+        file_daemon_read_bytes_per_second: None,
+        current_file: None,
+        file_daemon_basis: None,
+        tape_read_bytes_per_second: None,
+        tape_write_bytes_per_second: None,
+        tape_read_counter_available: false,
+        tape_write_counter_available: false,
+        tape_counters_available: false,
+        pipeline_basis: "bacula_job_bytes_delta",
+        tape_basis: None,
+        engine_state: None,
+        activity: None,
+        progress_idle_ms: None,
+        no_progress_timeout_ms: None,
+        spool_bytes: None,
+        spool_capacity_bytes: None,
+        spool_file_count: None,
+        spool_fill_bytes_per_second: None,
+        spool_drain_bytes_per_second: None,
+        spool_basis: None,
+    };
+    assert!(
+        store::record_single_tape_data_live_io(&pool, &data_claim, &write_progress)
+            .await
+            .expect("G0.2 write progress should persist")
+    );
     assert!(store::transition_single_tape_data_phase(
         &pool,
         &data_claim,
@@ -1280,6 +1319,20 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     assert_eq!(job_state, "verified");
     assert!(job_finished);
     assert_eq!(engine_operation_id.as_deref(), Some("bacula-job:1001"));
+    let finalized_data_result =
+        sqlx::query_scalar::<_, Value>("SELECT result FROM single_tape_data_runs WHERE id = $1")
+            .bind(data_claim.run.id)
+            .fetch_one(&pool)
+            .await
+            .expect("the finalized G0.2 result should reload");
+    assert_eq!(
+        finalized_data_result["transfer_progress"]["phase"],
+        "backup_write"
+    );
+    assert_eq!(
+        finalized_data_result["transfer_progress"]["pipeline_bytes_processed"],
+        8_192
+    );
 
     let web_directory = tempfile::tempdir().expect("temporary web directory should be created");
     let application = api::router(
@@ -2057,8 +2110,15 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         stale_after_seconds: 20,
         engine_job_id: 2_002,
         files_processed: 3,
-        logical_bytes_processed: 4_096,
+        files_total: Some(3),
+        progress_basis: "bacula_job_files_over_backup_job_files",
+        archive_entries_per_second: Some(1.0),
+        pipeline_bytes_processed: 4_096,
         pipeline_bytes_per_second: Some(800),
+        file_daemon_read_bytes_processed: Some(4_096),
+        file_daemon_read_bytes_per_second: Some(800),
+        current_file: Some("fixture.bin".to_owned()),
+        file_daemon_basis: Some("bacula_file_daemon_read_bytes_delta"),
         tape_read_bytes_per_second: Some(1_024),
         tape_write_bytes_per_second: Some(0),
         tape_read_counter_available: true,
@@ -2164,6 +2224,10 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             .await
             .expect("transitioned Restore result should be queryable");
     assert!(transitioned_result["live_io"].is_null());
+    assert_eq!(
+        transitioned_result["transfer_progress"]["pipeline_bytes_processed"],
+        4_096
+    );
     assert!(store::append_restore_rehearsal_artifact(
         &pool,
         &rehearsal_claim,
@@ -2299,6 +2363,16 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     else {
         panic!("complete matching restore rehearsal evidence should pass");
     };
+    let passed_result =
+        sqlx::query_scalar::<_, Value>("SELECT result FROM restore_rehearsals WHERE id = $1")
+            .bind(rehearsal_id)
+            .fetch_one(&pool)
+            .await
+            .expect("passed Restore transfer progress should remain queryable");
+    assert_eq!(
+        passed_result["transfer_progress"]["pipeline_bytes_processed"],
+        4_096
+    );
     assert!(matches!(
         store::finalize_restore_rehearsal_pass(&pool, &rehearsal_claim, rehearsal_result)
             .await
@@ -3293,6 +3367,45 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     let ClaimSingleTapeDataRunResult::Claimed(prewrite_claim) = prewrite_claim else {
         panic!("pre-write expiry fixture should be claimed");
     };
+    let prewrite_progress = store::SingleTapeLiveIoSample {
+        phase: store::SingleTapeLiveIoPhase::BackupWrite,
+        sampled_at: Utc::now(),
+        sample_window_ms: Some(5_000),
+        stale_after_seconds: 20,
+        engine_job_id: 7_001,
+        files_processed: 4,
+        files_total: Some(8),
+        progress_basis: "bacula_job_files_over_manifest_entries",
+        archive_entries_per_second: Some(2.0),
+        pipeline_bytes_processed: 8_192,
+        pipeline_bytes_per_second: Some(1_024),
+        file_daemon_read_bytes_processed: None,
+        file_daemon_read_bytes_per_second: None,
+        current_file: None,
+        file_daemon_basis: None,
+        tape_read_bytes_per_second: None,
+        tape_write_bytes_per_second: None,
+        tape_read_counter_available: false,
+        tape_write_counter_available: false,
+        tape_counters_available: false,
+        pipeline_basis: "bacula_job_bytes_delta",
+        tape_basis: None,
+        engine_state: None,
+        activity: None,
+        progress_idle_ms: None,
+        no_progress_timeout_ms: None,
+        spool_bytes: None,
+        spool_capacity_bytes: None,
+        spool_file_count: None,
+        spool_fill_bytes_per_second: None,
+        spool_drain_bytes_per_second: None,
+        spool_basis: None,
+    };
+    assert!(
+        store::record_single_tape_data_live_io(&pool, &prewrite_claim, &prewrite_progress,)
+            .await
+            .expect("pre-write progress should persist before lease recovery")
+    );
     let expired_prewrite_leases = sqlx::query(
         "UPDATE resource_leases SET expires_at = now() - interval '1 second'
          WHERE id = ANY($1::uuid[])",
@@ -3318,13 +3431,15 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         prewrite_health_after,
         prewrite_drive_reconciled,
         prewrite_drive_position_uncertain,
-    ) = sqlx::query_as::<_, (String, bool, bool, String, bool, bool)>(
+        prewrite_pipeline_bytes_processed,
+    ) = sqlx::query_as::<_, (String, bool, bool, String, bool, bool, i64)>(
         "SELECT data_run.state,
                 data_run.media_write_started,
                 COALESCE((data_run.result ->> 'position_uncertain')::boolean, false),
                 cartridge.health_status,
                 drive.reconciled,
-                COALESCE((drive.health ->> 'motion_position_uncertain')::boolean, false)
+                COALESCE((drive.health ->> 'motion_position_uncertain')::boolean, false),
+                COALESCE((data_run.result #>> '{transfer_progress,pipeline_bytes_processed}')::bigint, -1)
            FROM single_tape_data_runs data_run
            JOIN cartridges cartridge ON cartridge.id = data_run.cartridge_id
            JOIN drives drive ON drive.id = data_run.drive_id
@@ -3340,6 +3455,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     assert_eq!(prewrite_health_after, prewrite_health);
     assert!(prewrite_drive_reconciled);
     assert!(!prewrite_drive_position_uncertain);
+    assert_eq!(prewrite_pipeline_bytes_processed, 8_192);
 
     let fenced_run = store::queue_single_tape_data_run(
         &pool,
