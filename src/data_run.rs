@@ -65,6 +65,7 @@ use crate::{
         BaculaJobState, BaculaPaths, BaculaPoolName, BaculaRestoreSubpath, CorrelatedJobDispatch,
         DirectBconsoleExecutor, VolumeLabel,
     },
+    qualification::{BtapeOutcomeKind, BtapeQualificationConfig},
     store,
     tool_runner::ToolError,
 };
@@ -1069,6 +1070,23 @@ async fn perform_exercise(
         let initial_authorized_volumes = vec![volume.clone()];
         let bacula_pool = BaculaPoolName::for_run(claim.run.id);
         renew_claim(pool, claim, "before entering the irreversible media-write boundary").await?;
+        verify_loaded_tape_identity(
+            pool,
+            sas_config,
+            config,
+            claim,
+            claim.run.cartridge_id,
+            &claim.run.expected_cartridge_label,
+            None,
+            cancellation,
+        )
+        .await?;
+        renew_claim(
+            pool,
+            claim,
+            "after loaded-tape identity verification and before the irreversible media-write boundary",
+        )
+        .await?;
         if !store::mark_single_tape_media_write_started(pool, claim, volume.as_str())
             .await
             .map_err(|error| ExerciseFailure::interrupted(error.to_string()))?
@@ -1229,6 +1247,18 @@ async fn perform_exercise(
                 ExerciseFailure::failed(format!("Bacula volume labeling failed: {error}"))
             })?;
         validate_console_output("label", &label_output.stdout, &label_output.stderr)?;
+        if !store::mark_data_run_volume_labeled(pool, claim, 1, volume.as_str())
+            .await
+            .map_err(|error| {
+                ExerciseFailure::interrupted(format!(
+                    "could not retain the newly written tape identity: {error}"
+                ))
+            })?
+        {
+            return Err(ExerciseFailure::interrupted(
+                "the fenced run could not retain the newly written tape identity",
+            ));
+        }
         let mount_output = adapter
             .dispatch(&BaculaCommands::mount())
             .await
@@ -1266,6 +1296,7 @@ async fn perform_exercise(
         let backup = wait_for_job(
             pool,
             sas_config,
+            config,
             claim,
             &adapter,
             backup_dispatch.job_id,
@@ -1417,6 +1448,7 @@ async fn perform_exercise(
         let verify = wait_for_job(
             pool,
             sas_config,
+            config,
             claim,
             &adapter,
             verify_dispatch.job_id,
@@ -1528,6 +1560,7 @@ async fn perform_exercise(
         let restore = wait_for_job(
             pool,
             sas_config,
+            config,
             claim,
             &adapter,
             restore_dispatch.job_id,
@@ -2350,6 +2383,7 @@ fn existing_write_mount_action(phase: &str, state: &str) -> ExistingWriteMountAc
 async fn wait_for_job(
     pool: &PgPool,
     sas_config: &SasDiscoveryConfig,
+    config: &Config,
     claim: &store::ClaimedSingleTapeDataRun,
     adapter: &BaculaAdapter<DirectBconsoleExecutor>,
     job_id: BaculaJobId,
@@ -2369,6 +2403,7 @@ async fn wait_for_job(
     let mut last_progress_at = Instant::now();
     let mut active_manual_media: Option<ActiveManualMedia> = None;
     let mut next_readback_volume = 1_i32;
+    let mut last_waiting_identity_probe: Option<Instant> = None;
     let mut live_io =
         LiveIoSampler::with_totals(live_io_totals.files, live_io_totals.progress_basis);
     let mut tape_counter_error_reported = false;
@@ -2386,6 +2421,35 @@ async fn wait_for_job(
         if let Err(error) = renew_claim(pool, claim, &format!("during Bacula {operation}")).await {
             let cancellation_result = cancel_and_observe(adapter, job_id).await;
             return Err(engine_wait_failure(error, &cancellation_result));
+        }
+        if active_manual_media.is_none()
+            && last_waiting_identity_probe
+                .is_none_or(|sampled_at| sampled_at.elapsed() >= Duration::from_secs(30))
+            && store::open_data_run_media_request(pool, claim.run.id)
+                .await
+                .map_err(|error| {
+                    ExerciseFailure::interrupted(format!(
+                        "could not inspect the waiting media request before tape identification: {error}"
+                    ))
+                })?
+                .is_some_and(|request| request.state == "pending")
+        {
+            if let Err(error) = observe_waiting_loaded_tape_identity(
+                pool,
+                sas_config,
+                config,
+                claim,
+                cancellation,
+            )
+            .await
+            {
+                warn!(
+                    physical_data_run_id = %claim.run.id,
+                    %error,
+                    "could not refresh the loaded tape identity while waiting for media"
+                );
+            }
+            last_waiting_identity_probe = Some(Instant::now());
         }
         let evidence = match adapter.job_evidence(job_id).await {
             Ok(evidence) => {
@@ -2764,6 +2828,7 @@ async fn wait_for_job(
                 active_manual_media = prepare_manual_media(
                     pool,
                     sas_config,
+                    config,
                     claim,
                     adapter,
                     BaculaMediaPhase::FullReadback,
@@ -2805,6 +2870,7 @@ async fn wait_for_job(
                             active_manual_media = prepare_manual_media(
                                 pool,
                                 sas_config,
+                                config,
                                 claim,
                                 adapter,
                                 BaculaMediaPhase::BackupWrite,
@@ -2890,6 +2956,7 @@ async fn wait_for_job(
                 active_manual_media = prepare_manual_media(
                     pool,
                     sas_config,
+                    config,
                     claim,
                     adapter,
                     phase,
@@ -3006,6 +3073,7 @@ async fn complete_manual_media_request(
 async fn prepare_manual_media(
     pool: &PgPool,
     sas_config: &SasDiscoveryConfig,
+    config: &Config,
     claim: &store::ClaimedSingleTapeDataRun,
     adapter: &BaculaAdapter<DirectBconsoleExecutor>,
     phase: BaculaMediaPhase,
@@ -3167,6 +3235,26 @@ async fn prepare_manual_media(
         )));
     }
 
+    verify_loaded_tape_identity(
+        pool,
+        sas_config,
+        config,
+        claim,
+        volume.cartridge_id,
+        &volume.expected_cartridge_label,
+        (phase == BaculaMediaPhase::FullReadback)
+            .then_some(volume.engine_volume_name.as_deref())
+            .flatten(),
+        cancellation,
+    )
+    .await?;
+    renew_claim(
+        pool,
+        claim,
+        "after continuation loaded-tape identity verification and before media acceptance",
+    )
+    .await?;
+
     if !store::mark_data_run_media_loaded(pool, claim, request.id)
         .await
         .map_err(|error| {
@@ -3288,6 +3376,22 @@ async fn prepare_manual_media(
                 &label.stdout,
                 &label.stderr,
             )?;
+            if !store::mark_data_run_volume_labeled(
+                pool,
+                claim,
+                volume.volume_order,
+                engine_volume.as_str(),
+            )
+            .await
+            .map_err(|error| {
+                ExerciseFailure::interrupted(format!(
+                    "could not retain the continuation tape identity: {error}"
+                ))
+            })? {
+                return Err(ExerciseFailure::interrupted(
+                    "the fenced run could not retain the continuation tape identity",
+                ));
+            }
             let authorized_volumes = data_run_engine_volumes(pool, claim).await?;
             validate_labeled_volumes(
                 pool,
@@ -3997,6 +4101,196 @@ async fn cleanup_drive(
             }),
         ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_loaded_tape_identity(
+    pool: &PgPool,
+    sas_config: &SasDiscoveryConfig,
+    config: &Config,
+    claim: &store::ClaimedSingleTapeDataRun,
+    cartridge_id: Uuid,
+    expected_cartridge_label: &str,
+    expected_volume_override: Option<&str>,
+    cancellation: &CancellationToken,
+) -> Result<(), ExerciseFailure> {
+    let Some((registered_label, retained_identity)) =
+        store::media_on_tape_identity(pool, cartridge_id)
+            .await
+            .map_err(|error| {
+                ExerciseFailure::interrupted(format!(
+                    "could not load the registered tape identity: {error}"
+                ))
+            })?
+    else {
+        return Err(ExerciseFailure::blocked(format!(
+            "tape {expected_cartridge_label} has no reconciled on-tape identity; prepare it before use"
+        )));
+    };
+    if registered_label != expected_cartridge_label {
+        return Err(ExerciseFailure::blocked(
+            "the registered cartridge label changed before loaded-tape verification",
+        ));
+    }
+    let expected_volume = expected_volume_override.unwrap_or(&retained_identity);
+    if expected_volume.is_empty() || expected_volume.len() > 127 {
+        return Err(ExerciseFailure::blocked(
+            "the retained on-tape identity is invalid",
+        ));
+    }
+    let probe_config = BtapeQualificationConfig {
+        enabled: true,
+        program: config.btape_path.clone(),
+        state_dir: config.bacula_state_dir.clone(),
+        timeout: config.qualification_timeout.min(Duration::from_secs(120)),
+    };
+    let probe = probe_config
+        .probe_volume_label(
+            Uuid::now_v7(),
+            Path::new(&claim.run.expected_path),
+            cancellation,
+        )
+        .await;
+    let after = discover_and_persist(pool, sas_config)
+        .await
+        .map_err(|error| {
+            ExerciseFailure::interrupted(format!(
+                "could not observe the tape drive after identity verification: {error}"
+            ))
+        })?;
+    let observation = matching_observation(
+        &after,
+        &claim.run.expected_path,
+        &claim.run.expected_stable_id,
+    )
+    .ok_or_else(|| {
+        ExerciseFailure::blocked(
+            "the exact tape drive disappeared during loaded-tape identity verification",
+        )
+    })?;
+    let postcondition_ok =
+        observation_blocker(observation, &claim.run).is_none() && observation.at_bot == Some(true);
+    let detail = probe.evidence["detail"].as_str().or_else(|| {
+        (!postcondition_ok).then_some("the identity probe did not leave the drive ready at BOT")
+    });
+    let resolution = store::record_loaded_tape_identity(
+        pool,
+        claim.run.drive_id,
+        &claim.run.expected_stable_id,
+        &claim.run.expected_path,
+        probe.volume_name.as_deref(),
+        probe.kind == BtapeOutcomeKind::Passed && postcondition_ok,
+        detail,
+        observation.observed_at,
+    )
+    .await
+    .map_err(|error| {
+        ExerciseFailure::interrupted(format!(
+            "could not retain loaded-tape identity evidence: {error}"
+        ))
+    })?;
+    let store::LoadedTapeIdentityResolution::Known(identity) = resolution else {
+        return Err(ExerciseFailure::blocked(
+            "the loaded tape could not be identified as the selected registered cartridge",
+        ));
+    };
+    if identity.cartridge_id != cartridge_id
+        || identity.cartridge_label != expected_cartridge_label
+        || identity.volume_name != expected_volume
+        || probe.volume_name.as_deref() != Some(expected_volume)
+    {
+        return Err(ExerciseFailure::blocked(format!(
+            "wrong tape loaded: expected {expected_cartridge_label}, but the on-tape identity did not match"
+        )));
+    }
+    Ok(())
+}
+
+/// Refresh the identity hint shown while Bacula is waiting for an attended
+/// media change.  This path is deliberately best-effort: the authoritative
+/// check is repeated by `verify_loaded_tape_identity` immediately before the
+/// worker accepts the medium, and a Storage Daemon that has not yet released
+/// the device must not turn a healthy running job into a terminal failure.
+async fn observe_waiting_loaded_tape_identity(
+    pool: &PgPool,
+    sas_config: &SasDiscoveryConfig,
+    config: &Config,
+    claim: &store::ClaimedSingleTapeDataRun,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    if cancellation.is_cancelled() {
+        return Ok(());
+    }
+
+    // Restrict both observations to the drive fenced into this run.  Besides
+    // avoiding needless status commands against other drives, this prevents a
+    // missing unrelated device from being reconciled as part of a media-change
+    // hint refresh.
+    let mut exact_config = sas_config.clone();
+    exact_config
+        .devices
+        .retain(|device| device == Path::new(&claim.run.expected_path));
+    if exact_config.devices.len() != 1 {
+        anyhow::bail!(
+            "the run's exact tape path is not present in the configured device allowlist"
+        );
+    }
+
+    let before = discover_and_persist(pool, &exact_config).await?;
+    let Some(observation) = matching_observation(
+        &before,
+        &claim.run.expected_path,
+        &claim.run.expected_stable_id,
+    ) else {
+        return Ok(());
+    };
+    if observation_blocker(observation, &claim.run).is_some()
+        || observation.at_bot != Some(true)
+        || observation.position_lost == Some(true)
+    {
+        return Ok(());
+    }
+
+    let probe_config = BtapeQualificationConfig {
+        enabled: true,
+        program: config.btape_path.clone(),
+        state_dir: config.bacula_state_dir.clone(),
+        timeout: config.qualification_timeout.min(Duration::from_secs(120)),
+    };
+    let probe = probe_config
+        .probe_volume_label(
+            Uuid::now_v7(),
+            Path::new(&claim.run.expected_path),
+            cancellation,
+        )
+        .await;
+
+    let after = discover_and_persist(pool, &exact_config).await?;
+    let Some(observation) = matching_observation(
+        &after,
+        &claim.run.expected_path,
+        &claim.run.expected_stable_id,
+    ) else {
+        return Ok(());
+    };
+    let postcondition_ok = observation_blocker(observation, &claim.run).is_none()
+        && observation.at_bot == Some(true)
+        && observation.position_lost != Some(true);
+    let detail = probe.evidence["detail"].as_str().or_else(|| {
+        (!postcondition_ok).then_some("the label probe did not leave the drive ready at BOT")
+    });
+    store::record_loaded_tape_identity(
+        pool,
+        claim.run.drive_id,
+        &claim.run.expected_stable_id,
+        &claim.run.expected_path,
+        probe.volume_name.as_deref(),
+        probe.kind == BtapeOutcomeKind::Passed && postcondition_ok,
+        detail,
+        observation.observed_at,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn discover_and_persist(

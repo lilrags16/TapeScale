@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, path::Path, time::Duration};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -260,7 +261,7 @@ async fn reconcile_once(
     worker_id: Uuid,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    reconcile_sas_devices(pool, sas_config).await?;
+    reconcile_sas_devices(pool, sas_config, btape_config, cancellation).await?;
 
     if let Some(pool) = pool {
         // Restore requests outrank queued writes at this safe, between-job boundary. A running
@@ -313,6 +314,8 @@ async fn reconcile_once(
 async fn reconcile_sas_devices(
     pool: Option<&sqlx::PgPool>,
     config: &SasDiscoveryConfig,
+    btape_config: &BtapeQualificationConfig,
+    cancellation: &CancellationToken,
 ) -> Result<()> {
     if !config.is_enabled() {
         return Ok(());
@@ -336,7 +339,124 @@ async fn reconcile_sas_devices(
         warn!(device = %path, "status discovery deferred while a tape-motion operation is running");
     }
     let results = discover_sas_drives(&discovery_config).await;
-    persist_sas_results(pool, &results).await
+    persist_sas_results(pool, &results).await?;
+    if let Some(pool) = pool {
+        probe_idle_loaded_tape_identities(
+            pool,
+            &discovery_config,
+            btape_config,
+            &results,
+            cancellation,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn loaded_tape_identity_probe_due(drive: &store::DriveRecord) -> bool {
+    const REFRESH_SECONDS: i64 = 30;
+    drive.health["loaded_tape_identity_observed_at"]
+        .as_str()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_none_or(|observed_at| {
+            observed_at.with_timezone(&Utc)
+                < Utc::now() - chrono::TimeDelta::seconds(REFRESH_SECONDS)
+        })
+}
+
+async fn probe_idle_loaded_tape_identities(
+    pool: &sqlx::PgPool,
+    config: &SasDiscoveryConfig,
+    btape_config: &BtapeQualificationConfig,
+    observations: &[SasProbeResult],
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    if !btape_config.enabled || cancellation.is_cancelled() {
+        return Ok(());
+    }
+    let drives = store::list_drives(pool).await?;
+    for result in observations {
+        let SasProbeResult::Observed(observation) = result else {
+            continue;
+        };
+        if observation.accessible
+            && observation.ready == Some(true)
+            && observation.medium_loaded == Some(true)
+            && observation.at_bot == Some(true)
+            && observation.identity_verified
+            && !observation.identity_conflict
+            && observation.position_lost != Some(true)
+            && observation.immediate_mode == Some(false)
+            && observation.in_flight == Some(0)
+        {
+            let Some(drive) = drives.iter().find(|drive| {
+                drive.stable_id == observation.stable_id
+                    && drive.observed_path.as_deref() == Some(observation.observed_path.as_str())
+            }) else {
+                continue;
+            };
+            if drive.health["motion_position_uncertain"].as_bool() == Some(true)
+                || !loaded_tape_identity_probe_due(drive)
+            {
+                continue;
+            }
+            let probe = btape_config
+                .probe_volume_label(
+                    Uuid::now_v7(),
+                    Path::new(&observation.observed_path),
+                    cancellation,
+                )
+                .await;
+            let mut exact_config = config.clone();
+            exact_config
+                .devices
+                .retain(|device| device == Path::new(&observation.observed_path));
+            let after = discover_sas_drives(&exact_config).await;
+            persist_sas_results(Some(pool), &after).await?;
+            let Some(after_observation) =
+                matching_observation(&after, &observation.observed_path, &observation.stable_id)
+            else {
+                warn!(
+                    stable_id = %observation.stable_id,
+                    device = %observation.observed_path,
+                    "loaded-tape identity probe finished without a matching post-observation"
+                );
+                continue;
+            };
+            let postcondition_ok = after_observation.accessible
+                && after_observation.ready == Some(true)
+                && after_observation.medium_loaded == Some(true)
+                && after_observation.at_bot == Some(true)
+                && after_observation.identity_verified
+                && !after_observation.identity_conflict
+                && after_observation.position_lost != Some(true)
+                && after_observation.immediate_mode == Some(false)
+                && after_observation.in_flight == Some(0);
+            let detail = probe.evidence["detail"].as_str().or_else(|| {
+                (!postcondition_ok)
+                    .then_some("the label probe did not leave the drive ready at BOT")
+            });
+            let resolution = store::record_loaded_tape_identity(
+                pool,
+                drive.id,
+                &observation.stable_id,
+                &observation.observed_path,
+                probe.volume_name.as_deref(),
+                probe.kind == BtapeOutcomeKind::Passed && postcondition_ok,
+                detail,
+                after_observation.observed_at,
+            )
+            .await?;
+            info!(
+                stable_id = %observation.stable_id,
+                device = %observation.observed_path,
+                volume_name = ?probe.volume_name,
+                resolution = ?resolution,
+                "loaded tape identity observed"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn persist_sas_results(
@@ -501,7 +621,19 @@ async fn execute_claimed_qualification_run(
         BtapeOutcomeKind::Blocked => store::QualificationTerminalState::Blocked,
         BtapeOutcomeKind::Interrupted => store::QualificationTerminalState::Interrupted,
     };
-    let mut result = serde_json::to_value(&outcome)?;
+    // Keep the qualification evidence fields at the durable result root. Readiness queries use
+    // the proven block size directly and must not depend on a second nested `evidence` object.
+    let mut result = outcome.evidence.clone();
+    insert_result_field(
+        &mut result,
+        "kind",
+        json!(qualification_terminal_label(terminal)),
+    );
+    insert_result_field(
+        &mut result,
+        "position_uncertain",
+        json!(outcome.position_uncertain),
+    );
     insert_result_field(&mut result, "before", before_observation.health());
     let lease_heartbeat_failed = lease_heartbeat_failure.is_some();
     if let Some(detail) = lease_heartbeat_failure {
@@ -531,6 +663,56 @@ async fn execute_claimed_qualification_run(
                 json!("worker shutdown was requested before the required post-test rewind"),
             );
         } else {
+            // A label/readback is a short bounded phase after the long general
+            // test. Keep its deadline comfortably inside the freshly renewed
+            // 30-minute drive lease so it cannot outlive its fencing authority.
+            let identity_config = BtapeQualificationConfig {
+                timeout: btape_config.timeout.min(Duration::from_secs(10 * 60)),
+                ..btape_config.clone()
+            };
+            let identity_label = identity_config
+                .write_and_verify_preparation_label(
+                    claim.run.id,
+                    Path::new(&claim.run.expected_path),
+                    claim.run.cartridge_id,
+                    cancellation,
+                )
+                .await;
+            insert_result_field(
+                &mut result,
+                "identity_label",
+                serde_json::to_value(&identity_label)?,
+            );
+            let expected_identity =
+                tapescale::qualification::preparation_volume_label(claim.run.cartridge_id);
+            if identity_label.kind == BtapeOutcomeKind::Passed
+                && identity_label.volume_name.as_deref() == Some(expected_identity.as_str())
+            {
+                insert_result_field(&mut result, "on_tape_identity", json!(expected_identity));
+            } else {
+                terminal = match identity_label.kind {
+                    BtapeOutcomeKind::Interrupted => store::QualificationTerminalState::Interrupted,
+                    BtapeOutcomeKind::Blocked => store::QualificationTerminalState::Blocked,
+                    BtapeOutcomeKind::Passed | BtapeOutcomeKind::Failed => {
+                        store::QualificationTerminalState::Failed
+                    }
+                };
+                insert_result_field(
+                    &mut result,
+                    "kind",
+                    json!(qualification_terminal_label(terminal)),
+                );
+                insert_result_field(
+                    &mut result,
+                    "position_uncertain",
+                    json!(identity_label.position_uncertain),
+                );
+                insert_result_field(
+                    &mut result,
+                    "detail",
+                    json!("btape passed, but TapeScale could not write and read back the cartridge's stable internal identity"),
+                );
+            }
             let cleanup = execute_sas_motion(
                 config,
                 Path::new(&claim.run.expected_path),

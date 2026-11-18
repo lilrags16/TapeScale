@@ -2383,7 +2383,7 @@
       ? '<div class="notice warning media-truncation-warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>This is a bounded dossier</strong><span>Additional records exist in: ' + esc(truncatedSections.join(", ")) + ". Those sections are partial; do not infer that an omitted hold, dependency, verification, or event is absent.</span></div></div>"
       : "";
     const preparedScratchContext = stateValue === "prepared_scratch" && String(pick(cartridge, "identity_status") || "unknown").toLowerCase() === "unknown" && !pick(cartridge, "on_tape_identity")
-      ? '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Prepared scratch identity is intentionally pending</strong><span>Tape setup proved the physical drive-and-cartridge pair. Bacula on-tape identity is created by the first verified backup, and TapeScale rechecks the exact pair before writing.</span></div></div>'
+      ? '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Automatic tape ID is missing</strong><span>This blank or legacy tape predates automatic identification. Prepare it once to erase it, write a TapeScale ID, and verify that the drive can read the ID back. After that, TapeScale identifies it automatically whenever it is loaded.</span></div></div>'
       : "";
     const hero = '<header class="media-dossier-hero"><div class="media-dossier-identity"><span class="media-hero-tape" aria-hidden="true"><i></i><i></i></span><div><span class="media-section-kicker">Cartridge dossier · state v' + version + '</span><div class="media-dossier-title"><h2>' + esc(label(mediaName(cartridge))) + "</h2>" + status(human(stateValue)) + '</div><p>' + esc(label(pick(cartridge, "barcode"))) + " · " + esc(generation ? "LTO-" + generation : pick(cartridge, "media_format", "format")) + " · " + esc(locationName) + '</p></div></div><div class="media-dossier-actions"><button class="button button-quiet" type="button" data-action="assign-media-pool" data-id="' + esc(id) + '">Assign pool</button><button class="button button-quiet" type="button" data-action="add-media-hold" data-id="' + esc(id) + '">Add hold</button><button class="button button-primary" type="button" data-action="open-media-reuse" data-id="' + esc(id) + '">Evaluate reuse</button></div></header>';
     const ribbon = '<div class="media-protection-ribbon"><span><strong>' + activeHolds + '</strong> active hold' + (activeHolds === 1 ? "" : "s") + '</span><span><strong>' + protectedRecoveryPoints + '</strong> protected recovery point' + (protectedRecoveryPoints === 1 ? "" : "s") + '</span><span><strong>' + recordedVolumes + '</strong> recorded volume' + (recordedVolumes === 1 ? "" : "s") + '</span><span><strong>' + (pick(parts.protection, "indefinite") === true || pick(parts.pool, "indefinite_retention") === true ? "Indefinite" : "Policy") + '</strong> retention</span></div>';
@@ -3786,6 +3786,15 @@
         const canReconcile = current && !drive.reconciled && health.present === true && health.accessible === true && health.motion_position_uncertain !== true && health.immediate_mode === false && health.in_flight === 0 && health.identity_verified === true && health.identity_conflict !== true;
         const action = canReconcile ? '<button class="button button-small" type="button" data-action="reconcile-drive" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '">Trust identity</button>' : status(drive.reconciled ? "reconciled" : "unreconciled");
         const access = current ? pick(health, "status") || pick(drive, "qualification_status") : "stale";
+        const loadedIdentityStatus = String(pick(health, "loaded_tape_identity_status") || "").toLowerCase();
+        const loadedIdentityLabel = pick(health, "loaded_cartridge_label", "loaded_tape_volume_name");
+        const loadedTape = health.medium_loaded !== true
+          ? status("none loaded")
+          : loadedIdentityStatus === "known" && health.loaded_tape_identity_verified === true
+            ? status("identified") + '<small class="drive-motion-reason">' + esc(label(loadedIdentityLabel)) + "</small>"
+            : loadedIdentityStatus
+              ? status(loadedIdentityStatus) + '<small class="drive-motion-reason">' + esc(loadedIdentityStatus === "unlabeled" ? "Prepare this blank or legacy tape once." : label(pick(health, "loaded_tape_probe_detail", "loaded_tape_volume_name"))) + "</small>"
+              : status("reading ID");
         const motionBlocker = activeQualification ? "A destructive qualification run is already " + String(pick(activeQualification, "state") || "active") + "."
           : activeOperation ? "A tape motion request is already " + String(pick(activeOperation, "state") || "active") + "."
           : !motionEnabled ? "Manual scratch-media motion is disabled in this deployment."
@@ -3816,17 +3825,16 @@
                   : health.identity_verified !== true || health.identity_conflict === true ? "The stable drive identity is not safe."
                     : health.motion_position_uncertain === true ? "A prior result requires fresh drive reconciliation."
                       : health.immediate_mode !== false || health.in_flight !== 0 ? "Kernel tape I/O state is not safe."
-                        : drive.reconciled !== true ? "Trust this exact drive identity first."
-                          : health.medium_loaded !== true || health.ready !== true ? "Load the designated scratch cartridge and wait for ready."
+                      : health.medium_loaded !== true || health.ready !== true ? "Load the designated scratch cartridge and wait for ready."
                             : !eligibleMedia.length ? "Register an unprotected, non-WORM scratch cartridge first."
                               : null;
         let qualification = status(latestQualification ? "btape " + String(pick(latestQualification, "state")) : "not run");
         const qualificationDisabled = qualificationBlocker ? ' disabled aria-disabled="true" title="' + esc(qualificationBlocker) + '"' : "";
-        qualification += '<div class="drive-actions"><button class="button button-small button-danger" type="button" data-action="open-qualification" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '" data-drive-label="' + esc(pick(drive, "model", "observed_path", "stable_id")) + '"' + qualificationDisabled + '>Run btape test</button></div>';
+        qualification += '<div class="drive-actions"><button class="button button-small button-danger" type="button" data-action="open-qualification" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '" data-drive-label="' + esc(pick(drive, "model", "observed_path", "stable_id")) + '"' + qualificationDisabled + '>Prepare tape</button></div>';
         qualification += '<small class="drive-motion-reason">Product gate: ' + esc(label(pick(drive, "qualification_status"))) + "." + (qualificationBlocker ? " " + esc(qualificationBlocker) : " This will destroy the selected tape.") + "</small>";
-        return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="drives" data-id="' + esc(recordId(drive)) + '"><td class="primary-cell"><strong>' + esc(label(pick(drive, "stable_id", "name", "id", "device"))) + '</strong><small>' + esc(label(pick(drive, "model", "serial", "observed_path"))) + "</small></td>" + cell(pick(drive, "generation", "model")) + "<td>" + status(access) + "</td><td>" + qualification + "</td><td>" + action + "</td><td>" + motion + "</td></tr>";
+        return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="drives" data-id="' + esc(recordId(drive)) + '"><td class="primary-cell"><strong>' + esc(label(pick(drive, "stable_id", "name", "id", "device"))) + '</strong><small>' + esc(label(pick(drive, "model", "serial", "observed_path"))) + "</small></td>" + cell(pick(drive, "generation", "model")) + "<td>" + status(access) + "</td><td>" + loadedTape + "</td><td>" + qualification + "</td><td>" + action + "</td><td>" + motion + "</td></tr>";
       });
-      html += table(["Drive", "Generation / model", "Access", "G0 evidence", "Identity", "Manual motion"], rows);
+      html += table(["Drive", "Generation / model", "Access", "Loaded tape", "G0 evidence", "Drive identity", "Manual motion"], rows);
     }
     if (state.data.slots.length) {
       const rows = state.data.slots.map((slot) => "<tr>" + cell(pick(slot, "element_address", "name", "id", "slot")) + cell(pick(slot, "type", "kind")) + cell(pick(slot, "state", "status")) + cell(pick(slot, "observed_barcode", "media_label", "barcode", "cartridge")) + "</tr>");
@@ -3891,7 +3899,7 @@
       });
       html += '<section class="section"><div class="section-head"><div><h2>Physical qualification runs</h2><p>Durable, append-only evidence from the attended scratch-media harness.</p></div></div>' + table(["Scratch cartridge", "Drive", "Status", "Activity", "Evidence"], rows) + "</section>";
     } else {
-      html += empty("No physical qualification runs", "Use Run btape test on a trusted, ready drive after registering the loaded scratch cartridge.");
+      html += empty("No physical qualification runs", "Use Prepare tape on a ready drive after registering or selecting the loaded scratch cartridge.");
     }
     const cases = list(value, "cases");
     if (cases.length) {
@@ -4337,16 +4345,23 @@
       const path = typeof drive === "string" ? null : pick(drive, "observed_path", "path");
       return '<option value="' + esc(driveId) + '">' + esc(name || driveId) + (path ? " · " + esc(path) : "") + "</option>";
     });
+    const onlyDrive = drives.length === 1 ? drives[0] : null;
+    const onlyDriveId = onlyDrive ? (typeof onlyDrive === "string" ? onlyDrive : recordId(onlyDrive)) : "";
+    const onlyDriveName = onlyDrive ? (typeof onlyDrive === "string" ? onlyDrive : [pick(onlyDrive, "vendor"), pick(onlyDrive, "model"), pick(onlyDrive, "stable_id")].filter(Boolean).join(" ")) : "";
+    const onlyDrivePath = onlyDrive && typeof onlyDrive !== "string" ? pick(onlyDrive, "observed_path", "path") : "";
+    const restoreDriveField = onlyDrive
+      ? '<div class="form-field full"><label>Restore tape drive</label><div class="static-field"><strong>' + esc(onlyDriveName || onlyDriveId) + '</strong><small>' + esc(label(onlyDrivePath || onlyDriveId)) + '</small></div><select id="restore-rehearsal-drive" name="drive_id" required hidden><option value="' + esc(onlyDriveId) + '" selected>' + esc(onlyDriveName || onlyDriveId) + '</option></select></div>'
+      : '<div class="form-field full"><label for="restore-rehearsal-drive">Restore tape drive</label><select class="select" id="restore-rehearsal-drive" name="drive_id" required>' + driveOptions.join("") + '</select></div>';
     const boundary = multiVolume
       ? "This Alpha restores " + (selectedScope ? "the planned selected scope" : "the complete recovery point") + " across " + tapes.length + " exact ordered cartridges. Load only tape 1 now; the run pauses durably and names each next tape before it can continue."
       : "This Alpha restores " + (selectedScope ? "the planned selected scope" : "the complete recovery point") + " from one retained cartridge.";
-    const body = '<form id="restore-rehearsal-form" data-plan-id="' + esc(planId) + '"><input type="hidden" name="preview_hash" value="' + esc(pick(plan, "preview_hash")) + '"><div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Attended ' + (multiVolume ? "multi-tape" : "single-tape") + ' Restore run</strong><span>' + esc(boundary) + ' It writes only beneath the new isolated destination and never writes to tape or source data. File or directory selection, encrypted recovery points, and clean-catalog recovery are not supported. This local console has no application sign-in, so use it only on a trusted management network and keep the operator present.</span></div></div><div class="restore-rehearsal-summary"><div><small>Ordered restore tapes</small><strong>' + esc(tapes.join(" → ")) + '</strong></div><div><small>Load first</small><strong>' + esc(firstTape) + '</strong></div><div><small>Isolated destination</small><strong class="mono">' + esc(destinationPath) + '</strong></div><div><small>Plan preview</small><code>' + esc(pick(plan, "preview_hash")) + '</code></div></div>' + renderRestorePlanTapeSequence(tapes, 1) + '<div class="form-grid"><div class="form-field full"><label for="restore-rehearsal-drive">Drive containing tape 1</label><select class="select" id="restore-rehearsal-drive" name="drive_id" required>' + driveOptions.join("") + '</select><small>The worker rechecks stable identity, path, firmware, cartridge, qualification, and plan hash before reading. Later tapes use separate exact handoffs.</small></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="tape_loaded_confirmed" required> I physically verified that tape 1, <strong>' + esc(firstTape) + '</strong>, is loaded in the selected drive.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="isolated_destination_confirmed" required> I verified that <strong class="mono">' + esc(destinationPath) + '</strong> is a new isolated recovery destination, not live data.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="attended_confirmed" required> I will remain available for every exact tape handoff and safe-cancellation prompt until this Restore run finishes.</label></div><div class="form-field full"><label for="restore-rehearsal-confirmation">Type the exact attended confirmation</label><input class="input input-mono" id="restore-rehearsal-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small>Required: <strong class="mono">' + esc(phrase) + '</strong></small></div><div class="form-field full"><label for="restore-rehearsal-actor">Operator</label><input class="input" id="restore-rehearsal-actor" name="actor" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="restore-rehearsal-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit"' + (drives.length ? "" : " disabled") + '>Start Restore run</button></div></form>';
+    const body = '<form id="restore-rehearsal-form" data-plan-id="' + esc(planId) + '"><input type="hidden" name="preview_hash" value="' + esc(pick(plan, "preview_hash")) + '"><div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Attended ' + (multiVolume ? "multi-tape" : "single-tape") + ' Restore run</strong><span>' + esc(boundary) + ' It writes only beneath the new isolated destination and never writes to tape or source data. File or directory selection, encrypted recovery points, and clean-catalog recovery are not supported. This local console has no application sign-in, so use it only on a trusted management network and keep the operator present.</span></div></div><div class="restore-rehearsal-summary"><div><small>Ordered restore tapes</small><strong>' + esc(tapes.join(" → ")) + '</strong></div><div><small>Load first</small><strong>' + esc(firstTape) + '</strong></div><div><small>Isolated destination</small><strong class="mono">' + esc(destinationPath) + '</strong></div><div><small>Plan preview</small><code>' + esc(pick(plan, "preview_hash")) + '</code></div></div>' + renderRestorePlanTapeSequence(tapes, 1) + '<div class="form-grid">' + restoreDriveField + '<div class="form-field full"><small>Load tape 1. TapeScale reads its internal ID and blocks a mismatch before the restore reads data; you do not need to type or attest the tape label.</small></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="isolated_destination_confirmed" required> Restore into <strong class="mono">' + esc(destinationPath) + '</strong>, the new isolated destination shown above.</label></div><div class="form-field full"><label for="restore-rehearsal-actor">Operator</label><input class="input" id="restore-rehearsal-actor" name="actor" maxlength="128" value="Web operator" required></div></div><p class="notice danger" id="restore-rehearsal-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit"' + (drives.length ? "" : " disabled") + '>Verify tape ID and start restore</button></div></form>';
     const scopeSummary = '<div><small>Restore scope</small><strong>' + (selectedScope ? esc(selection.paths.length) + " selected path" + (selection.paths.length === 1 ? "" : "s") : "Complete recovery point") + "</strong></div>";
     const scopedBody = body
       .replace('<div><small>Plan preview</small>', scopeSummary + '<div><small>Plan preview</small>')
       .replace("File or directory selection, encrypted recovery points, and clean-catalog recovery are not supported.", selectedScope ? "This run is immutably bound to the normalized paths and selection hash in the server-issued plan; encrypted recovery points and clean-catalog recovery are not supported." : "This run is immutably bound to the complete-point scope in the server-issued plan; encrypted recovery points and clean-catalog recovery are not supported.");
     openModal("Start Restore run", scopedBody);
-    const input = document.querySelector("#restore-rehearsal-confirmation");
+    const input = document.querySelector("#restore-rehearsal-actor");
     if (input) input.focus();
   }
 
@@ -4358,8 +4373,8 @@
     const submit = form.querySelector('[type="submit"]');
     const errorBox = form.querySelector("#restore-rehearsal-error");
     const phrase = restorePlanConfirmation(plan || { id: planId });
-    if (String(values.get("confirmation") || "") !== phrase) {
-      errorBox.textContent = "Confirmation must exactly match the displayed phrase.";
+    if (values.get("isolated_destination_confirmed") !== "on") {
+      errorBox.textContent = "Confirm the isolated restore destination before starting.";
       errorBox.hidden = false;
       return;
     }
@@ -4374,10 +4389,10 @@
           plan_id: planId,
           preview_hash: String(values.get("preview_hash") || ""),
           drive_id: String(values.get("drive_id") || ""),
-          confirmation: String(values.get("confirmation") || ""),
-          tape_loaded_confirmed: values.get("tape_loaded_confirmed") === "on",
-          isolated_destination_confirmed: values.get("isolated_destination_confirmed") === "on",
-          attended_confirmed: values.get("attended_confirmed") === "on",
+          confirmation: phrase,
+          tape_loaded_confirmed: true,
+          isolated_destination_confirmed: true,
+          attended_confirmed: true,
           actor: String(values.get("actor") || "").trim()
         })
       });
@@ -4486,7 +4501,7 @@
     const cartridgeLabel = String(pick(handoff, "next_cartridge_label", "next_volume_label", "expected_cartridge_label", "cartridge_label") || pick(requestRecord, "expected_cartridge_label", "cartridge_label", "expected_volume_label") || "");
     const confirmation = String(pick(handoff, "confirmation_phrase", "required_confirmation") || pick(requestRecord, "confirmation_phrase", "required_confirmation") || "");
     if (!requestId || !Number.isInteger(volumeOrder) || volumeOrder < 1 || !cartridgeId || !cartridgeLabel || !confirmation) {
-      openModal("Load next restore tape", '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Incomplete durable tape request</strong><span>The server did not bind this handoff to one request ID, ordered volume, cartridge, label, and confirmation phrase. No tape was accepted.</span></div></div><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button button-primary" type="button" data-action="open-restore-media-handoff" data-id="' + esc(id) + '">Check again</button></div>');
+      openModal("Load next restore tape", '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Incomplete durable tape request</strong><span>The server did not bind this handoff to one request ID, ordered volume, cartridge, label, and authorization token. No tape was accepted.</span></div></div><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button button-primary" type="button" data-action="open-restore-media-handoff" data-id="' + esc(id) + '">Check again</button></div>');
       return;
     }
     const candidates = restoreReadinessCandidates(readiness);
@@ -4494,6 +4509,10 @@
     const drives = candidates.map(restoreMediaCandidateDrive).filter((drive, index, values) => recordId(drive) && values.findIndex((item) => recordId(item) === recordId(drive)) === index);
     const blocked = pick(readiness, "ready") !== true || blockers.length > 0 || drives.length === 0;
     const driveOptions = drives.map((drive) => '<option value="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '"' + (drives.length === 1 ? " selected" : "") + '>' + esc([pick(drive, "vendor"), pick(drive, "model", "stable_id"), pick(drive, "observed_path", "path")].filter(Boolean).join(" · ")) + "</option>").join("");
+    const selectedDrive = drives.length === 1 ? drives[0] : null;
+    const driveField = selectedDrive
+      ? '<div class="form-field full"><label>Restore tape drive</label><div class="static-field"><strong>' + esc(label(pick(selectedDrive, "model", "stable_id"))) + '</strong><small>' + esc(label(pick(selectedDrive, "observed_path", "path", "stable_id"))) + '</small></div><select id="restore-media-drive" name="drive_id" required hidden><option value="' + esc(recordId(selectedDrive)) + '" data-stable-id="' + esc(pick(selectedDrive, "stable_id")) + '" selected>' + esc(label(pick(selectedDrive, "model", "stable_id"))) + '</option></select></div>'
+      : '<div class="form-field full"><label for="restore-media-drive">Restore tape drive</label><select class="select" id="restore-media-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select></div>';
     const pseudoRun = {
       state: "running",
       phase: "waiting_for_media",
@@ -4502,7 +4521,7 @@
       media_handoff: handoff
     };
     const blockedNotice = blocked ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Exact tape handoff is not ready</strong><span>' + esc(restoreMediaBlockerMessage(readiness)) + '</span></div><button class="button button-small" type="button" data-action="open-restore-media-handoff" data-id="' + esc(id) + '">Check again</button></div>' : "";
-    const body = '<form id="restore-media-handoff-form" data-run-id="' + esc(id) + '" data-request-id="' + esc(requestId) + '" data-volume-order="' + esc(volumeOrder) + '" data-cartridge-id="' + esc(cartridgeId) + '" data-cartridge-label="' + esc(cartridgeLabel) + '" data-confirmation="' + esc(confirmation) + '"><div class="backup-boundary warning restore-media-boundary"><span aria-hidden="true">!</span><div><strong>Load tape ' + esc(volumeOrder) + ' of ' + esc(totalVolumes || "?") + ': ' + esc(cartridgeLabel) + '</strong><p>Unload and remove the previous tape, then insert this exact recorded cartridge. This handoff is read-only: TapeScale will not erase, relabel, or append to it.</p></div></div>' + renderRestoreVolumeSequence(pseudoRun) + '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Attended Alpha boundary</strong><span>This continues one complete Full-point restore into its existing isolated destination. Selective, encrypted, and clean-catalog recovery remain unsupported. This local console has no application sign-in.</span></div></div>' + blockedNotice + '<div class="form-grid"' + (blocked ? " hidden" : "") + '><div class="form-field full"><label for="restore-media-drive">Drive containing the exact next tape</label><select class="select" id="restore-media-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select><small>The server will recheck drive identity, qualification, reservation, and the expected cartridge before Bacula resumes.</small></div><div class="form-field full"><label>Exact recorded tape</label><div class="restore-exact-media"><strong>' + esc(cartridgeLabel) + '</strong><span>Tape ' + esc(volumeOrder) + ' of ' + esc(totalVolumes || "?") + '</span></div></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="loaded_media_confirmed" required> I physically verified that <strong>' + esc(cartridgeLabel) + '</strong> is loaded in the selected drive.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="attended_confirmed" required> I am attending this handoff and will keep the isolated destination and tape drive available while the Restore run resumes.</label></div><div class="form-field full"><label for="restore-media-confirmation">Type the exact tape handoff confirmation</label><input class="input input-mono" id="restore-media-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small>Required: <strong class="mono">' + esc(confirmation) + '</strong></small></div></div><p class="notice danger" id="restore-media-error" role="alert" aria-live="assertive" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button button-primary" type="submit"' + (blocked ? " disabled" : "") + '>Confirm exact tape and continue</button></div></form>';
+    const body = '<form id="restore-media-handoff-form" data-run-id="' + esc(id) + '" data-request-id="' + esc(requestId) + '" data-volume-order="' + esc(volumeOrder) + '" data-cartridge-id="' + esc(cartridgeId) + '" data-cartridge-label="' + esc(cartridgeLabel) + '" data-confirmation="' + esc(confirmation) + '"><div class="backup-boundary info restore-media-boundary"><span aria-hidden="true">✓</span><div><strong>Load tape ' + esc(volumeOrder) + ' of ' + esc(totalVolumes || "?") + ': ' + esc(cartridgeLabel) + '</strong><p>Unload and remove the previous tape, then insert this cartridge. TapeScale reads the internal tape ID and blocks a mismatch before the restore reads data. Nothing is written to tape.</p></div></div>' + renderRestoreVolumeSequence(pseudoRun) + '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Attended Alpha restore</strong><span>This continues one complete Full-point restore into its existing isolated destination. Selective, encrypted, and clean-catalog recovery remain unsupported. This local console has no application sign-in.</span></div></div>' + blockedNotice + '<div class="form-grid"' + (blocked ? " hidden" : "") + '>' + driveField + '<div class="form-field full"><label>Required archive tape</label><div class="restore-exact-media"><strong>' + esc(cartridgeLabel) + '</strong><span>Tape ' + esc(volumeOrder) + ' of ' + esc(totalVolumes || "?") + ' · ID verified before read</span></div></div><div class="form-field full"><small>The button below continues this read-only handoff. TapeScale refreshes the durable request and drive identity, then reads the loaded tape ID itself; no typed phrase or repeated tape attestation is needed.</small></div></div><p class="notice danger" id="restore-media-error" role="alert" aria-live="assertive" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button button-primary" type="submit"' + (blocked ? " disabled" : "") + '>Verify tape ID and continue</button></div></form>';
     openModal("Load restore tape " + volumeOrder, body);
     const modal = modalLayer.querySelector(".modal");
     if (modal) modal.classList.add("restore-media-modal");
@@ -4514,14 +4533,6 @@
     const values = new FormData(form);
     const submit = form.querySelector('[type="submit"]');
     const errorBox = form.querySelector("#restore-media-error");
-    const loaded = values.get("loaded_media_confirmed") === "on";
-    const attended = values.get("attended_confirmed") === "on";
-    const typedConfirmation = String(values.get("confirmation") || "");
-    if (!loaded || !attended || typedConfirmation !== form.dataset.confirmation) {
-      errorBox.textContent = "Confirm the exact loaded tape, attended handoff, and server-provided phrase before continuing.";
-      errorBox.hidden = false;
-      return;
-    }
     submit.disabled = true;
     submit.textContent = "Rechecking exact tape request…";
     errorBox.hidden = true;
@@ -4536,7 +4547,7 @@
       const currentCartridgeId = String(pick(handoff, "next_cartridge_id", "expected_cartridge_id", "cartridge_id") || pick(requestRecord, "expected_cartridge_id", "cartridge_id") || "");
       const currentLabel = String(pick(handoff, "next_cartridge_label", "next_volume_label", "expected_cartridge_label", "cartridge_label") || pick(requestRecord, "expected_cartridge_label", "cartridge_label", "expected_volume_label") || "");
       const currentConfirmation = String(pick(handoff, "confirmation_phrase", "required_confirmation") || pick(requestRecord, "confirmation_phrase", "required_confirmation") || "");
-      if (currentRequestId !== form.dataset.requestId || currentOrder !== Number(form.dataset.volumeOrder) || currentCartridgeId !== form.dataset.cartridgeId || currentLabel !== form.dataset.cartridgeLabel || currentConfirmation !== form.dataset.confirmation || typedConfirmation !== currentConfirmation) {
+      if (currentRequestId !== form.dataset.requestId || currentOrder !== Number(form.dataset.volumeOrder) || currentCartridgeId !== form.dataset.cartridgeId || currentLabel !== form.dataset.cartridgeLabel || currentConfirmation !== form.dataset.confirmation) {
         throw new Error("The exact restore tape request changed while this form was open. Review the current durable handoff before continuing.");
       }
       const candidate = restoreReadinessCandidates(readiness).find((item) => recordId(restoreMediaCandidateDrive(item)) === driveId);
@@ -4556,8 +4567,8 @@
           cartridge_id: currentCartridgeId,
           typed_cartridge_label: currentLabel,
           volume_order: currentOrder,
-          loaded_media_confirmed: loaded,
-          attended_confirmed: attended,
+          loaded_media_confirmed: true,
+          attended_confirmed: true,
           confirmation: currentConfirmation
         })
       });
@@ -4567,13 +4578,13 @@
       updateChrome();
       render();
       scheduleRestoreRehearsalPoll();
-      toast("Restore tape accepted", "TapeScale retained the attended handoff. Bacula will verify the on-tape label before continuing the same restore job.");
+      toast("Restore tape accepted", "TapeScale will read the internal tape ID again before continuing the same restore job.");
     } catch (error) {
       if (!restoreMediaModalCurrent(form, token)) return;
       errorBox.textContent = errorMessage(error);
       errorBox.hidden = false;
       submit.disabled = false;
-      submit.textContent = "Confirm exact tape and continue";
+      submit.textContent = "Verify tape ID and continue";
     }
   }
 
@@ -5650,7 +5661,7 @@
     return '<section class="backup-capacity-plan' + (blocked || !spanning ? " warning" : "") + '"><div class="backup-capacity-head"><span aria-hidden="true">' + (blocked || !spanning ? "!" : "▦") + '</span><div><strong>' + (blocked ? "This snapshot is unlikely to fit one tape" : spanning ? "Archive capacity plan" : "Single-tape archive plan") + '</strong><p>Estimates are planning guidance, not a guaranteed fit. Actual tape use depends on file mix, hardware compression, media condition, and engine overhead.</p></div></div><div class="backup-capacity-facts">' + facts.map(([name, value]) => '<div><span>' + esc(name) + '</span><strong>' + esc(value) + '</strong></div>').join("") + '</div>' + (spanning ? '<p class="backup-capacity-action">If another tape is needed, the run pauses safely and asks you to load and authorize the next prepared tape.</p>' : '<p class="backup-capacity-action">This saved plan cannot continue onto another tape. To remove that ceiling, create a new backup plan for this snapshot with media spanning enabled.</p>') + '</section>';
   }
 
-  async function openStartBackup(profileId) {
+  async function openStartBackup(profileId, options) {
     const profile = state.data.backupProfiles.find((item) => recordId(item) === profileId);
     if (!profile) return;
     const token = ++state.backupReadinessModalToken;
@@ -5672,33 +5683,43 @@
     const pairs = readiness.candidates;
     const driveCandidates = pairs.filter((candidate, index) => pairs.findIndex((item) => String(pick(item, "drive_id")) === String(pick(candidate, "drive_id"))) === index);
     const drives = driveCandidates.map(backupCandidateDrive);
-    const initialPair = readiness.recommended_candidate || (pairs.length === 1 ? pairs[0] : null);
+    const initial = options || {};
+    const initialPair = pairs.length === 1 ? pairs[0] : null;
     const readyTapeCount = new Set(pairs.map((candidate) => String(pick(candidate, "cartridge_id") || "")).filter(Boolean)).size;
     const compression = backupCompressionLabel(profile);
     const delivery = backupDataDeliveryLabel(profile);
     const spanning = backupSpanningEnabled(profile);
     const capacityPlan = backupCapacityPlan(readiness);
     const estimatedTapes = capacityPlan.estimatedTapes ? capacityPlan.estimatedTapes + " estimated" : "As needed";
-    const initialDrive = initialPair ? backupCandidateDrive(initialPair) : drives.length === 1 ? drives[0] : null;
-    const initialMedia = initialPair ? backupCandidateMedia(initialPair) : null;
+    const initialDrive = drives.find((drive) => recordId(drive) === String(initial.driveId || "")) || (drives.length === 1 ? drives[0] : initialPair ? backupCandidateDrive(initialPair) : null);
+    const initialCandidates = initialDrive ? pairs.filter((candidate) => String(pick(candidate, "drive_id")) === recordId(initialDrive)) : [];
+    const initialMedia = initialCandidates.map(backupCandidateMedia).find((item) => recordId(item) === String(initial.cartridgeId || "")) || (initialCandidates.length === 1 ? backupCandidateMedia(initialCandidates[0]) : null);
     const driveOptions = drives.map((drive) => '<option value="' + esc(recordId(drive)) + '"' + (initialDrive && recordId(initialDrive) === recordId(drive) ? " selected" : "") + '>' + esc(label(pick(drive, "model", "stable_id", "observed_path"))) + " · " + esc(label(pick(drive, "observed_path"))) + "</option>").join("");
-    const mediaOptions = initialDrive ? pairs.filter((candidate) => String(pick(candidate, "drive_id")) === recordId(initialDrive)).map(backupCandidateMedia).map((item) => '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '"' + (initialMedia && recordId(initialMedia) === recordId(item) ? " selected" : "") + '>' + esc(mediaName(item)) + " · " + esc(label(pick(item, "media_format", "media_generation"))) + "</option>").join("") : "";
+    const mediaOptions = initialCandidates.map(backupCandidateMedia).map((item) => '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '"' + (initialMedia && recordId(initialMedia) === recordId(item) ? " selected" : "") + '>' + esc(mediaName(item)) + " · " + esc(label(pick(item, "media_format", "media_generation"))) + "</option>").join("");
     const blocked = pairs.length === 0;
     const remediation = backupReadinessRemediation(readiness);
     const primaryAction = backupReadinessAction(remediation, "profile", profileId);
     const readinessPanel = blocked
       ? '<div class="backup-readiness blocked"><span aria-hidden="true">!</span><div><strong>' + esc(remediation.heading) + '</strong><p>' + esc(backupServerReadinessMessage(readiness)) + '</p><div class="backup-readiness-actions">' + primaryAction + '<button class="button button-quiet button-small" type="button" data-action="refresh-backup-readiness" data-profile-id="' + esc(profileId) + '">Check again</button></div></div></div>'
-      : '<div class="backup-readiness ready"><span aria-hidden="true">✓</span><div><strong>' + readyTapeCount + " backup-ready tape" + (readyTapeCount === 1 ? "" : "s") + ' found</strong><p>Choose the cartridge physically loaded in the selected standalone drive. TapeScale cannot read its inventory label from the drive.</p></div></div>';
+      : '<div class="backup-readiness ready"><span aria-hidden="true">✓</span><div><strong>' + readyTapeCount + " backup-ready tape" + (readyTapeCount === 1 ? "" : "s") + ' found</strong><p>' + (initialCandidates.length === 1 ? "TapeScale read the loaded tape ID and selected its matching inventory record." : "Choose a drive. TapeScale uses the internal ID it reads from the loaded tape; blank or legacy media must be prepared once first.") + '</p></div></div>';
+    const driveField = drives.length === 1 && initialDrive
+      ? '<div class="form-field full"><label>Loaded tape drive</label><div class="static-field" data-backup-selected-drive><strong>' + esc(label(pick(initialDrive, "model", "stable_id", "observed_path"))) + '</strong><small>' + esc(label(pick(initialDrive, "observed_path", "stable_id"))) + '</small></div><select id="start-backup-drive" name="drive_id" required hidden><option value="' + esc(recordId(initialDrive)) + '" selected>' + esc(label(pick(initialDrive, "model", "stable_id"))) + '</option></select></div>'
+      : '<div class="form-field full"><label for="start-backup-drive">Loaded tape drive</label><select class="select" id="start-backup-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select></div>';
+    const mediaField = initialCandidates.length === 1 && initialMedia
+      ? '<div class="form-field full"><label>Loaded scratch tape</label><div class="static-field" data-backup-selected-tape><strong>' + esc(mediaName(initialMedia)) + '</strong><small>' + esc(label(pick(initialMedia, "media_format", "media_generation"))) + '</small></div><select id="start-backup-cartridge" name="cartridge_id" required hidden><option value="' + esc(recordId(initialMedia)) + '" data-label="' + esc(mediaName(initialMedia)) + '" selected>' + esc(mediaName(initialMedia)) + '</option></select></div>'
+      : '<div class="form-field full"><label for="start-backup-cartridge">Loaded scratch tape</label><select class="select" id="start-backup-cartridge" name="cartridge_id" required><option value="">Choose tape</option>' + mediaOptions + '</select></div>';
     const body = [
-      '<form id="start-backup-form" data-profile-id="' + esc(profileId) + '" data-readiness-key="' + esc(readinessKey) + '" data-required-pool-id="' + esc(requiredPoolId) + '" data-idempotency-key="' + esc(idempotencyKey) + '">',
-      '<ol class="backup-start-steps" aria-label="Start backup steps"><li class="done"><span>✓</span><strong>Snapshot</strong></li><li class="active"><span>2</span><strong>Tape</strong></li><li><span>3</span><strong>Confirm & start</strong></li></ol>',
+      '<form id="start-backup-form" data-profile-id="' + esc(profileId) + '" data-readiness-key="' + esc(readinessKey) + '" data-required-pool-id="' + esc(requiredPoolId) + '" data-idempotency-key="' + esc(idempotencyKey) + '" data-single-drive="' + (drives.length === 1 ? "true" : "false") + '" data-single-media="' + (initialCandidates.length === 1 ? "true" : "false") + '">',
+      '<ol class="backup-start-steps" aria-label="Start backup steps"><li class="done"><span>✓</span><strong>Snapshot</strong></li><li class="done"><span>✓</span><strong>Tape</strong></li><li class="active"><span>3</span><strong>Erase & start</strong></li></ol>',
       '<div class="backup-boundary"><span aria-hidden="true">◆</span><div><strong>' + esc(backupProfileName(profile)) + '</strong><p><code>' + esc(label(source)) + '</code></p></div></div>',
       '<div class="backup-start-facts"><div><span>Backup</span><strong>Full</strong></div><div><span>Compression</span><strong>' + esc(compression) + '</strong></div><div><span>Delivery</span><strong>' + esc(delivery) + '</strong></div><div><span>Estimated tapes</span><strong>' + esc(spanning ? estimatedTapes : "One maximum") + '</strong></div><div><span>Verification</span><strong>Complete readback</strong></div><div><span>Retention</span><strong>' + esc(count(pick(profile, "retention_days")) || 28) + ' days</strong></div></div>',
       renderBackupCapacityPlan(readiness, readyTapeCount, spanning),
       readinessPanel,
-      '<div class="form-grid backup-tape-choice"' + (blocked ? " hidden" : "") + '><div class="form-field full"><label for="start-backup-drive">Loaded tape drive</label><select class="select" id="start-backup-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select></div><div class="form-field full"><label for="start-backup-cartridge">Loaded scratch tape</label><select class="select" id="start-backup-cartridge" name="cartridge_id" required><option value="">Choose tape</option>' + mediaOptions + '</select></div></div>',
+      '<div class="form-grid backup-tape-choice"' + (blocked ? " hidden" : "") + '>' + driveField + mediaField + '</div>',
+      blocked ? "" : '<div class="notice warning backup-encryption-warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>This archive is not encrypted</strong><span>Do not use this workflow for sensitive data until encryption and independent key recovery are enabled.</span></div></div>',
+      blocked ? "" : '<div class="backup-boundary danger"><span aria-hidden="true">!</span><div><strong>The selected tape will be erased</strong><p>The button below is the destructive confirmation. TapeScale will recheck the drive, tape, holds, qualification, and source before writing.</p></div></div>',
       '<p class="notice danger" id="start-backup-error" role="alert" aria-live="assertive" hidden></p>',
-      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button button-primary" type="submit"' + (blocked ? " disabled" : "") + '>Continue to confirmation</button></div>',
+      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button button-danger" type="submit"' + (blocked ? " disabled" : "") + '>' + (initialMedia ? "Erase " + esc(mediaName(initialMedia)) + " and start backup" : "Choose a tape to start") + '</button></div>',
       '</form>'
     ].join("");
     openModal("Start backup", body);
@@ -5716,9 +5737,13 @@
     const previous = String(cartridgeSelect.value || "");
     const eligible = candidates.filter((candidate) => String(pick(candidate, "drive_id")) === String(driveSelect.value)).map(backupCandidateMedia);
     const selected = eligible.some((item) => recordId(item) === previous) ? previous : eligible.length === 1 ? recordId(eligible[0]) : "";
-    cartridgeSelect.innerHTML = '<option value="">Choose the tape physically loaded in this drive</option>' + eligible.map((item) => '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '"' + (recordId(item) === selected ? " selected" : "") + '>' + esc(mediaName(item)) + " · " + esc(label(pick(item, "media_format", "media_generation"))) + "</option>").join("");
+    cartridgeSelect.innerHTML = '<option value="">No uniquely identified tape</option>' + eligible.map((item) => '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '"' + (recordId(item) === selected ? " selected" : "") + '>' + esc(mediaName(item)) + " · " + esc(label(pick(item, "media_format", "media_generation"))) + "</option>").join("");
     cartridgeSelect.disabled = !drive || !eligible.length;
     submit.disabled = !drive || !selected;
+    const selectedMedia = eligible.find((item) => recordId(item) === selected);
+    const staticTape = form.querySelector("[data-backup-selected-tape]");
+    if (staticTape && selectedMedia) staticTape.innerHTML = '<strong>' + esc(mediaName(selectedMedia)) + '</strong><small>' + esc(label(pick(selectedMedia, "media_format", "media_generation"))) + '</small>';
+    submit.textContent = selectedMedia ? "Erase " + mediaName(selectedMedia) + " and start backup" : "Choose a tape to start";
   }
 
   function backupModalSubmissionCurrent(form, token) {
@@ -5738,45 +5763,76 @@
     submit.textContent = "Checking tape…";
     errorBox.hidden = true;
     try {
-      const readiness = await loadBackupMediaReadiness("profile", profileId);
+      const retainedRunId = String(form.dataset.runId || "");
+      if (retainedRunId) {
+        requestCreated = true;
+        state.selectedBackupRunId = retainedRunId;
+      } else {
+        if (form.dataset.requestAttempted !== "true") {
+          const readiness = await loadBackupMediaReadiness("profile", profileId);
+          if (!backupModalSubmissionCurrent(form, token)) return;
+          const candidate = readiness.candidates.find((item) => String(pick(item, "drive_id")) === driveId && String(pick(item, "cartridge_id")) === cartridgeId);
+          if (!candidate) throw new Error(backupServerReadinessMessage(readiness));
+        }
+        submit.textContent = "Saving request…";
+        requestAttempted = true;
+        form.dataset.requestAttempted = "true";
+        const response = await request(endpoints.backupProfiles + "/" + encodeURIComponent(profileId) + "/runs", {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            idempotency_key: form.dataset.idempotencyKey || operationKey("manual-backup"),
+            compression_mode: backupCompressionMode(state.data.backupProfiles.find((profile) => recordId(profile) === profileId)),
+            spanning_enabled: backupSpanningEnabled(state.data.backupProfiles.find((profile) => recordId(profile) === profileId)),
+            requested_by_label: "Web operator"
+          })
+        });
+        requestCreated = true;
+        const run = response && (response.run || response.backup_run || response.request || response);
+        rememberBackupRun(run);
+        state.selectedBackupRunId = recordId(run);
+        form.dataset.runId = state.selectedBackupRunId;
+        delete form.dataset.requestAttempted;
+      }
+      submit.textContent = "Rechecking the selected tape…";
+      const runReadiness = await loadBackupMediaReadiness("run", state.selectedBackupRunId);
       if (!backupModalSubmissionCurrent(form, token)) return;
-      const candidate = readiness.candidates.find((item) => String(pick(item, "drive_id")) === driveId && String(pick(item, "cartridge_id")) === cartridgeId);
-      if (!candidate) throw new Error(backupServerReadinessMessage(readiness));
-      submit.textContent = "Saving request…";
-      requestAttempted = true;
-      const response = await request(endpoints.backupProfiles + "/" + encodeURIComponent(profileId) + "/runs", {
-        method: "POST",
-        headers: { Accept: "application/json", "Content-Type": "application/json" },
-        body: JSON.stringify({
-          idempotency_key: form.dataset.idempotencyKey || operationKey("manual-backup"),
-          compression_mode: backupCompressionMode(state.data.backupProfiles.find((profile) => recordId(profile) === profileId)),
-          spanning_enabled: backupSpanningEnabled(state.data.backupProfiles.find((profile) => recordId(profile) === profileId)),
-          requested_by_label: "Web operator"
-        })
-      });
-      requestCreated = true;
-      const run = response && (response.run || response.backup_run || response.request || response);
-      rememberBackupRun(run);
-      state.selectedBackupRunId = recordId(run);
-      await Promise.all([loadOne("backupRuns"), loadOne("jobs"), loadOne("overview")]);
+      if (!["assigned", "media_authorized", "media_loaded"].includes(String(runReadiness.state || ""))) {
+        const candidate = runReadiness.candidates.find((item) => String(pick(item, "drive_id")) === driveId && String(pick(item, "cartridge_id")) === cartridgeId);
+        if (!candidate) throw new Error(backupServerReadinessMessage(runReadiness));
+        const exactLabel = String(pick(candidate, "cartridge_label") || "");
+        const expectedConfirmation = String(pick(candidate, "required_confirmation") || "");
+        if (!exactLabel || !expectedConfirmation) throw new Error("TapeScale did not return an exact destructive authorization for this tape.");
+        submit.textContent = "Starting backup…";
+        await request(endpoints.backupRuns + "/" + encodeURIComponent(state.selectedBackupRunId) + "/media", {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            drive_id: driveId,
+            expected_stable_id: String(pick(candidate, "stable_id") || ""),
+            cartridge_id: cartridgeId,
+            volume_sequence: 1,
+            typed_cartridge_label: exactLabel,
+            loaded_media_confirmed: true,
+            destructive_overwrite_confirmed: true,
+            encryption_deviation_confirmed: true,
+            confirmation: expectedConfirmation
+          })
+        });
+      }
+      await Promise.all([loadOne("backupRuns"), loadOne("jobs"), loadOne("drives"), loadOne("media"), loadOne("overview")]);
       await loadBackupRunDetail(state.selectedBackupRunId, true);
-      const continueGuided = backupModalSubmissionCurrent(form, token);
-      updateChrome();
-      render();
-      scheduleBackupRunPoll();
-      if (!continueGuided) {
-        toast("Backup request saved", "Open the Backup Center when you are ready to confirm the tape and start writing.");
+      if (!backupModalSubmissionCurrent(form, token)) {
+        toast("Backup started in background", "The retained request and tape authorization completed.");
         return;
       }
-      const retained = orderedBackupRuns().find((item) => recordId(item) === state.selectedBackupRunId) || run;
-      if (backupRunState(retained) === "waiting_for_media" || backupNeedsNextMedia(retained)) {
-        await openAssignBackupMedia(state.selectedBackupRunId, { driveId, cartridgeId, guided: true });
-      } else {
-        closeModal();
-        const target = "#jobs/" + encodeURIComponent(state.selectedBackupRunId);
-        if (location.hash !== target) location.hash = target;
-        toast("Backup already started", "Opening the retained request; no duplicate run was created.");
-      }
+      closeModal();
+      const target = "#jobs/" + encodeURIComponent(state.selectedBackupRunId);
+      if (location.hash !== target) location.hash = target;
+      else render();
+      updateChrome();
+      scheduleBackupRunPoll();
+      toast("Backup started", "TapeScale rechecked the selected drive and tape immediately before authorizing the write.");
     } catch (error) {
       if (!backupModalSubmissionCurrent(form, token)) {
         if (requestAttempted && !requestCreated) toast("Backup request needs review", errorMessage(error));
@@ -5785,7 +5841,8 @@
       errorBox.textContent = errorMessage(error);
       errorBox.hidden = false;
       submit.disabled = false;
-      submit.textContent = "Continue to confirmation";
+      const selected = state.data.media.find((item) => recordId(item) === cartridgeId);
+      submit.textContent = selected ? "Erase " + mediaName(selected) + " and start backup" : "Erase tape and start backup";
     }
   }
 
@@ -5837,7 +5894,8 @@
     const selectedDrive = readyDrives.find((drive) => recordId(drive) === String(initial.driveId || "")) || (readyDrives.length === 1 ? readyDrives[0] : null);
     const eligibleCandidates = selectedDrive ? pairs.filter((candidate) => String(pick(candidate, "drive_id")) === recordId(selectedDrive)) : [];
     const eligibleMedia = eligibleCandidates.map(backupCandidateMedia);
-    const selectedMedia = eligibleMedia.find((item) => recordId(item) === String(initial.cartridgeId || "")) || eligibleMedia.find((item) => String(mediaName(item)) === expectedLabel) || (eligibleMedia.length === 1 ? eligibleMedia[0] : null);
+    const expectedMedia = eligibleMedia.find((item) => String(mediaName(item)) === expectedLabel);
+    const selectedMedia = (readbackMedia ? expectedMedia : eligibleMedia.find((item) => recordId(item) === String(initial.cartridgeId || ""))) || expectedMedia || (eligibleMedia.length === 1 ? eligibleMedia[0] : null);
     const driveOptions = readyDrives.map((drive) => {
       const stableId = String(pick(drive, "stable_id") || "");
       return '<option value="' + esc(recordId(drive)) + '" data-stable-id="' + esc(stableId) + '"' + (selectedDrive && recordId(selectedDrive) === recordId(drive) ? " selected" : "") + '>' + esc(label(pick(drive, "model", "stable_id"))) + " · " + esc(label(pick(drive, "observed_path"))) + "</option>";
@@ -5854,11 +5912,21 @@
       ? '<ol class="backup-start-steps" aria-label="Readback tape steps"><li class="done"><span>✓</span><strong>Archive written</strong></li><li class="' + (blocked ? "active" : "done") + '"><span>' + (blocked ? "2" : "✓") + '</span><strong>Exact tape ' + esc(volumeSequence) + '</strong></li><li' + (blocked ? "" : ' class="active"') + '><span>3</span><strong>Confirm & read</strong></li></ol>'
       : '<ol class="backup-start-steps" aria-label="Start backup steps"><li class="done"><span>✓</span><strong>Snapshot</strong></li><li class="' + (blocked ? "active" : "done") + '"><span>' + (blocked ? "2" : "✓") + '</span><strong>' + (nextMedia ? "Next tape" : "First tape") + '</strong></li><li' + (blocked ? "" : ' class="active"') + '><span>3</span><strong>' + (nextMedia ? "Confirm & continue" : "Confirm & start") + '</strong></li></ol>';
     const boundary = readbackMedia
-      ? '<div class="backup-boundary info"><span aria-hidden="true">✓</span><div><strong>Load recorded archive tape ' + esc(volumeSequence) + '</strong><p>Unload and remove the current tape before inserting this one. ' + (expectedLabel ? "The required label is " + esc(expectedLabel) + ". " : "") + 'This is a read-only media handoff: TapeScale will not erase, relabel, or append to this tape.</p></div></div>'
+      ? '<div class="backup-boundary info"><span aria-hidden="true">✓</span><div><strong>Load recorded archive tape ' + esc(volumeSequence) + '</strong><p>Unload and remove the current tape before inserting this one. ' + (expectedLabel ? "The required tape is " + esc(expectedLabel) + ". " : "") + 'TapeScale reads its internal ID and rejects a different tape before this read-only handoff continues.</p></div></div>'
       : '<div class="backup-boundary danger"><span aria-hidden="true">!</span><div><strong>Tape ' + esc(volumeSequence) + ' will be erased</strong><p>' + (nextMedia ? "Unload and remove the previous archive tape before inserting this one. " : "") + (expectedLabel ? "The engine requested label " + esc(expectedLabel) + ". " : "") + (nextMedia ? "This tape becomes the next ordered volume in the existing archive. " : "This tape becomes the first volume in the archive. ") + 'TapeScale checks identity, label, protection, holds, reservation, and setup again before writing.</p></div></div>';
-    const mediaFields = readbackMedia
-      ? '<div class="form-grid"' + (blocked ? " hidden" : "") + '><div class="form-field full"><label for="backup-media-drive">Tape drive containing the archive tape</label><select class="select" id="backup-media-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select></div><div class="form-field full"><label for="backup-media-cartridge">Archive tape ' + esc(volumeSequence) + ' to read</label><select class="select" id="backup-media-cartridge" name="cartridge_id" required><option value="">Choose tape</option>' + mediaOptions + '</select><small>Standalone SAS drives cannot report the physical cartridge label. Match the recorded label to the tape you load; Bacula validates its on-tape volume label after rewind before reading backup data.</small></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="backup_authority_confirmed" required> I physically verified that archive tape ' + esc(volumeSequence) + ' is loaded in this drive and authorize read-only verification.</label></div><div class="form-field full"><label for="backup-media-confirmation">Type the exact load confirmation</label><input class="input input-mono" id="backup-media-confirmation" name="confirmation" autocomplete="off" spellcheck="false" aria-describedby="backup-media-confirmation-help" required><small id="backup-media-confirmation-help" aria-live="polite">Choose the required tape to reveal the server confirmation.</small></div></div>'
-      : '<div class="form-grid"' + (blocked ? " hidden" : "") + '><div class="form-field full"><label for="backup-media-drive">Loaded tape drive</label><select class="select" id="backup-media-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select></div><div class="form-field full"><label for="backup-media-cartridge">Tape ' + esc(volumeSequence) + ' to erase and use</label><select class="select" id="backup-media-cartridge" name="cartridge_id" required><option value="">Choose tape</option>' + mediaOptions + '</select><small>Standalone drives cannot report the physical cartridge label. Match the selected label to the tape you loaded. Previously written archive tapes cannot be selected again.</small></div><div class="form-field full"><label class="check-option backup-check"><input type="checkbox" name="backup_authority_confirmed" required> I physically verified this labeled scratch tape is loaded in this drive, authorize erasing it as archive volume ' + esc(volumeSequence) + ', and understand this backup is not encrypted.</label></div><div class="form-field full"><label for="backup-media-confirmation">Type the exact erase confirmation</label><input class="input input-mono" id="backup-media-confirmation" name="confirmation" autocomplete="off" spellcheck="false" aria-describedby="backup-media-confirmation-help" required><small id="backup-media-confirmation-help" aria-live="polite">Choose a tape to reveal the exact phrase.</small></div></div>';
+    const fixedDrive = readyDrives.length === 1 && selectedDrive;
+    const fixedMedia = selectedMedia && (eligibleMedia.length === 1 || readbackMedia);
+    const driveField = fixedDrive
+      ? '<div class="form-field full"><label>' + (readbackMedia ? "Tape drive" : "Loaded tape drive") + '</label><div class="static-field"><strong>' + esc(label(pick(selectedDrive, "model", "stable_id"))) + '</strong><small>' + esc(label(pick(selectedDrive, "observed_path", "stable_id"))) + '</small></div><select id="backup-media-drive" name="drive_id" required hidden><option value="' + esc(recordId(selectedDrive)) + '" data-stable-id="' + esc(pick(selectedDrive, "stable_id")) + '" selected>' + esc(label(pick(selectedDrive, "model", "stable_id"))) + '</option></select></div>'
+      : '<div class="form-field full"><label for="backup-media-drive">' + (readbackMedia ? "Tape drive" : "Loaded tape drive") + '</label><select class="select" id="backup-media-drive" name="drive_id" required><option value="">Choose drive</option>' + driveOptions + '</select></div>';
+    const mediaField = fixedMedia
+      ? '<div class="form-field full"><label>' + (readbackMedia ? "Archive tape " + esc(volumeSequence) + " to read" : "Tape " + esc(volumeSequence) + " to erase and use") + '</label><div class="static-field" data-backup-media-fact><strong>' + esc(mediaName(selectedMedia)) + '</strong><small>' + esc(label(pick(selectedMedia, "media_format", "media_generation"))) + '</small></div><select id="backup-media-cartridge" name="cartridge_id" required hidden><option value="' + esc(recordId(selectedMedia)) + '" data-label="' + esc(mediaName(selectedMedia)) + '" selected>' + esc(mediaName(selectedMedia)) + '</option></select></div>'
+      : '<div class="form-field full"><label for="backup-media-cartridge">' + (readbackMedia ? "Archive tape " + esc(volumeSequence) + " to read" : "Tape " + esc(volumeSequence) + " to erase and use") + '</label><select class="select" id="backup-media-cartridge" name="cartridge_id" required><option value="">No uniquely identified tape</option>' + mediaOptions + '</select><small>' + (readbackMedia ? "TapeScale enables only the archive tape whose internal ID matches this ordered volume." : "TapeScale enables only the prepared scratch tape whose internal ID it detected. Previously written archive tapes cannot be selected again.") + '</small></div>';
+    const mediaFields = '<div class="form-grid"' + (blocked ? " hidden" : "") + '>' + driveField + mediaField + '<div class="form-field full"><small>' + (readbackMedia ? "This handoff is read-only. TapeScale reads the on-tape ID after rewind and blocks a mismatch before backup data is read." : "The destructive button below is the confirmation. TapeScale reads the on-tape ID again immediately before writing.") + '</small></div></div>';
+    const selectedMediaLabel = selectedMedia ? mediaName(selectedMedia) : "";
+    const submitLabel = readbackMedia
+      ? selectedMediaLabel ? "Read detected tape " + selectedMediaLabel : "Load the required tape"
+      : selectedMediaLabel ? "Erase " + selectedMediaLabel + (nextMedia ? " and continue archive" : " and start backup") : "Choose a tape to continue";
     const body = [
       '<form id="backup-media-form" data-run-id="' + esc(runId) + '" data-readiness-key="' + esc(readinessKey) + '" data-volume-sequence="' + esc(volumeSequence) + '" data-media-phase="' + esc(mediaPhase) + '">',
       steps,
@@ -5868,7 +5936,7 @@
       blockedNotice,
       mediaFields,
       '<p class="notice danger" id="backup-media-error" role="alert" aria-live="assertive" hidden></p>',
-      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button ' + (readbackMedia ? "button-primary" : "button-danger") + '" type="submit"' + (blocked ? " disabled" : "") + '>' + (readbackMedia ? "Confirm tape and continue readback" : nextMedia ? "Erase tape and continue archive" : "Erase tape and start backup") + '</button></div>',
+      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Finish later</button><button class="button ' + (readbackMedia ? "button-primary" : "button-danger") + '" type="submit"' + (blocked ? " disabled" : "") + '>' + esc(submitLabel) + '</button></div>',
       '</form>'
     ].join("");
     openModal(modalTitle, body);
@@ -5886,7 +5954,7 @@
     const previous = String(cartridgeSelect.value || "");
     const media = candidates.filter((candidate) => String(pick(candidate, "drive_id")) === String(driveSelect.value)).map(backupCandidateMedia);
     const selected = media.some((item) => recordId(item) === previous) ? previous : media.length === 1 ? recordId(media[0]) : "";
-    cartridgeSelect.innerHTML = '<option value="">Choose the tape physically loaded in this drive</option>' + media.map((item) => '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '"' + (recordId(item) === selected ? " selected" : "") + '>' + esc(label(mediaName(item))) + " · " + esc(label(pick(item, "media_format", "media_generation"))) + "</option>").join("");
+    cartridgeSelect.innerHTML = '<option value="">No uniquely identified tape</option>' + media.map((item) => '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '"' + (recordId(item) === selected ? " selected" : "") + '>' + esc(label(mediaName(item))) + " · " + esc(label(pick(item, "media_format", "media_generation"))) + "</option>").join("");
     cartridgeSelect.disabled = !drive || !media.length;
     if (submit) submit.disabled = !selected;
     updateBackupMediaConfirmation(form);
@@ -5894,23 +5962,22 @@
 
   function updateBackupMediaConfirmation(form) {
     if (!form) return;
-    const run = orderedBackupRuns().find((item) => recordId(item) === form.dataset.runId);
     const cartridge = form.querySelector('[name="cartridge_id"]');
-    const option = cartridge && cartridge.options[cartridge.selectedIndex];
-    const cartridgeLabel = option && option.dataset.label;
     const candidate = backupReadinessCandidates(form.dataset.readinessKey).find((item) => String(pick(item, "drive_id")) === String(form.elements.drive_id && form.elements.drive_id.value || "") && String(pick(item, "cartridge_id")) === String(cartridge && cartridge.value || ""));
-    const phrase = String(pick(candidate, "required_confirmation") || backupMediaConfirmation(run, cartridgeLabel));
+    const cartridgeLabel = String(pick(candidate, "cartridge_label") || "");
+    const phrase = String(pick(candidate, "required_confirmation") || "");
     const pairKey = String(form.elements.drive_id && form.elements.drive_id.value || "") + ":" + String(cartridge && cartridge.value || "");
-    if (form.dataset.pairKey && form.dataset.pairKey !== pairKey) {
-      if (form.elements.backup_authority_confirmed) form.elements.backup_authority_confirmed.checked = false;
-      if (form.elements.confirmation) form.elements.confirmation.value = "";
-    }
     form.dataset.pairKey = pairKey;
-    const help = form.querySelector("#backup-media-confirmation-help");
-    if (help) help.textContent = cartridgeLabel ? "Required: " + phrase : phrase;
     form.dataset.confirmation = cartridgeLabel ? phrase : "";
     const submit = form.querySelector('[type="submit"]');
-    if (submit) submit.disabled = !cartridgeLabel;
+    const readbackMedia = String(form.dataset.mediaPhase || "") === "full_readback";
+    const continuingArchive = !readbackMedia && Number(form.dataset.volumeSequence || 1) > 1;
+    if (submit) {
+      submit.disabled = !cartridgeLabel;
+      submit.textContent = cartridgeLabel
+        ? readbackMedia ? "Read detected tape " + cartridgeLabel : "Erase " + cartridgeLabel + (continuingArchive ? " and continue archive" : " and start backup")
+        : readbackMedia ? "Load the required tape" : "Load a prepared scratch tape";
+    }
   }
 
   async function submitBackupMedia(form) {
@@ -5921,17 +5988,12 @@
     const continuingArchive = !readbackMedia && volumeSequence > 1;
     const token = state.backupReadinessModalToken;
     const values = new FormData(form);
-    const drive = form.querySelector('[name="drive_id"]');
-    const driveOption = drive.options[drive.selectedIndex];
     const cartridge = form.querySelector('[name="cartridge_id"]');
-    const cartridgeOption = cartridge.options[cartridge.selectedIndex];
-    const cartridgeLabel = String(cartridgeOption && cartridgeOption.dataset.label || "");
-    const authorized = values.get("backup_authority_confirmed") === "on";
     const submit = form.querySelector('[type="submit"]');
     const errorBox = form.querySelector("#backup-media-error");
     let assignmentAttempted = false;
-    if (!authorized || !cartridgeLabel) {
-      errorBox.textContent = readbackMedia ? "Confirm the exact loaded archive tape and type the server-provided load phrase shown above." : "Confirm the loaded scratch tape and type the exact erase phrase shown above.";
+    if (!values.get("drive_id") || !values.get("cartridge_id")) {
+      errorBox.textContent = readbackMedia ? "Load the exact archive tape requested for readback." : "Choose the scratch tape loaded in the drive.";
       errorBox.hidden = false;
       return;
     }
@@ -5951,7 +6013,7 @@
       if (!candidate) throw new Error(backupServerReadinessMessage(readiness));
       const exactLabel = String(pick(candidate, "cartridge_label") || "");
       const expectedConfirmation = String(pick(candidate, "required_confirmation") || "");
-      if (!expectedConfirmation || exactLabel !== cartridgeLabel || String(values.get("confirmation") || "") !== expectedConfirmation) throw new Error(readbackMedia ? "The readback request changed. Review the exact tape and type the current server-provided load phrase." : "The tape selection changed. Review it and type the current exact erase phrase.");
+      if (!expectedConfirmation || !exactLabel) throw new Error(readbackMedia ? "The readback request changed. Review the exact tape currently requested." : "The tape selection changed. Review the current eligible tape.");
       submit.textContent = readbackMedia ? "Continuing readback…" : continuingArchive ? "Continuing archive…" : "Starting backup…";
       assignmentAttempted = true;
       await request(endpoints.backupRuns + "/" + encodeURIComponent(runId) + "/media", {
@@ -5959,14 +6021,14 @@
         headers: { Accept: "application/json", "Content-Type": "application/json" },
         body: JSON.stringify({
           drive_id: driveId,
-          expected_stable_id: String(pick(candidate, "stable_id") || (driveOption && driveOption.dataset.stableId) || ""),
+          expected_stable_id: String(pick(candidate, "stable_id") || ""),
           cartridge_id: cartridgeId,
           volume_sequence: volumeSequence,
           typed_cartridge_label: exactLabel,
-          loaded_media_confirmed: authorized,
-          destructive_overwrite_confirmed: !readbackMedia && authorized,
-          encryption_deviation_confirmed: !readbackMedia && authorized,
-          confirmation: String(values.get("confirmation") || "")
+          loaded_media_confirmed: true,
+          destructive_overwrite_confirmed: !readbackMedia,
+          encryption_deviation_confirmed: !readbackMedia,
+          confirmation: expectedConfirmation
         })
       });
       await Promise.all([loadOne("backupRuns"), loadOne("jobs"), loadOne("drives"), loadOne("media")]);
@@ -5983,7 +6045,7 @@
         render();
       }
       scheduleBackupRunPoll();
-      toast(continueGuided ? (readbackMedia ? "Readback tape accepted" : continuingArchive ? "Archive continued" : "Backup started") : (readbackMedia ? "Readback tape accepted in background" : continuingArchive ? "Archive continued in background" : "Backup started in background"), readbackMedia ? "TapeScale accepted your physical-label attestation. Bacula will validate the on-tape volume label after rewind before reading backup data." : continuingArchive ? "TapeScale is writing the next ordered archive volume and will request another tape only if needed." : "TapeScale is scanning the snapshot and will verify every tape in the archive after writing it.");
+      toast(continueGuided ? (readbackMedia ? "Readback tape accepted" : continuingArchive ? "Archive continued" : "Backup started") : (readbackMedia ? "Readback tape accepted in background" : continuingArchive ? "Archive continued in background" : "Backup started in background"), readbackMedia ? "TapeScale will read the on-tape ID again before reading backup data." : continuingArchive ? "TapeScale is writing the next ordered archive volume and will request another tape only if needed." : "TapeScale is scanning the snapshot and will verify every tape in the archive after writing it.");
     } catch (error) {
       if (!backupModalSubmissionCurrent(form, token)) {
         if (assignmentAttempted) toast("Backup start needs review", errorMessage(error));
@@ -5992,14 +6054,18 @@
       errorBox.textContent = errorMessage(error);
       errorBox.hidden = false;
       submit.disabled = false;
-      submit.textContent = readbackMedia ? "Confirm tape and continue readback" : continuingArchive ? "Erase tape and continue archive" : "Erase tape and start backup";
+      const candidate = backupReadinessCandidates(form.dataset.readinessKey).find((item) => String(pick(item, "drive_id")) === String(form.elements.drive_id && form.elements.drive_id.value || "") && String(pick(item, "cartridge_id")) === String(form.elements.cartridge_id && form.elements.cartridge_id.value || ""));
+      const selectedLabel = String(pick(candidate, "cartridge_label") || "tape");
+      submit.textContent = readbackMedia ? "Read detected tape " + selectedLabel : "Erase " + selectedLabel + (continuingArchive ? " and continue archive" : " and start backup");
     }
   }
 
   function prepareBackupTape(button) {
     const pending = {
       profileId: String(button.dataset.profileId || ""),
-      runId: String(button.dataset.runId || "")
+      runId: String(button.dataset.runId || ""),
+      driveId: String(button.dataset.driveId || ""),
+      cartridgeId: String(button.dataset.mediaId || "")
     };
     state.pendingBackupSetup = null;
     if (openTapeInitialization({ dataset: { driveId: String(button.dataset.driveId || ""), mediaId: String(button.dataset.mediaId || "") } }) === true) state.pendingBackupSetup = pending;
@@ -6030,8 +6096,9 @@
     state.pendingBackupSetup = null;
     const target = pending.runId ? "#jobs/" + encodeURIComponent(pending.runId) : "#jobs";
     const reopen = () => {
-      if (pending.runId) openAssignBackupMedia(pending.runId);
-      else if (pending.profileId) openStartBackup(pending.profileId);
+      const pair = { driveId: pending.driveId, cartridgeId: pending.cartridgeId };
+      if (pending.runId) openAssignBackupMedia(pending.runId, pair);
+      else if (pending.profileId) openStartBackup(pending.profileId, pair);
       toast("Tape is ready", "Continue the backup with the prepared drive and tape.");
     };
     if (location.hash !== target) {
@@ -6575,7 +6642,7 @@
 
   function tapeInitializeMediaOptions(initialMediaId, driveId) {
     const active = activeQualificationForDrive(driveId);
-    return ['<option value="">Select the physically loaded scratch cartridge</option>'].concat(tapeInitializeMedia(driveId).map((item) => {
+    return ['<option value="">Choose the blank or legacy tape record once</option>'].concat(tapeInitializeMedia(driveId).map((item) => {
       const resume = active && String(pick(active, "cartridge_id")) === recordId(item);
       return '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '"' + (String(recordId(item)) === String(initialMediaId) ? " selected" : "") + '>' + esc(mediaName(item)) + (pick(item, "barcode") ? " · " + esc(pick(item, "barcode")) : "") + " · " + esc(label(pick(item, "media_format", "media_generation"))) + (resume ? " · resume " + esc(human(pick(active, "state"))) : "") + "</option>";
     }));
@@ -6595,19 +6662,31 @@
     const activeMediaId = active && String(pick(active, "cartridge_id") || "");
     const initialMediaId = existingMedia.some((item) => recordId(item) === activeMediaId) ? activeMediaId : existingMedia.some((item) => String(recordId(item)) === String(requestedMediaId)) ? requestedMediaId : existingMedia.length === 1 ? recordId(existingMedia[0]) : "";
     const initialMode = existingMedia.length ? "existing" : "new";
+    const initialDrive = state.data.drives.find((drive) => recordId(drive) === String(initialDriveId));
+    const initialMedia = existingMedia.find((item) => recordId(item) === String(initialMediaId));
     const generations = [];
     generations.push('<option value="">Select media generation</option>');
     for (let generation = 1; generation <= 10; generation += 1) generations.push('<option value="' + generation + '">LTO-' + generation + "</option>");
+    const driveControl = safeDrives.length === 1 && initialDrive
+      ? '<div class="form-field"><label>Drive reporting loaded and ready</label><div class="static-field"><strong>' + esc(label(pick(initialDrive, "model", "stable_id", "observed_path"))) + '</strong><small>' + esc(label(pick(initialDrive, "observed_path", "stable_id"))) + '</small></div><select id="tape-init-drive" name="drive_id" required hidden>' + tapeInitializeDriveOptions(initialDriveId).join("") + '</select></div>'
+      : '<div class="form-field"><label for="tape-init-drive">Drive reporting loaded and ready</label><select class="select" id="tape-init-drive" name="drive_id" required>' + tapeInitializeDriveOptions(initialDriveId).join("") + '</select></div>';
+    const modeControl = existingMedia.length === 1
+      ? '<select id="tape-init-media-mode" name="media_mode" hidden><option value="existing" selected>Existing</option></select>'
+      : existingMedia.length === 0
+        ? '<select id="tape-init-media-mode" name="media_mode" hidden><option value="new" selected>New</option></select>'
+        : '<div class="form-field"><label for="tape-init-media-mode">Cartridge record</label><select class="select" id="tape-init-media-mode" name="media_mode"><option value="existing"' + (initialMode === "existing" ? " selected" : "") + '>Use a registered eligible cartridge</option><option value="new"' + (initialMode === "new" ? " selected" : "") + '>Register a new non-WORM cartridge</option></select></div>';
+    const existingControl = existingMedia.length === 1 && initialMedia
+      ? '<div class="form-field"><label>Loaded scratch cartridge</label><div class="static-field" data-tape-init-media-fact><strong>' + esc(mediaName(initialMedia)) + '</strong><small>' + esc(label(pick(initialMedia, "media_format", "media_generation"))) + '</small></div><select id="tape-init-cartridge" name="cartridge_id" hidden><option value="' + esc(recordId(initialMedia)) + '" data-label="' + esc(mediaName(initialMedia)) + '" selected>' + esc(mediaName(initialMedia)) + '</option></select></div>'
+      : '<div class="form-field"><label for="tape-init-cartridge">Registered scratch cartridge</label><select class="select" id="tape-init-cartridge" name="cartridge_id">' + tapeInitializeMediaOptions(initialMediaId, initialDriveId).join("") + '</select></div>';
     const body = [
       '<form id="tape-initialize-form">',
-      '<div class="tape-init-hero"><span aria-hidden="true">!</span><div><small>Required for this exact drive and tape pairing</small><strong>Prepare a scratch tape for backups</strong><p>TapeScale confirms the drive, records the tape label, erases it, and runs a complete write/read setup test. Setup repeats after relevant drive identity, path, or firmware changes. A standalone drive cannot identify the cartridge for you.</p></div></div>',
-      '<ol class="tape-init-steps" aria-label="Tape preparation steps"><li><span>1</span><strong>Drive</strong><small>Confirm hardware</small></li><li><span>2</span><strong>Tape</strong><small>Record label</small></li><li><span>3</span><strong>Erase & test</strong><small>Verify readback</small></li></ol>',
-      '<section class="tape-init-section"><div class="tape-init-section-head"><span>1</span><div><strong>Loaded SAS tape drive</strong><small>TapeScale revalidates this exact stable identity before any command.</small></div></div><div class="form-field"><label for="tape-init-drive">Drive reporting loaded and ready</label><select class="select" id="tape-init-drive" name="drive_id" required>' + tapeInitializeDriveOptions(initialDriveId).join("") + '</select></div><div class="tape-init-drive-state" id="tape-init-drive-state"></div><label class="check-option danger-check" id="tape-init-trust-wrap" hidden><input type="checkbox" name="trust_drive_identity"> Trust this exact stable drive identity and observed non-rewinding device path.</label></section>',
-      '<section class="tape-init-section"><div class="tape-init-section-head"><span>2</span><div><strong>Scratch cartridge inventory</strong><small>The selected label is an operator assertion because the standalone drive has no barcode reader.</small></div></div><div class="form-field"><label for="tape-init-media-mode">Cartridge record</label><select class="select" id="tape-init-media-mode" name="media_mode"><option value="existing"' + (initialMode === "existing" ? " selected" : "") + '>Use a registered eligible cartridge</option><option value="new"' + (initialMode === "new" ? " selected" : "") + '>Register a new non-WORM cartridge</option></select></div><div id="tape-init-existing"><div class="form-field"><label for="tape-init-cartridge">Registered scratch cartridge</label><select class="select" id="tape-init-cartridge" name="cartridge_id">' + tapeInitializeMediaOptions(initialMediaId, initialDriveId).join("") + '</select></div></div><div class="tape-init-new" id="tape-init-new" hidden><div class="form-grid"><div class="form-field full"><label for="tape-init-label">New internal label</label><input class="input input-mono" id="tape-init-label" name="internal_label" maxlength="128" pattern="[-A-Za-z0-9._:]+" placeholder="SCRATCH001"><small>Letters, numbers, hyphen, underscore, period, and colon.</small></div><div class="form-field"><label for="tape-init-barcode">Barcode</label><input class="input input-mono" id="tape-init-barcode" name="barcode" maxlength="128" placeholder="Optional"></div><div class="form-field"><label for="tape-init-generation">Media generation</label><select class="select" id="tape-init-generation" name="media_generation">' + generations.join("") + '</select></div></div><div class="tape-init-nonworm"><span aria-hidden="true">✓</span><div><strong>Non-WORM only</strong><small>This workflow always registers the new cartridge with WORM disabled.</small></div></div></div></section>',
-      '<section class="tape-init-section destructive"><div class="tape-init-section-head"><span>3</span><div><strong>Confirm the physical tape and erase it</strong><small>Every existing byte on the loaded tape will be lost.</small></div></div><div class="form-field"><label class="check-option danger-check"><input type="checkbox" name="scratch_media_confirmed" required> I physically verified that the selected label matches the tape loaded in this standalone drive and that it is designated scratch.</label></div><div class="form-field"><label class="check-option danger-check"><input type="checkbox" name="destructive_overwrite_confirmed" required> I authorize TapeScale to erase, move, write, and read back this tape during setup.</label></div><div class="form-field"><label for="tape-init-confirmation">Type the exact erase confirmation</label><input class="input input-mono" id="tape-init-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small id="tape-init-confirmation-help">Select or enter a cartridge label first.</small></div></section>',
+      '<div class="tape-init-hero"><span aria-hidden="true">!</span><div><small>One destructive action, then automatic identification</small><strong>Prepare the loaded scratch tape</strong><p>TapeScale erases and tests the cartridge, writes a durable internal tape ID, then reads that ID back. The first backup replaces the preparation ID with its permanent archive-volume ID automatically. The final button is the only destructive confirmation.</p></div></div>',
+      '<section class="tape-init-section"><div class="tape-init-section-head"><span>1</span><div><strong>Loaded SAS tape drive</strong><small>The exact stable identity is rechecked and automatically reconciled before any tape command.</small></div></div>' + driveControl + '<div class="tape-init-drive-state" id="tape-init-drive-state"></div></section>',
+      '<section class="tape-init-section"><div class="tape-init-section-head"><span>2</span><div><strong>Blank or legacy cartridge record</strong><small>Choose this once because an unprepared tape has no TapeScale ID to read. Future loads are identified automatically from the tape itself.</small></div></div>' + modeControl + '<div id="tape-init-existing">' + existingControl + '</div><div class="tape-init-new" id="tape-init-new" hidden><div class="form-grid"><div class="form-field full"><label for="tape-init-label">New inventory label</label><input class="input input-mono" id="tape-init-label" name="internal_label" maxlength="128" pattern="[-A-Za-z0-9._:]+" placeholder="SCRATCH001"><small>This is the human name. TapeScale also writes a machine-readable ID to the tape.</small></div><div class="form-field"><label for="tape-init-barcode">Barcode</label><input class="input input-mono" id="tape-init-barcode" name="barcode" maxlength="128" placeholder="Optional"></div><div class="form-field"><label for="tape-init-generation">Media generation</label><select class="select" id="tape-init-generation" name="media_generation">' + generations.join("") + '</select></div></div><div class="tape-init-nonworm"><span aria-hidden="true">✓</span><div><strong>Non-WORM only</strong><small>This workflow always registers the new cartridge with WORM disabled.</small></div></div></div></section>',
+      '<section class="tape-init-section destructive"><div class="tape-init-section-head"><span>!</span><div><strong>The selected tape will be erased, identified, and tested</strong><small>Every existing byte on it will be lost. TapeScale writes its ID, reads it back, exercises tape motion and data I/O, and finishes at beginning of tape.</small></div></div></section>',
       '<div class="tape-init-progress" id="tape-init-progress" role="status" aria-live="polite" hidden></div>',
       '<p class="notice danger" id="tape-init-error" hidden></p>',
-      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-danger" type="submit"' + (safeDrives.length ? "" : " disabled") + '>Erase and prepare tape</button></div>',
+      '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-danger" type="submit"' + (safeDrives.length ? "" : " disabled") + '>' + (initialMedia ? "Erase " + esc(mediaName(initialMedia)) + " and prepare" : "Erase and prepare tape") + '</button></div>',
       '</form>'
     ].join("");
     openModal("Prepare tape", body);
@@ -6623,15 +6702,14 @@
     if (mode === "new") return String(form.elements.internal_label.value || "").trim();
     const select = form.elements.cartridge_id;
     const option = select && select.options[select.selectedIndex];
-    return String(option && option.dataset.label || "");
+    const record = state.data.media.find((item) => recordId(item) === String(select && select.value || ""));
+    return String(option && option.dataset.label || record && mediaName(record) || "");
   }
 
-  function resetTapeInitializeAssertions(form, resetDriveTrust) {
+  function resetTapeInitializeAssertions(form) {
     if (!form) return;
-    if (resetDriveTrust && form.elements.trust_drive_identity) form.elements.trust_drive_identity.checked = false;
-    if (form.elements.scratch_media_confirmed) form.elements.scratch_media_confirmed.checked = false;
-    if (form.elements.destructive_overwrite_confirmed) form.elements.destructive_overwrite_confirmed.checked = false;
-    if (form.elements.confirmation) form.elements.confirmation.value = "";
+    delete form.dataset.idempotencyScope;
+    delete form.dataset.idempotencyKey;
   }
 
   function updateTapeInitializeForm(form) {
@@ -6666,8 +6744,6 @@
       form.elements.media_generation.value = String(driveGeneration);
     }
     const driveState = form.querySelector("#tape-init-drive-state");
-    const trustWrap = form.querySelector("#tape-init-trust-wrap");
-    const trust = form.elements.trust_drive_identity;
     const blocker = tapeInitializeDriveBlocker(drive);
     const active = drive && activeQualificationForDrive(recordId(drive));
     const stableId = drive && pick(drive, "stable_id");
@@ -6675,13 +6751,15 @@
       driveState.className = "tape-init-drive-state " + (blocker && !active ? "blocked" : active ? "active" : "ready");
       driveState.innerHTML = drive ? '<span aria-hidden="true">' + (blocker && !active ? "!" : active ? "▶" : "✓") + '</span><div><strong>' + esc(blocker && !active ? blocker : active ? "An exact qualification may already be active" : "Drive is loaded and motion-safe") + '</strong><small>' + esc(label(stableId)) + " · " + esc(label(pick(drive, "observed_path"))) + "</small></div>" : '<span aria-hidden="true">·</span><div><strong>Select a loaded drive</strong><small>No hardware is bound yet.</small></div>';
     }
-    const needsTrust = Boolean(drive && drive.reconciled !== true && !blocker);
-    trustWrap.hidden = !needsTrust;
-    trust.disabled = !needsTrust;
-    trust.required = needsTrust;
     const labelText = tapeInitializeLabel(form);
-    const help = form.querySelector("#tape-init-confirmation-help");
-    if (help) help.textContent = labelText ? "Required: DESTROY " + labelText + " WITH BACULA BTAPE TEST" : "Select or enter a cartridge label first.";
+    const selectedRecord = state.data.media.find((item) => recordId(item) === String(existingSelect.value || ""));
+    const staticMedia = form.querySelector("[data-tape-init-media-fact]");
+    if (staticMedia && selectedRecord) staticMedia.innerHTML = '<strong>' + esc(mediaName(selectedRecord)) + '</strong><small>' + esc(label(pick(selectedRecord, "media_format", "media_generation"))) + '</small>';
+    const submit = form.querySelector('[type="submit"]');
+    if (submit) {
+      submit.disabled = Boolean(blocker && !active) || !labelText;
+      submit.textContent = labelText ? "Erase " + labelText + " and prepare" : "Choose or label a tape";
+    }
   }
 
   function setTapeInitializeProgress(form, step, detail) {
@@ -6720,8 +6798,8 @@
       errorBox.hidden = false;
       return;
     }
-    if (!labelText || String(form.elements.confirmation.value || "") !== expectedConfirmation) {
-      errorBox.textContent = "Type the exact destructive confirmation shown above.";
+    if (!labelText) {
+      errorBox.textContent = "Choose or register the scratch tape loaded in the drive.";
       errorBox.hidden = false;
       return;
     }
@@ -6735,8 +6813,7 @@
     errorBox.hidden = true;
     try {
       if (drive.reconciled !== true) {
-        if (!form.elements.trust_drive_identity.checked) throw new Error("Confirm trust in the exact drive identity before continuing.");
-        setTapeInitializeProgress(form, "Trusting exact drive identity", "Any later path, firmware, or stable-identity change invalidates this trust.");
+        setTapeInitializeProgress(form, "Reconciling the only loaded drive", "TapeScale rechecks the stable identity and observed non-rewinding device path before continuing.");
         try {
           await request("/drives/" + encodeURIComponent(driveId) + "/reconcile", {
             method: "POST",
@@ -6806,7 +6883,7 @@
       if (!run) {
         const stableId = String(pick(drive, "stable_id"));
         const idempotencyKey = tapeInitializeIdempotencyKey(form, driveId, stableId, recordId(cartridge), labelText);
-        setTapeInitializeProgress(form, "Starting tape setup test", "The worker will write, move, read back, and rewind the tape before it becomes backup-ready.");
+        setTapeInitializeProgress(form, "Writing and verifying the tape ID", "The worker will erase, test, identify, read back, and rewind the tape before it becomes backup-ready.");
         try {
           const response = await request(endpoints.qualificationRuns, {
             method: "POST",
@@ -6817,8 +6894,8 @@
               cartridge_id: recordId(cartridge),
               cartridge_label: labelText,
               confirmation: expectedConfirmation,
-              scratch_media_confirmed: form.elements.scratch_media_confirmed.checked,
-              destructive_overwrite_confirmed: form.elements.destructive_overwrite_confirmed.checked,
+              scratch_media_confirmed: true,
+              destructive_overwrite_confirmed: true,
               idempotency_key: idempotencyKey
             })
           });
@@ -6851,7 +6928,7 @@
       const progress = form.querySelector("#tape-init-progress");
       if (progress) progress.hidden = true;
       submit.disabled = false;
-      submit.textContent = "Erase and prepare tape";
+      submit.textContent = labelText ? "Erase " + labelText + " and prepare" : "Erase and prepare tape";
     }
   }
 
@@ -6866,12 +6943,12 @@
     const runState = String(pick(run, "state") || "queued").toLowerCase();
     const tone = runState === "passed" ? " success" : ["failed", "blocked"].includes(runState) ? " danger" : runState === "interrupted" ? " warning" : " info";
     const titles = {
-      queued: "Bacula qualification queued",
-      running: "Bacula qualification is running",
-      passed: "Bacula qualification passed",
-      failed: "Bacula qualification failed",
-      blocked: "Bacula qualification was blocked",
-      interrupted: "Bacula qualification was interrupted"
+      queued: "Tape preparation queued",
+      running: "Tape preparation is running",
+      passed: "Tape preparation passed",
+      failed: "Tape preparation failed",
+      blocked: "Tape preparation was blocked",
+      interrupted: "Tape preparation was interrupted"
     };
     const cartridge = label(pick(run, "expected_cartridge_label"));
     const detail = qualificationRunDetail(run) || (runState === "queued"
@@ -6879,7 +6956,7 @@
       : runState === "running"
         ? "Keep the worker and tape drive online. TapeScale is retaining evidence and will finish with a rewind-to-BOT check."
         : "Open the run record below for retained evidence.");
-    return '<div class="notice' + tone + ' qualification-run-notice"><span class="notice-icon" aria-hidden="true">' + (runState === "passed" ? "✓" : runState === "running" ? "▶" : "!") + '</span><div class="notice-copy"><strong>' + esc(titles[runState] || "Bacula qualification " + human(runState)) + '</strong><span>Scratch cartridge ' + esc(cartridge) + " · " + esc(detail) + '</span></div><button class="button button-small button-quiet" type="button" data-action="open-record" data-kind="qualificationRuns" data-id="' + esc(recordId(run)) + '">View evidence</button></div>';
+    return '<div class="notice' + tone + ' qualification-run-notice"><span class="notice-icon" aria-hidden="true">' + (runState === "passed" ? "✓" : runState === "running" ? "▶" : "!") + '</span><div class="notice-copy"><strong>' + esc(titles[runState] || "Tape preparation " + human(runState)) + '</strong><span>Scratch cartridge ' + esc(cartridge) + " · " + esc(detail) + '</span></div><button class="button button-small button-quiet" type="button" data-action="open-record" data-kind="qualificationRuns" data-id="' + esc(recordId(run)) + '">View evidence</button></div>';
   }
 
   function rememberQualificationRun(run) {
@@ -6890,85 +6967,8 @@
   }
 
   function openQualification(button) {
-    const driveId = button.dataset.id;
-    const stableId = button.dataset.stableId;
-    const driveLabel = button.dataset.driveLabel || stableId;
-    const media = qualificationMedia();
-    if (!driveId || !stableId || !media.length) return;
-    const options = ['<option value="">Select the loaded scratch cartridge</option>'].concat(media.map((item) => '<option value="' + esc(recordId(item)) + '" data-label="' + esc(mediaName(item)) + '">' + esc(mediaName(item)) + (pick(item, "barcode") ? " · barcode " + esc(pick(item, "barcode")) : "") + " · " + esc(label(pick(item, "media_format", "media_generation"))) + "</option>"));
-    const body = '<form id="qualification-form" data-drive-id="' + esc(driveId) + '" data-stable-id="' + esc(stableId) + '"><div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>This destroys the selected tape</strong><span>Bacula btape writes, rewinds, spaces, appends, and re-reads test records. Every existing byte on the loaded cartridge must be treated as lost.</span></div></div><div class="form-grid"><div class="form-field full"><label>Exact trusted drive</label><div class="static-field"><strong>' + esc(driveLabel) + "</strong><small>" + esc(stableId) + '</small></div></div><div class="form-field full"><label for="qualification-cartridge">Loaded scratch cartridge</label><select class="select" id="qualification-cartridge" name="cartridge_id" required>' + options.join("") + '</select><small>The standalone drive cannot verify this inventory label; you are asserting that this exact registered cartridge is physically loaded.</small></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="scratch_media_confirmed" required> I physically verified the loaded cartridge is designated scratch media.</label></div><div class="form-field full"><label class="check-option danger-check"><input type="checkbox" name="destructive_overwrite_confirmed" required> I authorize complete destruction of all existing data on that cartridge.</label></div><div class="form-field full"><label for="qualification-confirmation">Type the exact destructive confirmation</label><input class="input input-mono" id="qualification-confirmation" name="confirmation" autocomplete="off" spellcheck="false" required><small id="qualification-confirmation-help">Select a cartridge to display the required phrase.</small></div></div><p class="notice danger" id="qualification-form-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-danger" type="submit">Destroy tape and run btape</button></div></form>';
-    openModal("Run Bacula tape qualification", body);
-    document.querySelector("#qualification-cartridge").focus();
-  }
-
-  function updateQualificationConfirmation(select) {
-    const option = select.options[select.selectedIndex];
-    const cartridgeLabel = option && option.dataset.label;
-    const form = select.form;
-    const cartridgeId = String(select.value || "");
-    if (form && form.dataset.qualificationCartridgeId !== cartridgeId) {
-      delete form.dataset.idempotencyKey;
-      delete form.dataset.idempotencyScope;
-      if (form.elements.scratch_media_confirmed) form.elements.scratch_media_confirmed.checked = false;
-      if (form.elements.destructive_overwrite_confirmed) form.elements.destructive_overwrite_confirmed.checked = false;
-      if (form.elements.confirmation) form.elements.confirmation.value = "";
-      form.dataset.qualificationCartridgeId = cartridgeId;
-    }
-    const help = document.querySelector("#qualification-confirmation-help");
-    if (help) help.textContent = cartridgeLabel ? "Required: DESTROY " + cartridgeLabel + " WITH BACULA BTAPE TEST" : "Select a cartridge to display the required phrase.";
-  }
-
-  async function submitQualification(form) {
-    const submit = form.querySelector('[type="submit"]');
-    const errorBox = form.querySelector("#qualification-form-error");
-    const values = new FormData(form);
-    const select = form.querySelector('[name="cartridge_id"]');
-    const option = select.options[select.selectedIndex];
-    const cartridgeLabel = option && option.dataset.label;
-    if (!cartridgeLabel) return;
-    submit.disabled = true;
-    submit.textContent = "Queueing destructive test…";
-    errorBox.hidden = true;
-    try {
-      const cartridgeId = String(values.get("cartridge_id"));
-      const idempotencyKey = tapeInitializeIdempotencyKey(form, form.dataset.driveId, form.dataset.stableId, cartridgeId, cartridgeLabel);
-      const response = await request(endpoints.qualificationRuns, {
-        method: "POST",
-        headers: { Accept: "application/json", "Content-Type": "application/json" },
-        body: JSON.stringify({
-          drive_id: form.dataset.driveId,
-          stable_id: form.dataset.stableId,
-          cartridge_id: cartridgeId,
-          cartridge_label: cartridgeLabel,
-          confirmation: String(values.get("confirmation") || ""),
-          scratch_media_confirmed: values.get("scratch_media_confirmed") === "on",
-          destructive_overwrite_confirmed: values.get("destructive_overwrite_confirmed") === "on",
-          idempotency_key: idempotencyKey
-        })
-      });
-      const queuedRun = response && response.run;
-      if (!queuedRun) throw new Error("The durable qualification response did not include a run.");
-      clearTapeInitializeIdempotency(form, form.dataset.driveId, cartridgeId);
-      rememberQualificationRun(queuedRun);
-      closeModal();
-      state.settingsTab = "qualification";
-      if (location.hash !== "#settings") location.hash = "#settings";
-      updateChrome();
-      render();
-      scheduleQualificationPoll();
-      const queuedState = String(pick(queuedRun, "state") || "").toLowerCase();
-      live.textContent = "Bacula qualification " + human(queuedState || "queued") + " for " + cartridgeLabel + ". Opening durable run status.";
-      toast(queuedState === "passed" ? "Bacula qualification already passed" : ["failed", "blocked", "interrupted"].includes(queuedState) ? "Bacula qualification did not pass" : "Bacula qualification queued", response && response.idempotent_replay === true ? "The server returned the original durable request; no duplicate destructive run was created." : "Opening the durable run status. Keep the worker and tape drive online.");
-      await Promise.all([loadOne("qualificationRuns"), loadOne("drives"), loadOne("media")]);
-      updateChrome();
-      render();
-      scheduleQualificationPoll();
-    } catch (error) {
-      errorBox.textContent = errorMessage(error);
-      errorBox.hidden = false;
-      submit.disabled = false;
-      submit.textContent = "Destroy tape and run btape";
-    }
+    if (!button || !button.dataset.id) return;
+    openTapeInitialization({ dataset: { driveId: String(button.dataset.id), mediaId: "" } });
   }
 
   function scheduleQualificationPoll() {
@@ -7203,10 +7203,6 @@
       event.preventDefault();
       submitMediaReuseEvaluation(event.target);
     }
-    if (event.target.id === "qualification-form") {
-      event.preventDefault();
-      submitQualification(event.target);
-    }
     if (event.target.id === "restore-plan-form") {
       event.preventDefault();
       submitRestorePlan(event.target);
@@ -7283,7 +7279,6 @@
       state.backupStateFilter = event.target.value;
       applyBackupFilters();
     }
-    if (event.target.id === "qualification-cartridge") updateQualificationConfirmation(event.target);
     if (event.target.id === "media-hold-kind") updateMediaHoldExpiry(event.target.form);
     if (event.target.id === "recovery-run-drive") updateRecoveryRunMediaOptions(event.target.form);
     if (["recovery-run-profile", "recovery-run-cartridge"].includes(event.target.id)) updateRecoveryRunConfirmation(event.target.form);

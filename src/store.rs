@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{
     device::{MissingSasDrive, SasDriveObservation, SasMotionOperation},
     domain::lto::{can_read, DriveGeneration, MediaFormat},
+    qualification::{preparation_volume_cartridge_id, preparation_volume_label},
 };
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -120,6 +121,22 @@ pub struct DriveRecord {
     pub health: Value,
     pub last_observed_at: Option<DateTime<Utc>>,
     pub changer_stable_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedTapeIdentityMatch {
+    pub cartridge_id: Uuid,
+    pub cartridge_label: String,
+    pub volume_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoadedTapeIdentityResolution {
+    Known(LoadedTapeIdentityMatch),
+    Unlabeled,
+    Foreign { volume_name: String },
+    Ambiguous { volume_name: String },
+    ProbeFailed,
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -1925,6 +1942,38 @@ pub async fn list_media(pool: &PgPool) -> Result<Vec<MediaRecord>, sqlx::Error> 
         .await
 }
 
+/// Return the exact physical label expected for a cartridge.
+///
+/// A retained operational label wins. Otherwise the deterministic preparation
+/// label is reconstructed from the cartridge UUID; callers must still prove it
+/// by reading the loaded tape before any destructive action.
+pub async fn media_on_tape_identity(
+    pool: &PgPool,
+    cartridge_id: Uuid,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    let record = sqlx::query_as::<_, (String, Option<String>, String)>(
+        "SELECT internal_label, on_tape_identity, identity_status
+           FROM cartridges
+          WHERE id = $1",
+    )
+    .bind(cartridge_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(
+        record.map(|(internal_label, on_tape_identity, identity_status)| {
+            let expected_identity = if identity_status == "reconciled" {
+                on_tape_identity.unwrap_or_else(|| preparation_volume_label(cartridge_id))
+            } else {
+                // The deterministic preparation identity is recoverable even if
+                // the physical label write won the race with a lost DB commit.
+                // The caller still has to read this exact value from the tape.
+                preparation_volume_label(cartridge_id)
+            };
+            (internal_label, expected_identity)
+        }),
+    )
+}
+
 pub async fn create_media(pool: &PgPool, media: &NewMedia) -> Result<MediaRecord, sqlx::Error> {
     let mut transaction = pool.begin().await?;
     let id = sqlx::query_scalar::<_, Uuid>(
@@ -2042,7 +2091,22 @@ pub async fn record_drive_observation(
                  THEN 'detected_unqualified'
                  ELSE drives.qualification_status
              END,
-             health = EXCLUDED.health,
+             health = EXCLUDED.health || CASE
+                 WHEN drives.health->>'medium_loaded' = 'true'
+                  AND EXCLUDED.health->>'medium_loaded' = 'true'
+                  AND drives.observed_path IS NOT DISTINCT FROM EXCLUDED.observed_path
+                  AND drives.health->'device_major' = EXCLUDED.health->'device_major'
+                  AND drives.health->'device_minor' = EXCLUDED.health->'device_minor'
+                 THEN jsonb_build_object(
+                     'loaded_tape_volume_name', drives.health->'loaded_tape_volume_name',
+                     'loaded_tape_identity_status', drives.health->'loaded_tape_identity_status',
+                     'loaded_tape_identity_verified', drives.health->'loaded_tape_identity_verified',
+                     'loaded_tape_identity_observed_at', drives.health->'loaded_tape_identity_observed_at',
+                     'loaded_cartridge_id', drives.health->'loaded_cartridge_id',
+                     'loaded_cartridge_label', drives.health->'loaded_cartridge_label',
+                     'loaded_tape_probe_detail', drives.health->'loaded_tape_probe_detail'),
+                 ELSE '{}'::jsonb
+             END,
              last_observed_at = EXCLUDED.last_observed_at
          RETURNING id",
     )
@@ -2072,6 +2136,127 @@ pub async fn record_drive_observation(
     Ok(record)
 }
 
+/// Retain the identity read from the first Bacula label on the currently loaded tape.
+///
+/// The worker calls this only while the drive is idle and after a fixed-input `btape
+/// readlabel` probe.  Resolution is intentionally database-backed: a Bacula volume name is
+/// considered known only when it maps to exactly one registered cartridge through the exact
+/// deterministic preparation UUID, the cartridge's current on-tape identity, or an ordered
+/// archive-volume record. A normal drive observation clears these fields as soon as the kernel
+/// reports no medium.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_loaded_tape_identity(
+    pool: &PgPool,
+    drive_id: Uuid,
+    expected_stable_id: &str,
+    expected_path: &str,
+    volume_name: Option<&str>,
+    probe_succeeded: bool,
+    detail: Option<&str>,
+    observed_at: DateTime<Utc>,
+) -> Result<LoadedTapeIdentityResolution, sqlx::Error> {
+    let valid_volume_name = volume_name.is_none_or(|name| {
+        !name.is_empty()
+            && name.len() <= 127
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    });
+    let probe_succeeded = probe_succeeded && valid_volume_name;
+    let volume_name = valid_volume_name.then_some(volume_name).flatten();
+    let mut transaction = pool.begin().await?;
+    let matches = if let Some(volume_name) = volume_name {
+        let preparation_cartridge_id = preparation_volume_cartridge_id(volume_name);
+        sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT DISTINCT cartridge.id, cartridge.internal_label
+               FROM cartridges cartridge
+               LEFT JOIN single_tape_data_run_volumes archive_volume
+                 ON archive_volume.cartridge_id = cartridge.id
+              WHERE cartridge.on_tape_identity = $1
+                 OR archive_volume.engine_volume_name = $1
+                 OR cartridge.id = $2
+              ORDER BY cartridge.internal_label, cartridge.id
+              LIMIT 2",
+        )
+        .bind(volume_name)
+        .bind(preparation_cartridge_id)
+        .fetch_all(&mut *transaction)
+        .await?
+    } else {
+        Vec::new()
+    };
+    let resolution = match (probe_succeeded, volume_name, matches.as_slice()) {
+        (false, _, _) => LoadedTapeIdentityResolution::ProbeFailed,
+        (true, None, _) => LoadedTapeIdentityResolution::Unlabeled,
+        (true, Some(volume_name), [(cartridge_id, cartridge_label)]) => {
+            LoadedTapeIdentityResolution::Known(LoadedTapeIdentityMatch {
+                cartridge_id: *cartridge_id,
+                cartridge_label: cartridge_label.clone(),
+                volume_name: volume_name.to_owned(),
+            })
+        }
+        (true, Some(volume_name), []) => LoadedTapeIdentityResolution::Foreign {
+            volume_name: volume_name.to_owned(),
+        },
+        (true, Some(volume_name), _) => LoadedTapeIdentityResolution::Ambiguous {
+            volume_name: volume_name.to_owned(),
+        },
+    };
+    let (status, verified, cartridge_id, cartridge_label) = match &resolution {
+        LoadedTapeIdentityResolution::Known(identity) => (
+            "known",
+            true,
+            Some(identity.cartridge_id),
+            Some(identity.cartridge_label.as_str()),
+        ),
+        LoadedTapeIdentityResolution::Unlabeled => ("unlabeled", false, None, None),
+        LoadedTapeIdentityResolution::Foreign { .. } => ("foreign", false, None, None),
+        LoadedTapeIdentityResolution::Ambiguous { .. } => ("ambiguous", false, None, None),
+        LoadedTapeIdentityResolution::ProbeFailed => ("probe_failed", false, None, None),
+    };
+    let updated = sqlx::query(
+        "UPDATE drives
+            SET health = health || jsonb_build_object(
+                    'loaded_tape_volume_name', $1::text,
+                    'loaded_tape_identity_status', $2::text,
+                    'loaded_tape_identity_verified', $3::boolean,
+                    'loaded_tape_identity_observed_at', $4::timestamptz,
+                    'loaded_cartridge_id', $5::uuid,
+                    'loaded_cartridge_label', $6::text,
+                    'loaded_tape_probe_detail', $7::text)
+          WHERE id = $8 AND stable_id = $9 AND observed_path = $10
+            AND last_observed_at = $4
+            AND health->>'present' = 'true'
+            AND health->>'accessible' = 'true'
+            AND health->>'ready' = 'true'
+            AND health->>'medium_loaded' = 'true'
+            AND health->>'identity_verified' = 'true'
+            AND COALESCE(health->>'identity_conflict', 'false') <> 'true'
+            AND COALESCE(health->>'position_lost', 'false') <> 'true'
+            AND COALESCE(health->>'motion_position_uncertain', 'false') <> 'true'
+            AND health->>'immediate_mode' = 'false'
+            AND health->>'in_flight' = '0'",
+    )
+    .bind(volume_name)
+    .bind(status)
+    .bind(verified)
+    .bind(observed_at)
+    .bind(cartridge_id)
+    .bind(cartridge_label)
+    .bind(detail)
+    .bind(drive_id)
+    .bind(expected_stable_id)
+    .bind(expected_path)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(LoadedTapeIdentityResolution::ProbeFailed);
+    }
+    transaction.commit().await?;
+    Ok(resolution)
+}
+
 pub async fn mark_drive_missing(
     pool: &PgPool,
     missing: &MissingSasDrive,
@@ -2079,7 +2264,12 @@ pub async fn mark_drive_missing(
     let result = sqlx::query(
         "UPDATE drives
          SET reconciled = false,
-             health = health || jsonb_build_object(
+             health = (health - ARRAY[
+                 'loaded_tape_volume_name', 'loaded_tape_identity_status',
+                 'loaded_tape_identity_verified', 'loaded_tape_identity_observed_at',
+                 'loaded_cartridge_id', 'loaded_cartridge_label',
+                 'loaded_tape_probe_detail'
+             ]) || jsonb_build_object(
                  'present', false,
                  'accessible', false,
                  'ready', NULL,
@@ -3382,12 +3572,24 @@ pub async fn finish_qualification_run(
     } else {
         "qualification_failed"
     };
+    let on_tape_identity = (state == QualificationTerminalState::Passed)
+        .then(|| result.get("on_tape_identity").and_then(Value::as_str))
+        .flatten()
+        .filter(|identity| {
+            !identity.is_empty()
+                && identity.len() <= 127
+                && identity
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        });
     sqlx::query(
         "UPDATE cartridges
-         SET on_tape_identity = NULL, identity_status = 'unknown',
-             health_status = $1, updated_at = now()
-         WHERE id = $2",
+         SET on_tape_identity = $1,
+             identity_status = CASE WHEN $1::text IS NULL THEN 'unknown' ELSE 'reconciled' END,
+             health_status = $2, updated_at = now()
+         WHERE id = $3",
     )
+    .bind(on_tape_identity)
     .bind(cartridge_health)
     .bind(claim.run.cartridge_id)
     .execute(&mut *transaction)
@@ -4320,6 +4522,36 @@ fn readback_identity_status_blocker(identity_status: &str) -> Option<&'static st
         .then_some("the archive tape has a known foreign or mismatched identity")
 }
 
+fn detected_loaded_cartridge_id(drive: &DriveRecord) -> Option<Uuid> {
+    (drive.health["loaded_tape_identity_verified"].as_bool() == Some(true)
+        && drive.health["loaded_tape_identity_status"].as_str() == Some("known"))
+    .then(|| drive.health["loaded_cartridge_id"].as_str())
+    .flatten()
+    .and_then(|id| Uuid::parse_str(id).ok())
+}
+
+fn loaded_tape_identity_blocker(drive: &DriveRecord) -> Option<&'static str> {
+    match drive.health["loaded_tape_identity_status"].as_str() {
+        None => None,
+        Some("known")
+            if detected_loaded_cartridge_id(drive).is_some()
+                && drive.health["loaded_tape_volume_name"]
+                    .as_str()
+                    .is_some_and(|name| !name.is_empty()) =>
+        {
+            None
+        }
+        Some("known") => Some("the loaded tape identity evidence is incomplete"),
+        Some("unlabeled") => Some("the loaded tape has no readable TapeScale/Bacula identity"),
+        Some("foreign") => Some("the loaded tape identity is not registered in TapeScale"),
+        Some("ambiguous") => {
+            Some("the loaded tape identity resolves to more than one inventory record")
+        }
+        Some("probe_failed") => Some("TapeScale could not read the loaded tape identity"),
+        Some(_) => Some("the loaded tape identity is not trustworthy"),
+    }
+}
+
 /// Returns a live preview for the exact ordered archive volume requested by a
 /// Bacula full-readback job. Already-written media is intentionally eligible,
 /// but the retained hardware binding, drive motion gates, worker lease, and
@@ -4512,6 +4744,26 @@ pub async fn backup_readback_media_readiness(
                 None,
                 reason,
                 action,
+            ));
+        } else if let Some(reason) = loaded_tape_identity_blocker(drive) {
+            blockers.push(backup_media_blocker(
+                "loaded_tape_identity_unknown",
+                "drive",
+                Some(drive.id),
+                media_request.expected_cartridge_id,
+                reason,
+                "check_loaded_tape",
+            ));
+        } else if detected_loaded_cartridge_id(drive)
+            .is_some_and(|loaded_id| Some(loaded_id) != media_request.expected_cartridge_id)
+        {
+            blockers.push(backup_media_blocker(
+                "wrong_tape_loaded",
+                "drive",
+                Some(drive.id),
+                media_request.expected_cartridge_id,
+                "the loaded tape does not match the archive volume requested for readback",
+                "load_tape",
             ));
         }
     } else {
@@ -4863,6 +5115,15 @@ async fn backup_media_readiness_inner(
                 reason,
                 action,
             ));
+        } else if let Some(reason) = loaded_tape_identity_blocker(&drive) {
+            blockers.push(backup_media_blocker(
+                "loaded_tape_identity_unknown",
+                "drive",
+                Some(drive.id),
+                None,
+                reason,
+                "prepare_tape",
+            ));
         } else {
             ready_drives.push(drive);
         }
@@ -5000,6 +5261,15 @@ async fn backup_media_readiness_inner(
     truncated.pairs = pair_count > pair_rows.len();
     let mut candidates = Vec::new();
     for pair in pair_rows {
+        let drive = ready_drives
+            .iter()
+            .find(|drive| drive.id == pair.drive_id)
+            .expect("the bounded pair query only returns selected drives");
+        if detected_loaded_cartridge_id(drive)
+            .is_some_and(|loaded_id| loaded_id != pair.cartridge_id)
+        {
+            continue;
+        }
         if pair.busy {
             blockers.push(backup_media_blocker(
                 "resource_busy",
@@ -5022,10 +5292,6 @@ async fn backup_media_readiness_inner(
             ));
             continue;
         };
-        let drive = ready_drives
-            .iter()
-            .find(|drive| drive.id == pair.drive_id)
-            .expect("the bounded pair query only returns selected drives");
         let cartridge = ready_cartridges
             .iter()
             .find(|cartridge| cartridge.id == pair.cartridge_id)
@@ -7250,6 +7516,84 @@ pub async fn mark_data_run_volume_write_started(
             "cartridge_id": volume.cartridge_id,
             "expected_engine_volume": expected_engine_volume,
             "detail": "durable media-write boundary committed before Bacula label dispatch"
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// Record the exact Bacula volume name immediately after the label command succeeds.
+///
+/// This is identity evidence, not write-completion evidence: the cartridge remains
+/// `write_in_progress` until the backup and physical readback gates finish.  Retaining it here
+/// lets an idle label probe identify the cartridge even when a later write or verification step
+/// fails.
+pub async fn mark_data_run_volume_labeled(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    volume_order: i32,
+    engine_volume_name: &str,
+) -> Result<bool, sqlx::Error> {
+    if volume_order <= 0
+        || engine_volume_name.is_empty()
+        || engine_volume_name.len() > 127
+        || !engine_volume_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Ok(false);
+    }
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let volume = sqlx::query_as::<_, DataRunVolumeRecord>(&format!(
+        "{DATA_RUN_VOLUME_SELECT}
+         WHERE single_tape_data_run_id = $1 AND volume_order = $2 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(volume) = volume else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    if volume.state != "write_started"
+        || volume.engine_volume_name.as_deref() != Some(engine_volume_name)
+    {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE cartridges
+            SET on_tape_identity = $1, identity_status = 'reconciled', updated_at = now()
+          WHERE id = $2 AND reserved_by = $3
+            AND health_status = 'write_in_progress'",
+    )
+    .bind(engine_volume_name)
+    .bind(volume.cartridge_id)
+    .bind(format!("single_tape_data:{}", claim.run.id))
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "media_identified",
+        json!({
+            "phase": "writing",
+            "volume_order": volume_order,
+            "cartridge_id": volume.cartridge_id,
+            "engine_volume_name": engine_volume_name,
+            "detail": "the exact Bacula volume label was written and retained for automatic loaded-tape identification"
         }),
         "tapescale-worker",
     )

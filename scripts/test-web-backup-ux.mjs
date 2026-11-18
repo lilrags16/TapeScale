@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-13/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-13/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-14/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-14/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -73,8 +73,21 @@ test("cartridge headlines do not confuse the destructive reuse gate with operati
   assert.equal(attentionRequired(prepared), false);
   assert.equal(attentionRequired({ ...verified, confirmed_location_id: null }), true);
   assert.equal(reuseAssessment(prepared), "Reuse evidence incomplete");
-  assert.match(app, /Prepared scratch identity is intentionally pending/);
+  assert.match(app, /Automatic tape ID is missing/);
+  assert.match(app, /blank or legacy tape predates automatic identification/);
   assert.match(app, /Destructive reuse gate/);
+});
+
+test("the drive inventory shows the automatically detected loaded tape identity", () => {
+  const drives = section("  function renderDrives()", "  function renderVerification()");
+  assert.match(drives, /loaded_tape_identity_status/);
+  assert.match(drives, /loaded_tape_identity_verified/);
+  assert.match(drives, /loaded_cartridge_label/);
+  assert.match(drives, /loaded_tape_volume_name/);
+  assert.match(drives, /status\("identified"\)/);
+  assert.match(drives, /status\("reading ID"\)/);
+  assert.match(drives, /"Loaded tape"/);
+  assert.match(drives, /Prepare this blank or legacy tape once/);
 });
 
 test("the start flow requires a currently eligible drive and tape", () => {
@@ -85,7 +98,13 @@ test("the start flow requires a currently eligible drive and tape", () => {
   assert.match(open, /await loadBackupMediaReadiness\("profile", profileId\)/);
   assert.match(open, /const pairs = readiness\.candidates/);
   assert.match(open, /new Set\(pairs\.map/);
-  assert.match(open, /readiness\.recommended_candidate/);
+  assert.doesNotMatch(open, /readiness\.recommended_candidate/, "an arbitrary inventory tape must not be presented as physically loaded");
+  assert.match(open, /drives\.length === 1/);
+  assert.match(open, /initialCandidates\.length === 1/);
+  assert.match(open, /name="drive_id" required hidden/);
+  assert.match(open, /name="cartridge_id" required hidden/);
+  assert.match(open, /The button below is the destructive confirmation/);
+  assert.match(open, /Erase .* and start backup/);
   assert.match(open, /const blocked = pairs\.length === 0/);
   assert.match(open, /backupReadinessRemediation\(readiness\)/);
   assert.match(open, /backupReadinessAction\(remediation, "profile", profileId\)/);
@@ -104,8 +123,14 @@ test("the start flow requires a currently eligible drive and tape", () => {
 test("creating a request continues directly into final tape authorization", () => {
   const submit = section("  async function submitStartBackup(", "  function backupMediaConfirmation(");
 
-  assert.match(submit, /backupRunState\(retained\) === "waiting_for_media" \|\| backupNeedsNextMedia\(retained\)/);
-  assert.match(submit, /openAssignBackupMedia\(state\.selectedBackupRunId, \{ driveId, cartridgeId, guided: true \}\)/);
+  assert.match(submit, /await loadBackupMediaReadiness\("run", state\.selectedBackupRunId\)/);
+  assert.match(submit, /await request\(endpoints\.backupRuns \+ "\/" \+ encodeURIComponent\(state\.selectedBackupRunId\) \+ "\/media"/);
+  assert.match(submit, /typed_cartridge_label: exactLabel/);
+  assert.match(submit, /loaded_media_confirmed: true/);
+  assert.match(submit, /destructive_overwrite_confirmed: true/);
+  assert.match(submit, /encryption_deviation_confirmed: true/);
+  assert.match(submit, /confirmation: expectedConfirmation/);
+  assert.doesNotMatch(submit, /openAssignBackupMedia\(/, "initial backup must remain in one modal and one operator action");
   assert.match(submit, /compression_mode: backupCompressionMode/);
   assert.match(submit, /spanning_enabled: backupSpanningEnabled/);
   assert.doesNotMatch(submit, /toast\("Full backup queued"/);
@@ -460,6 +485,7 @@ test("the Recovery Vault keeps multi-tape full restore and single-tape selected 
   const mediaContract = section("  function restorePlanTapes(", "  function restorePlanDrives(");
   const result = section("  function renderRestorePlanResult(", "  async function submitRestorePlan(");
   const start = section("  function openRestoreRehearsal(", "  async function submitRestoreRehearsal(");
+  const queue = section("  async function submitRestoreRehearsal(", "  function restoreMediaReadinessValue(");
   const handoff = section("  function restoreMediaReadinessValue(", "  function openCancelRestoreRehearsal(");
 
   assert.match(phases, /name: "Restore files", detail: "Read the planned scope across its ordered tapes"/);
@@ -516,22 +542,42 @@ test("the Recovery Vault keeps multi-tape full restore and single-tape selected 
   assert.match(start, /pick\(restorePlanExecution\(plan\), "destination_subpath", "destination"\)/);
   assert.match(start, /planned selected scope.*complete recovery point/);
   assert.match(start, /Load only tape 1 now/);
-  assert.match(start, /Later tapes use separate exact handoffs/);
+  assert.match(start, /pauses durably and names each next tape/);
   assert.match(start, /immutably bound to the normalized paths and selection hash/);
   assert.match(start, /local console has no application sign-in/);
-  assert.match(start, /new isolated recovery destination, not live data/);
+  assert.match(start, /new isolated destination shown above/);
+  assert.match(start, /const onlyDrive = drives\.length === 1/);
+  assert.match(start, /name="drive_id" required hidden/);
+  assert.match(start, /reads its internal ID and blocks a mismatch/);
+  assert.doesNotMatch(start, /name="tape_loaded_confirmed"/);
+  assert.doesNotMatch(start, /name="attended_confirmed"/);
+  assert.doesNotMatch(start, /name="confirmation"/);
+  assert.match(queue, /confirmation: phrase/);
+  assert.match(queue, /tape_loaded_confirmed: true/);
+  assert.match(queue, /attended_confirmed: true/);
+  assert.doesNotMatch(queue, /values\.get\("confirmation"\)/);
   assert.match(start, /openModal\("Start Restore run"/);
   assert.doesNotMatch(start, /supported G0\.2 recovery point|Start recovery rehearsal/);
 
   assert.match(handoff, /\/media-readiness/);
   assert.match(handoff, /pick\(readiness, "ready"\) !== true/);
   assert.match(handoff, /Incomplete durable tape request/);
-  assert.match(handoff, /Unload and remove the previous tape, then insert this exact recorded cartridge/);
-  assert.match(handoff, /name="loaded_media_confirmed" required/);
-  assert.match(handoff, /name="attended_confirmed" required/);
+  assert.match(handoff, /Unload and remove the previous tape, then insert this cartridge/);
+  assert.match(handoff, /const selectedDrive = drives\.length === 1/);
+  assert.match(handoff, /name="drive_id" required hidden/);
+  assert.match(handoff, /TapeScale reads the internal tape ID and blocks a mismatch/);
+  assert.match(handoff, /no typed phrase or repeated tape attestation is needed/);
+  assert.doesNotMatch(handoff, /name="loaded_media_confirmed"/);
+  assert.doesNotMatch(handoff, /name="attended_confirmed"/);
+  assert.doesNotMatch(handoff, /name="confirmation"/);
   assert.match(handoff, /Finish later/);
   assert.match(handoff, /const readiness = await loadRestoreMediaReadiness\(runId\)/);
   assert.match(handoff, /The exact restore tape request changed while this form was open/);
+  assert.match(handoff, /loaded_media_confirmed: true/);
+  assert.match(handoff, /attended_confirmed: true/);
+  assert.doesNotMatch(handoff, /values\.get\("loaded_media_confirmed"\)/);
+  assert.doesNotMatch(handoff, /values\.get\("attended_confirmed"\)/);
+  assert.doesNotMatch(handoff, /values\.get\("confirmation"\)/);
   assert.match(handoff, /endpoints\.restoreRehearsals \+ "\/" \+ encodeURIComponent\(runId\) \+ "\/media"/);
   for (const field of ["request_id", "drive_id", "expected_stable_id", "cartridge_id", "typed_cartridge_label", "volume_order", "loaded_media_confirmed", "attended_confirmed", "confirmation"]) {
     assert.match(handoff, new RegExp(field + ":"), `media handoff must send ${field}`);
@@ -1219,26 +1265,27 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   assert.match(app, /outcome \+ renderBackupPreparationProgress\(\{ state: stateValue/);
 });
 
-test("final authorization is explicit without asking for the cartridge label twice", () => {
+test("one media action synthesizes the legacy authorization only after fresh readiness", () => {
   const open = section("  async function openAssignBackupMedia(", "  function updateBackupMediaForDrive(");
   const submit = section("  async function submitBackupMedia(", "  function prepareBackupTape(");
 
-  assert.match(open, /name="backup_authority_confirmed" required/);
-  assert.match(open, /I physically verified this labeled scratch tape is loaded/);
-  assert.match(open, /name="confirmation"/);
-  assert.match(open, /aria-describedby="backup-media-confirmation-help"/);
-  assert.match(open, /id="backup-media-confirmation-help" aria-live="polite"/);
-  assert.doesNotMatch(open, /backup-typed-cartridge/);
-  assert.equal((open.match(/name="backup_authority_confirmed"/g) || []).length, 2, "each mutually exclusive write/readback branch has one authority checkbox");
+  assert.doesNotMatch(open, /backup_authority_confirmed/);
+  assert.doesNotMatch(open, /name="confirmation"/);
+  assert.match(open, /const fixedDrive = readyDrives\.length === 1/);
+  assert.match(open, /const fixedMedia = selectedMedia/);
+  assert.match(open, /name="drive_id" required hidden/);
+  assert.match(open, /name="cartridge_id" required hidden/);
+  assert.match(open, /The destructive button below is the confirmation/);
 
   assert.match(submit, /await loadBackupMediaReadiness\("run", runId\)/);
   assert.match(submit, /required_confirmation/);
   assert.match(submit, /typed_cartridge_label: exactLabel/);
   assert.match(submit, /volume_sequence: volumeSequence/);
-  assert.match(submit, /loaded_media_confirmed: authorized/);
-  assert.match(submit, /destructive_overwrite_confirmed: !readbackMedia && authorized/);
-  assert.match(submit, /encryption_deviation_confirmed: !readbackMedia && authorized/);
-  assert.match(submit, /String\(values\.get\("confirmation"\) \|\| ""\) !== expectedConfirmation/);
+  assert.match(submit, /loaded_media_confirmed: true/);
+  assert.match(submit, /destructive_overwrite_confirmed: !readbackMedia/);
+  assert.match(submit, /encryption_deviation_confirmed: !readbackMedia/);
+  assert.match(submit, /confirmation: expectedConfirmation/);
+  assert.doesNotMatch(submit, /values\.get\("confirmation"\)/);
 
   const validation = submit.indexOf('await loadBackupMediaReadiness("run", runId)');
   const currentModal = submit.indexOf("if (!backupModalSubmissionCurrent(form, token)) return;");
@@ -1262,8 +1309,35 @@ test("modal cancellation is a real pre-mutation boundary", () => {
   assert.equal(current({ isConnected: true }, 7), false);
 
   const start = section("  async function submitStartBackup(", "  function backupMediaConfirmation(");
-  assert.match(start, /const continueGuided = backupModalSubmissionCurrent\(form, token\)/);
-  assert.match(start, /if \(!continueGuided\) \{[\s\S]*Backup request saved[\s\S]*return;/);
+  const requestCheck = start.indexOf('await loadBackupMediaReadiness("run", state.selectedBackupRunId)');
+  const currentCheck = start.indexOf("if (!backupModalSubmissionCurrent(form, token)) return;", requestCheck);
+  const assignment = start.indexOf("await request(endpoints.backupRuns", currentCheck);
+  assert.ok(requestCheck >= 0 && requestCheck < currentCheck && currentCheck < assignment, "closing the modal during the second readiness check must stop media authorization");
+  assert.match(start, /Backup started in background/);
+});
+
+test("tape preparation uses one destructive action and automatically reconciles the sole drive", () => {
+  const open = section("  function openTapeInitialization(", "  function tapeInitializeLabel(");
+  const submit = section("  async function submitTapeInitialization(", "  function qualificationRunDetail(");
+  const legacy = section("  function openQualification(", "  function scheduleQualificationPoll(");
+
+  assert.match(open, /safeDrives\.length === 1/);
+  assert.match(open, /name="drive_id" required hidden/);
+  assert.match(open, /data-tape-init-media-fact/);
+  assert.match(open, /The final button is the only destructive confirmation/);
+  assert.match(open, /writes a durable internal tape ID/);
+  assert.match(open, /replaces the preparation ID with its permanent archive-volume ID automatically/);
+  assert.match(open, /Future loads are identified automatically from the tape itself/);
+  assert.doesNotMatch(open, /trust_drive_identity/);
+  assert.doesNotMatch(open, /name="scratch_media_confirmed"/);
+  assert.doesNotMatch(open, /name="destructive_overwrite_confirmed"/);
+  assert.doesNotMatch(open, /name="confirmation"/);
+  assert.match(submit, /"DESTROY " \+ labelText \+ " WITH BACULA BTAPE TEST"/);
+  assert.match(submit, /Reconciling the only loaded drive/);
+  assert.match(submit, /scratch_media_confirmed: true/);
+  assert.match(submit, /destructive_overwrite_confirmed: true/);
+  assert.match(legacy, /openTapeInitialization\(\{ dataset: \{ driveId:/);
+  assert.doesNotMatch(legacy, /qualification-form/);
 });
 
 test("server blocker actions lead to the correct recovery surface", () => {
@@ -1624,7 +1698,9 @@ test("multi-tape runs ask for each ordered continuation volume", () => {
   assert.match(open, /objectValue\(readiness, "media_request"\)/);
   assert.match(open, /"volume_order", "volume_sequence", "media_sequence"/);
   assert.match(open, /data-volume-sequence/);
-  assert.match(open, /Erase tape and continue archive/);
+  assert.match(open, /and continue archive/);
+  assert.doesNotMatch(open, /backup_authority_confirmed/);
+  assert.doesNotMatch(open, /name="confirmation"/);
   assert.match(action, /Load next tape/);
   assert.match(action, /Unload and remove it, then insert a different prepared scratch tape/);
   assert.match(open, /Unload and remove the previous archive tape before inserting this one/);
@@ -1656,18 +1732,19 @@ test("readback media handoffs load exact ordered tapes without destructive copy"
   assert.match(open, /data-media-phase=/);
   assert.match(open, /Load recorded archive tape/);
   assert.match(open, /Unload and remove the current tape before inserting this one/);
-  assert.match(open, /will not erase, relabel, or append/);
+  assert.match(open, /rejects a different tape before this read-only handoff continues/);
   assert.match(open, /Readback order/);
-  assert.match(open, /Confirm tape and continue readback/);
-  assert.match(open, /server confirmation/);
+  assert.match(open, /Read detected tape/);
+  assert.doesNotMatch(open, /backup_authority_confirmed/);
+  assert.doesNotMatch(open, /name="confirmation"/);
   assert.match(submit, /currentPhase !== mediaPhase \|\| currentSequence !== volumeSequence/);
-  assert.match(submit, /destructive_overwrite_confirmed: !readbackMedia && authorized/);
-  assert.match(submit, /encryption_deviation_confirmed: !readbackMedia && authorized/);
-  assert.match(open, /Standalone SAS drives cannot report the physical cartridge label/);
-  assert.match(open, /Bacula validates its on-tape volume label after rewind/);
-  assert.doesNotMatch(open, /reject a different label before any tape operation/);
-  assert.match(submit, /accepted your physical-label attestation/);
-  assert.match(submit, /validate the on-tape volume label after rewind/);
+  assert.match(submit, /destructive_overwrite_confirmed: !readbackMedia/);
+  assert.match(submit, /encryption_deviation_confirmed: !readbackMedia/);
+  assert.match(submit, /confirmation: expectedConfirmation/);
+  assert.match(open, /const fixedMedia = selectedMedia/);
+  assert.match(open, /reads the on-tape ID after rewind and blocks a mismatch/);
+  assert.doesNotMatch(submit, /physical-label attestation/);
+  assert.match(submit, /read the on-tape ID again before reading backup data/);
   assert.doesNotMatch(submit, /reading the exact ordered archive tape/);
   assert.match(action, /Load tape .* for readback/);
   assert.match(action, /will not erase or relabel it/);

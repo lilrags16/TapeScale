@@ -2,6 +2,24 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.14] - 2026-11-18
+
+### Automatic on-tape identity
+
+- A successful **Prepare tape** run now writes and immediately reads back a durable internal `TS-PREP-V1-<cartridge UUID>` volume identity after the destructive setup test. The worker retains that exact identity against the inventory record and periodically probes an idle loaded drive, so a prepared cartridge can identify itself without repeated printed-label attestations.
+- The first operational Bacula label replaces the preparation label as the cartridge's current internal identity. TapeScale retains both the cartridge association and each archive volume label, and re-reads the loaded label immediately before every destructive write or physical readback boundary. A missing, foreign, ambiguous, or wrong label blocks the operation before data I/O.
+- Drive discovery preserves a freshly observed loaded-tape identity only while the same loaded device remains continuously observed. Unload, device loss, identity conflict, or failed probing clears or invalidates the hint; the just-in-time label probe remains authoritative at the physical boundary.
+
+### One-action standalone-drive workflow
+
+- Tape preparation, initial backup assignment, continuation, and readback now present the one relevant drive/tape fact and one explicit action instead of exposing duplicated checkboxes and typed confirmation phrases. The API and worker still repeat every eligibility, lease, identity, and destructive-boundary check.
+- A one-drive deployment automatically narrows eligible media to the cartridge identified from tape. The running job continues to retain ordered volume requests and blocks a wrong cartridge, but the operator no longer has to manually reassert the identity already stored on the media.
+- Existing tapes prepared by an earlier alpha do not contain the new preparation identity. Before their next destructive write, run **Prepare tape** once with a blank or expendable scratch cartridge; that operation overwrites the tape. Never re-prepare a retained archive. Previously written Bacula volumes can still be resolved by their retained operational volume labels when those records are present.
+
+### Engine boundary
+
+- Bacula remains the alpha's pinned physical archive adapter for write, spanning, catalog, readback, and restore behavior. The console no longer treats Bacula's confirmation mechanics as the product workflow, but this release does not claim a new native packed archive format or remove the Bacula catalog dependency.
+
 ## [0.1.0-alpha.13] - 2026-11-18
 
 ### Anti-shoe-shine tape delivery
@@ -206,6 +224,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.14]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.14
 [0.1.0-alpha.13]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.13
 [0.1.0-alpha.12]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.12
 [0.1.0-alpha.11]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.11

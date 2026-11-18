@@ -117,8 +117,8 @@ async fn create_backup_profile(
         .expect("full-file backup profile should persist")
 }
 
-async fn create_loaded_drive(pool: &PgPool) -> store::DriveRecord {
-    let observation = SasDriveObservation {
+fn loaded_drive_observation() -> SasDriveObservation {
+    SasDriveObservation {
         stable_id: "serial:IBM:ULTRIUM-HH9:BACKUP-INTEGRATION".to_owned(),
         identity_verified: true,
         identity_conflict: false,
@@ -147,7 +147,11 @@ async fn create_loaded_drive(pool: &PgPool) -> store::DriveRecord {
         status_detail: Some("integration fixture has loaded scratch media".to_owned()),
         raw_status: None,
         observed_at: Utc::now(),
-    };
+    }
+}
+
+async fn create_loaded_drive(pool: &PgPool) -> store::DriveRecord {
+    let observation = loaded_drive_observation();
     let detected = store::record_drive_observation(pool, &observation)
         .await
         .expect("drive observation should persist");
@@ -607,6 +611,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         panic!("current qualification should be claimable");
     };
     assert_eq!(current_claim.run.id, current_qualification.id);
+    let qualified_scratch_identity = tapescale::qualification::preparation_volume_label(scratch.id);
     assert!(store::finish_qualification_run(
         &pool,
         &current_claim,
@@ -615,11 +620,24 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
             "detail": "backup integration 256 KiB block qualification",
             "position_uncertain": false,
             "engine_version": "15.0.3",
-            "maximum_block_size_bytes": 262144
+            "maximum_block_size_bytes": 262144,
+            "on_tape_identity": qualified_scratch_identity
         }),
     )
     .await
     .expect("current block-size qualification pass should persist"));
+    let qualified_scratch = sqlx::query_as::<_, (Option<String>, String)>(
+        "SELECT on_tape_identity, identity_status FROM cartridges WHERE id = $1",
+    )
+    .bind(scratch.id)
+    .fetch_one(&pool)
+    .await
+    .expect("qualified scratch identity should be queryable");
+    assert_eq!(
+        qualified_scratch.0.as_deref(),
+        Some(qualified_scratch_identity.as_str())
+    );
+    assert_eq!(qualified_scratch.1, "reconciled");
 
     // Exercise the complete attended continuation/readback request contract on
     // its own run so the later finalization fixture remains single-volume.
@@ -970,6 +988,73 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         panic!("archive volume one should be requested for readback");
     };
 
+    let identity_observed_at = store::list_drives(&pool)
+        .await
+        .expect("loaded-drive observation should be queryable")
+        .into_iter()
+        .find(|candidate| candidate.id == drive.id)
+        .and_then(|candidate| candidate.last_observed_at)
+        .expect("loaded drive should retain its observation timestamp");
+    let wrong_loaded_tape = store::record_loaded_tape_identity(
+        &pool,
+        drive.id,
+        &drive.stable_id,
+        drive
+            .observed_path
+            .as_deref()
+            .expect("loaded drive should retain its device path"),
+        Some(second_engine_volume),
+        true,
+        Some("integration probe intentionally observed archive volume two"),
+        identity_observed_at,
+    )
+    .await
+    .expect("wrong loaded-tape identity should resolve durably");
+    assert!(matches!(
+        wrong_loaded_tape,
+        store::LoadedTapeIdentityResolution::Known(ref identity)
+            if identity.cartridge_id == continuation_second.id
+    ));
+    let wrong_tape_readiness = store::backup_readback_media_readiness(
+        &pool,
+        continuation_profile.id,
+        continuation_request.id,
+        continuation_run.id,
+        pending_readback.id,
+    )
+    .await
+    .expect("wrong-tape readback readiness should be queryable");
+    let store::BackupMediaReadinessResult::Readiness(wrong_tape_readiness) = wrong_tape_readiness
+    else {
+        panic!("pending readback should retain a readiness result");
+    };
+    assert_eq!(wrong_tape_readiness.state, "blocked");
+    assert!(wrong_tape_readiness
+        .blockers
+        .iter()
+        .any(|blocker| blocker.code == "wrong_tape_loaded"));
+
+    let expected_loaded_tape = store::record_loaded_tape_identity(
+        &pool,
+        drive.id,
+        &drive.stable_id,
+        drive
+            .observed_path
+            .as_deref()
+            .expect("loaded drive should retain its device path"),
+        Some(first_engine_volume),
+        true,
+        Some("integration probe observed the requested archive volume"),
+        identity_observed_at,
+    )
+    .await
+    .expect("expected loaded-tape identity should resolve durably");
+    assert!(matches!(
+        expected_loaded_tape,
+        store::LoadedTapeIdentityResolution::Known(ref identity)
+            if identity.cartridge_id == continuation_first.id
+    ));
+
     sqlx::query("UPDATE cartridges SET identity_status = 'mismatch' WHERE id = $1")
         .bind(continuation_first.id)
         .execute(&pool)
@@ -1188,6 +1273,167 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         2_048
     );
     assert!(terminal_continuation_result["live_io"].is_null());
+
+    let decoy_scratch = store::create_media(
+        &pool,
+        &NewMedia {
+            internal_label: "BACKUP-INTEGRATION-SCRATCH-002".to_owned(),
+            barcode: Some("BISCR002".to_owned()),
+            media_generation: 9,
+            media_format: "LTO-9".to_owned(),
+            worm: false,
+        },
+    )
+    .await
+    .expect("second eligible scratch cartridge should persist");
+    qualify_backup_media(&pool, &drive, &decoy_scratch).await;
+
+    let mut unloaded_observation = loaded_drive_observation();
+    unloaded_observation.ready = Some(false);
+    unloaded_observation.medium_loaded = Some(false);
+    unloaded_observation.at_bot = None;
+    unloaded_observation.status = "no_media".to_owned();
+    unloaded_observation.status_detail = Some("integration fixture changed cartridges".to_owned());
+    store::record_drive_observation(&pool, &unloaded_observation)
+        .await
+        .expect("unloaded observation should clear the prior loaded identity");
+    let reloaded_observation = loaded_drive_observation();
+    store::record_drive_observation(&pool, &reloaded_observation)
+        .await
+        .expect("reloaded observation should restore drive readiness");
+
+    let unprobed_readiness = store::backup_media_readiness(&pool, assignment_profile.id, None)
+        .await
+        .expect("unprobed readiness should expose both eligible scratch cartridges");
+    let store::BackupMediaReadinessResult::Readiness(unprobed_readiness) = unprobed_readiness
+    else {
+        panic!("the retained backup profile should have a readiness result");
+    };
+    assert_eq!(unprobed_readiness.state, "selection_required");
+    let mut unprobed_candidates = unprobed_readiness
+        .candidates
+        .iter()
+        .map(|candidate| candidate.cartridge_id)
+        .collect::<Vec<_>>();
+    unprobed_candidates.sort_unstable();
+    let mut expected_candidates = vec![scratch.id, decoy_scratch.id];
+    expected_candidates.sort_unstable();
+    assert_eq!(unprobed_candidates, expected_candidates);
+
+    let identity_observed_at = store::list_drives(&pool)
+        .await
+        .expect("drive identity observation should remain queryable")
+        .into_iter()
+        .find(|candidate| candidate.id == drive.id)
+        .and_then(|candidate| candidate.last_observed_at)
+        .expect("ready drive should retain an observation timestamp");
+    let loaded_identity = store::record_loaded_tape_identity(
+        &pool,
+        drive.id,
+        &drive.stable_id,
+        drive
+            .observed_path
+            .as_deref()
+            .expect("ready drive should retain its device path"),
+        Some(&qualified_scratch_identity),
+        true,
+        Some("integration probe identified the first prepared scratch cartridge"),
+        identity_observed_at,
+    )
+    .await
+    .expect("known loaded scratch identity should persist");
+    assert!(matches!(
+        loaded_identity,
+        store::LoadedTapeIdentityResolution::Known(ref identity)
+            if identity.cartridge_id == scratch.id
+                && identity.volume_name == qualified_scratch_identity
+    ));
+    let observed_drive = store::list_drives(&pool)
+        .await
+        .expect("loaded identity health should be queryable")
+        .into_iter()
+        .find(|candidate| candidate.id == drive.id)
+        .expect("loaded drive should remain registered");
+    assert_eq!(
+        observed_drive.health["loaded_tape_identity_status"],
+        json!("known")
+    );
+    assert_eq!(
+        observed_drive.health["loaded_tape_identity_verified"],
+        json!(true)
+    );
+    assert_eq!(
+        observed_drive.health["loaded_cartridge_id"],
+        json!(scratch.id)
+    );
+
+    // The preparation label embeds the cartridge UUID. If the physical write
+    // succeeds immediately before a process/database failure, the next probe
+    // must reconstruct identity without relying on the lost metadata commit.
+    sqlx::query(
+        "UPDATE cartridges
+            SET on_tape_identity = NULL, identity_status = 'unknown'
+          WHERE id = $1",
+    )
+    .bind(scratch.id)
+    .execute(&pool)
+    .await
+    .expect("integration fixture should simulate a lost preparation-label commit");
+    assert_eq!(
+        store::media_on_tape_identity(&pool, scratch.id)
+            .await
+            .expect("expected identity fallback should be queryable"),
+        Some((
+            scratch.internal_label.clone(),
+            qualified_scratch_identity.clone()
+        ))
+    );
+    let recovered_identity = store::record_loaded_tape_identity(
+        &pool,
+        drive.id,
+        &drive.stable_id,
+        drive
+            .observed_path
+            .as_deref()
+            .expect("ready drive should retain its device path"),
+        Some(&qualified_scratch_identity),
+        true,
+        Some("integration probe recovered the deterministic preparation identity"),
+        identity_observed_at,
+    )
+    .await
+    .expect("deterministic preparation identity should recover without retained metadata");
+    assert!(matches!(
+        recovered_identity,
+        store::LoadedTapeIdentityResolution::Known(ref identity)
+            if identity.cartridge_id == scratch.id
+                && identity.volume_name == qualified_scratch_identity
+    ));
+    sqlx::query(
+        "UPDATE cartridges
+            SET on_tape_identity = $1, identity_status = 'reconciled'
+          WHERE id = $2",
+    )
+    .bind(&qualified_scratch_identity)
+    .bind(scratch.id)
+    .execute(&pool)
+    .await
+    .expect("integration fixture should restore prepared tape metadata");
+
+    let detected_readiness = store::backup_media_readiness(&pool, assignment_profile.id, None)
+        .await
+        .expect("detected-tape readiness should be queryable");
+    let store::BackupMediaReadinessResult::Readiness(detected_readiness) = detected_readiness
+    else {
+        panic!("the retained backup profile should have a readiness result");
+    };
+    assert_eq!(detected_readiness.state, "ready");
+    assert_eq!(detected_readiness.candidates.len(), 1);
+    assert_eq!(detected_readiness.candidates[0].cartridge_id, scratch.id);
+    assert!(detected_readiness
+        .candidates
+        .iter()
+        .all(|candidate| candidate.cartridge_id != decoy_scratch.id));
 
     sqlx::query(
         "INSERT INTO cartridges
