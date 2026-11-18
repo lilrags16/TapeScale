@@ -1247,7 +1247,10 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         .expect("the one qualified pair should be recommended");
     assert_eq!(candidate.drive_id, drive.id);
     assert_eq!(candidate.cartridge_id, scratch.id);
-    assert_eq!(candidate.qualification_run_id, qualification.id);
+    assert_eq!(
+        candidate.qualification_run_id, current_qualification.id,
+        "write readiness must retain the newer 256 KiB qualification, not the legacy pass"
+    );
     let expected_confirmation = format!(
         "OVERWRITE {} FOR BACKUP {}",
         scratch.internal_label, assignment_request.id
