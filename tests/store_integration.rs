@@ -897,6 +897,174 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         Some("/source/fixtures/immutable-001")
     );
 
+    let action_baseline = store::overview_counts(&pool)
+        .await
+        .expect("action-count baseline should query")
+        .required_actions;
+    let action_job_id = Uuid::now_v7();
+    let first_failed_run_id = Uuid::now_v7();
+    let second_failed_run_id = Uuid::now_v7();
+    let verified_retry_run_id = Uuid::now_v7();
+    let waiting_backup_run_id = Uuid::now_v7();
+    let waiting_backup_request_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO jobs (id, external_id, kind, priority)
+         VALUES ($1, $2, 'backup', 50)",
+    )
+    .bind(action_job_id)
+    .bind(format!("integration-action-feed-{action_job_id}"))
+    .execute(&pool)
+    .await
+    .expect("action-feed fixture job should persist");
+    sqlx::query(
+        "INSERT INTO job_runs
+            (id, job_id, scheduled_occurrence, attempt, state, correlation_id,
+             failure_class, finished_at, created_at)
+         VALUES ($1, $2, 'action-feed-failure-1', 1, 'failed', $3,
+                 'integration_failure', now() - interval '4 minutes',
+                 now() - interval '4 minutes')",
+    )
+    .bind(first_failed_run_id)
+    .bind(action_job_id)
+    .bind(Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .expect("first failed action fixture should persist");
+    assert_eq!(
+        store::overview_counts(&pool)
+            .await
+            .expect("failed action count should query")
+            .required_actions,
+        action_baseline + 1
+    );
+    assert!(store::list_required_actions(&pool)
+        .await
+        .expect("first failed action should query")
+        .iter()
+        .any(|action| action.id == first_failed_run_id.to_string() && action.route == "jobs"));
+
+    sqlx::query(
+        "INSERT INTO job_runs
+            (id, job_id, scheduled_occurrence, attempt, state, correlation_id,
+             failure_class, finished_at, created_at)
+         VALUES ($1, $2, 'action-feed-failure-2', 2, 'failed', $3,
+                 'integration_failure', now() - interval '3 minutes',
+                 now() - interval '3 minutes')",
+    )
+    .bind(second_failed_run_id)
+    .bind(action_job_id)
+    .bind(Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .expect("second failed action fixture should persist");
+    let repeated_failure_actions = store::list_required_actions(&pool)
+        .await
+        .expect("repeated failed actions should query");
+    assert!(!repeated_failure_actions
+        .iter()
+        .any(|action| action.id == first_failed_run_id.to_string()));
+    assert!(repeated_failure_actions
+        .iter()
+        .any(|action| action.id == second_failed_run_id.to_string()));
+    assert_eq!(
+        store::overview_counts(&pool)
+            .await
+            .expect("deduplicated action count should query")
+            .required_actions,
+        action_baseline + 1,
+        "only the newest failed attempt for a job should require attention"
+    );
+
+    sqlx::query(
+        "INSERT INTO job_runs
+            (id, job_id, scheduled_occurrence, attempt, state, correlation_id,
+             finished_at, created_at)
+         VALUES ($1, $2, 'action-feed-verified', 3, 'verified', $3,
+                 now() - interval '2 minutes', now() - interval '2 minutes')",
+    )
+    .bind(verified_retry_run_id)
+    .bind(action_job_id)
+    .bind(Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .expect("verified retry fixture should persist");
+    assert!(!store::list_required_actions(&pool)
+        .await
+        .expect("resolved action feed should query")
+        .iter()
+        .any(|action| {
+            action.id == first_failed_run_id.to_string()
+                || action.id == second_failed_run_id.to_string()
+        }));
+    assert_eq!(
+        store::overview_counts(&pool)
+            .await
+            .expect("resolved action count should query")
+            .required_actions,
+        action_baseline,
+        "a successful retry should clear older failed attempts"
+    );
+
+    sqlx::query(
+        "INSERT INTO job_runs
+            (id, job_id, scheduled_occurrence, attempt, state, correlation_id, created_at)
+         VALUES ($1, $2, 'action-feed-waiting', 4, 'waiting_for_media', $3,
+                 now() - interval '1 minute')",
+    )
+    .bind(waiting_backup_run_id)
+    .bind(action_job_id)
+    .bind(Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .expect("waiting backup action fixture should persist");
+    sqlx::query(
+        "INSERT INTO backup_requests
+            (id, profile_id, job_run_id, trigger_kind, requested_level,
+             idempotency_key, requested_by_label, correlation_id)
+         VALUES ($1, $2, $3, 'manual', 'full', $4, 'integration test', $5)",
+    )
+    .bind(waiting_backup_request_id)
+    .bind(created_profile.id)
+    .bind(waiting_backup_run_id)
+    .bind(format!(
+        "integration-action-feed-{waiting_backup_request_id}"
+    ))
+    .bind(Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .expect("waiting backup request fixture should persist");
+    assert!(store::list_required_actions(&pool)
+        .await
+        .expect("waiting backup action should query")
+        .iter()
+        .any(|action| {
+            action.id == waiting_backup_run_id.to_string()
+                && action.route == format!("jobs/{waiting_backup_request_id}")
+        }));
+
+    sqlx::query("DELETE FROM backup_requests WHERE id = $1")
+        .bind(waiting_backup_request_id)
+        .execute(&pool)
+        .await
+        .expect("action-feed backup fixture should clean up");
+    sqlx::query("DELETE FROM job_runs WHERE job_id = $1")
+        .bind(action_job_id)
+        .execute(&pool)
+        .await
+        .expect("action-feed run fixtures should clean up");
+    sqlx::query("DELETE FROM jobs WHERE id = $1")
+        .bind(action_job_id)
+        .execute(&pool)
+        .await
+        .expect("action-feed job fixture should clean up");
+    assert_eq!(
+        store::overview_counts(&pool)
+            .await
+            .expect("clean action count should query")
+            .required_actions,
+        action_baseline
+    );
+
     assert!(matches!(
         store::queue_single_tape_data_run(
             &pool,

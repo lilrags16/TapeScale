@@ -15,7 +15,7 @@
   "required_software": [
     {
       "component": "tapescale-recovery",
-      "version": "0.1.0-alpha.11"
+      "version": "0.1.0-alpha.12"
     },
     {
       "component": "tape-engine",

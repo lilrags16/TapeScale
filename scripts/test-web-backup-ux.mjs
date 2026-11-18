@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-11/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-11/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-12/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-12/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -182,8 +182,184 @@ test("unsupported legacy compression is shown and blocked instead of becoming au
 
   const profiles = section("  function renderBackupProfiles(", "  function renderBackupRunTable(");
   assert.match(profiles, /!compressionSupported/);
-  assert.match(profiles, /disabled title="Create a new backup plan with supported compression and delivery settings\./);
+  assert.match(profiles, /disabled title="Choose a new snapshot with supported compression and delivery settings\./);
   assert.match(profiles, /unsupported legacy setting/);
+});
+
+test("management work uses only the latest attempt per saved snapshot", () => {
+  const helpers = section("  function backupRunSuccessful(", "  function backupRunMatches(");
+  const terminal = new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
+  let runs = [];
+  const testPick = (object, ...keys) => {
+    if (!object || typeof object !== "object") return null;
+    for (const key of keys) if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+    return null;
+  };
+  const functions = Function(
+    "BACKUP_TERMINAL_STATES", "pick", "recordId", "orderedBackupRuns", "backupRunState", "backupWaitingForOperator", "backupRunActive",
+    "backupMediaIsReadback", "backupNeedsNextMedia", "backupRunProfileName", "backupRunStateLabel", "backupTapeSummary", "label",
+    "backupProfileForRun", "backupTableProgressLabel", "backupOperatorFailure", "esc", "date", "status",
+    '"use strict";\n' + helpers + "\nreturn { latestBackupAttempts, backupWorkItems, backupSemanticState, backupFilterMatches };"
+  )(
+    terminal,
+    testPick,
+    (run) => String(run.id),
+    () => runs,
+    (run) => run.state,
+    (run) => run.state === "waiting_for_media",
+    (run) => !terminal.has(run.state),
+    () => false,
+    () => false,
+    (run) => run.name,
+    (run) => run.state,
+    () => "Not assigned",
+    String,
+    () => null,
+    () => null,
+    () => "Recorded failure",
+    String,
+    String,
+    String
+  );
+
+  runs = [
+    { id: "new", profile_id: "profile-a", state: "verified", name: "Archive A" },
+    { id: "old", profile_id: "profile-a", state: "failed", name: "Archive A" }
+  ];
+  assert.deepEqual(functions.latestBackupAttempts().map((run) => run.id), ["new"]);
+  assert.equal(functions.backupWorkItems().length, 0, "a protected retry must clear the older failed attempt");
+
+  runs = [
+    { id: "wait", profile_id: "profile-w", state: "waiting_for_media", name: "Needs tape" },
+    { id: "active", profile_id: "profile-b", state: "writing", name: "Streaming" },
+    { id: "failed-new", profile_id: "profile-c", state: "failed", name: "Archive C" },
+    { id: "failed-old", profile_id: "profile-c", state: "failed", name: "Archive C" }
+  ];
+  assert.deepEqual(functions.backupWorkItems().map((item) => item.kind), ["waiting", "failed", "active"]);
+  assert.equal(functions.backupWorkItems().filter((item) => item.kind === "failed").length, 1);
+});
+
+test("the command center prioritizes and deduplicates unified work without hiding shared routes", () => {
+  const helpers = section("  function managementActions()", "  function renderOverviewPrimaryAction(");
+  const state = {
+    data: {
+      overview: {
+        summary: { required_actions: 3 },
+        actions: [
+          { id: "same-backup-server", title: "Server duplicate", state: "waiting_for_media", route: "jobs/wait" },
+          { id: "stale-active-server", title: "Stale tape wait", state: "waiting_for_media", route: "jobs/active" },
+          { id: "tape-a", title: "Tape A conflict", state: "blocked", route: "tapes" },
+          { id: "tape-b", title: "Tape B conflict", state: "blocked", route: "tapes" }
+        ]
+      }
+    }
+  };
+  const work = [
+    { kind: "waiting", run: { id: "wait", created_at: "2026-01-01" }, title: "Tape needed", detail: "Load tape" },
+    { kind: "failed", run: { id: "failed", created_at: "2026-01-01" }, title: "Backup failed", detail: "Review" },
+    { kind: "active", run: { id: "active", created_at: "2026-01-01" }, title: "Backup active", detail: "Writing" }
+  ];
+  const testPick = (object, ...keys) => {
+    if (!object || typeof object !== "object") return null;
+    for (const key of keys) if (object[key] !== undefined && object[key] !== null && object[key] !== "") return object[key];
+    return null;
+  };
+  const api = Function(
+    "state", "backupWorkItems", "recordId", "pick", "count",
+    '"use strict";\n' + helpers + "\nreturn { managementActions, managementNeedsCount };"
+  )(state, () => work, (run) => run.id, testPick, (value) => Number(value) || 0);
+  const actions = api.managementActions();
+  assert.deepEqual(actions.map((action) => action.title), ["Tape needed", "Tape A conflict", "Tape B conflict", "Backup failed", "Backup active"]);
+  assert.equal(actions.filter((action) => action.route === "jobs/wait").length, 1, "the same deep-linked backup must appear once");
+  assert.equal(actions.find((action) => action.route === "jobs/active").title, "Backup active", "fresh polled backup state must replace a stale overview duplicate");
+  assert.equal(actions.filter((action) => action.route === "tapes").length, 2, "distinct system actions may share a top-level route");
+  assert.equal(api.managementNeedsCount(), 4, "healthy active work is excluded from Needs you");
+
+  work.splice(0, work.length, { kind: "active", run: { id: "active", created_at: "2026-01-01" }, title: "Backup active", detail: "Writing" });
+  state.data.overview.summary.required_actions = 1;
+  state.data.overview.actions = [{ id: "stale-active-server", title: "Stale tape wait", state: "waiting_for_media", route: "jobs/active" }];
+  assert.equal(api.managementNeedsCount(), 0, "a listed stale server duplicate must not keep the alert count raised after the run resumes");
+});
+
+test("backup history filters describe operator outcomes instead of raw engine states", () => {
+  const helpers = section("  function backupRunSuccessful(", "  function backupProfileKey(");
+  const terminal = new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
+  const semantic = Function(
+    "BACKUP_TERMINAL_STATES", "backupRunState", "backupWaitingForOperator", "backupRunActive",
+    '"use strict";\n' + helpers + "\nreturn backupSemanticState;"
+  )(
+    terminal,
+    (run) => run.state,
+    (run) => ["waiting_for_media", "waiting_for_next_media", "next_media", "media_required"].includes(run.state),
+    (run) => !terminal.has(run.state)
+  );
+  for (const state of ["verified", "passed", "completed", "complete"]) assert.equal(semantic({ state }), "protected");
+  for (const state of ["failed", "blocked", "interrupted"]) assert.equal(semantic({ state }), "unsuccessful");
+  for (const state of ["cancelled", "canceled"]) assert.equal(semantic({ state }), "cancelled");
+  for (const state of ["waiting_for_media", "waiting_for_next_media", "next_media", "media_required"]) assert.equal(semantic({ state }), "needs_tape");
+  assert.equal(semantic({ state: "writing" }), "active");
+
+  const table = section("  function renderBackupRunTable(", "  function renderBackupEvidence(");
+  assert.match(table, /\["active", "In progress"\]/);
+  assert.match(table, /\["needs_tape", "Waiting on me"\]/);
+  assert.match(table, /\["unsuccessful", "Needs attention"\]/);
+  assert.match(table, /\["protected", "Protected"\]/);
+  assert.doesNotMatch(table, /All states/);
+});
+
+test("the operator home and Backup Center lead with current work and honest snapshot actions", () => {
+  const overview = section("  function renderOverview()", "  function backupRunState(");
+  const hero = section("  function renderOverviewPrimaryAction(", "  function renderOverview()");
+  const profiles = section("  function renderBackupProfiles(", "  function renderBackupRunTable(");
+  const jobs = section("  function renderBackupWorkQueue(", "  function mediaName(");
+  const detail = section("  function renderBackupRunDetail(", "  function renderBackupWorkQueue(");
+
+  assert.match(overview, /What needs attention now/);
+  assert.match(overview, /Backup work/);
+  assert.match(overview, /Prepared tapes/);
+  assert.match(hero, /System action needed/);
+  assert.match(hero, /safeActionRoute\(first\)/);
+  assert.match(jobs, /Needs you/);
+  assert.match(jobs, /In progress/);
+  assert.match(profiles, /Saved snapshot selections/);
+  assert.match(profiles, /Back up same snapshot/);
+  assert.match(profiles, /Choose newer snapshot/);
+  assert.match(profiles, /manual only/);
+  assert.match(profiles, /scheduled exact snapshot/);
+  assert.match(profiles, /Schedule repeats this exact snapshot/);
+  assert.doesNotMatch(profiles, /Back up again/);
+  assert.match(detail, /Retry same snapshot/);
+  assert.match(detail, /Choose newer snapshot/);
+  assert.match(detail, /Reload details/);
+});
+
+test("refresh and polling load only the data needed for current work", () => {
+  const refresh = section("  function routeRefreshKeys(", "  async function refreshCurrentRoute(");
+  const routeRefreshKeys = Function('"use strict";\n' + refresh + "\nreturn routeRefreshKeys;")();
+  assert.deepEqual(routeRefreshKeys("jobs"), ["backupProfiles", "backupRuns", "media", "drives", "recoveryPoints"]);
+  assert.deepEqual(routeRefreshKeys("movements"), ["movements", "media", "locations"]);
+  assert.ok(!routeRefreshKeys("jobs").includes("qualificationRuns"));
+
+  const poll = section("  function scheduleBackupRunPoll(", "  function openAddMedia(");
+  assert.match(poll, /await loadOne\("backupRuns"\)/);
+  assert.match(poll, /currentActive\.some\(backupWaitingForOperator\)/);
+  assert.match(poll, /if \(completed\).*loadOne\("overview"\).*loadOne\("recoveryPoints"\)/s);
+  assert.doesNotMatch(poll, /loadOne\("jobs"\)/);
+  assert.doesNotMatch(poll, /Promise\.all\(\[loadOne\("backupRuns"\), loadOne\("jobs"\), loadOne\("overview"\)/);
+
+  const clicks = section('  document.addEventListener("click"', '  document.addEventListener("input"');
+  assert.match(clicks, /if \(action === "refresh"\) refreshCurrentRoute\(\)/);
+});
+
+test("mobile More opens complete navigation and exposes live work badges", () => {
+  assert.match(index, /<button type="button" data-action="open-nav"[^>]*>[\s\S]*<small>More<\/small><\/button>/);
+  assert.doesNotMatch(index, /data-route="settings" href="#settings">[\s\S]{0,120}<small>More<\/small>/);
+  assert.match(index, /id="mobile-backup-count"/);
+  assert.match(index, /id="mobile-action-count"/);
+  assert.match(css, /\.mobile-nav-count/);
+  const chrome = section("  function updateChrome()", "  function pageHead(");
+  assert.match(chrome, /Backups, " \+ backupWork\.length \+ " current item/);
+  assert.match(chrome, /Open all navigation, " \+ actionCount \+ " current item/);
 });
 
 test("the separate G0.2 phase track remains single-tape and uncompressed", () => {

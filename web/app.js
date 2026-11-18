@@ -345,6 +345,53 @@
     scheduleBackupRunPoll();
   }
 
+  function routeRefreshKeys(route) {
+    const groups = {
+      overview: ["overview", "backupProfiles", "backupRuns", "media", "drives", "recoveryPoints", "recoveryExercises"],
+      jobs: ["backupProfiles", "backupRuns", "media", "drives", "recoveryPoints"],
+      restore: ["recoveryPoints", "restoreRehearsals", "media", "drives"],
+      movements: ["movements", "media", "locations"],
+      tapes: ["media", "mediaPools", "locations", "verification", "recoveryPoints", "drives"],
+      drives: ["drives", "qualification", "qualificationRuns"],
+      verification: ["verification", "recoveryPoints", "media"],
+      "recovery-lab": ["recoveryProfiles", "recoveryExercises", "drives", "media", "qualification", "qualificationRuns"],
+      settings: ["system", "overview", "preflight", "qualification", "qualificationRuns", "drives", "media", "locations"]
+    };
+    return groups[route] || ["overview"];
+  }
+
+  async function refreshCurrentRoute() {
+    state.refreshing = true;
+    updateChrome();
+    render();
+    await Promise.all(routeRefreshKeys(state.route).map(loadOne));
+    if (state.route === "recovery-lab") {
+      const exercise = selectedRecoveryExercise();
+      if (exercise && recordId(exercise)) await loadRecoveryExerciseDetail(recordId(exercise), true);
+    } else if (state.route === "restore") {
+      const point = selectedRecoveryPoint();
+      if (point && recordId(point)) await loadRecoveryPointDetail(recordId(point), true);
+      const rehearsal = selectedRestoreRehearsal();
+      if (rehearsal && recordId(rehearsal)) await loadRestoreRehearsalDetail(recordId(rehearsal), true);
+    } else if (state.route === "movements") {
+      const movement = selectedMovement();
+      if (movement && recordId(movement)) await loadMovementDetail(recordId(movement), true);
+    } else if (state.route === "tapes") {
+      const media = selectedMedia();
+      if (media && recordId(media)) await loadMediaDetail(recordId(media), true);
+    } else if (state.route === "jobs") {
+      const id = backupRunRouteId() || recordId(selectedBackupRun());
+      if (id) await loadBackupRunDetail(id, true, false);
+    }
+    state.refreshing = false;
+    updateChrome();
+    render();
+    scheduleQualificationPoll();
+    scheduleRecoveryExercisePoll();
+    scheduleRestoreRehearsalPoll();
+    scheduleBackupRunPoll();
+  }
+
   function setBadge(id, value) {
     const element = document.querySelector(id);
     if (!element) return;
@@ -375,14 +422,20 @@
     const preflightDot = document.querySelector(".system-pill .health-dot");
     const preflightState = String(pick(checks, "status") || "").toLowerCase();
     if (preflightDot) preflightDot.className = "health-dot" + (/fail|block|error/.test(preflightState) ? " failed" : /warn|attention|pending/.test(preflightState) ? " warning" : "");
-    const summary = state.data.overview.summary || {};
-    setBadge("#nav-job-count", state.data.backupRuns.filter(backupRunActive).length);
+    const backupWork = backupWorkItems();
+    setBadge("#nav-job-count", backupWork.length);
+    setBadge("#mobile-backup-count", backupWork.length);
+    const mobileBackups = document.querySelector('.mobile-nav [data-route="jobs"]');
+    if (mobileBackups) mobileBackups.setAttribute("aria-label", backupWork.length ? "Backups, " + backupWork.length + " current item" + (backupWork.length === 1 ? "" : "s") : "Backups");
     setBadge("#nav-move-count", state.data.movements.filter((movement) => !movementTerminal(movement)).length);
     setBadge("#nav-recovery-count", state.data.recoveryExercises.filter(recoveryExerciseActive).length);
-    const actionCount = Math.max(count(pick(summary, "required_actions")), state.data.overview.actions.length);
+    const actionCount = managementActionCount();
     setBadge("#notification-badge", actionCount);
+    setBadge("#mobile-action-count", actionCount);
+    const mobileMore = document.querySelector('.mobile-nav [data-action="open-nav"]');
+    if (mobileMore) mobileMore.setAttribute("aria-label", actionCount ? "Open all navigation, " + actionCount + " current item" + (actionCount === 1 ? "" : "s") : "Open all navigation");
     const notification = document.querySelector(".notification-button");
-    if (notification) notification.setAttribute("aria-label", actionCount ? "Open notifications, " + actionCount + " unresolved" : "Open notifications");
+    if (notification) notification.setAttribute("aria-label", actionCount ? "Open notifications, " + actionCount + " current item" + (actionCount === 1 ? "" : "s") : "Open notifications");
   }
 
   function pageHead(title, description, actions) {
@@ -428,39 +481,104 @@
   function renderActionItem(action) {
     const route = safeActionRoute(action);
     const stateValue = String(pick(action, "state", "status") || "attention");
-    const body = '<span class="action-symbol ' + esc(stateValue.toLowerCase()) + '" aria-hidden="true">!</span><span class="action-copy"><strong>' + esc(label(pick(action, "title", "label", "name"))) + '</strong><span>' + esc(label(pick(action, "detail", "message", "state"))) + '</span></span>' + (pick(action, "due_at", "due") ? '<time class="action-time">' + esc(date(pick(action, "due_at", "due"))) + "</time>" : "");
+    const symbol = stateValue.toLowerCase() === "running" ? "▶" : "!";
+    const body = '<span class="action-symbol ' + esc(stateValue.toLowerCase()) + '" aria-hidden="true">' + symbol + '</span><span class="action-copy"><strong>' + esc(label(pick(action, "title", "label", "name"))) + '</strong><span>' + esc(label(pick(action, "detail", "message", "state"))) + '</span></span>' + (pick(action, "due_at", "due") ? '<time class="action-time">' + esc(date(pick(action, "due_at", "due"))) + "</time>" : "");
     return route ? '<li class="action-item action-item-routed"><a class="action-item-link" href="' + esc(route) + '">' + body + "</a></li>" : '<li class="action-item">' + body + "</li>";
+  }
+
+  function managementActions() {
+    const derived = backupWorkItems().map((item) => ({
+      id: "backup:" + recordId(item.run),
+      title: item.title,
+      detail: item.detail,
+      state: item.kind === "failed" ? "failed" : item.kind === "waiting" ? "attention" : "running",
+      due_at: pick(item.run, "started_at", "created_at"),
+      route: "jobs/" + recordId(item.run),
+      work_kind: item.kind,
+      work_run: item.run,
+      priority: item.kind === "waiting" ? 0 : item.kind === "failed" ? 2 : 3
+    }));
+    const server = (state.data.overview.actions || []).map((action) => Object.assign({}, action, { priority: 1 }));
+    const seen = new Set();
+    const deduplicated = derived.concat(server).filter((action) => {
+      const route = String(pick(action, "route") || "").replace(/^#?\/?/, "");
+      const id = String(pick(action, "id") || "");
+      const key = route.includes("/") ? "route:" + route : id ? "id:" + route + ":" + id : [route, pick(action, "title"), pick(action, "detail")].join(":");
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    return deduplicated.map((action, index) => ({ action, index })).sort((left, right) => {
+      return count(pick(left.action, "priority")) - count(pick(right.action, "priority")) || left.index - right.index;
+    }).map((entry) => entry.action);
+  }
+
+  function managementActionCount() {
+    const summary = state.data.overview.summary || {};
+    const actionable = managementActions().filter((action) => pick(action, "state") !== "running").length;
+    const hiddenServerActions = Math.max(0, count(pick(summary, "required_actions")) - (state.data.overview.actions || []).length);
+    return actionable + hiddenServerActions;
+  }
+
+  function managementNeedsCount() {
+    return managementActionCount();
+  }
+
+  function renderOverviewPrimaryAction(actions) {
+    const first = actions[0];
+    if (first) {
+      const kind = String(pick(first, "work_kind") || "system");
+      const waiting = kind === "waiting";
+      const failed = kind === "failed";
+      const active = kind === "active";
+      const eyebrow = waiting ? "Operator action needed" : failed ? "Backup needs review" : active ? "Backup in progress" : "System action needed";
+      const button = waiting ? "Continue backup" : failed ? "Review and retry" : active ? "View live progress" : "Review action";
+      const route = safeActionRoute(first);
+      const control = route ? '<a class="button button-primary" href="' + esc(route) + '">' + esc(button) + '</a>' : '<button class="button button-primary" type="button" data-action="notifications">Open notifications</button>';
+      return '<section class="operator-hero ' + esc(kind) + '"><div class="operator-hero-copy"><span>' + esc(eyebrow) + '</span><h2>' + esc(label(pick(first, "title", "label", "name"))) + '</h2><p>' + esc(label(pick(first, "detail", "message", "state"))) + "</p></div>" + control + "</section>";
+    }
+    if (!state.data.backupProfiles.length) {
+      return '<section class="operator-hero clear"><div class="operator-hero-copy"><span>Start here</span><h2>Choose the first snapshot to protect</h2><p>Pick an existing read-only ZFS snapshot, choose archive settings, then TapeScale will guide tape selection and verification.</p></div><button class="button button-primary" type="button" data-action="create-backup-profile">New backup</button></section>';
+    }
+    return '<section class="operator-hero clear"><div class="operator-hero-copy"><span>Operations clear</span><h2>No backup needs attention</h2><p>There is no running, tape-waiting, or unresolved latest attempt. Start another exact-snapshot backup when ready.</p></div><button class="button button-primary" type="button" data-action="create-backup-profile">New backup</button></section>';
   }
 
   function renderOverview() {
     const overview = state.data.overview;
-    const summary = overview.summary || {};
-    const ready = state.received.has("overview");
-    const metric = (name, value) => '<div class="metric"><span>' + esc(name) + '</span><strong>' + esc(ready ? value : "—") + "</strong></div>";
-    let html = pageHead("Overview", "Current protection state reported by TapeScale.", refreshButton()) + noticeFor("overview");
-    html += renderRecoveryOverviewCallout();
+    const items = backupWorkItems();
+    const active = items.filter((item) => item.kind === "active").length;
+    const prepared = state.data.media.filter((item) => mediaOperationalState(item) === "prepared_scratch").length;
+    const latestProtected = orderedBackupRuns().find(backupRunSuccessful);
+    const actions = managementActions();
+    const needsYou = managementNeedsCount();
+    const metric = (name, value, detail) => '<div class="metric"><span>' + esc(name) + '</span><strong>' + esc(value) + '</strong>' + (detail ? '<small>' + esc(detail) + '</small>' : "") + "</div>";
+    let html = pageHead("Operations", "What needs attention now, what is moving, and what is ready for the next backup.", refreshButton()) + noticeFor("overview");
+    html += renderOverviewPrimaryAction(actions);
     html += '<section class="panel metric-strip">' +
-      metric("Protected sources", summary.protected_sources) +
-      metric("Active jobs", summary.active_jobs) +
-      metric("Required actions", summary.required_actions) +
-      metric("Cartridges", state.received.has("media") ? state.data.media.length : "—") +
+      metric("Needs you", needsYou, needsYou ? "Open the first item above" : "No unresolved latest attempt") +
+      metric("Backups running", active, active ? "Live progress available" : "No active transfer") +
+      metric("Prepared tapes", state.received.has("media") ? prepared : "—", "Ready scratch media") +
+      metric("Latest protected", latestProtected ? date(pick(latestProtected, "finished_at", "created_at")) : "None", "Complete physical readback") +
       "</section>";
-    html += '<div class="grid-2 section"><section class="panel"><div class="panel-head"><div><h2>Protected sources</h2><p>Sources returned by the overview API.</p></div></div><div class="panel-body">';
+    if (items.length) html += '<section class="section operator-work"><div class="section-head"><div><h2>Backup work</h2><p>Waiting and running work, ordered by what needs the operator first.</p></div><a class="section-link" href="#jobs">Open Backup Center →</a></div><div class="backup-work-grid">' + items.slice(0, 4).map(renderBackupWorkCard).join("") + "</div></section>";
+    html += '<div class="grid-2 section"><section class="panel"><div class="panel-head"><div><h2>Protected sources</h2><p>Sources with retained protection records.</p></div><a class="section-link" href="#restore">Open recovery vault →</a></div><div class="panel-body">';
     if (overview.sources.length) {
       html += '<ul class="detail-list">' + overview.sources.map((source) => "<li><span>" + esc(label(pick(source, "dataset_name", "name", "id"))) + "</span><strong>" + esc(label(pick(source, "recovery_status", "logical_root", "path", "dataset", "state", "status"))) + "</strong></li>").join("") + "</ul>";
     } else {
-      html += '<p>No protected sources have been reported.</p>';
+      html += '<p>No protected sources have been retained yet.</p>';
     }
-    html += '</div></section><section class="panel"><div class="panel-head"><div><h2>Required actions</h2><p>Actions returned by the overview API.</p></div></div><div class="panel-body">';
-    if (overview.actions.length) {
-      html += '<ul class="action-list">' + overview.actions.map(renderActionItem).join("") + "</ul>";
+    html += '</div></section><section class="panel"><div class="panel-head"><div><h2>Current work and alerts</h2><p>Running backups and required system actions in one queue.</p></div><button class="button button-small" type="button" data-action="notifications">Open all</button></div><div class="panel-body">';
+    if (actions.length) {
+      html += '<ul class="action-list">' + actions.slice(0, 5).map(renderActionItem).join("") + "</ul>";
       if (overview.actions_truncated) {
         html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Showing the first ' + esc(overview.actions.length) + ' of ' + esc(overview.actions_total) + ' required actions</strong><span>Resolve visible items or refresh as conditions change. The total includes additional actions not shown in this bounded overview.</span></div></div>';
       }
     } else {
-      html += "<p>No actions are currently reported.</p>";
+      html += "<p>No backup or system action currently needs attention.</p>";
     }
-    return html + "</div></section></div>";
+    html += "</div></section></div>";
+    html += '<section class="section overview-quick-actions"><a class="quick-action" href="#jobs"><span aria-hidden="true">▶</span><strong>Backups</strong><small>Start, continue, and review</small></a><a class="quick-action" href="#tapes"><span aria-hidden="true">▦</span><strong>Tapes</strong><small>Prepare media and inspect custody</small></a><a class="quick-action" href="#restore"><span aria-hidden="true">↶</span><strong>Restore</strong><small>Browse and recover retained files</small></a><a class="quick-action" href="#drives"><span aria-hidden="true">◉</span><strong>Hardware</strong><small>Drives, libraries, and readiness</small></a></section>';
+    return html + renderRecoveryOverviewCallout();
   }
 
   function backupRunState(run) {
@@ -1522,9 +1640,91 @@
     return String(evidence);
   }
 
+  function backupRunSuccessful(run) {
+    return ["verified", "passed", "completed", "complete"].includes(backupRunState(run));
+  }
+
+  function backupRunCancelled(run) {
+    return ["cancelled", "canceled"].includes(backupRunState(run));
+  }
+
+  function backupRunUnsuccessful(run) {
+    return BACKUP_TERMINAL_STATES.has(backupRunState(run)) && !backupRunSuccessful(run) && !backupRunCancelled(run);
+  }
+
+  function backupSemanticState(run) {
+    if (backupWaitingForOperator(run)) return "needs_tape";
+    if (backupRunActive(run)) return "active";
+    if (backupRunSuccessful(run)) return "protected";
+    if (backupRunCancelled(run)) return "cancelled";
+    return "unsuccessful";
+  }
+
+  function backupProfileKey(run) {
+    const profileId = String(pick(run, "profile_id", "backup_profile_id") || "");
+    return profileId ? "profile:" + profileId : "run:" + recordId(run);
+  }
+
+  function latestBackupAttempts() {
+    const seen = new Set();
+    return orderedBackupRuns().filter((run) => {
+      const key = backupProfileKey(run);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function backupWorkItems() {
+    const ordered = orderedBackupRuns();
+    const waiting = ordered.filter((run) => backupRunActive(run) && backupWaitingForOperator(run));
+    const active = ordered.filter((run) => backupRunActive(run) && !backupWaitingForOperator(run));
+    const failed = latestBackupAttempts().filter(backupRunUnsuccessful);
+    return waiting.map((run) => ({
+      kind: "waiting",
+      run,
+      title: backupRunProfileName(run) + (backupMediaIsReadback(run) ? " needs a tape for readback" : backupNeedsNextMedia(run) ? " needs the next tape" : " needs its first tape"),
+      detail: backupRunStateLabel(run) + " · " + backupTapeSummary(run) + " · " + label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))
+    })).concat(failed.map((run) => ({
+      kind: "failed",
+      run,
+      title: backupRunProfileName(run) + " did not create a recovery point",
+      detail: backupOperatorFailure(run)
+    })), active.map((run) => {
+      const progress = backupTableProgressLabel(run);
+      return {
+        kind: "active",
+        run,
+        title: backupRunProfileName(run) + " is in progress",
+        detail: [backupRunStateLabel(run), progress, backupTapeSummary(run)].filter(Boolean).join(" · ")
+      };
+    }));
+  }
+
+  function renderBackupWorkCard(item) {
+    const run = item.run;
+    const id = recordId(run);
+    const profile = backupProfileForRun(run);
+    const profileId = String(pick(run, "profile_id", "backup_profile_id") || recordId(profile));
+    const repeatAllowed = Boolean(profileId && profile && pick(profile, "enabled") !== false && backupCompressionSupported(profile) && backupDataDeliverySupported(profile));
+    const source = pick(run, "source_subpath", "source_path", "logical_root") || pick(profile, "source_subpath", "source_path", "logical_root") || "Source not reported";
+    const progress = backupTableProgressLabel(run);
+    const primary = item.kind === "waiting" ? "Continue backup" : item.kind === "active" ? "View live progress" : "Review attempt";
+    let actions = '<a class="button button-small' + (item.kind === "failed" ? "" : " button-primary") + '" href="#jobs/' + esc(id) + '">' + esc(primary) + "</a>";
+    if (item.kind === "failed" && repeatAllowed) actions += '<button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">Retry same snapshot</button>';
+    if (item.kind === "failed") actions += '<button class="button button-small button-quiet" type="button" data-action="create-backup-profile">Choose newer snapshot</button>';
+    const activityAt = item.kind === "failed" ? pick(run, "finished_at", "started_at", "created_at") : pick(run, "started_at", "created_at", "finished_at");
+    return '<article class="backup-work-card ' + esc(item.kind) + '"><header><span>' + status(backupRunStateLabel(run)) + '</span><time>' + esc(date(activityAt)) + '</time></header><h3>' + esc(item.title) + '</h3><code>' + esc(source) + '</code><p>' + esc(item.detail) + '</p><div class="backup-work-facts"><span><small>Tape</small><strong>' + esc(backupTapeSummary(run)) + '</strong></span><span><small>Progress</small><strong>' + esc(progress || backupRunStateLabel(run)) + '</strong></span></div><footer>' + actions + "</footer></article>";
+  }
+
+  function backupFilterMatches(run, filter) {
+    if (filter === "all") return true;
+    return backupSemanticState(run) === filter;
+  }
+
   function backupRunMatches(run) {
     const runState = backupRunState(run);
-    if (state.backupStateFilter !== "all" && runState !== state.backupStateFilter) return false;
+    if (!backupFilterMatches(run, state.backupStateFilter)) return false;
     const query = state.backupQuery.trim().toLowerCase();
     if (!query) return true;
     return [
@@ -1559,16 +1759,17 @@
       const source = pick(profile, "source_subpath", "source_path", "logical_root") || "Source not reported";
       const retention = count(pick(profile, "retention_days")) || 28;
       const pool = pick(profile, "media_pool_name") || "any eligible scratch pool";
+      const scheduled = pick(profile, "schedule_enabled") === true;
       const compressionSupported = backupCompressionSupported(profile);
       const deliverySupported = backupDataDeliverySupported(profile);
       const archivePolicy = backupCompressionLabel(profile) + " · " + backupDataDeliveryLabel(profile) + " · " + (backupSpanningEnabled(profile) ? "spans tapes as needed" : "one tape maximum");
       const action = active
         ? '<button class="button button-small button-primary" type="button" data-action="select-backup-run" data-id="' + esc(recordId(active)) + '">' + (backupWaitingForOperator(active) ? "Continue backup" : "View progress") + '</button>'
-        : '<button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(id) + '"' + (pick(profile, "enabled") === false || !compressionSupported || !deliverySupported ? ' disabled title="Create a new backup plan with supported compression and delivery settings."' : "") + '>' + (latest ? "Back up again" : "Start backup") + '</button>';
-      const compatibility = compressionSupported && deliverySupported ? "" : '<small class="backup-profile-warning">This saved plan uses an unsupported legacy setting. Create a new snapshot backup plan before starting it.</small>';
-      return '<article class="backup-profile-card"><div class="backup-profile-mark" aria-hidden="true">◆</div><div class="backup-profile-copy"><span><strong>' + esc(backupProfileName(profile)) + '</strong>' + status(human(pick(profile, "enabled") === false ? "disabled" : compressionSupported && deliverySupported ? "snapshot saved" : "needs new plan")) + '</span><code>' + esc(source) + '</code><small>Keep verified backup ' + retention + " days · " + esc(pool) + '</small><small>' + esc(archivePolicy) + '</small>' + compatibility + '</div><div class="backup-profile-actions"><span>' + (latest ? esc(backupRunStateLabel(latest)) + " · " + esc(date(pick(latest, "finished_at", "created_at", "started_at"))) : "Not backed up yet") + "</span>" + action + "</div></article>";
+        : '<button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(id) + '"' + (pick(profile, "enabled") === false || !compressionSupported || !deliverySupported ? ' disabled title="Choose a new snapshot with supported compression and delivery settings."' : "") + '>' + (latest ? "Back up same snapshot" : "Start backup") + '</button>';
+      const compatibility = compressionSupported && deliverySupported ? "" : '<small class="backup-profile-warning">This saved selection uses an unsupported legacy setting. Choose a new snapshot before starting it.</small>';
+      return '<article class="backup-profile-card"><div class="backup-profile-mark" aria-hidden="true">◆</div><div class="backup-profile-copy"><span><strong>' + esc(backupProfileName(profile)) + '</strong>' + status(human(pick(profile, "enabled") === false ? "disabled" : !compressionSupported || !deliverySupported ? "needs new selection" : scheduled ? "scheduled exact snapshot" : "manual only")) + '</span><code>' + esc(source) + '</code><small>Exact read-only snapshot · saved ' + esc(date(pick(profile, "created_at"))) + '</small><small>' + (scheduled ? "Schedule repeats this exact snapshot; it does not select newer data" : "Manual start only") + '</small><small>Keep verified backup ' + retention + " days · " + esc(pool) + '</small><small>' + esc(archivePolicy) + '</small>' + compatibility + '</div><div class="backup-profile-actions"><span>' + (latest ? esc(backupRunStateLabel(latest)) + " · " + esc(date(pick(latest, "finished_at", "created_at", "started_at"))) : "Not backed up yet") + '</span><div class="backup-profile-action-row">' + action + '<button class="button button-small button-quiet" type="button" data-action="create-backup-profile">Choose newer snapshot</button></div></div></article>';
     }).join("");
-    return '<section class="panel backup-profiles"><div class="panel-head"><div><h2>Saved snapshot backups</h2><p>Availability and read-only state are checked again before every new request.</p></div><button class="button button-small" type="button" data-action="create-backup-profile">Choose snapshot</button></div><div class="backup-profile-list">' + (cards || '<div class="media-inline-empty">No snapshot has been selected yet. Choose a named ZFS snapshot folder to begin.</div>') + "</div></section>";
+    return '<section class="panel backup-profiles"><div class="panel-head"><div><h2>Saved snapshot selections</h2><p>Each item points to one exact existing snapshot. It does not follow newer data automatically.</p></div><button class="button button-small" type="button" data-action="create-backup-profile">New backup</button></div><div class="backup-profile-list">' + (cards || '<div class="media-inline-empty">No snapshot has been selected yet. Choose a named ZFS snapshot folder to begin.</div>') + "</div></section>";
   }
 
   function renderBackupRunTable(runs) {
@@ -1579,14 +1780,20 @@
       const logical = backupEvidenceValue(run, "logical_bytes", "source_bytes");
       const progress = backupTableProgressLabel(run);
       const searchable = [id, backupRunProfileName(run), source, tape, backupRunState(run)].filter(Boolean).join(" ").toLowerCase();
-      return '<tr class="row-action" tabindex="0" data-action="select-backup-run" data-backup-run data-id="' + esc(id) + '" data-state="' + esc(backupRunState(run)) + '" data-search="' + esc(searchable) + '"' + (backupRunMatches(run) ? "" : " hidden") + '><td class="primary-cell" data-label="Backup"><strong>' + esc(backupRunProfileName(run)) + '</strong><small>' + esc(label(source)) + '</small></td><td data-label="Status">' + status(backupRunStateLabel(run)) + (progress == null ? "" : '<small class="backup-table-progress">' + esc(progress) + '</small>') + '</td><td data-label="Tape">' + esc(tape) + '</td><td data-label="Data">' + esc(logical == null ? "Pending" : bytes(logical)) + '</td><td data-label="Activity">' + esc(date(pick(run, "finished_at", "started_at", "created_at"))) + "</td></tr>";
+      return '<tr class="row-action" tabindex="0" data-action="select-backup-run" data-backup-run data-id="' + esc(id) + '" data-state="' + esc(backupSemanticState(run)) + '" data-search="' + esc(searchable) + '"' + (backupRunMatches(run) ? "" : " hidden") + '><td class="primary-cell" data-label="Backup"><strong>' + esc(backupRunProfileName(run)) + '</strong><small>' + esc(label(source)) + '</small></td><td data-label="Status">' + status(backupRunStateLabel(run)) + (progress == null ? "" : '<small class="backup-table-progress">' + esc(progress) + '</small>') + '</td><td data-label="Tape">' + esc(tape) + '</td><td data-label="Data">' + esc(logical == null ? "Pending" : bytes(logical)) + '</td><td data-label="Activity">' + esc(date(pick(run, "finished_at", "started_at", "created_at"))) + "</td></tr>";
     }).join("");
-    const filterOptions = ["queued", "waiting_for_media", "waiting_for_next_media", "preparing", "inventorying", "writing", "written", "verifying", "verified", "failed", "blocked", "interrupted", "cancelled"].map((value) => '<option value="' + value + '"' + (state.backupStateFilter === value ? " selected" : "") + '>' + esc(backupRunStateLabel({ state: value })) + "</option>").join("");
+    const filterOptions = [
+      ["active", "In progress"],
+      ["needs_tape", "Waiting on me"],
+      ["unsuccessful", "Needs attention"],
+      ["protected", "Protected"],
+      ["cancelled", "Cancelled"]
+    ].map(([value, name]) => '<option value="' + value + '"' + (state.backupStateFilter === value ? " selected" : "") + '>' + esc(name) + "</option>").join("");
     const visible = runs.filter(backupRunMatches).length;
     return '<section class="panel backup-run-table">' +
       '<div class="table-toolbar"><div class="toolbar-start">' +
       '<label class="search-field"><span class="sr-only">Search backup history</span><input id="backup-search" type="search" placeholder="Search backup, snapshot, or tape" value="' + esc(state.backupQuery) + '"></label>' +
-      '<select class="select compact" id="backup-state-filter" aria-label="Filter backup runs by state"><option value="all">All states</option>' + filterOptions + "</select>" +
+      '<select class="select compact" id="backup-state-filter" aria-label="Filter backup history"><option value="all">All backup attempts</option>' + filterOptions + "</select>" +
       '</div><div class="toolbar-end"><span id="backup-filter-count">' + visible + " of " + runs.length + " runs</span></div></div>" +
       '<div class="table-scroll"><table class="data-table responsive-table"><thead><tr><th>Backup</th><th>Status</th><th>Tape</th><th>Data</th><th>Activity</th></tr></thead><tbody id="backup-run-rows">' + rows + "</tbody></table>" +
       '<div class="media-filter-empty" id="backup-filter-empty"' + (visible ? " hidden" : "") + ">No runs match the current filters.</div></div></section>";
@@ -1706,20 +1913,38 @@
     const assignment = volumes.length
       ? '<span><strong>' + esc(volumes.length + " tape" + (volumes.length === 1 ? "" : "s")) + '</strong><small class="backup-volume-summary">' + volumes.map((volume) => esc(volume.sequence + ". " + volume.label)).join(" · ") + "</small></span>"
       : '<span><strong>Not selected</strong><small>Choose a prepared scratch tape</small></span>';
-    const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + ' Live progress may be incomplete until this succeeds.</span></div><button class="button button-small" type="button" data-action="retry-backup-run" data-id="' + esc(id) + '">Retry</button></div>' : "";
+    const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + ' Live progress may be incomplete until this succeeds.</span></div><button class="button button-small" type="button" data-action="retry-backup-run" data-id="' + esc(id) + '">Reload details</button></div>' : "";
     const requestedAt = pick(run, "created_at");
     const startedAt = pick(run, "started_at");
     const technical = '<details class="backup-technical"><summary><span><strong>Technical details</strong><small>Request identity, engine evidence, and complete activity history</small></span></summary><div class="backup-technical-body"><dl class="vault-facts"><dt>Request ID</dt><dd class="mono">' + esc(id) + '</dd><dt>Requested</dt><dd>' + esc(date(requestedAt)) + '</dd>' + (startedAt ? '<dt>Started</dt><dd>' + esc(date(startedAt)) + "</dd>" : "") + '<dt>Raw state</dt><dd>' + esc(runState) + '</dd>' + (backupFailureDetail(run) ? '<dt>Recorded failure</dt><dd>' + esc(backupFailureDetail(run)) + "</dd>" : "") + '</dl><section class="backup-detail-section"><div class="backup-section-head"><div><span>Engine evidence</span><h3>Recorded facts</h3></div></div>' + renderBackupEvidence(run) + '</section><section class="backup-detail-section"><div class="backup-section-head"><div><span>Complete history</span><h3>Activity</h3></div></div>' + renderBackupTimeline(run) + "</section>" + renderBackupArtifacts(run) + "</div></details>";
     const outcome = terminal ? '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>' + (successful ? "Verified backup" : "Attempt summary") + '</h3></div></div>' + renderBackupOutcome(run) + "</section>" : "";
-    const actions = cancel ? '<div class="backup-run-actions">' + cancel + "</div>" : "";
+    const profile = backupProfileForRun(run);
+    const profileId = String(pick(run, "profile_id", "backup_profile_id") || recordId(profile));
+    const repeatAllowed = Boolean(profileId && profile && pick(profile, "enabled") !== false && backupCompressionSupported(profile) && backupDataDeliverySupported(profile));
+    const repeat = terminal && repeatAllowed ? '<button class="button button-primary button-small" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">' + (successful ? "Back up same snapshot" : "Retry same snapshot") + "</button>" : "";
+    const newer = terminal ? '<button class="button button-small" type="button" data-action="create-backup-profile">Choose newer snapshot</button>' : "";
+    const actions = cancel || repeat || newer ? '<div class="backup-run-actions">' + cancel + repeat + newer + "</div>" : "";
     const timing = startedAt ? "Started " + date(startedAt) : "Requested " + date(requestedAt);
     return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span><span class="backup-kind-badge secondary">' + esc(backupDataDeliveryLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>' + esc(timing) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header><div class="panel-body backup-primary-body">' + detailFailure + notice + renderBackupCurrentOperation(run) + actions + "</div>" + renderBackupPhaseTrack(run) + '<div class="panel-body backup-secondary-body">' + outcome + technical + "</div></article>";
+  }
+
+  function renderBackupWorkQueue() {
+    const items = backupWorkItems();
+    const needs = items.filter((item) => item.kind !== "active");
+    const active = items.filter((item) => item.kind === "active");
+    if (!items.length) {
+      return '<section class="panel backup-work-clear"><span aria-hidden="true">✓</span><div><h2>No backup needs attention</h2><p>There is no active transfer, tape handoff, or unresolved latest attempt.</p></div></section>';
+    }
+    let html = '<section class="section backup-work-queue"><div class="section-head"><div><h2>Current backup work</h2><p>Operator handoffs first, then live transfers and unresolved latest attempts.</p></div><span>' + esc(items.length + " current") + "</span></div>";
+    if (needs.length) html += '<div class="backup-work-group"><div class="backup-work-group-head"><h3>Needs you</h3><span>' + needs.length + '</span></div><div class="backup-work-grid">' + needs.map(renderBackupWorkCard).join("") + "</div></div>";
+    if (active.length) html += '<div class="backup-work-group"><div class="backup-work-group-head"><h3>In progress</h3><span>' + active.length + '</span></div><div class="backup-work-grid">' + active.map(renderBackupWorkCard).join("") + "</div></div>";
+    return html + "</section>";
   }
 
   function renderJobs() {
     const profiles = state.data.backupProfiles;
     const runs = orderedBackupRuns();
-    const selected = selectedBackupRun();
+    const selected = state.route === "jobs" ? selectedBackupRun() : null;
     const routeId = backupRunRouteId();
     if (routeId) {
       const back = '<a class="button button-quiet" href="#jobs">← Back to Backup Center</a>';
@@ -1728,16 +1953,16 @@
     }
     const active = runs.filter(backupRunActive).length;
     const waiting = runs.filter(backupWaitingForOperator).length;
-    const failed = runs.filter((run) => ["failed", "blocked", "interrupted"].includes(backupRunState(run))).length;
-    const latestVerified = runs.find((run) => ["verified", "passed", "completed", "complete"].includes(backupRunState(run)));
-    const create = '<button class="button button-primary" type="button" data-action="create-backup-profile">Choose snapshot</button>';
-    let html = pageHead("Backup Center", "Choose an existing ZFS snapshot, select compression, and follow a one- or multi-tape archive through complete readback.", refreshButton() + create);
+    const failed = latestBackupAttempts().filter(backupRunUnsuccessful).length;
+    const latestVerified = runs.find(backupRunSuccessful);
+    const create = '<button class="button button-primary" type="button" data-action="create-backup-profile">New backup</button>';
+    let html = pageHead("Backup Center", "Start a backup, continue tape handoffs, and watch every active archive through physical readback.", refreshButton() + create);
     html += noticeFor("backupProfiles") + noticeFor("backupRuns");
-    html += '<div class="notice info backup-scope-notice"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>One exact snapshot per saved item</strong><span>This build copies an existing read-only ZFS snapshot; it does not create a fresh snapshot on each run yet. Full backups may be compressed and span as many prepared tapes as the archive requires.</span></div></div>';
-    html += '<section class="panel metric-strip backup-metrics"><div class="metric"><span>Saved snapshots</span><strong>' + profiles.length + '</strong></div><div class="metric"><span>Backups running</span><strong>' + active + '</strong></div><div class="metric"><span>Tape needed</span><strong>' + waiting + '</strong></div><div class="metric"><span>Latest protected</span><strong class="backup-metric-date">' + esc(latestVerified ? date(pick(latestVerified, "finished_at", "created_at")) : "None") + "</strong></div></section>";
+    html += '<section class="panel metric-strip backup-metrics"><div class="metric"><span>Saved selections</span><strong>' + profiles.length + '</strong><small>Exact snapshots</small></div><div class="metric"><span>Backups running</span><strong>' + active + '</strong><small>Including tape waits</small></div><div class="metric"><span>Needs you</span><strong>' + (waiting + failed) + '</strong><small>' + esc(waiting + " tape wait" + (waiting === 1 ? "" : "s") + " · " + failed + " unresolved") + '</small></div><div class="metric"><span>Latest protected</span><strong class="backup-metric-date">' + esc(latestVerified ? date(pick(latestVerified, "finished_at", "created_at")) : "None") + "</strong><small>Complete readback</small></div></section>";
+    html += renderBackupWorkQueue();
     html += renderBackupProfiles();
     if (!runs.length) return html + empty("No backups yet", state.errors.backupRuns ? "Backup history could not be loaded." : "Choose a snapshot, then continue through tape selection to start the first backup.", create);
-    html += '<section class="section"><div class="section-head"><div><h2>Backup history</h2><p>Running backups and every retained result.</p></div><span class="status ' + (failed ? "failed" : active ? "running" : "ready") + '">' + (failed ? failed + " need review" : active ? active + " active" : "No active work") + "</span></div>" + renderBackupRunTable(runs) + "</section>";
+    html += '<section class="section"><div class="section-head"><div><h2>Backup history</h2><p>Recent retained attempts. Use the grouped filter to find operational outcomes.</p></div><span class="status ' + (failed ? "failed" : active ? "running" : "ready") + '">' + (failed ? failed + " unresolved latest" : active ? active + " active" : "Current work clear") + "</span></div>" + renderBackupRunTable(runs) + "</section>";
     return html;
   }
 
@@ -3173,12 +3398,12 @@
     if (!state.received.has("recoveryExercises") && state.errors.recoveryExercises) return "";
     const latest = recoveryExerciseRecord(orderedRecoveryExercises()[0]);
     if (!latest) {
-      return '<section class="recovery-callout section"><div><span class="lab-badge">G0.2 laboratory workflow</span><h2>Create your first recoverable tape</h2><p>Write a complete prepared fixture to one scratch cartridge, decode it from the physical tape, restore it into isolation, and compare the result.</p></div><a class="button button-primary" href="#recovery-lab">Start guided setup</a></section>';
+      return '<section class="panel assurance-card section"><div><span class="lab-badge">G0.2 laboratory workflow</span><h2>Recovery assurance exercise</h2><p>No laboratory recovery exercise has been retained yet. This is separate from day-to-day backup operations.</p></div><a class="button button-small" href="#recovery-lab">Open recovery exercise</a></section>';
     }
     const stateValue = recoveryExerciseState(latest);
     const title = recoveryExercisePassed(latest) ? "A physical recovery exercise passed" : recoveryExerciseActive(latest) ? "Physical recovery exercise in progress" : "Review the latest recovery exercise";
     const detail = recoveryExerciseDetail(latest) || (recoveryExercisePassed(latest) ? "TapeScale retained the write, readback, isolated restore, and comparison evidence." : "Open the laboratory workflow for the exact phase and retained evidence.");
-    return '<section class="recovery-callout section ' + (recoveryExercisePassed(latest) ? "passed" : recoveryExerciseFailed(latest) ? "failed" : "") + '"><div><span class="lab-badge">G0.2 laboratory workflow</span><h2>' + esc(title) + '</h2><p>' + esc(detail) + '</p></div><a class="button button-primary" href="#recovery-lab">Open ' + esc(human(stateValue)) + " run</a></section>";
+    return '<section class="panel assurance-card section ' + (recoveryExercisePassed(latest) ? "passed" : recoveryExerciseFailed(latest) ? "failed" : "") + '"><div><span class="lab-badge">G0.2 laboratory workflow</span><h2>' + esc(title) + '</h2><p>' + esc(detail) + '</p></div><a class="button button-small" href="#recovery-lab">Open ' + esc(human(stateValue)) + " run</a></section>";
   }
 
   function recoveryPhaseIndex(exercise) {
@@ -5887,7 +6112,7 @@
   function scheduleBackupRunPoll() {
     if (state.backupRunPollTimer) window.clearTimeout(state.backupRunPollTimer);
     const active = orderedBackupRuns().filter(backupRunActive);
-    const selected = selectedBackupRun();
+    const selected = state.route === "jobs" ? selectedBackupRun() : null;
     if (selected && backupRunActive(selected) && !active.some((run) => recordId(run) === recordId(selected))) active.push(selected);
     if (!active.length) {
       state.backupRunPollTimer = null;
@@ -5895,11 +6120,16 @@
     }
     state.backupRunPollTimer = window.setTimeout(async () => {
       const previouslyActive = new Set(active.map(recordId));
-      await Promise.all([loadOne("backupRuns"), loadOne("jobs"), loadOne("overview"), loadOne("drives"), loadOne("media"), loadOne("recoveryPoints")]);
-      const selected = selectedBackupRun();
-      if (selected) await loadBackupRunDetail(recordId(selected), true, false);
+      await loadOne("backupRuns");
+      const currentActive = orderedBackupRuns().filter(backupRunActive);
+      if (currentActive.some(backupWaitingForOperator)) await Promise.all([loadOne("drives"), loadOne("media")]);
+      const selected = state.route === "jobs" ? selectedBackupRun() : null;
+      if (selected && backupRunActive(selected)) await loadBackupRunDetail(recordId(selected), true, false);
       const completed = state.data.backupRuns.find((run) => previouslyActive.has(recordId(run)) && !backupRunActive(run));
-      if (completed) toast("Backup " + human(backupRunState(completed)), backupFailureDetail(completed) || "The durable result and retained evidence are ready.");
+      if (completed) {
+        await Promise.all([loadOne("overview"), loadOne("recoveryPoints")]);
+        toast("Backup " + human(backupRunState(completed)), backupFailureDetail(completed) || "The durable result and retained evidence are ready.");
+      }
       const routeUi = captureBackupRouteUiState();
       updateChrome();
       if (["jobs", "overview"].includes(state.route)) {
@@ -6819,12 +7049,12 @@
 
   function showActions() {
     const overview = state.data.overview;
-    const actions = overview.actions;
+    const actions = managementActions();
     const boundedWarning = overview.actions_truncated
-      ? '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Showing the first ' + esc(actions.length) + " of " + esc(overview.actions_total) + ' required actions</strong><span>The total includes additional actions outside this bounded list.</span></div></div>'
+      ? '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>The system action list is bounded</strong><span>The server reports ' + esc(overview.actions_total) + ' system actions; additional items may appear after visible work is resolved.</span></div></div>'
       : "";
-    const body = actions.length ? '<ul class="action-list">' + actions.map(renderActionItem).join("") + "</ul>" + boundedWarning : '<p>No unresolved actions are reported.</p>';
-    openModal("Notifications", body);
+    const body = actions.length ? '<ul class="action-list">' + actions.map(renderActionItem).join("") + "</ul>" + boundedWarning : '<p>No backup or system action currently needs attention.</p>';
+    openModal("Current work and notifications", body);
   }
 
   function showPreflight() {
@@ -6837,7 +7067,7 @@
     const action = target.dataset.action;
     if (action === "open-nav") shell.classList.add("nav-open");
     if (action === "close-nav") shell.classList.remove("nav-open");
-    if (action === "refresh") loadAll(false);
+    if (action === "refresh") refreshCurrentRoute();
     if (action === "create-backup-profile") openBackupProfile();
     if (action === "open-source-browser") openSourceBrowser(target.dataset.browserTarget || "backup");
     if (action === "close-source-browser") closeSourceBrowser();

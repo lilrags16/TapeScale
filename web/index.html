@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#132522">
     <meta name="description" content="TapeScale storage operations console for TrueNAS and LTO protection.">
     <title>TapeScale Alpha Operations</title>
-    <link rel="stylesheet" href="app.css?v=tapescale-alpha-11">
-    <script src="app.js?v=tapescale-alpha-11" defer></script>
+    <link rel="stylesheet" href="app.css?v=tapescale-alpha-12">
+    <script src="app.js?v=tapescale-alpha-12" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Skip to main content</a>
@@ -99,10 +99,10 @@
 
         <nav class="mobile-nav" aria-label="Mobile navigation">
           <a data-route="overview" href="#overview"><span aria-hidden="true">&#9632;</span><small>Overview</small></a>
-          <a data-route="jobs" href="#jobs"><span aria-hidden="true">&#9654;</span><small>Backups</small></a>
+          <a data-route="jobs" href="#jobs"><span class="mobile-nav-icon" aria-hidden="true">&#9654;<span class="mobile-nav-count" id="mobile-backup-count" hidden>0</span></span><small>Backups</small></a>
           <a data-route="restore" href="#restore"><span aria-hidden="true">&#8630;</span><small>Restore</small></a>
           <a data-route="tapes" href="#tapes"><span aria-hidden="true">&#9638;</span><small>Tapes</small></a>
-          <a data-route="settings" href="#settings"><span aria-hidden="true">&#8226;&#8226;&#8226;</span><small>More</small></a>
+          <button type="button" data-action="open-nav" aria-label="Open all navigation"><span class="mobile-nav-icon" aria-hidden="true">&#8226;&#8226;&#8226;<span class="mobile-nav-count" id="mobile-action-count" hidden>0</span></span><small>More</small></button>
         </nav>
       </div>
     </div>

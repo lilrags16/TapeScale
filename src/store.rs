@@ -1675,12 +1675,17 @@ pub async fn release_worker_singleton(connection: &mut PoolConnection<Postgres>)
 
 pub async fn overview_counts(pool: &PgPool) -> Result<OverviewCounts, sqlx::Error> {
     sqlx::query_as(
-        "SELECT
+        "WITH latest_job_runs AS (
+            SELECT DISTINCT ON (run.job_id) run.*
+            FROM job_runs run
+            ORDER BY run.job_id, run.created_at DESC, run.id DESC
+         )
+         SELECT
             (SELECT count(*) FROM sources WHERE enabled) AS protected_sources,
-            (SELECT count(*) FROM job_runs
+            (SELECT count(*) FROM latest_job_runs
              WHERE state IN ('queued','preparing','inventorying','waiting_for_media','writing','written','verifying','restoring','comparing','blocked','interrupted')
                AND finished_at IS NULL) AS active_jobs,
-            ((SELECT count(*) FROM job_runs
+            ((SELECT count(*) FROM latest_job_runs
               WHERE state IN ('waiting_for_media','blocked','interrupted','failed')
                 AND (finished_at IS NULL OR finished_at >= now() - interval '7 days')) +
              (SELECT count(*) FROM movement_tasks
@@ -1708,7 +1713,12 @@ pub async fn list_required_actions(
     pool: &PgPool,
 ) -> Result<Vec<RequiredActionRecord>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT action.id, action.title, action.detail, action.state,
+        "WITH latest_job_runs AS (
+            SELECT DISTINCT ON (run.job_id) run.*
+            FROM job_runs run
+            ORDER BY run.job_id, run.created_at DESC, run.id DESC
+         )
+         SELECT action.id, action.title, action.detail, action.state,
                 action.due_at, action.route
          FROM (
              SELECT movement.id::text AS id,
@@ -1744,10 +1754,14 @@ pub async fn list_required_actions(
                     concat_ws(' · ', job.external_id, run.failure_class),
                     run.state,
                     NULL::timestamptz,
-                    'jobs'::text,
+                    CASE
+                        WHEN request.id IS NOT NULL THEN 'jobs/' || request.id::text
+                        ELSE 'jobs'
+                    END,
                     COALESCE(run.finished_at, run.started_at, run.created_at)
-             FROM job_runs run
+             FROM latest_job_runs run
              JOIN jobs job ON job.id = run.job_id
+             LEFT JOIN backup_requests request ON request.job_run_id = run.id
              WHERE run.state IN ('waiting_for_media', 'blocked', 'interrupted', 'failed')
                AND (run.finished_at IS NULL OR run.finished_at >= now() - interval '7 days')
              UNION ALL

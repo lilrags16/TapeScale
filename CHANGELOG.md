@@ -2,6 +2,21 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.12] - 2026-11-18
+
+### Operator command center
+
+- Overview now opens with one prioritized next action and a unified queue of backup work plus system alerts. Tape handoffs lead, then media/custody failures and unresolved backup attempts; healthy active transfers remain visible without inflating the alert badge.
+- Backup Center places **Needs you** and **In progress** ahead of saved selections, shows live phase/tape/progress facts, and offers direct continuation, retry, and newer-snapshot paths. History filters use operator outcomes—active, waiting on me, needs attention, protected, and cancelled—instead of raw engine states.
+- Saved items are explicitly described as exact snapshot selections. Repeating one is labeled **Back up same snapshot**; existing scheduled records disclose that they repeat that exact snapshot rather than silently implying rolling protection.
+- The responsive console gains a real mobile **More** navigation control, current-work badges with accessible labels, stacked narrow-screen actions, operational quick links, and a compact assurance card instead of leading day-to-day operations with the G0.2 laboratory workflow.
+
+### Action trust and refresh behavior
+
+- Only the latest attempt for each job contributes a failed/waiting required action, so a verified retry clears the earlier alarm and repeated failures do not inflate counts. Backup actions now deep-link to the exact request while distinct system actions sharing a top-level route remain visible.
+- Frontend work items merge fresher polled backup state with the bounded server action feed, deduplicate exact deep links before urgency sorting, and never let a stale waiting action override a run that has already resumed.
+- Manual refresh now requests only the endpoint group used by the current route. Active-backup polling refreshes the run summary and selected live detail, fetches drive/media state only during a tape handoff, and refreshes overview/recovery points once when a run becomes terminal.
+
 ## [0.1.0-alpha.11] - 2026-11-14
 
 ### Honest live backup progress
@@ -177,6 +192,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.12]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.12
 [0.1.0-alpha.11]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.11
 [0.1.0-alpha.10]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.10
 [0.1.0-alpha.9]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.9
