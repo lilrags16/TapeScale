@@ -27,6 +27,16 @@ use uuid::Uuid;
 const ATTRIBUTE_SPOOL_BYTES_PER_ENTRY: u64 = 4 * 1024;
 const ATTRIBUTE_SPOOL_MANIFEST_MULTIPLIER: u64 = 2;
 const ATTRIBUTE_SPOOL_BASE_BYTES: u64 = 64 * 1024 * 1024;
+// Disk-staged delivery is intentionally a complete-job stage, not Bacula's
+// repeating fill/drain cycle.  The estimate is conservative because the
+// exact encoded stream size is unavailable before Bacula reads the source:
+// reserve twenty-five percent of logical payload, 64 KiB of stream/metadata
+// framing per manifest entry, and four GiB for job/block framing. Compression may
+// reduce the actual spool, but eligibility never relies on that reduction.
+const COMPLETE_STAGE_BYTES_PER_ENTRY: u64 = 64 * 1024;
+const COMPLETE_STAGE_PAYLOAD_PERCENT: u64 = 125;
+const COMPLETE_STAGE_PAYLOAD_DIVISOR: u64 = 100;
+const COMPLETE_STAGE_BASE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 use crate::{
     bacula_catalog::{
@@ -114,7 +124,8 @@ struct BaculaSpoolUsage {
 #[derive(Clone, Debug)]
 struct BaculaSpoolMonitor {
     directory: PathBuf,
-    capacity_bytes: u64,
+    hard_limit_bytes: u64,
+    progress_target_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -247,7 +258,7 @@ impl LiveIoSampler {
         evidence: &BaculaJobEvidence,
         pipeline_basis: &'static str,
         tape_counters: Option<SasTapeIoCounters>,
-        spool: Option<(BaculaSpoolUsage, u64)>,
+        spool: Option<(BaculaSpoolUsage, u64, u64)>,
         running_hints: Option<BaculaRunningHints>,
         file_daemon_hints: Option<&BaculaFileDaemonHints>,
         last_progress_at: Instant,
@@ -275,7 +286,7 @@ impl LiveIoSampler {
         evidence: &BaculaJobEvidence,
         pipeline_basis: &'static str,
         tape_counters: Option<SasTapeIoCounters>,
-        spool: Option<(BaculaSpoolUsage, u64)>,
+        spool: Option<(BaculaSpoolUsage, u64, u64)>,
         running_hints: Option<BaculaRunningHints>,
         file_daemon_hints: Option<&BaculaFileDaemonHints>,
         last_progress_at: Option<Instant>,
@@ -360,7 +371,7 @@ impl LiveIoSampler {
         let tape_write_counter_available =
             tape_counters.is_some_and(|counters| counters.write_bytes.is_some());
         let tape_counters_available = tape_read_counter_available || tape_write_counter_available;
-        let spool_usage = spool.map(|(usage, _)| usage);
+        let spool_usage = spool.map(|(usage, _, _)| usage);
         let spool_fill_bytes_per_second = previous.and_then(|sample| {
             let previous = sample.spool_usage?;
             let current = spool_usage?;
@@ -463,7 +474,8 @@ impl LiveIoSampler {
             progress_idle_ms,
             no_progress_timeout_ms: timeout_ms,
             spool_bytes: spool_usage.map(|usage| usage.bytes),
-            spool_capacity_bytes: spool.map(|(_, capacity)| capacity),
+            spool_capacity_bytes: spool.map(|(_, capacity, _)| capacity),
+            spool_target_bytes: spool.map(|(_, _, target)| target),
             spool_file_count: spool_usage.map(|usage| usage.file_count),
             spool_fill_bytes_per_second,
             spool_drain_bytes_per_second,
@@ -1018,7 +1030,7 @@ async fn perform_exercise(
             ));
         }
         let mut data_options = bacula_data_options(claim)?;
-        let (spool_limit, spool_capacity) = bacula_delivery_capacity(
+        let (spool_limit, spool_capacity, complete_stage_target) = bacula_delivery_capacity(
             config,
             source_manifest.artifact(),
             data_options.delivery,
@@ -1032,9 +1044,9 @@ async fn perform_exercise(
             store::SingleTapeDataPhase::Writing,
             json!({
                 "detail": if data_options.data_spooling_enabled() && claim.run.spanning_enabled {
-                    "source manifest retained; Bacula will stage bounded segments on disk before writing the authorized tape set"
+                    "source manifest retained; Bacula is capacity-gated to stage the complete archive before the tape data pass across the authorized tape set"
                 } else if data_options.data_spooling_enabled() {
-                    "source manifest retained; Bacula will stage bounded segments on disk before writing tape"
+                    "source manifest retained; Bacula is capacity-gated to stage the complete archive before the tape data pass"
                 } else if claim.run.spanning_enabled {
                     "source manifest retained; Bacula will stream continuously from the source through the File and Storage Daemons to the authorized tape set"
                 } else {
@@ -1194,7 +1206,9 @@ async fn perform_exercise(
                 .evidence()
                 .data_spool_directory
                 .clone(),
-            capacity_bytes: data_options.maximum_spool_size_bytes(),
+            hard_limit_bytes: data_options.maximum_spool_size_bytes(),
+            progress_target_bytes: complete_stage_target
+                .expect("disk-spooled delivery has a complete-stage target"),
         });
 
         let adapter = BaculaAdapter::new(DirectBconsoleExecutor::default());
@@ -1320,7 +1334,7 @@ async fn perform_exercise(
                 "directory": runtime.as_ref().expect("runtime is active").evidence().data_spool_directory,
                 "maximum_bytes": if data_options.data_spooling_enabled() { data_options.maximum_spool_size_bytes() } else { 0 },
                 "purpose": if data_options.data_spooling_enabled() {
-                    "bounded disk staging; Bacula fills and drains segments and this does not limit archive size"
+                    "capacity-gated whole-archive staging with runtime aborts near the hard limit or on an early drain"
                 } else {
                     "disabled; the processed source stream is delivered continuously to tape"
                 }
@@ -2360,7 +2374,8 @@ async fn wait_for_job(
     let mut tape_counter_error_reported = false;
     let mut consecutive_running_status_failures = 0_u8;
     let mut consecutive_file_daemon_status_failures = 0_u8;
-    let mut spool_monitor_error_reported = false;
+    let mut file_daemon_observed = false;
+    let mut source_production_complete = spool_monitor.is_none() || live_io_totals.files == 0;
     loop {
         if cancellation.is_cancelled() {
             let cancellation_result = cancel_and_observe(adapter, job_id).await;
@@ -2431,6 +2446,12 @@ async fn wait_for_job(
             Err(error) => {
                 consecutive_running_status_failures =
                     consecutive_running_status_failures.saturating_add(1);
+                if spool_monitor.is_some() && consecutive_running_status_failures >= 3 {
+                    let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                    return Err(ExerciseFailure::failed(format!(
+                        "whole-archive staging lost exact Bacula Storage status for {consecutive_running_status_failures} consecutive samples and can no longer prove that an early despool is not occurring: {error}; {cancellation_result}"
+                    )));
+                }
                 if consecutive_running_status_failures == 1
                     || consecutive_running_status_failures % 12 == 0
                 {
@@ -2465,6 +2486,12 @@ async fn wait_for_job(
             Err(error) => {
                 consecutive_file_daemon_status_failures =
                     consecutive_file_daemon_status_failures.saturating_add(1);
+                if spool_monitor.is_some() && consecutive_file_daemon_status_failures >= 12 {
+                    let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                    return Err(ExerciseFailure::failed(format!(
+                        "whole-archive staging lost exact Bacula File Daemon progress for {consecutive_file_daemon_status_failures} consecutive samples and can no longer prove that source production finished before tape movement: {error}; {cancellation_result}"
+                    )));
+                }
                 if consecutive_file_daemon_status_failures == 1
                     || consecutive_file_daemon_status_failures % 12 == 0
                 {
@@ -2479,6 +2506,26 @@ async fn wait_for_job(
                 None
             }
         };
+        let file_daemon_was_observed = file_daemon_observed;
+        file_daemon_observed |= file_daemon_hints.is_some();
+        if spool_monitor.is_some() {
+            source_production_complete = match observe_source_production_completion(
+                source_production_complete,
+                live_io_totals.files,
+                file_daemon_hints.as_ref().map(|hints| hints.files),
+                file_daemon_was_observed,
+                live_evidence.files,
+                running_hints.and_then(|hints| hints.despooling),
+            ) {
+                Ok(complete) => complete,
+                Err(detail) => {
+                    let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                    return Err(ExerciseFailure::failed(format!(
+                        "whole-archive staging lost an exact source-entry completion proof: {detail}; {cancellation_result}"
+                    )));
+                }
+            };
+        }
 
         let observed_at = Instant::now();
         let catalog_progress = (
@@ -2505,26 +2552,51 @@ async fn wait_for_job(
         }
 
         let spool = match spool_monitor.map(|monitor| {
-            bacula_spool_usage(&monitor.directory).map(|usage| (usage, monitor.capacity_bytes))
+            bacula_spool_usage(&monitor.directory).map(|usage| {
+                (
+                    usage,
+                    monitor.hard_limit_bytes,
+                    monitor.progress_target_bytes,
+                )
+            })
         }) {
-            Some(Ok(spool)) => {
-                spool_monitor_error_reported = false;
-                Some(spool)
-            }
+            Some(Ok(spool)) => Some(spool),
             Some(Err(error)) => {
-                if !spool_monitor_error_reported {
-                    warn!(
-                        physical_data_run_id = %claim.run.id,
-                        engine_job_id = %job_id,
-                        detail = %error.detail,
-                        "live disk-spool measurement is unavailable; the Bacula job will continue"
-                    );
-                    spool_monitor_error_reported = true;
-                }
-                None
+                let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                return Err(ExerciseFailure::failed(format!(
+                    "whole-archive staging could not measure its isolated disk spool and was cancelled because anti-shoe-shine safety can no longer be enforced: {}; {cancellation_result}",
+                    error.detail
+                )));
             }
             None => None,
         };
+
+        // Bacula's same-job spool is not a producer/consumer ring. If its hard
+        // ceiling is reached before the File Daemon finishes, Bacula begins a
+        // partial despool and later refills the same spool, recreating the
+        // exact stop/start tape cycle this mode exists to prevent. Keep a wide
+        // ten-percent margin for the five-second observation interval and fail
+        // closed instead of knowingly continuing into another partial batch.
+        let produced_files = file_daemon_hints
+            .as_ref()
+            .map_or(live_io.maximum_files_processed, |hints| {
+                hints.files.max(live_io.maximum_files_processed)
+            });
+        if !evidence.is_terminal() {
+            if let (Some(monitor), Some((usage, _, _))) = (spool_monitor, spool) {
+                if stage_near_hard_limit(
+                    source_production_complete,
+                    usage.bytes,
+                    monitor.hard_limit_bytes,
+                ) {
+                    let cancellation_result = cancel_and_observe(adapter, job_id).await;
+                    return Err(ExerciseFailure::failed(format!(
+                        "whole-archive staging reached its safety margin after {produced_files} of {} source entries; refusing Bacula's cyclic partial despool before it can repeatedly backhitch the tape; {cancellation_result}",
+                        live_io_totals.files
+                    )));
+                }
+            }
+        }
 
         let tape_counters =
             match read_sas_tape_io_counters(sas_config, Path::new(&claim.run.expected_path)) {
@@ -2554,6 +2626,21 @@ async fn wait_for_job(
             no_progress_timeout,
             observed_at,
         );
+        if !evidence.is_terminal()
+            && spool_monitor.is_some()
+            && stage_draining_before_complete(
+                source_production_complete,
+                running_hints.and_then(|hints| hints.despooling),
+                sample.tape_write_bytes_per_second,
+                sample.spool_drain_bytes_per_second,
+            )
+        {
+            let cancellation_result = cancel_and_observe(adapter, job_id).await;
+            return Err(ExerciseFailure::failed(format!(
+                "Bacula began draining staged data after {produced_files} of {} source entries instead of completing the whole-archive stage; the job was cancelled rather than permitting repeated fill/drain tape cycles; {cancellation_result}",
+                live_io_totals.files
+            )));
+        }
         if measured_movement {
             last_progress_at = observed_at;
         }
@@ -2834,6 +2921,68 @@ async fn wait_for_job(
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+fn stage_near_hard_limit(
+    source_production_complete: bool,
+    staged_bytes: u64,
+    hard_limit_bytes: u64,
+) -> bool {
+    !source_production_complete && staged_bytes >= stage_guard_threshold(hard_limit_bytes)
+}
+
+fn stage_guard_threshold(hard_limit_bytes: u64) -> u64 {
+    let guard_margin = (hard_limit_bytes / 10).max(1024 * 1024 * 1024);
+    hard_limit_bytes.saturating_sub(guard_margin)
+}
+
+fn stage_draining_before_complete(
+    source_production_complete: bool,
+    engine_despooling: Option<bool>,
+    tape_write_bytes_per_second: Option<u64>,
+    spool_drain_bytes_per_second: Option<u64>,
+) -> bool {
+    !source_production_complete
+        && (engine_despooling == Some(true)
+            || tape_write_bytes_per_second.unwrap_or(0) > 0
+            || spool_drain_bytes_per_second.unwrap_or(0) > 0)
+}
+
+/// Latch source completion without treating Storage/catalog counters as an
+/// interchangeable live File Daemon numerator. The exact Storage count is
+/// accepted only at the observed FD-to-SD handoff (or while SD explicitly
+/// reports despooling), covering the poll interval in which the final File
+/// Daemon record legitimately disappears.
+fn observe_source_production_completion(
+    already_complete: bool,
+    total_files: u64,
+    file_daemon_files: Option<u64>,
+    file_daemon_was_observed: bool,
+    storage_files: u64,
+    engine_despooling: Option<bool>,
+) -> Result<bool, &'static str> {
+    if already_complete || total_files == 0 {
+        return Ok(true);
+    }
+    if let Some(files) = file_daemon_files {
+        return match files.cmp(&total_files) {
+            std::cmp::Ordering::Less => Ok(false),
+            std::cmp::Ordering::Equal => Ok(true),
+            std::cmp::Ordering::Greater => {
+                Err("File Daemon entry count exceeded the immutable manifest")
+            }
+        };
+    }
+    if file_daemon_was_observed || engine_despooling == Some(true) {
+        return match storage_files.cmp(&total_files) {
+            std::cmp::Ordering::Less => Ok(false),
+            std::cmp::Ordering::Equal => Ok(true),
+            std::cmp::Ordering::Greater => {
+                Err("Storage Daemon entry count exceeded the immutable manifest at handoff")
+            }
+        };
+    }
+    Ok(false)
 }
 
 async fn complete_manual_media_request(
@@ -3247,7 +3396,7 @@ fn bacula_delivery_capacity(
     config: &Config,
     manifest: &ManifestArtifactSummary,
     delivery: BaculaDataDelivery,
-) -> Result<(Option<NonZeroU64>, Value), ExerciseFailure> {
+) -> Result<(Option<NonZeroU64>, Value, Option<u64>), ExerciseFailure> {
     let metadata = fs::symlink_metadata(&config.bacula_spool_dir).map_err(|error| {
         ExerciseFailure::blocked(format!(
             "the Bacula spool directory {} is unavailable: {error}",
@@ -3343,6 +3492,7 @@ fn bacula_delivery_capacity(
                 },
                 "storage_daemon_working_directory": config.bacula_spool_dir.display().to_string()
             }),
+            None,
         ));
     }
     let Some(limit) = effective_spool_limit(
@@ -3361,6 +3511,19 @@ fn bacula_delivery_capacity(
         )));
     };
     let effective_maximum_bytes = limit.get();
+    let complete_stage_required_bytes =
+        estimated_complete_stage_bytes(manifest).ok_or_else(|| {
+            ExerciseFailure::blocked(
+                "the whole-archive Bacula staging estimate overflowed for this manifest",
+            )
+        })?;
+    let runtime_safety_threshold_bytes = stage_guard_threshold(effective_maximum_bytes);
+    if runtime_safety_threshold_bytes < complete_stage_required_bytes {
+        return Err(ExerciseFailure::blocked(format!(
+            "whole-archive anti-shoe-shine staging needs a {complete_stage_required_bytes} byte target plus runtime headroom before the archive data pass can start, but {} has a {runtime_safety_threshold_bytes} byte safety threshold below its {effective_maximum_bytes} byte hard limit after attribute and filesystem reserves; tape was not touched. Increase the dedicated spool capacity or use direct delivery only when sustained source throughput can feed the drive",
+            config.bacula_spool_dir.display()
+        )));
+    }
     Ok((
         Some(limit),
         json!({
@@ -3380,13 +3543,26 @@ fn bacula_delivery_capacity(
                 "base_bytes": ATTRIBUTE_SPOOL_BASE_BYTES
             },
             "configured_maximum_bytes": config.bacula_spool_max_bytes,
+            "configured_maximum_is_automatic": config.bacula_spool_max_bytes == 0,
             "effective_maximum_bytes": effective_maximum_bytes,
+            "runtime_safety_threshold_bytes": runtime_safety_threshold_bytes,
             "minimum_required_bytes": config.bacula_spool_min_bytes,
+            "complete_stage_required_bytes": complete_stage_required_bytes,
+            "complete_stage_estimate": {
+                "logical_bytes": manifest.logical_bytes,
+                "manifest_entries": manifest.entry_count,
+                "payload_percent": COMPLETE_STAGE_PAYLOAD_PERCENT,
+                "bytes_per_entry": COMPLETE_STAGE_BYTES_PER_ENTRY,
+                "base_bytes": COMPLETE_STAGE_BASE_BYTES
+            },
             "archive_size_limited": false,
-            "behavior_at_limit": "despool_to_tape_then_continue",
+            "behavior": "capacity_gated_complete_archive_stage_with_fail_closed_runtime_guards",
+            "capacity_guard": "conservative_estimate_plus_runtime_near-limit_and_early-despool_abort",
+            "residual_risk": "encoded Bacula metadata or external filesystem consumption can exceed a point-in-time estimate; TapeScale cancels when observed before allowing repeated partial batches",
             "attribute_spooling_enabled": true,
             "storage_daemon_working_directory": config.bacula_spool_dir.display().to_string()
         }),
+        Some(complete_stage_required_bytes),
     ))
 }
 
@@ -3396,15 +3572,33 @@ fn estimated_attribute_spool_reserve(entry_count: u64, manifest_size_bytes: u64)
         .checked_add(manifest_size_bytes.checked_mul(ATTRIBUTE_SPOOL_MANIFEST_MULTIPLIER)?)
 }
 
+fn estimated_complete_stage_bytes(manifest: &ManifestArtifactSummary) -> Option<u64> {
+    let payload = manifest
+        .logical_bytes
+        .checked_mul(COMPLETE_STAGE_PAYLOAD_PERCENT)?
+        .checked_add(COMPLETE_STAGE_PAYLOAD_DIVISOR - 1)?
+        / COMPLETE_STAGE_PAYLOAD_DIVISOR;
+    payload
+        .checked_add(
+            manifest
+                .entry_count
+                .checked_mul(COMPLETE_STAGE_BYTES_PER_ENTRY)?,
+        )?
+        .checked_add(COMPLETE_STAGE_BASE_BYTES)
+}
+
 fn effective_spool_limit(
     available_bytes: u64,
     reserve_bytes: u64,
     configured_maximum_bytes: u64,
     minimum_bytes: u64,
 ) -> Option<NonZeroU64> {
-    let effective = available_bytes
-        .saturating_sub(reserve_bytes)
-        .min(configured_maximum_bytes);
+    let available_after_reserve = available_bytes.saturating_sub(reserve_bytes);
+    let effective = if configured_maximum_bytes == 0 {
+        available_after_reserve
+    } else {
+        available_after_reserve.min(configured_maximum_bytes)
+    };
     if effective < minimum_bytes {
         None
     } else {
@@ -4306,6 +4500,7 @@ mod tests {
                     file_count: 2,
                 },
                 64_000,
+                60_000,
             )),
             Some(BaculaRunningHints {
                 spooling: Some(true),
@@ -4323,6 +4518,7 @@ mod tests {
         );
         assert_eq!(first.spool_bytes, Some(1_000));
         assert_eq!(first.spool_capacity_bytes, Some(64_000));
+        assert_eq!(first.spool_target_bytes, Some(60_000));
 
         evidence.files = 1;
         evidence.bytes = 6_000;
@@ -4337,6 +4533,7 @@ mod tests {
                     file_count: 2,
                 },
                 64_000,
+                60_000,
             )),
             None,
             None,
@@ -4366,6 +4563,7 @@ mod tests {
                     file_count: 1,
                 },
                 64_000,
+                60_000,
             )),
             Some(BaculaRunningHints {
                 despooling: Some(true),
@@ -4398,6 +4596,7 @@ mod tests {
                     file_count: 1,
                 },
                 64_000,
+                60_000,
             )),
             Some(BaculaRunningHints {
                 spooling: Some(true),
@@ -4426,6 +4625,7 @@ mod tests {
                     file_count: 1,
                 },
                 64_000,
+                60_000,
             )),
             None,
             None,
@@ -4505,21 +4705,95 @@ mod tests {
     }
 
     #[test]
-    fn spool_limit_preserves_reserve_and_does_not_limit_archive_size() {
+    fn spool_limit_supports_automatic_whole_filesystem_capacity() {
         let gib = 1024_u64 * 1024 * 1024;
         assert_eq!(
             effective_spool_limit(200 * gib, 8 * gib, 64 * gib, 8 * gib)
-                .expect("ample spool capacity")
+                .expect("configured spool capacity")
                 .get(),
             64 * gib
         );
         assert_eq!(
+            effective_spool_limit(200 * gib, 8 * gib, 0, 8 * gib)
+                .expect("zero selects automatic capacity")
+                .get(),
+            192 * gib
+        );
+        assert_eq!(
             effective_spool_limit(48 * gib, 8 * gib, 64 * gib, 8 * gib)
-                .expect("available space caps the buffer")
+                .expect("available space caps staging")
                 .get(),
             40 * gib
         );
         assert!(effective_spool_limit(15 * gib, 8 * gib, 64 * gib, 8 * gib).is_none());
+        assert!(effective_spool_limit(15 * gib, 8 * gib, 0, 8 * gib).is_none());
+    }
+
+    #[test]
+    fn whole_archive_stage_estimate_is_conservative_and_bounded() {
+        let spool = Path::new("/tmp");
+        let mut manifest = capacity_test_manifest(spool);
+        manifest.logical_bytes = 1_000;
+        manifest.entry_count = 2;
+        assert_eq!(
+            estimated_complete_stage_bytes(&manifest).expect("bounded estimate"),
+            COMPLETE_STAGE_BASE_BYTES + 1_250 + 2 * COMPLETE_STAGE_BYTES_PER_ENTRY
+        );
+
+        manifest.logical_bytes = u64::MAX;
+        assert!(estimated_complete_stage_bytes(&manifest).is_none());
+    }
+
+    #[test]
+    fn staged_backup_aborts_near_the_hard_limit_until_source_production_finishes() {
+        let gib = 1024_u64 * 1024 * 1024;
+        let hard_limit = 100 * gib;
+
+        assert!(!stage_near_hard_limit(false, 89 * gib, hard_limit));
+        assert!(stage_near_hard_limit(false, 90 * gib, hard_limit));
+        assert!(!stage_near_hard_limit(true, 99 * gib, hard_limit));
+        assert_eq!(stage_guard_threshold(hard_limit), 90 * gib);
+    }
+
+    #[test]
+    fn staged_backup_aborts_an_early_drain_but_allows_the_final_data_pass() {
+        assert!(!stage_draining_before_complete(false, None, None, None));
+        assert!(stage_draining_before_complete(
+            false,
+            Some(true),
+            None,
+            None
+        ));
+        assert!(stage_draining_before_complete(false, None, Some(1), None));
+        assert!(stage_draining_before_complete(false, None, None, Some(1)));
+        assert!(!stage_draining_before_complete(
+            true,
+            Some(true),
+            Some(1),
+            Some(1)
+        ));
+    }
+
+    #[test]
+    fn source_completion_latches_across_an_exact_file_to_storage_handoff() {
+        assert!(
+            !observe_source_production_completion(false, 100, Some(99), false, 100, None)
+                .expect("an incomplete File Daemon sample is valid")
+        );
+        assert!(
+            observe_source_production_completion(false, 100, None, true, 100, Some(true))
+                .expect("an exact FD-to-SD handoff proves completion")
+        );
+        assert!(
+            !observe_source_production_completion(false, 100, None, true, 99, Some(true))
+                .expect("an under-count remains incomplete")
+        );
+        assert!(
+            observe_source_production_completion(false, 100, None, true, 101, Some(true)).is_err()
+        );
+        assert!(
+            observe_source_production_completion(false, 100, Some(101), false, 0, None).is_err()
+        );
     }
 
     #[test]
@@ -4528,10 +4802,11 @@ mod tests {
         let manifest = capacity_test_manifest(spool.path());
         let mut config = capacity_test_config(spool.path());
 
-        let (limit, evidence) =
+        let (limit, evidence, target) =
             bacula_delivery_capacity(&config, &manifest, BaculaDataDelivery::Direct)
                 .expect("direct delivery should not require the configured data-spool minimum");
         assert_eq!(limit, None);
+        assert_eq!(target, None);
         assert_eq!(evidence["enabled"], false);
         assert_eq!(evidence["mode"], "direct");
         assert_eq!(evidence["effective_maximum_bytes"], 0);

@@ -692,8 +692,8 @@
   function backupDataDeliveryLabel(source) {
     const mode = backupDataDelivery(source);
     if (!backupDataDeliverySupported(source)) return "Unsupported (" + mode + ")";
-    if (mode === "direct") return "Continuous streaming";
-    return backupDataDeliveryExplicit(source) ? "Disk staged" : "Disk staged (legacy)";
+    if (mode === "direct") return "Direct streaming (advanced)";
+    return backupDataDeliveryExplicit(source) ? "Whole-archive staging" : "Staged delivery (legacy)";
   }
 
   function backupSpanningEnabled(source) {
@@ -1049,9 +1049,9 @@
   function backupLiveActivityLabel(activity, livePhase, directDelivery) {
     const labels = {
       starting: "Starting the data pipeline",
-      buffering: directDelivery ? "Starting the tape stream" : "Filling the disk buffer",
-      streaming: directDelivery ? "Streaming directly to tape" : "Streaming staged data to tape",
-      despooling: directDelivery ? "Streaming directly to tape" : "Draining the disk buffer to tape",
+      buffering: directDelivery ? "Starting the tape stream" : "Staging archive on disk",
+      streaming: directDelivery ? "Streaming directly to tape" : "Writing the staged archive to tape",
+      despooling: directDelivery ? "Streaming directly to tape" : "Writing the staged archive to tape",
       idle: "No data movement",
       stalled: "Transfer stalled",
       waiting: "Waiting for the backup engine",
@@ -1200,19 +1200,26 @@
     const tapeReadRate = pick(liveIo, "tape_read_bytes_per_second");
     const spoolBytesValue = pick(liveIo, "spool_bytes");
     const spoolCapacityValue = pick(liveIo, "spool_capacity_bytes");
+    const spoolTargetValue = pick(liveIo, "spool_target_bytes");
     const spoolFilesValue = pick(liveIo, "spool_file_count");
     const spoolFillRate = pick(liveIo, "spool_fill_bytes_per_second");
     const spoolDrainRate = pick(liveIo, "spool_drain_bytes_per_second");
     const spoolBytes = spoolBytesValue === null ? Number.NaN : Number(spoolBytesValue);
     const spoolCapacity = spoolCapacityValue === null ? Number.NaN : Number(spoolCapacityValue);
+    const spoolTarget = spoolTargetValue === null ? Number.NaN : Number(spoolTargetValue);
+    const spoolDenominator = Number.isFinite(spoolTarget) && spoolTarget > 0 ? spoolTarget : spoolCapacity;
+    const targetReported = Number.isFinite(spoolTarget) && spoolTarget > 0;
     const spoolFiles = spoolFilesValue === null ? Number.NaN : Number(spoolFilesValue);
-    const spoolMeasured = !directDelivery && (Boolean(spoolBasis) || Number.isFinite(spoolBytes) || Number.isFinite(spoolCapacity));
-    const occupancy = Number.isFinite(spoolBytes) && Number.isFinite(spoolCapacity) && spoolBytes >= 0 && spoolCapacity > 0
-      ? Math.min(100, spoolBytes / spoolCapacity * 100)
+    const spoolMeasured = !directDelivery && (Boolean(spoolBasis) || Number.isFinite(spoolBytes) || Number.isFinite(spoolDenominator));
+    const occupancy = Number.isFinite(spoolBytes) && Number.isFinite(spoolDenominator) && spoolBytes >= 0 && spoolDenominator > 0
+      ? Math.min(100, spoolBytes / spoolDenominator * 100)
       : Number.NaN;
     const spoolAmount = Number.isFinite(spoolBytes) && spoolBytes >= 0
-      ? bytes(spoolBytes) + (Number.isFinite(spoolCapacity) && spoolCapacity > 0 ? " / " + bytes(spoolCapacity) : "")
+      ? bytes(spoolBytes) + (Number.isFinite(spoolDenominator) && spoolDenominator > 0 ? " / " + bytes(spoolDenominator) : "")
       : "Measuring…";
+    const spoolLimit = targetReported && Number.isFinite(spoolCapacity) && spoolCapacity > 0
+      ? " · hard limit " + bytes(spoolCapacity)
+      : "";
     const spoolDirection = Number(spoolDrainRate) > 0 ? "Draining" : Number(spoolFillRate) > 0 ? "Filling" : "Net movement";
     const spoolRate = Number(spoolDrainRate) > 0
       ? rate(spoolDrainRate, true)
@@ -1220,7 +1227,7 @@
         ? rate(spoolFillRate, true)
         : spoolFillRate != null || spoolDrainRate != null ? "0 B/s" : "Measuring…";
     const spoolCards = spoolMeasured
-      ? '<div class="backup-spool-occupancy"><span>Disk buffer</span><strong>' + esc(spoolAmount) + '</strong><small>' + (Number.isFinite(occupancy) ? esc(occupancy.toFixed(1) + "% temporary occupancy") : "Temporary occupancy") + ' · not archive completion' + (Number.isFinite(spoolFiles) && spoolFiles >= 0 ? " · " + esc(Math.trunc(spoolFiles).toLocaleString()) + " spool files" : "") + '</small></div><div><span>' + esc(spoolDirection) + '</span><strong>' + esc(spoolRate) + '</strong><small>Measured from the run-specific disk spool</small></div>'
+      ? '<div class="backup-spool-occupancy"><span>Archive staging</span><strong>' + esc(spoolAmount) + '</strong><small>' + (Number.isFinite(occupancy) ? esc(occupancy.toFixed(1) + (targetReported ? "% of estimated stage target" : "% of reported spool capacity (legacy sample)")) : targetReported ? "Estimated stage target" : "Reported spool capacity") + esc(spoolLimit) + (Number.isFinite(spoolFiles) && spoolFiles >= 0 ? " · " + esc(Math.trunc(spoolFiles).toLocaleString()) + " spool files" : "") + '</small></div><div><span>' + esc(spoolDirection) + '</span><strong>' + esc(spoolRate) + '</strong><small>Measured from this backup\'s isolated staging area</small></div>'
       : "";
     const idleMillisecondsValue = pick(liveIo, "progress_idle_ms");
     const timeoutMillisecondsValue = pick(liveIo, "no_progress_timeout_ms");
@@ -1237,9 +1244,9 @@
       : "";
     const activityDetail = {
       starting: "The worker is connected and waiting for the first measured byte movement.",
-      buffering: directDelivery ? "Bacula is starting the continuous source-to-tape stream; no disk data spool is in this path." : "Source data is moving into the temporary disk buffer. Tape can remain idle until Bacula drains a buffered segment.",
+      buffering: directDelivery ? "Bacula is starting the direct source-to-tape stream; no disk data spool is in this path." : "Source data is being staged toward a conservative whole-archive target before the archive data pass starts. If staging nears its hard limit or begins draining early, TapeScale cancels instead of knowingly cycling partial batches.",
       streaming: "The physical tape-write counter is advancing.",
-      despooling: directDelivery ? "The physical tape-write path is active without a disk data spool." : "The temporary disk buffer is shrinking as Bacula sends its contents to tape.",
+      despooling: directDelivery ? "The physical tape-write path is active without disk staging." : "The staged data is shrinking as Bacula sends it to tape. Physical tape rate and archive-entry progress remain visible separately.",
       idle: "The worker is responding, but no measured " + (directDelivery ? "engine or tape" : "disk-buffer, engine, or tape") + " bytes have moved for " + idleLabel + ". This heartbeat is not counted as progress." + safety,
       stalled: "No measured " + (directDelivery ? "engine or tape" : "disk-buffer, engine, or tape") + " bytes have moved for " + idleLabel + "." + safety,
       waiting: "Bacula is waiting for an engine resource; no transfer is being claimed as active." + safety,
@@ -1259,7 +1266,7 @@
     }[activity] || "Updated";
     const basis = [
       pipelineBasis ? "Engine progress: " + human(pipelineBasis) : null,
-      !directDelivery && spoolBasis ? "Disk buffer: " + human(spoolBasis) : null,
+      !directDelivery && spoolBasis ? "Archive staging: " + human(spoolBasis) : null,
       tapeBasis ? "Physical tape I/O: " + human(tapeBasis) : tapeCountersAvailable === false ? "Physical tape counters unavailable on this host or drive" : "Physical tape counters measuring",
       pick(liveIo, "engine_state") ? "Bacula: " + human(pick(liveIo, "engine_state")) : null
     ].filter(Boolean).join(" · ");
@@ -1397,8 +1404,8 @@
     } else if (runState === "writing") {
       const headings = direct
         ? { starting: "Starting the tape stream", buffering: "Starting the tape stream", streaming: "Streaming directly to tape", despooling: "Streaming directly to tape", idle: "No data movement", stalled: "Transfer stalled", waiting: "Waiting for the backup engine" }
-        : { starting: "Starting the data pipeline", buffering: "Filling the disk buffer", streaming: "Writing staged data to tape", despooling: "Draining the disk buffer to tape", idle: "No data movement", stalled: "Transfer stalled", waiting: "Waiting for the backup engine" };
-      heading = headings[activity] || (progress.sampleFresh ? direct ? "Streaming directly to tape" : "Writing staged data to tape" : direct ? "Starting the tape stream" : "Starting the data pipeline");
+        : { starting: "Preparing whole-archive staging", buffering: "Staging archive on disk", streaming: "Writing the staged archive to tape", despooling: "Writing the staged archive to tape", idle: "No data movement", stalled: "Transfer stalled", waiting: "Waiting for the backup engine" };
+      heading = headings[activity] || (progress.sampleFresh ? direct ? "Streaming directly to tape" : "Staging archive on disk" : direct ? "Starting the tape stream" : "Preparing whole-archive staging");
       badge = activity === "stalled" ? "Action required" : activity === "idle" ? "No movement" : activity === "waiting" ? "Waiting" : progress.stale ? "Update delayed" : progress.sampleFresh ? "Active" : "Measuring";
       if (progress.stale) detail = "The last cumulative position is retained. Live rates and ETA are hidden until a fresh sample arrives.";
       else if (!progress.sampleFresh) detail = "Waiting for the first live Bacula sample. No transfer rate or movement is being claimed yet.";
@@ -1411,9 +1418,9 @@
           : "";
         detail = "The worker is responding, but no measured source, engine, buffer, or tape bytes have moved" + (Number.isFinite(idle) ? " for " + backupDurationLabel(idle) : "") + ". The retained position will not advance until data movement resumes." + safety;
       }
-      else if (direct) detail = "Bacula is processing source data through the continuous tape path; archive-entry progress, engine stream rate, and physical tape rate are measured separately.";
-      else if (activity === "buffering") detail = "Bacula is moving source data into the bounded disk buffer. Buffer occupancy is not archive completion.";
-      else detail = "Bacula is draining staged data to tape while retaining archive-entry progress separately from engine and physical tape rates.";
+      else if (direct) detail = "Bacula is processing source data directly to tape. If source and compression throughput fall below the drive minimum, the tape can still backhitch.";
+      else if (activity === "buffering") detail = "Bacula is staging toward a conservative whole-archive target before the tape data pass. The target is an estimate, not a guarantee; runtime guards cancel near the hard limit or on early drain rather than knowingly repeating partial batches.";
+      else detail = "Bacula is writing staged data to tape while retaining archive-entry progress separately from engine and physical tape rates.";
     } else if (["written", "finalizing"].includes(runState)) {
       heading = "Closing archive";
       badge = "Write complete";
@@ -1491,9 +1498,13 @@
       const spoolSource = progress.sampleFresh ? liveIo : progress.sample;
       const spoolBytes = number(spoolSource, "spool_bytes");
       const spoolCapacity = number(spoolSource, "spool_capacity_bytes");
-      if (spoolBytes !== null || spoolCapacity !== null) {
-        const occupancy = spoolBytes !== null && spoolCapacity > 0 ? Math.min(100, spoolBytes / spoolCapacity * 100) : null;
-        metrics.push({ label: "Disk buffer", value: spoolBytes === null ? "Measuring…" : bytes(spoolBytes) + (spoolCapacity > 0 ? " / " + bytes(spoolCapacity) : ""), detail: occupancy === null ? "Temporary staging" : backupPercentLabel(occupancy) + " occupied · not archive progress" });
+      const spoolTarget = number(spoolSource, "spool_target_bytes");
+      const targetReported = spoolTarget !== null && spoolTarget > 0;
+      const denominator = targetReported ? spoolTarget : spoolCapacity;
+      if (spoolBytes !== null || denominator !== null) {
+        const occupancy = spoolBytes !== null && denominator > 0 ? Math.min(100, spoolBytes / denominator * 100) : null;
+        const limitDetail = targetReported && spoolCapacity > 0 ? " · hard limit " + bytes(spoolCapacity) : "";
+        metrics.push({ label: "Archive staging", value: spoolBytes === null ? "Measuring…" : bytes(spoolBytes) + (denominator > 0 ? " / " + bytes(denominator) : ""), detail: occupancy === null ? targetReported ? "Conservative stage target" : "Reported spool capacity" : backupPercentLabel(occupancy) + (targetReported ? " of estimated stage target" : " of reported spool capacity (legacy sample)") + limitDetail });
       }
     }
 
@@ -1505,7 +1516,7 @@
       progress,
       metrics,
       action: cancellationRequested ? null : backupOperatorAction(run),
-      modeNote: runState === "writing" ? direct ? "Continuous streaming · no disk data spool" : "Disk staged · buffer occupancy is not archive completion" : null,
+      modeNote: runState === "writing" ? direct ? "Direct streaming · source speed must continuously sustain tape" : "Capacity-gated staging · fails closed near the spool limit or on early drain" : null,
       activity,
       preparationStep,
       cancellationRequested,
@@ -5529,9 +5540,9 @@
       '<div class="form-field"><label for="backup-retention-days">Keep completed backups for</label><div class="input-suffix"><input class="input" id="backup-retention-days" name="retention_days" type="number" min="1" max="36500" value="28" required><span>days</span></div></div>',
       '<div class="form-field"><label for="backup-media-pool">Tape pool <small>(optional)</small></label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div>',
       '<div class="form-field"><label for="backup-compression">Compression</label><select class="select" id="backup-compression" name="compression_mode"><option value="auto" selected>Automatic · LZO (recommended)</option><option value="gzip">GZIP · balanced</option><option value="lzo">LZO · fastest</option><option value="none">None</option></select><small>Automatic uses LZO to prioritize source throughput and reduce tape starvation. Balanced GZIP may compress more but is substantially slower; already-compressed files may not shrink.</small></div>',
-      '<fieldset class="form-field full backup-delivery-options"><legend>Tape delivery</legend><label class="backup-delivery-option"><input type="radio" id="backup-delivery-direct" name="data_delivery" value="direct" checked><span><strong>Continuous streaming <em>Recommended</em></strong><small>Send Bacula\'s processed stream directly to tape. Best for fast local ZFS; avoids writing and rereading a disk data spool.</small><small>If sustained source or compression throughput falls below the drive minimum, the tape can still pause.</small></span></label><label class="backup-delivery-option"><input type="radio" id="backup-delivery-disk-spool" name="data_delivery" value="disk_spool"><span><strong>Disk staged</strong><small>Fill and drain a bounded disk spool. Use for slow or bursty sources, ideally with dedicated SSD/NVMe staging. This is disk staging, not a RAM ring.</small></span></label></fieldset>',
+      '<fieldset class="form-field full backup-delivery-options"><legend>Tape delivery</legend><label class="backup-delivery-option"><input type="radio" id="backup-delivery-disk-spool" name="data_delivery" value="disk_spool" checked><span><strong>Whole-archive staging <em>Recommended</em></strong><small>Stage toward a conservative whole-archive target before the tape data pass. This avoids intentionally running Bacula as repeated partial fill/drain batches.</small><small>The target is an estimate, not a guarantee. TapeScale cancels near the hard spool limit or if early draining is detected; use fast dedicated storage with room for the entire archive.</small></span></label><label class="backup-delivery-option"><input type="radio" id="backup-delivery-direct" name="data_delivery" value="direct"><span><strong>Direct streaming <em>Advanced</em></strong><small>Skip disk staging and send the processed source directly to tape. Use only when measured source and compression throughput continuously exceed the drive\'s minimum streaming rate.</small><small>Small-file or slow sources can starve the drive and cause shoe-shining.</small></span></label></fieldset>',
       '<div class="form-field"><label>Archive size</label><label class="check-option backup-span-option"><input type="checkbox" id="backup-media-spanning" name="spanning_enabled" checked> Continue onto additional prepared tapes when this archive fills a cartridge.</label></div>',
-      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · LZO · continuous streaming · spans tapes as needed</strong><small>Data goes directly to tape; source and compression throughput must sustain the drive. TapeScale requests each additional tape only if the archive needs it.</small></div></div></div>',
+      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · LZO · capacity-gated staging · spans tapes as needed</strong><small>TapeScale stages toward a conservative whole-archive target and fails closed if the spool nears its limit or drains early. Additional tapes are requested only if the archive needs them.</small></div></div></div>',
       '</div>',
       '<p class="notice danger" id="backup-profile-error" role="alert" aria-live="assertive" hidden></p>',
       '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Continue to tape</button></div>',
@@ -5550,14 +5561,15 @@
   function updateBackupProfileOptions(form) {
     if (!form) return;
     const compression = backupCompressionLabel({ compression_mode: String(form.elements.compression_mode && form.elements.compression_mode.value || "auto") });
-    const delivery = backupDataDeliveryLabel({ data_delivery: String(form.elements.data_delivery && form.elements.data_delivery.value || "direct") });
+    const deliveryMode = String(form.elements.data_delivery && form.elements.data_delivery.value || "disk_spool");
+    const delivery = backupDataDeliveryLabel({ data_delivery: deliveryMode });
     const spanning = Boolean(form.elements.spanning_enabled && form.elements.spanning_enabled.checked);
     const summary = form.querySelector("#backup-plan-summary strong");
     const detail = form.querySelector("#backup-plan-summary small");
     if (summary) summary.textContent = "Full backup · " + compression + " · " + delivery.toLowerCase() + " · " + (spanning ? "spans tapes as needed" : "one tape maximum");
-    if (detail) detail.textContent = delivery === "Continuous streaming"
-      ? "Data goes directly to tape; source and compression throughput must sustain the drive. TapeScale requests additional tapes only if needed."
-      : "Bacula fills and drains a bounded disk spool; use fast dedicated spool storage. TapeScale requests additional tapes only if needed.";
+    if (detail) detail.textContent = deliveryMode === "direct"
+      ? "Data goes directly to tape. Use this only when measured source and compression throughput can sustain the drive without backhitching."
+      : "TapeScale checks a conservative whole-archive target and fails closed near the spool limit or on early drain rather than knowingly cycling partial batches.";
   }
 
   async function submitBackupProfile(form) {
@@ -5584,7 +5596,7 @@
           source_subpath: source,
           media_pool_id: String(values.get("media_pool_id") || "") || null,
           compression_mode: String(values.get("compression_mode") || "auto"),
-          data_delivery: String(values.get("data_delivery") || "direct"),
+          data_delivery: String(values.get("data_delivery") || "disk_spool"),
           spanning_enabled: values.get("spanning_enabled") === "on",
           schedule_timezone: form.dataset.timezone || "UTC",
           schedule_enabled: false,

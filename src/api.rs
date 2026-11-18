@@ -280,7 +280,7 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
             "backup_level": "full",
             "compression_modes": ["auto_lzo", "gzip6", "lzo", "none"],
             "data_delivery_modes": ["direct", "disk_spool"],
-            "default_data_delivery": "direct",
+            "default_data_delivery": "disk_spool",
             "manual_media_spanning": true,
             "complete_physical_readback": true,
             "production_eligible": false
@@ -510,7 +510,7 @@ const fn default_backup_spanning() -> bool {
 }
 
 fn default_backup_data_delivery() -> String {
-    "direct".to_owned()
+    "disk_spool".to_owned()
 }
 
 fn backup_actor_label(value: Option<&str>) -> Result<String, AppError> {
@@ -4213,6 +4213,7 @@ async fn has_ready_prepared_tape_pair(pool: &PgPool) -> Result<bool, sqlx::Error
                JOIN drives drive ON drive.id = qualification.drive_id
                JOIN cartridges cartridge ON cartridge.id = qualification.cartridge_id
               WHERE qualification.state = 'passed'
+                AND qualification.result->>'maximum_block_size_bytes' = '262144'
                 AND qualification.attempt > 0
                 AND qualification.engine_name = 'Bacula Community'
                 AND qualification.engine_version = $1
@@ -5037,7 +5038,7 @@ mod tests {
             None
         );
         assert_eq!(without_legacy_fields._legacy_limitations_acknowledged, None);
-        assert_eq!(without_legacy_fields.data_delivery, "direct");
+        assert_eq!(without_legacy_fields.data_delivery, "disk_spool");
 
         let old_client_payload: CreateBackupProfileRequest = serde_json::from_value(json!({
             "name": "Radio archive",
@@ -5054,7 +5055,7 @@ mod tests {
             old_client_payload._legacy_limitations_acknowledged,
             Some(true)
         );
-        assert_eq!(old_client_payload.data_delivery, "direct");
+        assert_eq!(old_client_payload.data_delivery, "disk_spool");
 
         let run_without_attestation: CreateBackupRunRequest =
             serde_json::from_value(json!({"idempotency_key": "manual-radio-001"}))

@@ -548,7 +548,8 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         json!({
             "detail":"integration btape evidence fixture",
             "position_uncertain":false,
-            "engine_version":"15.0.3"
+            "engine_version":"15.0.3",
+            "maximum_block_size_bytes":262144
         }),
     )
     .await
@@ -665,7 +666,8 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             terminal_state,
             json!({
                 "detail": format!("integration {suffix} terminal replay fixture"),
-                "position_uncertain": false
+                "position_uncertain": false,
+                "maximum_block_size_bytes": 262144
             }),
         )
         .await
@@ -738,7 +740,8 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         json!({
             "detail": "integration qualification restored after terminal replay matrix",
             "position_uncertain": false,
-            "engine_version": "15.0.3"
+            "engine_version": "15.0.3",
+            "maximum_block_size_bytes": 262144
         }),
     )
     .await
@@ -1294,6 +1297,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         no_progress_timeout_ms: None,
         spool_bytes: None,
         spool_capacity_bytes: None,
+        spool_target_bytes: None,
         spool_file_count: None,
         spool_fill_bytes_per_second: None,
         spool_drain_bytes_per_second: None,
@@ -2300,6 +2304,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         no_progress_timeout_ms: None,
         spool_bytes: None,
         spool_capacity_bytes: None,
+        spool_target_bytes: None,
         spool_file_count: None,
         spool_fill_bytes_per_second: None,
         spool_drain_bytes_per_second: None,
@@ -3501,7 +3506,11 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         &pool,
         &quarantine_qualification,
         QualificationTerminalState::Passed,
-        json!({"detail":"qualified quarantine fixture","position_uncertain":false}),
+        json!({
+            "detail":"qualified quarantine fixture",
+            "position_uncertain":false,
+            "maximum_block_size_bytes":262144
+        }),
     )
     .await
     .expect("quarantine fixture qualification should finish"));
@@ -3572,6 +3581,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         no_progress_timeout_ms: None,
         spool_bytes: None,
         spool_capacity_bytes: None,
+        spool_target_bytes: None,
         spool_file_count: None,
         spool_fill_bytes_per_second: None,
         spool_drain_bytes_per_second: None,
@@ -3791,7 +3801,11 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         &pool,
         &requalification,
         QualificationTerminalState::Passed,
-        json!({"detail":"fresh destructive qualification passed","position_uncertain":false}),
+        json!({
+            "detail":"fresh destructive qualification passed",
+            "position_uncertain":false,
+            "maximum_block_size_bytes":262144
+        }),
     )
     .await
     .expect("fresh qualification should clear quarantine"));
@@ -3832,7 +3846,11 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         &pool,
         &failed_newer_qualification,
         QualificationTerminalState::Failed,
-        json!({"detail":"newer physical attempt failed","position_uncertain":false}),
+        json!({
+            "detail":"newer physical attempt failed",
+            "position_uncertain":false,
+            "maximum_block_size_bytes":262144
+        }),
     )
     .await
     .expect("newer failed qualification should persist"));

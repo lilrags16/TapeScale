@@ -273,6 +273,7 @@ impl RestoreLiveIoSampler {
             no_progress_timeout_ms: None,
             spool_bytes: None,
             spool_capacity_bytes: None,
+            spool_target_bytes: None,
             spool_file_count: None,
             spool_fill_bytes_per_second: None,
             spool_drain_bytes_per_second: None,

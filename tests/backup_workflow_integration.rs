@@ -193,7 +193,8 @@ async fn qualify_backup_media(
         json!({
             "detail": "manual-media state integration qualification",
             "position_uncertain": false,
-            "engine_version": "15.0.3"
+            "engine_version": "15.0.3",
+            "maximum_block_size_bytes": 262144
         }),
     )
     .await
@@ -212,7 +213,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(manual_profile.verification_mode, "full_readback");
     assert_eq!(manual_profile.compression_mode, "auto");
     assert!(manual_profile.spanning_enabled);
-    assert_eq!(manual_profile.data_delivery, "direct");
+    assert_eq!(manual_profile.data_delivery, "disk_spool");
     assert!(!manual_profile.production_eligible);
 
     let invalid_delivery_source = create_source_profile(
@@ -559,13 +560,66 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         &claimed,
         QualificationTerminalState::Passed,
         json!({
-            "detail": "backup integration exact qualification",
+            "detail": "legacy backup integration qualification",
             "position_uncertain": false,
             "engine_version": "15.0.3"
         }),
     )
     .await
-    .expect("qualification pass should persist"));
+    .expect("legacy qualification pass should persist"));
+
+    let legacy_readiness = store::backup_media_readiness(
+        &pool,
+        assignment_profile.id,
+        Some((assignment_request.id, assignment_request.job_run_id)),
+    )
+    .await
+    .expect("legacy qualification readiness should be queryable");
+    let store::BackupMediaReadinessResult::Readiness(legacy_readiness) = legacy_readiness else {
+        panic!("the retained backup profile should have a readiness result");
+    };
+    assert_eq!(legacy_readiness.state, "blocked");
+    assert!(legacy_readiness.candidates.is_empty());
+    assert!(legacy_readiness.blockers.iter().any(|blocker| {
+        blocker.code == "setup_test_required"
+            && blocker.resource_id == Some(drive.id)
+            && blocker.related_resource_id == Some(scratch.id)
+    }));
+
+    let current_qualification = store::queue_qualification_run(
+        &pool,
+        drive.id,
+        &drive.stable_id,
+        scratch.id,
+        &scratch.internal_label,
+        true,
+        true,
+    )
+    .await
+    .expect("current block-size qualification should queue");
+    let QueueQualificationRunResult::Queued(current_qualification) = current_qualification else {
+        panic!("prepared scratch media should permit a current setup test");
+    };
+    let current_claim = store::claim_next_qualification_run(&pool, Uuid::now_v7())
+        .await
+        .expect("current qualification worker claim should succeed");
+    let ClaimQualificationRunResult::Claimed(current_claim) = current_claim else {
+        panic!("current qualification should be claimable");
+    };
+    assert_eq!(current_claim.run.id, current_qualification.id);
+    assert!(store::finish_qualification_run(
+        &pool,
+        &current_claim,
+        QualificationTerminalState::Passed,
+        json!({
+            "detail": "backup integration 256 KiB block qualification",
+            "position_uncertain": false,
+            "engine_version": "15.0.3",
+            "maximum_block_size_bytes": 262144
+        }),
+    )
+    .await
+    .expect("current block-size qualification pass should persist"));
 
     // Exercise the complete attended continuation/readback request contract on
     // its own run so the later finalization fixture remains single-volume.
@@ -634,7 +688,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     let QueueSingleTapeDataRunResult::Queued(continuation_run) = continuation_run else {
         panic!("the spanning integration run should queue");
     };
-    assert_eq!(continuation_run.data_delivery, "direct");
+    assert_eq!(continuation_run.data_delivery, "disk_spool");
     let continuation_claim = store::claim_next_single_tape_data_run(&pool, Uuid::now_v7())
         .await
         .expect("spanning integration run should be claimable");
@@ -689,6 +743,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         no_progress_timeout_ms: None,
         spool_bytes: None,
         spool_capacity_bytes: None,
+        spool_target_bytes: None,
         spool_file_count: None,
         spool_fill_bytes_per_second: None,
         spool_drain_bytes_per_second: None,
@@ -1281,7 +1336,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(assignment.compression_mode, "auto");
     assert_eq!(assignment.resolved_compression, "lzo");
     assert!(assignment.spanning_enabled);
-    assert_eq!(assignment.data_delivery, "direct");
+    assert_eq!(assignment.data_delivery, "disk_spool");
     let assignment_volumes = store::data_run_volumes(&pool, assignment.id)
         .await
         .expect("the ordered initial tape assignment should reload");
@@ -1478,7 +1533,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     let QueueSingleTapeDataRunResult::Queued(final_run) = final_run else {
         panic!("the finalization fixture should queue");
     };
-    assert_eq!(final_run.data_delivery, "direct");
+    assert_eq!(final_run.data_delivery, "disk_spool");
     let claimed = store::claim_next_single_tape_data_run(&pool, Uuid::now_v7())
         .await
         .expect("backup worker claim should succeed");
@@ -1633,6 +1688,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         no_progress_timeout_ms: Some(1_800_000),
         spool_bytes: Some(1_048_576),
         spool_capacity_bytes: Some(68_719_476_736),
+        spool_target_bytes: Some(64_424_509_440),
         spool_file_count: Some(2),
         spool_fill_bytes_per_second: None,
         spool_drain_bytes_per_second: Some(256),
@@ -2234,6 +2290,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         no_progress_timeout_ms: None,
         spool_bytes: None,
         spool_capacity_bytes: None,
+        spool_target_bytes: None,
         spool_file_count: None,
         spool_fill_bytes_per_second: None,
         spool_drain_bytes_per_second: None,

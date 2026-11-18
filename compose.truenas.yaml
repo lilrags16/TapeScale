@@ -6,8 +6,8 @@
 # This alpha stack exposes status, rewind, unload, an attended Bacula btape
 # qualification run with a guided tape-initialization flow, an attended Backup
 # Center with graphical source browsing, operator-attended multi-cartridge
-# full-file writes, selectable Bacula compression and direct/disk-staged
-# delivery, physical readback, retained
+# full-file writes, selectable Bacula compression and whole-archive staged or
+# advanced direct delivery, physical readback, retained
 # manifest browsing, the narrower G0.2 recovery exercise,
 # recovery evidence/planning, attended multi-volume complete-point or
 # single-volume selected-path read-only verified-point rehearsal,
@@ -16,7 +16,10 @@
 # overwrite the loaded tape; the later rehearsal reads it. Use scratch media for
 # every destructive workflow. No unattended tape selection is performed.
 # Before installing, create /mnt/tapescale-restores as an isolated restore dataset
-# with a Generic/POSIX-compatible ACL preset and no SMB or NFS share.
+# and /mnt/tapescale-spool as a large dedicated staging dataset, preferably on
+# SSD/NVMe. Give both a Generic/POSIX-compatible ACL preset and no SMB/NFS share.
+# The worker runs as container root and must be able to create and fsync files in
+# /mnt/tapescale-spool; verify that before the first backup.
 # /mnt is exposed read-only as /source so the UI can select an immutable
 # .zfs/snapshot subpath; it is never a writable source mount.
 # Paste this entire file into Apps > Discover Apps > Install via YAML.
@@ -25,11 +28,11 @@ name: tapescale
 
 x-tapescale-common: &tapescale-common
   build:
-    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-alpha.12
+    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-alpha.13
     args:
-      TAPESCALE_VERSION: 0.1.0-alpha.12
-      TAPESCALE_REVISION: v0.1.0-alpha.12
-  image: tapescale:0.1.0-alpha.12
+      TAPESCALE_VERSION: 0.1.0-alpha.13
+      TAPESCALE_REVISION: v0.1.0-alpha.13
+  image: tapescale:0.1.0-alpha.13
   pull_policy: build
   restart: unless-stopped
   read_only: true
@@ -102,10 +105,11 @@ services:
       TAPESCALE_BTAPE_PATH: /usr/sbin/btape
       TAPESCALE_BCONSOLE_PATH: /usr/sbin/bconsole
       TAPESCALE_BACULA_STATE_DIR: /var/lib/tapescale/bacula
-      # Up to 64 GiB of data buffering plus an 8 GiB filesystem reserve.
-      # TapeScale also reserves an archive-specific attribute-spool allowance.
-      # Bacula drains a full data buffer and continues, so this is no size cap.
-      TAPESCALE_BACULA_SPOOL_MAX_BYTES: "68719476736"
+      # Whole-archive anti-shoe-shine staging. Zero uses the dedicated spool
+      # dataset's available capacity after filesystem and attribute reserves.
+      # TapeScale blocks before dispatch unless the conservative archive estimate
+      # fits; runtime guards cancel near the limit or on an observed early drain.
+      TAPESCALE_BACULA_SPOOL_MAX_BYTES: "0"
       TAPESCALE_BACULA_SPOOL_RESERVE_BYTES: "8589934592"
       TAPESCALE_BACULA_SPOOL_MIN_BYTES: "8589934592"
       TAPESCALE_QUALIFICATION_TIMEOUT_SECS: "1800"
@@ -117,7 +121,11 @@ services:
       - /dev/nst0:/dev/nst0:rwm
     volumes:
       - worker_recovery:/var/lib/tapescale/recovery
-      - worker_spool:/var/lib/tapescale/spool
+      - type: bind
+        source: /mnt/tapescale-spool
+        target: /var/lib/tapescale/spool
+        bind:
+          create_host_path: false
       - worker_engine_state:/var/lib/tapescale/bacula
       - worker_bacula_runtime:/var/lib/bacula
       - /mnt:/source:ro
@@ -185,7 +193,6 @@ volumes:
   postgres_data:
   # PostgreSQL retains plans, requests, inventory, runs, and recovery evidence.
   worker_recovery:
-  worker_spool:
   worker_engine_state:
   worker_bacula_runtime:
 

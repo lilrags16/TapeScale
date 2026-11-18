@@ -243,7 +243,7 @@ const fn default_spanning_enabled() -> bool {
 }
 
 fn default_data_delivery() -> String {
-    "direct".to_owned()
+    "disk_spool".to_owned()
 }
 
 fn default_actor() -> String {
@@ -1420,7 +1420,7 @@ mod tests {
         assert!(!profile.encryption_enabled);
         assert!(profile.spanning_enabled);
         assert_eq!(profile.compression_mode, "auto");
-        assert_eq!(profile.data_delivery, "direct");
+        assert_eq!(profile.data_delivery, "disk_spool");
         profile.validate().expect("safe defaults should validate");
     }
 

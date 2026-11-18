@@ -2,8 +2,13 @@ use std::{env, fs, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration}
 
 use anyhow::{Context, Result};
 
-use crate::engine::bacula::{DATA_SPOOL_DIRECTORY, DEFAULT_DATA_SPOOL_MAX_BYTES};
+use crate::engine::bacula::DATA_SPOOL_DIRECTORY;
 
+// Zero deliberately means "use all capacity currently available after the
+// configured and per-archive reserves".  A fixed ceiling can make Bacula
+// alternate between filling and draining partial spool batches, which leaves
+// a fast tape drive starved while the next batch is produced.
+const DEFAULT_DATA_SPOOL_MAX_BYTES: u64 = 0;
 const DEFAULT_DATA_SPOOL_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_DATA_SPOOL_MIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -141,8 +146,9 @@ impl Config {
         );
         anyhow::ensure!(
             bacula_spool_min_bytes > 0
-                && bacula_spool_max_bytes >= bacula_spool_min_bytes,
-            "TAPESCALE_BACULA_SPOOL_MAX_BYTES must be at least TAPESCALE_BACULA_SPOOL_MIN_BYTES, and both must be non-zero"
+                && (bacula_spool_max_bytes == 0
+                    || bacula_spool_max_bytes >= bacula_spool_min_bytes),
+            "TAPESCALE_BACULA_SPOOL_MIN_BYTES must be non-zero; TAPESCALE_BACULA_SPOOL_MAX_BYTES must be zero (automatic) or at least the minimum"
         );
 
         Ok(Self {

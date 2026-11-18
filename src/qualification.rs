@@ -12,7 +12,10 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::tool_runner::{self, ToolCommand, ToolError, ToolOutput};
+use crate::{
+    engine::bacula::MAXIMUM_TAPE_BLOCK_BYTES,
+    tool_runner::{self, ToolCommand, ToolError, ToolOutput},
+};
 
 pub const BACULA_CANDIDATE: &str = "Bacula Community";
 pub const BACULA_CANDIDATE_VERSION: &str = "15.0.3";
@@ -130,7 +133,7 @@ fn render_storage_config(
     let working_dir = safe_config_path(working_dir)?;
     let pid_dir = safe_config_path(pid_dir)?;
     Ok(format!(
-        "Storage {{\n  Name = tapescale-qualification-sd\n  Working Directory = \"{working_dir}\"\n  Pid Directory = \"{pid_dir}\"\n  Plugin Directory = \"/usr/lib/bacula\"\n  Maximum Concurrent Jobs = 1\n  Messages = Standard\n}}\n\nDirector {{\n  Name = tapescale-qualification-dir\n  Password = \"qualification-{run_id}\"\n}}\n\nDevice {{\n  Name = tapescale-qualification-drive\n  Media Type = LTO\n  Archive Device = \"{device}\"\n  AutomaticMount = yes\n  AlwaysOpen = yes\n  RemovableMedia = yes\n  RandomAccess = no\n}}\n\nMessages {{\n  Name = Standard\n  director = tapescale-qualification-dir = all\n}}\n"
+        "Storage {{\n  Name = tapescale-qualification-sd\n  Working Directory = \"{working_dir}\"\n  Pid Directory = \"{pid_dir}\"\n  Plugin Directory = \"/usr/lib/bacula\"\n  Maximum Concurrent Jobs = 1\n  Messages = Standard\n}}\n\nDirector {{\n  Name = tapescale-qualification-dir\n  Password = \"qualification-{run_id}\"\n}}\n\nDevice {{\n  Name = tapescale-qualification-drive\n  Media Type = LTO\n  Archive Device = \"{device}\"\n  AutomaticMount = yes\n  AlwaysOpen = yes\n  RemovableMedia = yes\n  RandomAccess = no\n  Maximum Block Size = {MAXIMUM_TAPE_BLOCK_BYTES}\n}}\n\nMessages {{\n  Name = Standard\n  director = tapescale-qualification-dir = all\n}}\n"
     ))
 }
 
@@ -207,6 +210,7 @@ fn outcome_from_execution(
         "device": paths.device,
         "config_path": paths.config_path,
         "config_sha256": paths.config_sha256,
+        "maximum_block_size_bytes": MAXIMUM_TAPE_BLOCK_BYTES,
         "stdin_transcript": "test\\n",
         "scope": "destructive scratch-media drive compatibility test",
         "g0_gate": "not_passed"
@@ -433,6 +437,7 @@ mod tests {
         .expect("config");
         assert!(config.contains("Archive Device = \"/dev/nst0\""));
         assert!(config.contains("RandomAccess = no"));
+        assert!(config.contains("Maximum Block Size = 262144"));
     }
 
     #[test]

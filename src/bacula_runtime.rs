@@ -30,8 +30,8 @@ use crate::{
     engine::bacula::{
         BaculaConfig, BaculaCredentials, BaculaDaemon, BaculaDataDelivery, BaculaDataOptions,
         BaculaEndpoints, BaculaPaths, BaculaPoolName, RenderedBaculaConfigs, BCONSOLE_CONFIG,
-        DATA_SPOOL_DIRECTORY, DIRECTOR_CONFIG, FILE_DAEMON_CONFIG, MAXIMUM_TAPE_FILE_BYTES,
-        STORAGE_DAEMON_CONFIG,
+        DATA_SPOOL_DIRECTORY, DIRECTOR_CONFIG, FILE_DAEMON_CONFIG, MAXIMUM_TAPE_BLOCK_BYTES,
+        MAXIMUM_TAPE_FILE_BYTES, STORAGE_DAEMON_CONFIG,
     },
     tool_runner::{self, ToolCommand},
 };
@@ -173,6 +173,7 @@ pub struct BaculaRuntimeEvidence {
     pub backup_attribute_spooling_enabled: bool,
     pub attribute_spool_directory: PathBuf,
     pub maximum_tape_file_bytes: u64,
+    pub maximum_tape_block_bytes: u64,
 }
 
 struct ManagedDaemon {
@@ -272,6 +273,7 @@ impl BaculaRuntime {
         evidence.backup_attribute_spooling_enabled = true;
         evidence.attribute_spool_directory = run_spool_directory;
         evidence.maximum_tape_file_bytes = MAXIMUM_TAPE_FILE_BYTES;
+        evidence.maximum_tape_block_bytes = MAXIMUM_TAPE_BLOCK_BYTES;
 
         for daemon in BaculaDaemon::STARTUP_ORDER {
             validate_daemon(daemon, cancellation).await?;
@@ -584,6 +586,7 @@ fn write_configs(
         backup_attribute_spooling_enabled: false,
         attribute_spool_directory: PathBuf::new(),
         maximum_tape_file_bytes: 0,
+        maximum_tape_block_bytes: 0,
     })
 }
 

@@ -54,6 +54,16 @@ pub const DEFAULT_DATA_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// guidance but still requires generation-specific physical qualification; it
 /// changes positioning granularity, not archive capacity.
 pub const MAXIMUM_TAPE_FILE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// Use substantially larger physical tape records than Bacula's 64,512-byte
+/// default. Modern LTO drives otherwise spend more time crossing record
+/// boundaries, which increases protocol overhead and can aggravate
+/// backhitching when the data path is close to the drive's streaming floor.
+///
+/// The value remains below Linux `st`'s usual variable-block ceiling and is
+/// emitted for every runtime, so write, verification, and restore all use the
+/// same format boundary. Physical qualification still has to prove this exact
+/// setting on each supported drive generation and firmware combination.
+pub const MAXIMUM_TAPE_BLOCK_BYTES: u64 = 256 * 1024;
 /// Maximum source-relative path exposed in an ephemeral live-I/O sample.
 ///
 /// Bacula's raw File Daemon status reports the absolute source path.  The
@@ -129,7 +139,9 @@ impl BaculaCompression {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BaculaDataDelivery {
-    /// Stage bounded segments on disk before writing them to tape.
+    /// Stage data on disk before writing it to tape. TapeScale's operational
+    /// backup path replaces the constructor placeholder with a capacity-gated
+    /// per-run limit before daemon startup.
     #[default]
     DiskSpool,
     /// Send the File Daemon stream directly to the Storage Daemon and tape.
@@ -182,9 +194,8 @@ impl BaculaDataOptions {
         matches!(self.delivery, BaculaDataDelivery::DiskSpool)
     }
 
-    /// Bound Bacula's disk buffer without limiting the backup itself. Once
-    /// this many bytes have been staged, Bacula despools them to tape and
-    /// then resumes filling the buffer.
+    /// Set Bacula's per-run disk-stage ceiling. Callers that perform writes
+    /// must first prove their intended staging contract fits below this value.
     #[must_use]
     pub const fn with_maximum_spool_size(mut self, maximum_spool_size: NonZeroU64) -> Self {
         self.maximum_spool_size = maximum_spool_size;
@@ -909,6 +920,7 @@ Messages {{
     fn render_storage_daemon(&self) -> String {
         let maximum_spool_size = self.data_options.maximum_spool_size_bytes();
         let maximum_tape_file_size = MAXIMUM_TAPE_FILE_BYTES;
+        let maximum_tape_block_size = MAXIMUM_TAPE_BLOCK_BYTES;
         let data_spool_directory = self.data_spool_directory.display();
         format!(
             r#"Storage {{
@@ -946,6 +958,9 @@ Device {{
   Random Access = no
   Label Media = no
   Maximum File Size = {maximum_tape_file_size}
+  # Bacula defaults to 64,512-byte records. A 256 KiB ceiling reduces block
+  # overhead on modern LTO while retaining variable-block operation.
+  Maximum Block Size = {maximum_tape_block_size}
   # Keep the local File/Storage stream on Bacula's documented high-throughput
   # buffer size. Both ends use the same value.
   Maximum Network Buffer Size = 65536
@@ -965,6 +980,7 @@ Messages {{
             data_spool_directory = data_spool_directory,
             maximum_spool_size = maximum_spool_size,
             maximum_tape_file_size = maximum_tape_file_size,
+            maximum_tape_block_size = maximum_tape_block_size,
         )
     }
 
@@ -2670,6 +2686,9 @@ mod tests {
         assert!(rendered
             .storage_daemon
             .contains("Maximum File Size = 34359738368"));
+        assert!(rendered
+            .storage_daemon
+            .contains("Maximum Block Size = 262144"));
         assert!(rendered
             .file_daemon
             .contains("Allowed Backup Directories = /source"));

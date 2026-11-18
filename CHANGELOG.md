@@ -2,6 +2,20 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.13] - 2026-11-18
+
+### Anti-shoe-shine tape delivery
+
+- **Whole-archive staging** is now the safe default for new and existing saved backup policies. TapeScale budgets a conservative stage target of 125% of logical payload plus 64 KiB per entry and 4 GiB of framing, separate from attribute and filesystem reserves. It blocks before dispatch when that point-in-time estimate cannot fit and cancels near the hard limit or on observed early drain rather than knowingly continuing cyclic partial batches. Already assigned runs retain their immutable delivery choice.
+- A spool maximum of `0` now selects all currently usable staging capacity after attribute and filesystem reserves. The TrueNAS deployment bind-mounts the required dedicated `/mnt/tapescale-spool` dataset instead of hiding staging inside a Docker-managed 64 GiB batch buffer.
+- Direct source-to-tape delivery remains an explicit advanced option for sources proven to sustain the drive. The console warns that slow or small-file workloads can still starve and backhitch the drive; TapeScale does not yet claim a packed-object small-file format.
+- The generated Bacula runtime and destructive `btape` setup test use a 256 KiB maximum tape block size. Existing installations must rerun **Prepare tape** with blank/scratch media before its next write so the exact drive/media pair exercises the new physical record ceiling. Existing archives remain readable and must not be destructively prepared.
+
+### Operator feedback and compatibility
+
+- Live backup status distinguishes complete-archive staging from the sustained tape pass and labels staging capacity, occupancy, and tape-wait behavior without presenting any of them as archive completion.
+- Upgrade migration `0018` moves saved direct policies to the safe whole-stage default while preserving already assigned run evidence and permitting an operator to deliberately select direct delivery again.
+
 ## [0.1.0-alpha.12] - 2026-11-18
 
 ### Operator command center
@@ -192,6 +206,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.13]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.13
 [0.1.0-alpha.12]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.12
 [0.1.0-alpha.11]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.11
 [0.1.0-alpha.10]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.10

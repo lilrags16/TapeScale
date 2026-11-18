@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-12/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-12/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-13/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-13/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -111,7 +111,7 @@ test("creating a request continues directly into final tape authorization", () =
   assert.doesNotMatch(submit, /toast\("Full backup queued"/);
 });
 
-test("backup policy exposes compression, continuous delivery, and spanning without a one-tape ceiling", () => {
+test("backup policy defaults to whole-archive anti-shoe-shine staging and retains advanced direct delivery", () => {
   const open = section("  function openBackupProfile(", "  async function submitBackupProfile(");
   const submit = section("  async function submitBackupProfile(", "  function backupCapacityPlan(");
 
@@ -125,17 +125,20 @@ test("backup policy exposes compression, continuous delivery, and spanning witho
   assert.doesNotMatch(open, /Automatic · fast GZIP/);
   assert.match(open, /name="spanning_enabled" checked/);
   assert.match(open, /spans tapes as needed/);
-  assert.match(open, /name="data_delivery" value="direct" checked/);
-  assert.match(open, /name="data_delivery" value="disk_spool"/);
-  assert.match(open, /Continuous streaming/);
-  assert.match(open, /avoids writing and rereading a disk data spool/);
-  assert.match(open, /This is disk staging, not a RAM ring/);
+  assert.match(open, /name="data_delivery" value="disk_spool" checked/);
+  assert.match(open, /name="data_delivery" value="direct"/);
+  assert.match(open, /Whole-archive staging <em>Recommended<\/em>/);
+  assert.match(open, /stage toward a conservative whole-archive target before the tape data pass/i);
+  assert.match(open, /target is an estimate, not a guarantee/i);
+  assert.match(open, /cancels near the hard spool limit or if early draining is detected/i);
+  assert.match(open, /Direct streaming <em>Advanced<\/em>/);
+  assert.match(open, /Small-file or slow sources can starve the drive and cause shoe-shining/);
   assert.match(submit, /compression_mode: String\(values\.get\("compression_mode"\) \|\| "auto"\)/);
-  assert.match(submit, /data_delivery: String\(values\.get\("data_delivery"\) \|\| "direct"\)/);
+  assert.match(submit, /data_delivery: String\(values\.get\("data_delivery"\) \|\| "disk_spool"\)/);
   assert.match(submit, /spanning_enabled: values\.get\("spanning_enabled"\) === "on"/);
 });
 
-test("delivery labels distinguish direct, staged, legacy, and unsupported plans", () => {
+test("delivery labels distinguish advanced direct, whole-archive staged, legacy, and unsupported plans", () => {
   const helpers = section("  function backupDataDeliveryExplicit(", "  function backupSpanningEnabled(");
   const testPick = (object, ...keys) => {
     if (!object || typeof object !== "object") return null;
@@ -147,9 +150,9 @@ test("delivery labels distinguish direct, staged, legacy, and unsupported plans"
     '"use strict";\n' + helpers + "\nreturn [backupDataDelivery, backupDataDeliverySupported, backupDataDeliveryLabel];"
   )(testPick, () => null, () => null);
   assert.equal(values[0]({ data_delivery: "direct" }), "direct");
-  assert.equal(values[2]({ data_delivery: "direct" }), "Continuous streaming");
-  assert.equal(values[2]({ data_delivery: "disk_spool" }), "Disk staged");
-  assert.equal(values[2]({}), "Disk staged (legacy)");
+  assert.equal(values[2]({ data_delivery: "direct" }), "Direct streaming (advanced)");
+  assert.equal(values[2]({ data_delivery: "disk_spool" }), "Whole-archive staging");
+  assert.equal(values[2]({}), "Staged delivery (legacy)");
   assert.equal(values[1]({ data_delivery: "ram_ring" }), false);
   assert.equal(values[2]({ data_delivery: "ram_ring" }), "Unsupported (ram_ring)");
 });
@@ -838,7 +841,8 @@ test("the operation hero renders phase-specific progress, rates, and tape action
   assert.match(direct, /Radio Stuff\/session &lt;final&gt;&amp;&quot;\.wav/);
   assert.doesNotMatch(direct, /<final>/, "the source-relative filename must be HTML escaped");
   assert.match(direct, /not retained after this phase/);
-  assert.match(direct, /Continuous streaming · no disk data spool/);
+  assert.match(direct, /Direct streaming · source speed must continuously sustain tape/);
+  assert.match(direct, /tape can still backhitch/);
 
   const readbackRun = {
     ...directRun,
@@ -873,16 +877,24 @@ test("the operation hero renders phase-specific progress, rates, and tape action
         tape_write_counter_available: true,
         tape_write_bytes_per_second: 0,
         spool_bytes: 250,
-        spool_capacity_bytes: 1000
+        spool_target_bytes: 1000,
+        spool_capacity_bytes: 1200
       }
     })
   };
   const staged = render(stagedRun);
-  assert.match(staged, /Filling the disk buffer/);
-  assert.match(staged, /Disk buffer/);
+  assert.match(staged, /Staging archive on disk/);
+  assert.match(staged, /Archive staging/);
   assert.match(staged, /250 B \/ 1,000 B/);
-  assert.match(staged, /25% occupied · not archive progress/);
+  assert.match(staged, /25% of estimated stage target · hard limit 1,200 B/);
+  assert.match(staged, /Capacity-gated staging · fails closed near the spool limit or on early drain/);
   assert.doesNotMatch(staged, /Tape read/);
+
+  const legacyStaged = render({
+    ...stagedRun,
+    _progress: progress({ liveIo: { phase: "backup_write", activity: "buffering", spool_bytes: 250, spool_capacity_bytes: 1000 } })
+  });
+  assert.match(legacyStaged, /25% of reported spool capacity \(legacy sample\)/);
 
   const pausedRun = {
     ...directRun,
@@ -1046,7 +1058,8 @@ test("shared preparation and engine telemetry remain honest about stale or missi
     pipeline_basis: "bacula_storage_running_job_bytes_delta",
     tape_basis: "linux_scsi_tape_sysfs_counter_delta",
     spool_bytes: 16777216,
-    spool_capacity_bytes: 67108864,
+    spool_target_bytes: 67108864,
+    spool_capacity_bytes: 83886080,
     spool_file_count: 2,
     spool_fill_bytes_per_second: 2097152,
     spool_drain_bytes_per_second: 0,
@@ -1055,14 +1068,15 @@ test("shared preparation and engine telemetry remain honest about stale or missi
 
   assert.equal(stale(freshSample, now), false);
   const live = render({ state: "writing", result: { live_io: freshSample } });
-  assert.match(live, /Filling the disk buffer/);
+  assert.match(live, /Staging archive on disk/);
   assert.match(live, /Buffering/);
-  assert.match(live, /Disk buffer/);
+  assert.match(live, /Archive staging/);
   assert.match(live, /16\.0 MiB \/ 64\.0 MiB/);
-  assert.match(live, /25\.0% temporary occupancy/);
-  assert.match(live, /not archive completion/);
+  assert.match(live, /25\.0% of estimated stage target/);
+  assert.match(live, /hard limit 80\.0 MiB/);
   assert.match(live, /Filling<\/span><strong>2\.0 MiB\/s/);
-  assert.match(live, /Source data is moving into the temporary disk buffer/);
+  assert.match(live, /Source data is being staged toward a conservative whole-archive target/);
+  assert.match(live, /cancels instead of knowingly cycling partial batches/);
   assert.match(live, /Bacula write stream/);
   assert.match(live, /After Bacula hashing\/compression · not raw ZFS throughput/);
   assert.doesNotMatch(live, /Logical backup pipeline/);
@@ -1072,7 +1086,7 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   assert.doesNotMatch(live, /Tape read/);
   assert.match(live, /Rolling 5 second sample/);
   assert.match(live, /Engine progress: Bacula Storage Running Job Bytes Delta/);
-  assert.match(live, /Disk buffer: Run Scoped Bacula Spool Regular File Bytes/);
+  assert.match(live, /Archive staging: Run Scoped Bacula Spool Regular File Bytes/);
   assert.match(live, /Linux Scsi Tape Sysfs Counter Delta/);
   assert.match(live, /Bacula: Running/);
 
@@ -1084,14 +1098,15 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   assert.doesNotMatch(firstSpool, /Net movement<\/span><strong>0 B\/s/);
 
   const streaming = render({ state: "writing", result: { live_io: { ...freshSample, activity: "streaming", spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 4194304, tape_write_bytes_per_second: 4194304 } } });
-  assert.match(streaming, /Streaming staged data to tape/);
+  assert.match(streaming, /Writing the staged archive to tape/);
   assert.match(streaming, /Tape active/);
   assert.match(streaming, /Draining<\/span><strong>4\.0 MiB\/s/);
   assert.match(streaming, /physical tape-write counter is advancing/);
 
   const despooling = render({ state: "writing", result: { live_io: { ...freshSample, activity: "despooling", spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 3145728, tape_write_counter_available: false, tape_write_bytes_per_second: null } } });
-  assert.match(despooling, /Draining the disk buffer to tape/);
-  assert.match(despooling, /temporary disk buffer is shrinking/);
+  assert.match(despooling, /Writing the staged archive to tape/);
+  assert.match(despooling, /staged data is shrinking/);
+  assert.match(despooling, /Physical tape rate and archive-entry progress remain visible separately/);
 
   const idle = render({ state: "writing", result: { live_io: { ...freshSample, activity: "idle", progress_idle_ms: 300000, pipeline_bytes_per_second: 0, spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 0 } } });
   assert.match(idle, /No data movement/);
@@ -1108,7 +1123,7 @@ test("shared preparation and engine telemetry remain honest about stale or missi
 
   const legacyIdle = render({ state: "writing", result: { live_io: { sampled_at: new Date(now).toISOString(), sample_window_ms: 5000, phase: "backup_write", pipeline_bytes_per_second: 0, tape_write_bytes_per_second: 0, tape_read_bytes_per_second: 0, tape_counters_available: true, stale_after_seconds: 20 } } });
   assert.match(legacyIdle, /No data movement/);
-  assert.doesNotMatch(legacyIdle, /Disk buffer<\/span>/);
+  assert.doesNotMatch(legacyIdle, /Archive staging<\/span>/);
 
   const unavailable = render({ state: "writing", result: { live_io: { ...freshSample, tape_read_counter_available: false, tape_write_counter_available: false, tape_counters_available: false } } });
   assert.equal((unavailable.match(/Unavailable/g) || []).length, 1);
@@ -1182,15 +1197,15 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   const stability = renderPreparation({ state: "verifying", result: { preparation_progress: { ...preparationSample, stage: "source_stability_check", step: "sorting" } } });
   assert.match(stability, /Sorting manifest entries/);
   assert.match(stability, /Tape readback is complete/);
-  assert.match(render({ state: "writing", result: { live_io: freshSample, preparation_progress: preparationSample } }), /Filling the disk buffer/, "a retained inventory sample must not hide active write telemetry");
+  assert.match(render({ state: "writing", result: { live_io: freshSample, preparation_progress: preparationSample } }), /Staging archive on disk/, "a retained inventory sample must not hide active write telemetry");
 
   const direct = render({ state: "writing", data_delivery: "direct", result: { live_io: { ...freshSample, activity: "streaming", tape_write_bytes_per_second: 4194304 } } });
   assert.match(direct, /Streaming directly to tape/);
-  assert.doesNotMatch(direct, /Disk buffer|Filling the disk buffer|Streaming staged data/);
+  assert.doesNotMatch(direct, /Archive staging|Staging archive on disk|staged archive/);
   const directStarting = render({ state: "writing", data_delivery: "direct", result: { live_io: { ...freshSample, activity: "buffering" } } });
   assert.match(directStarting, /Starting the tape stream/);
   assert.match(directStarting, /no disk data spool is in this path/);
-  assert.doesNotMatch(directStarting, /temporary disk buffer/);
+  assert.doesNotMatch(directStarting, /staged archive/);
 
   const evidence = section("  function renderBackupEvidence(", "  function renderBackupOutcome(");
   assert.match(evidence, /\["Recorded average", throughput == null \? null/);

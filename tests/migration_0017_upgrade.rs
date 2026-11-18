@@ -61,7 +61,19 @@ async fn continuous_delivery_upgrade_preserves_runs_and_accelerates_future_polic
     .expect("legacy delivery columns should be inspectable");
     assert_eq!(absent, 0);
 
-    all.run(&pool)
+    let through_0017 = Migrator {
+        migrations: Cow::Owned(
+            all.iter()
+                .filter(|migration| migration.version <= 17)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    through_0017
+        .run(&pool)
         .await
         .expect("0017 should add selectable tape delivery");
 

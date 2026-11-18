@@ -1913,6 +1913,7 @@ pub async fn evaluate_media_reuse(
                 drive.last_observed_at,
                 COALESCE((
                     SELECT qualification.state = 'passed'
+                           AND qualification.result->>'maximum_block_size_bytes' = '262144'
                     FROM qualification_runs qualification
                     JOIN cartridges qualified_cartridge
                       ON qualified_cartridge.id = qualification.cartridge_id

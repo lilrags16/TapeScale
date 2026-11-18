@@ -1109,6 +1109,8 @@ pub struct SingleTapeLiveIoSample {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spool_capacity_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_target_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub spool_file_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spool_fill_bytes_per_second: Option<u64>,
@@ -4920,7 +4922,9 @@ async fn backup_media_readiness_inner(
                  FROM drive_ids CROSS JOIN cartridge_ids
              )
              SELECT pair.drive_id, pair.cartridge_id,
-                    CASE WHEN latest.state = 'passed' THEN latest.id END
+                    CASE WHEN latest.state = 'passed'
+                                   AND latest.result->>'maximum_block_size_bytes' = '262144'
+                              THEN latest.id END
                         AS qualification_run_id,
                     EXISTS(
                         SELECT 1 FROM drive_operations operation
@@ -4959,7 +4963,7 @@ async fn backup_media_readiness_inner(
              JOIN drives drive ON drive.id = pair.drive_id
              JOIN cartridges cartridge ON cartridge.id = pair.cartridge_id
              LEFT JOIN LATERAL (
-                 SELECT qualification.id, qualification.state
+                 SELECT qualification.id, qualification.state, qualification.result
                  FROM qualification_runs qualification
                  WHERE qualification.drive_id = drive.id
                    AND qualification.cartridge_id = cartridge.id
@@ -5263,7 +5267,7 @@ async fn queue_single_tape_data_run_inner(
     }
 
     let qualification_passed =
-        single_tape_qualification_passed(&mut transaction, &drive, cartridge_id).await?;
+        single_tape_write_qualification_passed(&mut transaction, &drive, cartridge_id).await?;
     let blocker = if profile.workflow_kind
         != if is_backup {
             "backup"
@@ -5675,7 +5679,7 @@ pub async fn claim_next_single_tape_data_run(
     .fetch_one(&mut *transaction)
     .await?;
     let qualification_passed =
-        single_tape_qualification_passed(&mut transaction, &drive, run.cartridge_id).await?;
+        single_tape_write_qualification_passed(&mut transaction, &drive, run.cartridge_id).await?;
     let blocker = if run.cancel_requested_at.is_some() {
         Some("cancellation was requested before the worker claimed the tape".to_owned())
     } else if run.created_at < Utc::now() - chrono::TimeDelta::minutes(15) {
@@ -6283,7 +6287,7 @@ pub async fn authorize_data_run_media(
             transaction.rollback().await?;
             return Ok(AuthorizeDataRunMediaResult::Blocked(reason));
         }
-        if !single_tape_qualification_passed(&mut transaction, &drive, cartridge.id).await? {
+        if !single_tape_write_qualification_passed(&mut transaction, &drive, cartridge.id).await? {
             transaction.rollback().await?;
             return Ok(AuthorizeDataRunMediaResult::Blocked(
                 "the exact drive and continuation cartridge need a current passed qualification"
@@ -6879,8 +6883,14 @@ pub async fn record_single_tape_data_live_io(
         || sample.spool_basis.is_some()
             != (sample.spool_bytes.is_some()
                 && sample.spool_capacity_bytes.is_some()
+                && sample.spool_target_bytes.is_some()
                 && sample.spool_file_count.is_some())
         || sample.spool_capacity_bytes == Some(0)
+        || sample.spool_target_bytes == Some(0)
+        || sample
+            .spool_target_bytes
+            .zip(sample.spool_capacity_bytes)
+            .is_some_and(|(target, capacity)| target > capacity)
         || sample.activity.is_some()
             != (sample.engine_state.is_some()
                 && sample.progress_idle_ms.is_some()
@@ -8542,8 +8552,26 @@ async fn single_tape_qualification_passed(
     drive: &DriveRecord,
     cartridge_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
+    // Read eligibility deliberately accepts the retained qualification that
+    // authorized the original archive write. A 256 KiB maximum can read older
+    // 64 KiB records, and rerunning destructive btape on archive media would
+    // destroy the data operators are trying to recover.
     Ok(
         single_tape_qualification_passed_id(transaction, drive, cartridge_id)
+            .await?
+            .is_some(),
+    )
+}
+
+async fn single_tape_write_qualification_passed(
+    transaction: &mut Transaction<'_, Postgres>,
+    drive: &DriveRecord,
+    cartridge_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    // Every new destructive write must prove the current physical block
+    // ceiling on this exact drive/media pair.
+    Ok(
+        single_tape_qualification_passed_id_for(transaction, drive, cartridge_id, true)
             .await?
             .is_some(),
     )
@@ -8554,8 +8582,20 @@ async fn single_tape_qualification_passed_id(
     drive: &DriveRecord,
     cartridge_id: Uuid,
 ) -> Result<Option<Uuid>, sqlx::Error> {
+    single_tape_qualification_passed_id_for(transaction, drive, cartridge_id, false).await
+}
+
+async fn single_tape_qualification_passed_id_for(
+    transaction: &mut Transaction<'_, Postgres>,
+    drive: &DriveRecord,
+    cartridge_id: Uuid,
+    require_current_write_block_size: bool,
+) -> Result<Option<Uuid>, sqlx::Error> {
     let result = sqlx::query_scalar::<_, Option<Uuid>>(
-        "SELECT CASE WHEN qualification.state = 'passed' THEN qualification.id END
+        "SELECT CASE WHEN qualification.state = 'passed'
+                              AND (NOT $10::boolean
+                                   OR qualification.result->>'maximum_block_size_bytes' = '262144')
+                         THEN qualification.id END
          FROM qualification_runs qualification
          JOIN cartridges cartridge ON cartridge.id = qualification.cartridge_id
          WHERE qualification.drive_id = $1
@@ -8586,6 +8626,7 @@ async fn single_tape_qualification_passed_id(
     .bind(&drive.serial)
     .bind(&drive.wwn)
     .bind(&drive.firmware)
+    .bind(require_current_write_block_size)
     .fetch_optional(&mut **transaction)
     .await?;
     Ok(result.flatten())
@@ -11085,6 +11126,7 @@ pub async fn record_restore_rehearsal_live_io(
             .is_some_and(|value| !valid_live_current_file(value))
         || sample.spool_bytes.is_some()
         || sample.spool_capacity_bytes.is_some()
+        || sample.spool_target_bytes.is_some()
         || sample.spool_file_count.is_some()
         || sample.spool_fill_bytes_per_second.is_some()
         || sample.spool_drain_bytes_per_second.is_some()
