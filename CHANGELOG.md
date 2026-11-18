@@ -2,6 +2,12 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.1.0-alpha.15] - 2026-11-18
+
+### Database-backed identity fix
+
+- Corrects the loaded-tape health merge statement found by the PostgreSQL-backed release test, allowing SAS drive observations and automatic on-tape identity state to persist correctly.
+
 ## [0.1.0-alpha.14] - 2026-11-18
 
 ### Automatic on-tape identity
@@ -224,6 +230,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.1.0-alpha.15]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.15
 [0.1.0-alpha.14]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.14
 [0.1.0-alpha.13]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.13
 [0.1.0-alpha.12]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.12

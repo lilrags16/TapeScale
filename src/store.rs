@@ -2104,7 +2104,7 @@ pub async fn record_drive_observation(
                      'loaded_tape_identity_observed_at', drives.health->'loaded_tape_identity_observed_at',
                      'loaded_cartridge_id', drives.health->'loaded_cartridge_id',
                      'loaded_cartridge_label', drives.health->'loaded_cartridge_label',
-                     'loaded_tape_probe_detail', drives.health->'loaded_tape_probe_detail'),
+                     'loaded_tape_probe_detail', drives.health->'loaded_tape_probe_detail')
                  ELSE '{}'::jsonb
              END,
              last_observed_at = EXCLUDED.last_observed_at
