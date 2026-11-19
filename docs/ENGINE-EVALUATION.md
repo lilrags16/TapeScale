@@ -1,6 +1,6 @@
 # Tape engine decision record
 
-Decision status: **TapeScale Native v1 selected for the `0.2.0-alpha.4` architecture; physical production qualification remains open**.
+Decision status: **TapeScale Native v1 selected for the `0.2.0-alpha.5` architecture; physical production qualification remains open**.
 
 ## Decision
 

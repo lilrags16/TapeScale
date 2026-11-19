@@ -1,6 +1,6 @@
 # TapeScale Native operations
 
-This guide describes TapeScale `0.2.0-alpha.4`. It is an attended alpha for one standalone SAS tape drive, not a production-qualification claim. The active writer is **TapeScale Native v1** and DAR 2.8.6 is used only as the file-archive codec. Bacula is not installed or used by the current runtime.
+This guide describes TapeScale `0.2.0-alpha.5`. It is an attended alpha for one standalone SAS tape drive, not a production-qualification claim. The active writer is **TapeScale Native v1** and DAR 2.8.6 is used only as the file-archive codec. Bacula is not installed or used by the current runtime.
 
 Do not make this alpha the only copy of data. A result is evidence for the exact source snapshot, drive, firmware, cartridge set, format, and software revision recorded by the run.
 

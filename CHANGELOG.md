@@ -2,6 +2,15 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.2.0-alpha.5] - 2026-11-19
+
+### Native live-database contract completion
+
+- Updates the complete PostgreSQL-backed operator workflow to treat TapeScale Native v1 recovery as planning-only in the web console until the native restore worker is implemented. The independent `tapescale-recovery` full-archive path remains available without the TapeScale database.
+- Makes the destructive tape-preparation feature gate fail closed for every request, including an idempotency replay, when preparation has been administratively disabled.
+- Validates the cutover through the full live PostgreSQL migration and end-to-end workflow suite instead of carrying forward executable Bacula restore assumptions.
+- Supersedes `v0.2.0-alpha.4`; its native container path passed, but its live catalog suite still expected the retired Bacula restore worker.
+
 ## [0.2.0-alpha.4] - 2026-11-19
 
 ### Native qualification release-fixture fix
@@ -276,6 +285,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.2.0-alpha.5]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.5
 [0.2.0-alpha.4]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.4
 [0.2.0-alpha.3]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.3
 [0.2.0-alpha.2]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.2

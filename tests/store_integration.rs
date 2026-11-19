@@ -12,13 +12,12 @@ use tapescale::{
     data_path::{build_manifest, persist_manifest},
     device::{MissingSasDrive, SasDriveObservation, SasMotionOperation},
     store::{
-        self, ClaimDriveOperationResult, ClaimQualificationRunResult,
-        ClaimRestoreRehearsalRunResult, ClaimSingleTapeDataRunResult,
+        self, ClaimDriveOperationResult, ClaimQualificationRunResult, ClaimSingleTapeDataRunResult,
         CreateSingleTapeDataProfileResult, DriveOperationTerminalState,
-        FinalizeRestoreRehearsalResult, FinalizeSingleTapeDataResult, NewMedia,
-        NewSingleTapeDataProfile, QualificationTerminalState, QueueDriveOperationResult,
-        QueueQualificationRunResult, QueueSingleTapeDataRunResult, ReconcileDriveResult,
-        RestoreRehearsalPhase, SingleTapeDataPhase, SingleTapePassEvidence,
+        FinalizeSingleTapeDataResult, NewMedia, NewSingleTapeDataProfile,
+        QualificationTerminalState, QueueDriveOperationResult, QueueQualificationRunResult,
+        QueueSingleTapeDataRunResult, ReconcileDriveResult, SingleTapeDataPhase,
+        SingleTapePassEvidence,
     },
 };
 use tower::ServiceExt;
@@ -591,14 +590,11 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         Some(qualification_request.clone()),
     )
     .await;
-    assert_eq!(disabled_known_replay.status(), StatusCode::OK);
+    assert_eq!(disabled_known_replay.status(), StatusCode::CONFLICT);
     let disabled_known_replay = response_json(disabled_known_replay).await;
-    assert_eq!(
-        disabled_known_replay["run"]["id"],
-        json!(queued_qualification.id)
-    );
-    assert_eq!(disabled_known_replay["run"]["state"], "passed");
-    assert_eq!(disabled_known_replay["idempotent_replay"], true);
+    assert!(disabled_known_replay["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("destructive tape preparation is disabled")));
     let mut disabled_new_request = qualification_request.clone();
     disabled_new_request["idempotency_key"] = json!("disabled-new-qualification-request");
     let disabled_new_response = api_request(
@@ -1192,8 +1188,6 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     .expect("source manifest artifact should persist");
     let source_manifest_digest = source_manifest.digest_sha256.clone();
     let source_manifest_artifact_sha256 = source_manifest_artifact.artifact_sha256.clone();
-    let supported_manifest_bytes = i64::try_from(source_manifest_artifact.size_bytes)
-        .expect("manifest artifact size should fit the catalog range");
     assert!(store::append_single_tape_data_artifact(
         &pool,
         &data_claim,
@@ -1989,149 +1983,39 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
             .as_array()
             .is_some_and(|drives| !drives.is_empty())
     );
-    assert_eq!(ready_plan["plan"]["execution_supported"], true);
+    assert_eq!(ready_plan["plan"]["execution_supported"], false);
+    assert_eq!(
+        ready_plan["plan"]["execution"]["native_restore_pending"],
+        true
+    );
+    assert_eq!(
+        ready_plan["plan"]["execution"]["availability"],
+        "pending_native_restore"
+    );
+    assert_eq!(
+        ready_plan["plan"]["execution"]["offline_recovery_utility"],
+        "tapescale-recovery"
+    );
     assert_eq!(
         ready_plan["plan"]["execution"]["original_drive_id"],
         json!(drive_id)
     );
+
     let ready_plan_id = uuid::Uuid::parse_str(
         ready_plan["plan"]["id"]
             .as_str()
-            .expect("ready restore plan should have an id"),
+            .expect("native restore plan should have an id"),
     )
-    .expect("ready restore plan id should parse");
-    let ready_preview_hash = ready_plan["plan"]["preview_hash"]
-        .as_str()
-        .expect("ready restore plan should have a preview hash")
-        .to_owned();
-    let ready_confirmation = ready_plan["plan"]["confirmation_phrase"]
-        .as_str()
-        .expect("ready restore plan should have an exact confirmation phrase")
-        .to_owned();
-    let queue_rehearsal_body = json!({
-        "plan_id": ready_plan_id,
-        "preview_hash": ready_preview_hash,
-        "drive_id": drive_id,
-        "confirmation": ready_confirmation,
-        "tape_loaded_confirmed": true,
-        "isolated_destination_confirmed": true,
-        "attended_confirmed": true,
-        "actor": "integration recovery operator"
-    });
-    let oversized_manifest_bytes = i64::try_from(store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES + 1)
-        .expect("fixed manifest limit plus one fits i64");
-    sqlx::query(
-        "ALTER TABLE single_tape_data_artifacts
-         DISABLE TRIGGER single_tape_data_artifacts_append_only",
-    )
-    .execute(&pool)
-    .await
-    .expect("integration fixture should temporarily expose a legacy oversized artifact");
-    assert_eq!(
-        sqlx::query(
-            "UPDATE single_tape_data_artifacts SET size_bytes = $1
-             WHERE single_tape_data_run_id = $2 AND artifact_kind = 'source_manifest'",
-        )
-        .bind(oversized_manifest_bytes)
-        .bind(data_claim.run.id)
-        .execute(&pool)
-        .await
-        .expect("legacy oversized manifest fixture should persist")
-        .rows_affected(),
-        1
-    );
-    let oversized_queue_response = api_request(
-        &application,
-        Method::POST,
-        "/api/v1/restore-rehearsals".to_owned(),
-        Some(queue_rehearsal_body.clone()),
-    )
-    .await;
-    let oversized_plan_response = api_request(
-        &application,
-        Method::POST,
-        "/api/v1/restores/plan".to_owned(),
-        Some(json!({
-            "recovery_point_id": recovery_point_id,
-            "mode": "file_archive",
-            "destination": "planned-restores/integration-oversized-manifest",
-            "conflict_policy": "skip",
-            "destination_approved": true,
-            "is_new_destination": true,
-            "acl_semantics_supported": true,
-            "identity_mapping_complete": true,
-            "estimated_required_bytes": 4096,
-            "available_bytes": 1048576,
-            "required_free_reserve_bytes": 4096,
-            "automatic_publication_requested": false
-        })),
-    )
-    .await;
-    assert_eq!(
-        sqlx::query(
-            "UPDATE single_tape_data_artifacts SET size_bytes = $1
-             WHERE single_tape_data_run_id = $2 AND artifact_kind = 'source_manifest'",
-        )
-        .bind(supported_manifest_bytes)
-        .bind(data_claim.run.id)
-        .execute(&pool)
-        .await
-        .expect("integration fixture should restore the supported manifest size")
-        .rows_affected(),
-        1
-    );
-    sqlx::query(
-        "ALTER TABLE single_tape_data_artifacts
-         ENABLE TRIGGER single_tape_data_artifacts_append_only",
-    )
-    .execute(&pool)
-    .await
-    .expect("append-only artifact enforcement should be restored");
-    assert_eq!(oversized_queue_response.status(), StatusCode::CONFLICT);
-    let oversized_queue = response_json(oversized_queue_response).await;
-    assert!(oversized_queue["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("attended restore supports at most")));
-    assert_eq!(oversized_plan_response.status(), StatusCode::CREATED);
-    let oversized_plan = response_json(oversized_plan_response).await;
-    assert_eq!(oversized_plan["plan"]["ready"], false);
-    assert_eq!(oversized_plan["plan"]["execution_supported"], false);
-    assert_eq!(oversized_plan["plan"]["selection"]["planning_only"], true);
-    assert_eq!(oversized_plan["plan"]["estimates"]["estimate_only"], true);
-    assert_eq!(
-        oversized_plan["plan"]["estimates"]["authority"],
-        "operator planning estimate"
-    );
-    assert_eq!(
-        oversized_plan["plan"]["execution"]["source_manifest_artifact"]["size_bytes"],
-        oversized_manifest_bytes
-    );
-    assert_eq!(
-        oversized_plan["plan"]["execution"]["source_manifest_artifact"]["maximum_supported_bytes"],
-        store::RESTORE_MANIFEST_ARTIFACT_MAX_BYTES
-    );
-    assert_eq!(
-        oversized_plan["plan"]["execution"]["source_manifest_artifact"]["supported"],
-        false
-    );
-    assert!(oversized_plan["plan"]["blockers"]
-        .as_array()
-        .is_some_and(|blockers| blockers.iter().any(|blocker| {
-            blocker["code"] == "source_manifest_artifact_too_large"
-                && blocker["size_bytes"] == oversized_manifest_bytes
-        })));
-    assert!(oversized_plan["plan"]["execution_detail"]
-        .as_str()
-        .is_some_and(|detail| detail.contains("attended restore supports artifacts")));
-    let stale_rehearsal_response = api_request(
+    .expect("native restore plan id should parse");
+    let queue_rehearsal_response = api_request(
         &application,
         Method::POST,
         "/api/v1/restore-rehearsals".to_owned(),
         Some(json!({
             "plan_id": ready_plan_id,
-            "preview_hash": "0".repeat(64),
+            "preview_hash": ready_plan["plan"]["preview_hash"],
             "drive_id": drive_id,
-            "confirmation": format!("RESTORE PLAN {ready_plan_id} TO ISOLATED DESTINATION"),
+            "confirmation": ready_plan["plan"]["confirmation_phrase"],
             "tape_loaded_confirmed": true,
             "isolated_destination_confirmed": true,
             "attended_confirmed": true,
@@ -2139,546 +2023,16 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         })),
     )
     .await;
-    assert_eq!(stale_rehearsal_response.status(), StatusCode::CONFLICT);
-
-    let queued_rehearsal_response = api_request(
-        &application,
-        Method::POST,
-        "/api/v1/restore-rehearsals".to_owned(),
-        Some(queue_rehearsal_body.clone()),
-    )
-    .await;
-    let queued_rehearsal_status = queued_rehearsal_response.status();
-    let queued_rehearsal = response_json(queued_rehearsal_response).await;
+    let queue_rehearsal_status = queue_rehearsal_response.status();
+    let queue_rehearsal = response_json(queue_rehearsal_response).await;
     assert_eq!(
-        queued_rehearsal_status,
-        StatusCode::ACCEPTED,
-        "queue response: {queued_rehearsal}"
+        queue_rehearsal_status,
+        StatusCode::CONFLICT,
+        "native in-console restore must remain unavailable: {queue_rehearsal}"
     );
-    let cancelled_rehearsal_id = uuid::Uuid::parse_str(
-        queued_rehearsal["rehearsal"]["id"]
-            .as_str()
-            .expect("queued restore rehearsal should have an id"),
-    )
-    .expect("queued restore rehearsal id should parse");
-    assert_eq!(queued_rehearsal["rehearsal"]["state"], "queued");
-    assert_eq!(queued_rehearsal["writes_tape"], false);
-    let retained_attestations = sqlx::query_scalar::<_, Value>(
-        "SELECT evidence->'operator_attestations'
-         FROM restore_rehearsal_events
-         WHERE restore_rehearsal_id = $1 AND event_type = 'queued'",
-    )
-    .bind(cancelled_rehearsal_id)
-    .fetch_one(&pool)
-    .await
-    .expect("attended assertions should be retained with the queued event");
-    assert_eq!(retained_attestations["tape_loaded_confirmed"], true);
-    assert_eq!(
-        retained_attestations["isolated_destination_confirmed"],
-        true
-    );
-    assert_eq!(retained_attestations["attended_confirmed"], true);
-    assert_eq!(retained_attestations["assertion_only"], true);
-    assert_eq!(retained_attestations["safety_authority"], false);
-
-    let idempotent_rehearsal_response = api_request(
-        &application,
-        Method::POST,
-        "/api/v1/restore-rehearsals".to_owned(),
-        Some(queue_rehearsal_body.clone()),
-    )
-    .await;
-    assert_eq!(idempotent_rehearsal_response.status(), StatusCode::ACCEPTED);
-    let idempotent_rehearsal = response_json(idempotent_rehearsal_response).await;
-    assert_eq!(
-        idempotent_rehearsal["rehearsal"]["id"],
-        json!(cancelled_rehearsal_id)
-    );
-
-    let cancel_rehearsal_response = api_request(
-        &application,
-        Method::POST,
-        format!("/api/v1/restore-rehearsals/{cancelled_rehearsal_id}/cancel"),
-        Some(json!({
-            "confirmation": format!("CANCEL RESTORE REHEARSAL {cancelled_rehearsal_id}"),
-            "actor": "integration recovery operator"
-        })),
-    )
-    .await;
-    assert_eq!(cancel_rehearsal_response.status(), StatusCode::OK);
-    let cancelled_rehearsal = response_json(cancel_rehearsal_response).await;
-    assert_eq!(cancelled_rehearsal["rehearsal"]["state"], "cancelled");
-    assert_eq!(
-        cancelled_rehearsal["cancel"],
-        "completed_before_worker_claim"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT reserved_by FROM cartridges WHERE id = $1",
-        )
-        .bind(scratch.id)
-        .fetch_one(&pool)
-        .await
-        .expect("queued cancellation should release the cartridge"),
-        None
-    );
-
-    let replay_rehearsal_response = api_request(
-        &application,
-        Method::POST,
-        "/api/v1/restore-rehearsals".to_owned(),
-        Some(queue_rehearsal_body),
-    )
-    .await;
-    assert_eq!(replay_rehearsal_response.status(), StatusCode::ACCEPTED);
-    let replay_rehearsal = response_json(replay_rehearsal_response).await;
-    let rehearsal_id = uuid::Uuid::parse_str(
-        replay_rehearsal["rehearsal"]["id"]
-            .as_str()
-            .expect("requeued restore rehearsal should have an id"),
-    )
-    .expect("requeued restore rehearsal id should parse");
-    assert_ne!(rehearsal_id, cancelled_rehearsal_id);
-
-    let rehearsal_claim = store::claim_next_restore_rehearsal_run(&pool, uuid::Uuid::now_v7())
-        .await
-        .expect("the worker should claim the exact restore plan, drive, and cartridge");
-    let ClaimRestoreRehearsalRunResult::Claimed(rehearsal_claim) = rehearsal_claim else {
-        panic!("the attended restore rehearsal should be claimable");
-    };
-    assert_eq!(rehearsal_claim.run.id, rehearsal_id);
-    let complete_restore_scope = rehearsal_claim.run.restore_scope.clone();
-    assert_eq!(complete_restore_scope["kind"], "complete_point");
-    assert!(
-        store::renew_restore_rehearsal_run_leases(&pool, &rehearsal_claim)
-            .await
-            .expect("both restore rehearsal leases should renew")
-    );
-    assert_eq!(
-        store::running_restore_rehearsal_paths(&pool)
-            .await
-            .expect("running restore paths should query"),
-        vec!["/dev/nst0".to_owned()]
-    );
-    assert!(store::append_restore_rehearsal_event(
-        &pool,
-        &rehearsal_claim,
-        "media_observed",
-        json!({"stable_id":"serial:IBM:ULTRIUM-HH9:DRIVE-001","ready":true}),
-    )
-    .await
-    .expect("current drive observation should append"));
-    assert!(store::transition_restore_rehearsal_phase(
-        &pool,
-        &rehearsal_claim,
-        RestoreRehearsalPhase::Restoring,
-        json!({"detail":"integration physical read started","media_mutation_allowed":false}),
-    )
-    .await
-    .expect("rehearsal should enter restoring"));
-    let restore_live_sample = store::SingleTapeLiveIoSample {
-        phase: store::SingleTapeLiveIoPhase::Restore,
-        sampled_at: Utc::now(),
-        sample_window_ms: Some(5_000),
-        stale_after_seconds: 20,
-        engine_job_id: 2_002,
-        files_processed: 3,
-        files_total: Some(3),
-        progress_basis: "bacula_job_files_over_backup_job_files",
-        archive_entries_per_second: Some(1.0),
-        pipeline_bytes_processed: 4_096,
-        pipeline_bytes_total: None,
-        pipeline_bytes_per_second: Some(800),
-        file_daemon_read_bytes_processed: Some(4_096),
-        file_daemon_read_bytes_per_second: Some(800),
-        current_file: Some("fixture.bin".to_owned()),
-        file_daemon_basis: Some("bacula_file_daemon_read_bytes_delta"),
-        tape_read_bytes_per_second: Some(1_024),
-        tape_write_bytes_per_second: Some(0),
-        tape_read_counter_available: true,
-        tape_write_counter_available: true,
-        tape_counters_available: true,
-        pipeline_basis: "bacula_job_bytes_delta",
-        tape_basis: Some("linux_scsi_tape_sysfs_counter_delta"),
-        engine_state: None,
-        activity: None,
-        progress_idle_ms: None,
-        no_progress_timeout_ms: None,
-        spool_bytes: None,
-        spool_capacity_bytes: None,
-        spool_target_bytes: None,
-        spool_file_count: None,
-        spool_fill_bytes_per_second: None,
-        spool_drain_bytes_per_second: None,
-        spool_basis: None,
-    };
-    assert!(
-        store::record_restore_rehearsal_live_io(&pool, &rehearsal_claim, &restore_live_sample,)
-            .await
-            .expect("fenced Restore telemetry should persist")
-    );
-    let live_result =
-        sqlx::query_scalar::<_, Value>("SELECT result FROM restore_rehearsals WHERE id = $1")
-            .bind(rehearsal_id)
-            .fetch_one(&pool)
-            .await
-            .expect("Restore telemetry should be queryable");
-    assert_eq!(live_result["live_io"]["phase"], "restore");
-    assert_eq!(live_result["live_io"]["tape_read_bytes_per_second"], 1_024);
-    let claimed_restore_volumes = store::restore_rehearsal_volumes(&pool, rehearsal_id)
-        .await
-        .expect("the normalized single-volume restore ledger should load");
-    assert_eq!(claimed_restore_volumes.len(), 1);
-    assert_eq!(claimed_restore_volumes[0].state, "loaded");
-    let ordered_restore_volumes = json!([{
-        "volume_order": claimed_restore_volumes[0].volume_order,
-        "cartridge_label": claimed_restore_volumes[0].expected_cartridge_label.clone(),
-        "volume_label": claimed_restore_volumes[0].expected_volume_label.clone(),
-        "engine_media_id": claimed_restore_volumes[0].expected_engine_media_id
-    }]);
-    assert!(store::append_restore_rehearsal_event(
-        &pool,
-        &rehearsal_claim,
-        "engine_dispatched",
-        json!({"engine_operation_id":"bacula-job:2002","restore_job_id":2002}),
-    )
-    .await
-    .expect("restore dispatch evidence should append"));
-    let rehearsal_destination =
-        format!("/restore/planned-restores/integration-ready-recovery/{rehearsal_id}");
-    assert!(store::append_restore_rehearsal_artifact(
-        &pool,
-        &rehearsal_claim,
-        "engine_restore",
-        "/var/lib/tapescale/bacula/restore-rehearsals/secret-engine.json",
-        &"e".repeat(64),
-        512,
-        json!({
-            "completed": true,
-            "finalized": true,
-            "read_only_media_operation": true,
-            "physical_media_readback": true,
-            "backup_job_id": 1001,
-            "restore_job_id": 2002,
-            "engine_media_id": 2001,
-            "media_id": 2001,
-            "volume": "INTEGRATION-SCRATCH-L9-000001",
-            "volume_count": 1,
-            "volumes": ordered_restore_volumes.clone(),
-            "restore_scope": complete_restore_scope.clone(),
-            "destination": rehearsal_destination.clone()
-        }),
-    )
-    .await
-    .expect("engine restore artifact should append"));
-    assert!(store::append_restore_rehearsal_event(
-        &pool,
-        &rehearsal_claim,
-        "engine_completed",
-        json!({"restore_job_id":2002,"job_status":"T","job_errors":0}),
-    )
-    .await
-    .expect("restore completion evidence should append"));
-    assert!(
-        store::complete_restore_rehearsal_volume(&pool, &rehearsal_claim, 1)
-            .await
-            .expect("the single ordered restore volume should complete")
-    );
-    assert!(store::transition_restore_rehearsal_phase(
-        &pool,
-        &rehearsal_claim,
-        RestoreRehearsalPhase::Comparing,
-        json!({"detail":"integration independently hashing restored content"}),
-    )
-    .await
-    .expect("rehearsal should enter comparing"));
-    let transitioned_result =
-        sqlx::query_scalar::<_, Value>("SELECT result FROM restore_rehearsals WHERE id = $1")
-            .bind(rehearsal_id)
-            .fetch_one(&pool)
-            .await
-            .expect("transitioned Restore result should be queryable");
-    assert!(transitioned_result["live_io"].is_null());
-    assert_eq!(
-        transitioned_result["transfer_progress"]["pipeline_bytes_processed"],
-        4_096
-    );
-    assert!(store::append_restore_rehearsal_artifact(
-        &pool,
-        &rehearsal_claim,
-        "restored_manifest",
-        "/var/lib/tapescale/bacula/restore-rehearsals/secret-restored-manifest.json",
-        &"f".repeat(64),
-        1024,
-        json!({
-            "manifest_digest": source_manifest_digest.clone(),
-            "entry_count": 3,
-            "file_count": 3,
-            "logical_bytes": 4096
-        }),
-    )
-    .await
-    .expect("restored manifest artifact should append"));
-    assert!(store::append_restore_rehearsal_artifact(
-        &pool,
-        &rehearsal_claim,
-        "comparison",
-        "/var/lib/tapescale/bacula/restore-rehearsals/secret-comparison.json",
-        &"1".repeat(64),
-        384,
-        json!({
-            "matched": true,
-            "restore_scope": complete_restore_scope.clone(),
-            "expected_digest": source_manifest_digest.clone(),
-            "actual_digest": source_manifest_digest.clone(),
-            "differences": 0
-        }),
-    )
-    .await
-    .expect("manifest comparison artifact should append"));
-    assert!(store::append_restore_rehearsal_artifact(
-        &pool,
-        &rehearsal_claim,
-        "evidence_report",
-        "/var/lib/tapescale/bacula/restore-rehearsals/secret-report.json",
-        &"2".repeat(64),
-        768,
-        json!({
-            "complete": true,
-            "matched": true,
-            "restore_scope": complete_restore_scope.clone(),
-            "read_only_media_operation": true,
-            "volume_count": 1,
-            "volumes": ordered_restore_volumes.clone(),
-            "source_manifest_digest": source_manifest_digest.clone(),
-            "restored_manifest_digest": source_manifest_digest.clone(),
-            "raw_restored_manifest_digest": source_manifest_digest.clone()
-        }),
-    )
-    .await
-    .expect("bounded rehearsal report should append"));
-
-    let recovery_points_before_rehearsal =
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM recovery_points")
-            .fetch_one(&pool)
-            .await
-            .expect("recovery point count should query");
-    let restore_tests_before_rehearsal = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM verification_records
-         WHERE recovery_point_id = $1 AND kind = 'restore_test'",
-    )
-    .bind(recovery_point_id)
-    .fetch_one(&pool)
-    .await
-    .expect("restore-test count should query");
-    let rehearsal_result = json!({
-        "scope": "integration attended G0.2 physical restore rehearsal",
-        "production_eligible": false,
-        "media_operation": "read_only",
-        "source_backup_job_id": 1001,
-        "engine_operation_id": "bacula-job:2002",
-        "restore_job_id": 2002,
-        "restore_job": {"job_id":2002,"job_status":"T","job_errors":0},
-        "restore_catalog": {
-            "source_backup_job_id": 1001,
-            "job": {"job_id":2002}
-        },
-        "volume_count": 1,
-        "volumes": ordered_restore_volumes,
-        "restore_scope": complete_restore_scope,
-        "retained_manifest_digest": source_manifest_digest.clone(),
-        "source_manifest_digest": source_manifest_digest.clone(),
-        "restored_manifest_digest": source_manifest_digest.clone(),
-        "raw_restored_manifest_digest": source_manifest_digest.clone(),
-        "restored_manifest_sha256": "f".repeat(64),
-        "comparison": {
-            "matched": true,
-            "expected_digest": source_manifest_digest.clone(),
-            "actual_digest": source_manifest_digest.clone(),
-            "differences": []
-        },
-        "restore_destination": rehearsal_destination,
-        "runtime": {
-            "daemon_logs": {"director":"/var/lib/tapescale/bacula/private-director.log"},
-            "director_config_path": "/var/lib/tapescale/bacula/private-director.conf"
-        },
-        "cleanup": {"postcondition":"ready_at_bot","position_uncertain":false},
-        "media_mutation_commands_dispatched": false
-    });
-    let mut mismatched_rehearsal_result = rehearsal_result.clone();
-    mismatched_rehearsal_result["restored_manifest_sha256"] = json!("0".repeat(64));
-    assert!(matches!(
-        store::finalize_restore_rehearsal_pass(
-            &pool,
-            &rehearsal_claim,
-            mismatched_rehearsal_result,
-        )
-        .await
-        .expect("mismatched artifact evidence should be a domain outcome"),
-        FinalizeRestoreRehearsalResult::Rejected(_)
-    ));
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM verification_records
-             WHERE recovery_point_id = $1 AND kind = 'restore_test'",
-        )
-        .bind(recovery_point_id)
-        .fetch_one(&pool)
-        .await
-        .expect("rejected finalization must not append verification"),
-        restore_tests_before_rehearsal
-    );
-    let finalized_rehearsal =
-        store::finalize_restore_rehearsal_pass(&pool, &rehearsal_claim, rehearsal_result.clone())
-            .await
-            .expect("complete physical restore evidence should finalize atomically");
-    let FinalizeRestoreRehearsalResult::Passed {
-        verification_record_id,
-    } = finalized_rehearsal
-    else {
-        panic!("complete matching restore rehearsal evidence should pass");
-    };
-    let passed_result =
-        sqlx::query_scalar::<_, Value>("SELECT result FROM restore_rehearsals WHERE id = $1")
-            .bind(rehearsal_id)
-            .fetch_one(&pool)
-            .await
-            .expect("passed Restore transfer progress should remain queryable");
-    assert_eq!(
-        passed_result["transfer_progress"]["pipeline_bytes_processed"],
-        4_096
-    );
-    assert!(matches!(
-        store::finalize_restore_rehearsal_pass(&pool, &rehearsal_claim, rehearsal_result)
-            .await
-            .expect("a terminal stale claim should be a domain outcome"),
-        FinalizeRestoreRehearsalResult::FencedOut
-    ));
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM recovery_points")
-            .fetch_one(&pool)
-            .await
-            .expect("recovery point count should remain stable"),
-        recovery_points_before_rehearsal
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM verification_records
-             WHERE recovery_point_id = $1 AND kind = 'restore_test'",
-        )
-        .bind(recovery_point_id)
-        .fetch_one(&pool)
-        .await
-        .expect("restore-test count should advance"),
-        restore_tests_before_rehearsal + 1
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT outcome FROM verification_records WHERE id = $1",)
-            .bind(verification_record_id)
-            .fetch_one(&pool)
-            .await
-            .expect("new restore verification should reload"),
-        "passed"
-    );
-    assert!(store::running_restore_rehearsal_paths(&pool)
-        .await
-        .expect("passed rehearsal should release its path")
-        .is_empty());
-    assert_eq!(
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT reserved_by FROM cartridges WHERE id = $1",
-        )
-        .bind(scratch.id)
-        .fetch_one(&pool)
-        .await
-        .expect("passed rehearsal should release the cartridge"),
-        None
-    );
-
-    let rehearsal_detail_response = api_request(
-        &application,
-        Method::GET,
-        format!("/api/v1/restore-rehearsals/{rehearsal_id}"),
-        None,
-    )
-    .await;
-    assert_eq!(rehearsal_detail_response.status(), StatusCode::OK);
-    let rehearsal_detail = response_json(rehearsal_detail_response).await;
-    assert_eq!(rehearsal_detail["rehearsal"]["state"], "passed");
-    assert_eq!(rehearsal_detail["rehearsal"]["production_eligible"], false);
-    assert_eq!(
-        rehearsal_detail["artifacts"].as_array().map(Vec::len),
-        Some(4)
-    );
-    let rehearsal_detail_text = serde_json::to_string(&rehearsal_detail)
-        .expect("restore rehearsal detail should serialize");
-    for private_value in [
-        "storage_ref",
-        "source_manifest_storage_ref",
-        "source_mount_path",
-        "drive_lease_id",
-        "drive_fencing_token",
-        "media_lease_id",
-        "media_fencing_token",
-        "daemon_logs",
-        "director_config_path",
-        "private-director.log",
-    ] {
-        assert!(
-            !rehearsal_detail_text.contains(private_value),
-            "public rehearsal detail leaked {private_value}"
-        );
-    }
-
-    let rehearsal_evidence_response = api_request(
-        &application,
-        Method::GET,
-        format!("/api/v1/restore-rehearsals/{rehearsal_id}/evidence"),
-        None,
-    )
-    .await;
-    assert_eq!(rehearsal_evidence_response.status(), StatusCode::OK);
-    assert!(rehearsal_evidence_response
-        .headers()
-        .get(header::ETAG)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("\"sha256-") && value.ends_with('"')));
-    let rehearsal_evidence = to_bytes(rehearsal_evidence_response.into_body(), 4 * 1024 * 1024)
-        .await
-        .expect("bounded restore rehearsal evidence should be readable");
-    assert!(!rehearsal_evidence.contains(&b'\n'));
-    let rehearsal_evidence_text =
-        std::str::from_utf8(&rehearsal_evidence).expect("rehearsal evidence should be UTF-8");
-    assert!(!rehearsal_evidence_text.contains("storage_ref"));
-    assert!(!rehearsal_evidence_text.contains("private-director"));
-
-    let rehearsal_artifact_mutation = sqlx::query(
-        "UPDATE restore_rehearsal_artifacts SET metadata = '{}' WHERE restore_rehearsal_id = $1",
-    )
-    .bind(rehearsal_id)
-    .execute(&pool)
-    .await
-    .expect_err("restore rehearsal artifacts must be append-only");
-    assert_eq!(
-        rehearsal_artifact_mutation
-            .as_database_error()
-            .and_then(sqlx::error::DatabaseError::code)
-            .as_deref(),
-        Some("P0001")
-    );
-    let rehearsal_event_mutation =
-        sqlx::query("DELETE FROM restore_rehearsal_events WHERE restore_rehearsal_id = $1")
-            .bind(rehearsal_id)
-            .execute(&pool)
-            .await
-            .expect_err("restore rehearsal events must be append-only");
-    assert_eq!(
-        rehearsal_event_mutation
-            .as_database_error()
-            .and_then(sqlx::error::DatabaseError::code)
-            .as_deref(),
-        Some("P0001")
-    );
+    assert!(queue_rehearsal["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("not ready or still contains blockers")));
 
     let movement_actions = store::list_required_actions(&pool)
         .await

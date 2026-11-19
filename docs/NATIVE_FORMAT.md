@@ -132,7 +132,7 @@ The on-tape fields are sufficient in principle for a replacement-host reader to:
 6. extract through DAR into an isolated destination;
 7. compare the restored tree with the authenticated source manifest.
 
-`tapescale-recovery` implements that database-independent full-archive path in `0.2.0-alpha.4`:
+`tapescale-recovery` implements that database-independent full-archive path in `0.2.0-alpha.5`:
 
 1. `capture-native-volume --device /dev/nstN --archive-dir /capture` rewinds one cartridge, reads the authenticated header, and uses its `slice_count` to stream the catalog, manifest, slices, index, and trailer without guessing at end of data.
 2. The capture rejects mismatched identities, ordinals, tape-file numbers, offsets, lengths, hashes, index commitments, duplicate media, or artifacts from another archive. It writes canonical DAR slice names into a private capture directory.
