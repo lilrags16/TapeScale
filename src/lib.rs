@@ -1,8 +1,8 @@
 //! `TapeScale` control-plane library.
 //!
-//! The crate intentionally keeps physical tape operations behind an engine adapter. The alpha
-//! release includes both an attended Bacula data path and a deterministic simulator, and it never
-//! promotes simulated evidence to a hardware qualification claim.
+//! Physical tape operations remain behind a fenced worker boundary. The alpha release uses the
+//! TapeScale Native media format with DAR as a separate archive codec, and it never promotes
+//! simulated evidence to a hardware qualification claim.
 
 pub mod api;
 pub mod backup_ops;

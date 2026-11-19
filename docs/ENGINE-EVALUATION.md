@@ -1,6 +1,6 @@
 # Tape engine decision record
 
-Decision status: **TapeScale Native v1 selected for the `0.2.0-alpha.5` architecture; physical production qualification remains open**.
+Decision status: **TapeScale Native v2 selected for the `0.2.0-alpha.6` architecture; physical production qualification remains open**.
 
 ## Decision
 
@@ -8,8 +8,8 @@ The Bacula-backed alpha path failed to provide the performance, operational simp
 
 - TapeScale owns the on-tape format, cartridge/archive identities, volume ordering, motion, direct device I/O, physical byte readback, evidence, and recovery contract.
 - DAR 2.8.6 is a pinned, separately executed archive codec used to package and restore file trees.
-- Every archive is completely staged and tested on disk before the first data tape is written.
-- Every native volume carries an authenticated header, repeated isolated DAR catalog and source manifest, complete DAR slices, index, and trailer.
+- The source is split into independently tested DAR packs that are produced concurrently into a bounded rolling disk spool; a 1 TiB spool does not need to hold a 30 TiB archive.
+- Every native volume carries an authenticated header and source manifest, ordered pack descriptors/catalogs/slices, a chained index, and a trailer; the final member carries the archive-set seal.
 - A clean-host `tapescale-recovery` utility captures and authenticates tapes, reconstructs the archive, extracts it, and compares the restored tree without PostgreSQL.
 - The runtime image contains no Bacula package, daemon, console, or catalog utility.
 
@@ -19,8 +19,8 @@ The exact media contract is documented in [NATIVE_FORMAT.md](NATIVE_FORMAT.md). 
 
 The new architecture directly addresses the observed failure modes:
 
-- Complete staging removes source traversal, tiny-file packaging, metadata walking, and compression from the active tape pass.
-- Whole DAR slices give the tape writer long sequential files and make volume placement deterministic.
+- Independently finalized DAR packs turn tiny files into long sequential tape files while bounded disk absorbs short source, metadata, and compression stalls.
+- Concurrent production and consumption avoid the long whole-archive pre-stage while high/low watermarks bound disk use. Sustained production below the drive's streaming floor can still cause a safe filemark pause and must be measured physically.
 - TapeScale reads identity from media at destructive boundaries instead of asking the operator to attest repeatedly to the only loaded cartridge.
 - Native headers and trailers make a cartridge self-describing and bind it to one archive and volume ordinal.
 - Immediate readback verifies the bytes actually readable from every written tape.
@@ -34,11 +34,11 @@ Bacula was the earlier feasibility engine. It is no longer an active runtime or 
 
 ### Amanda/Zmanda and Bareos
 
-These remain possible external tools for separate deployments, but adopting either would reintroduce an engine catalog, adapter lifecycle, media conventions, and operator surface that TapeScale would still need to reconcile. Neither is part of Native v1 and neither can read its media without a TapeScale-aware reader.
+These remain possible external tools for separate deployments, but adopting either would reintroduce an engine catalog, adapter lifecycle, media conventions, and operator surface that TapeScale would still need to reconcile. Neither is part of Native v2 and neither can read its media without a TapeScale-aware reader.
 
 ### LTFS
 
-LTFS does not cover the intended LTO-1-through-current generation model and does not by itself solve multi-volume archive identity, complete-set validation, clean-host catalog reconstruction, or the required recovery evidence. It is not the Native v1 format.
+LTFS does not cover the intended LTO-1-through-current generation model and does not by itself solve multi-volume archive identity, complete-set validation, clean-host catalog reconstruction, or the required recovery evidence. It is not the Native v2 format.
 
 ## Mandatory qualification before production claims
 
@@ -56,10 +56,10 @@ The current status for each acceptance case is maintained in [QUALIFICATION.md](
 
 ## Alpha limits
 
-Native v1 currently targets attended Full backups to one standalone SAS tape drive. It is unencrypted. It does not yet provide incrementals, changers, automatic snapshot lifecycle, native ZFS streams/zvols, selected-file restore, or web-operated restore. Physical EOM is treated as a failed uncertain volume rather than a normal spanning signal; planned volume placement uses conservative generation capacity and keeps slices whole.
+Native v2 currently targets attended Full backups to one standalone SAS tape drive. It is unencrypted. It does not yet provide incrementals, changers, automatic snapshot lifecycle, native ZFS streams/zvols, selected-file restore, or web-operated restore. Physical EOM is treated as a failed uncertain volume rather than a normal spanning signal; planned volume placement uses conservative generation capacity and keeps packs/slices whole. Worker restart does not resume or append a partially written member: it is quarantined and a retry restages a new archive set.
 
 Do not rely on this alpha as the only copy of data. Do not destructively prepare a cartridge that may contain data worth preserving in another format.
 
 ## Superseded research record
 
-The pre-`0.2.0` repository evaluated Bacula, Bareos, and other established engines under a G0 laboratory gate. That research is superseded as an implementation decision by TapeScale Native v1. Historical commits and the changelog preserve why the earlier adapter existed; current operator documentation must not present it as enabled.
+The pre-`0.2.0` repository evaluated Bacula, Bareos, and other established engines under a G0 laboratory gate. That research is superseded as an implementation decision by TapeScale Native v2. Historical commits and the changelog preserve why the earlier adapter existed; current operator documentation must not present it as enabled.

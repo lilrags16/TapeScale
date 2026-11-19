@@ -1003,6 +1003,136 @@ pub struct NativeVerifiedVolume {
     pub segment_files: Vec<(i32, i32)>,
 }
 
+/// One independently finalized TapeScale Native v2 pack retained in the
+/// rolling-spool ledger. `tape_file_count` covers the pack descriptor,
+/// catalogue, and payload files; the pack is assigned to one contiguous
+/// tape-file range.
+#[derive(Clone, Debug)]
+pub struct NativeV2StagedPack {
+    pub pack_ordinal: i32,
+    pub pack_id: Uuid,
+    pub content_sha256: String,
+    pub catalog_sha256: String,
+    pub logical_bytes: u64,
+    pub encoded_bytes: u64,
+    pub storage_ref: String,
+    pub manifest_entry_start: u64,
+    pub manifest_entry_count: u64,
+    pub tape_file_count: i32,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize, PartialEq, Eq)]
+pub struct NativeV2PackRecord {
+    pub pack_ordinal: i32,
+    pub pack_id: Uuid,
+    pub content_sha256: String,
+    pub catalog_sha256: String,
+    pub logical_bytes: i64,
+    pub encoded_bytes: i64,
+    pub storage_ref: Option<String>,
+    pub state: String,
+    pub spool_state: String,
+    pub volume_order: Option<i32>,
+    pub first_tape_file_number: Option<i32>,
+    pub tape_file_count: i32,
+    pub manifest_entry_start: i64,
+    pub manifest_entry_count: i64,
+    pub written_at: Option<DateTime<Utc>>,
+    pub verified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize, PartialEq, Eq)]
+pub struct NativeV2VolumeRecord {
+    pub volume_order: i32,
+    pub cartridge_id: Uuid,
+    pub engine_volume_name: Option<String>,
+    pub state: String,
+    pub native_layout_version: i16,
+    pub archive_volume_id: Option<Uuid>,
+    pub previous_archive_volume_id: Option<Uuid>,
+    pub previous_index_sha256: Option<String>,
+    pub header_sha256: Option<String>,
+    pub index_sha256: Option<String>,
+    pub tape_file_count: Option<i32>,
+    pub encoded_bytes: Option<i64>,
+    pub first_record: Option<String>,
+    pub last_record: Option<String>,
+    pub archive_final: bool,
+    pub archive_seal_sha256: Option<String>,
+    pub verified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct NativeV2ResumeLedger {
+    pub producer_state: String,
+    pub spool_low_water_bytes: Option<i64>,
+    pub spool_high_water_bytes: Option<i64>,
+    pub produced_pack_count: Option<i64>,
+    pub produced_encoded_bytes: Option<i64>,
+    pub producer_root_sha256: Option<String>,
+    pub producer_completed_at: Option<DateTime<Utc>>,
+    pub archive_seal_sha256: Option<String>,
+    pub archive_sealed_at: Option<DateTime<Utc>>,
+    pub packs: Vec<NativeV2PackRecord>,
+    pub volumes: Vec<NativeV2VolumeRecord>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeV2VerifiedVolume {
+    pub volume_order: i32,
+    pub archive_volume_id: Uuid,
+    pub previous_archive_volume_id: Option<Uuid>,
+    pub previous_index_sha256: Option<String>,
+    pub engine_volume_name: String,
+    pub header_sha256: String,
+    pub index_sha256: String,
+    pub tape_file_count: i32,
+    pub encoded_bytes: u64,
+    pub first_record: String,
+    pub last_record: String,
+    pub archive_final: bool,
+    pub archive_seal_sha256: Option<String>,
+    /// Pairs of `(pack_ordinal, first_tape_file_number)`.
+    pub pack_files: Vec<(i32, i32)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeV2ArchiveSealEvidence {
+    pub final_archive_volume_id: Uuid,
+    pub source_manifest_sha256: String,
+    pub pack_catalog_root_sha256: String,
+    pub volume_count: i32,
+    pub pack_count: u64,
+    pub total_encoded_bytes: u64,
+    pub total_logical_bytes: u64,
+    pub total_entries: u64,
+    pub ordered_volume_index_sha256: String,
+    pub ordered_pack_sha256: String,
+    pub archive_set_sha256: String,
+    pub evidence: Value,
+    pub completed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, FromRow, Serialize, PartialEq, Eq)]
+pub struct NativeV2ArchiveSealRecord {
+    pub single_tape_data_run_id: Uuid,
+    pub archive_id: Uuid,
+    pub final_archive_volume_id: Uuid,
+    pub source_manifest_sha256: String,
+    pub pack_catalog_root_sha256: String,
+    pub volume_count: i32,
+    pub pack_count: i64,
+    pub total_encoded_bytes: i64,
+    pub total_logical_bytes: i64,
+    pub total_entries: i64,
+    pub ordered_volume_index_sha256: String,
+    pub ordered_pack_sha256: String,
+    pub archive_set_sha256: String,
+    pub evidence: Value,
+    pub completed_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, FromRow, Serialize, PartialEq, Eq)]
 pub struct DataRunMediaRequestRecord {
     pub id: Uuid,
@@ -1159,6 +1289,14 @@ pub struct SingleTapeLiveIoSample {
     pub spool_capacity_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spool_target_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_high_water_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_low_water_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_pack_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_reclaimed_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spool_file_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3807,7 +3945,7 @@ fn qualification_run_blocker(
         );
     }
     if run.engine_name != "TapeScale Native"
-        || run.engine_version != "1"
+        || !matches!(run.engine_version.as_str(), "1" | "2")
         || run.test_kind != "native_tape_test"
     {
         return Some(
@@ -3972,6 +4110,31 @@ const DATA_RUN_VOLUME_SELECT: &str = "SELECT id, single_tape_data_run_id,
             encoded_bytes, first_record, last_record, created_at, updated_at
             , archive_volume_id, header_sha256, index_sha256, tape_file_count
      FROM single_tape_data_run_volumes";
+
+const NATIVE_V2_PACK_SELECT: &str = "SELECT segment_order AS pack_ordinal,
+            pack_id, content_sha256, catalog_sha256,
+            logical_bytes, encoded_bytes, storage_ref, state, spool_state,
+            volume_order, tape_file_number AS first_tape_file_number,
+            (metadata->>'tape_file_count')::integer AS tape_file_count,
+            manifest_entry_start, manifest_entry_count,
+            written_at, verified_at
+     FROM single_tape_data_run_segments";
+
+const NATIVE_V2_VOLUME_SELECT: &str = "SELECT volume_order, cartridge_id,
+            engine_volume_name, state, native_layout_version,
+            archive_volume_id, previous_archive_volume_id, previous_index_sha256,
+            header_sha256, index_sha256, tape_file_count, encoded_bytes,
+            first_record, last_record,
+            archive_final, archive_seal_sha256, verified_at
+     FROM single_tape_data_run_volumes";
+
+const NATIVE_V2_ARCHIVE_SEAL_SELECT: &str = "SELECT single_tape_data_run_id,
+            archive_id, final_archive_volume_id, source_manifest_sha256,
+            pack_catalog_root_sha256, volume_count, pack_count,
+            total_encoded_bytes, total_logical_bytes, total_entries,
+            ordered_volume_index_sha256, ordered_pack_sha256,
+            archive_set_sha256, evidence, completed_at, created_at
+     FROM native_archive_set_seals";
 
 const DATA_RUN_MEDIA_REQUEST_SELECT: &str = "SELECT id, single_tape_data_run_id,
             request_sequence, phase, volume_order, expected_cartridge_id,
@@ -4199,8 +4362,11 @@ pub async fn create_single_tape_data_profile(
         "INSERT INTO single_tape_data_profiles
             (id, job_id, source_id, source_snapshot_id, name,
              source_subpath, restore_subpath, source_mount_path, restore_root_path,
-             logical_root, immutable_snapshot_confirmed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             logical_root, engine_name, engine_version, adapter_version,
+             format_version, archive_codec, immutable_snapshot_confirmed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                 'TapeScale Native', '1', 'native-v1', 'tapescale-native-v1',
+                 'dar', $11)",
     )
     .bind(profile_id)
     .bind(job_id)
@@ -5439,7 +5605,7 @@ async fn backup_media_readiness_inner(
                    AND qualification.expected_media_format
                        IS NOT DISTINCT FROM cartridge.media_format
                    AND qualification.engine_name = 'TapeScale Native'
-                   AND qualification.engine_version = '1'
+                   AND qualification.engine_version IN ('1', '2')
                    AND qualification.test_kind = 'native_tape_test'
                    AND qualification.attempt > 0
                  ORDER BY qualification.created_at DESC, qualification.id DESC
@@ -5895,6 +6061,14 @@ async fn queue_single_tape_data_run_inner(
             None,
         )
     };
+    let native_layout_version = if profile.engine_name == "TapeScale Native"
+        && profile.engine_version == "2"
+        && profile.format_version == "tapescale-native-v2"
+    {
+        2_i16
+    } else {
+        1_i16
+    };
     sqlx::query(
         "INSERT INTO single_tape_data_runs
             (id, profile_id, job_run_id, source_snapshot_id, drive_id, cartridge_id,
@@ -5907,11 +6081,11 @@ async fn queue_single_tape_data_run_inner(
              encryption_deviation_confirmed, workflow_kind, trigger_kind,
              requested_level, scheduled_occurrence, retention_days,
              compression_mode, resolved_compression, spanning_enabled, data_delivery,
-             requested_by_label, correlation_id)
+             requested_by_label, correlation_id, native_layout_version)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                  $11, $12, $13, $14, $15, $16, $17, $18, $19,
                  $20, $21, $22, $23, $24, $25, $26, $27, $28,
-                 'full', $29, $30, $31, $32, $33, $34, 'local-api', $35)",
+                 'full', $29, $30, $31, $32, $33, $34, 'local-api', $35, $36)",
     )
     .bind(id)
     .bind(profile_id)
@@ -5948,20 +6122,22 @@ async fn queue_single_tape_data_run_inner(
     .bind(spanning_enabled)
     .bind(&data_delivery)
     .bind(correlation_id)
+    .bind(native_layout_version)
     .execute(&mut *transaction)
     .await?;
     sqlx::query(
         "INSERT INTO single_tape_data_run_volumes
             (single_tape_data_run_id, volume_order, cartridge_id,
              expected_cartridge_label, expected_media_generation,
-             expected_media_format, state)
-         VALUES ($1, 1, $2, $3, $4, $5, 'authorized')",
+             expected_media_format, state, native_layout_version)
+         VALUES ($1, 1, $2, $3, $4, $5, 'authorized', $6)",
     )
     .bind(id)
     .bind(cartridge_id)
     .bind(&cartridge.internal_label)
     .bind(cartridge.media_generation)
     .bind(&cartridge.media_format)
+    .bind(native_layout_version)
     .execute(&mut *transaction)
     .await?;
     if let Some(request) = &backup_request {
@@ -6797,13 +6973,42 @@ pub async fn authorize_data_run_media(
             .bind(cartridge.id)
             .execute(&mut *transaction)
             .await?;
+        let (native_layout_version, previous_archive_volume_id, previous_index_sha256) =
+            if run.engine_name == "TapeScale Native"
+                && run.engine_version == "2"
+                && run.format_version == "tapescale-native-v2"
+            {
+                let previous = sqlx::query_as::<_, (Option<Uuid>, Option<String>)>(
+                    "SELECT archive_volume_id, index_sha256
+                       FROM single_tape_data_run_volumes
+                      WHERE single_tape_data_run_id = $1 AND volume_order = $2
+                        AND native_layout_version = 2 AND state = 'verified'
+                      FOR SHARE",
+                )
+                .bind(run.id)
+                .bind(request.volume_order.saturating_sub(1))
+                .fetch_optional(&mut *transaction)
+                .await?;
+                let Some((Some(volume_id), Some(index_sha256))) = previous else {
+                    transaction.rollback().await?;
+                    return Ok(AuthorizeDataRunMediaResult::Blocked(
+                        "the preceding Native v2 archive volume is not durably verified".to_owned(),
+                    ));
+                };
+                (2_i16, Some(volume_id), Some(index_sha256))
+            } else {
+                (1_i16, None, None)
+            };
         let volume_id = Uuid::now_v7();
         sqlx::query(
             "INSERT INTO single_tape_data_run_volumes
                 (id, single_tape_data_run_id, volume_order, cartridge_id,
                  expected_cartridge_label, expected_media_generation,
-                 expected_media_format, media_lease_id, media_fencing_token, state)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'authorized')",
+                 expected_media_format, media_lease_id, media_fencing_token, state,
+                 native_layout_version, previous_archive_volume_id,
+                 previous_index_sha256)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'authorized',
+                     $10, $11, $12)",
         )
         .bind(volume_id)
         .bind(run.id)
@@ -6814,6 +7019,9 @@ pub async fn authorize_data_run_media(
         .bind(&cartridge.media_format)
         .bind(media_lease_id)
         .bind(media_fencing_token)
+        .bind(native_layout_version)
+        .bind(previous_archive_volume_id)
+        .bind(previous_index_sha256)
         .execute(&mut *transaction)
         .await?;
         sqlx::query_as::<_, DataRunVolumeRecord>(&format!("{DATA_RUN_VOLUME_SELECT} WHERE id = $1"))
@@ -7235,7 +7443,8 @@ fn monotonic_single_tape_live_sample(
         }
         return Some(monotonic);
     }
-    let native_stage_reset = sample.progress_basis.starts_with("native_archive_");
+    let native_stage_reset = sample.progress_basis.starts_with("native_archive_")
+        || sample.progress_basis.starts_with("native_v2_");
     if previous.get("engine_job_id").and_then(Value::as_u64) != Some(sample.engine_job_id) {
         if native_stage_reset {
             if let Some(total) = monotonic.files_total {
@@ -7320,6 +7529,7 @@ fn valid_single_tape_progress_basis(basis: &str) -> bool {
             | "bacula_job_files_over_selected_manifest_entries"
             | "native_archive_slices_or_entries"
             | "native_archive_bytes_over_staged_bytes"
+            | "native_v2_complete_packs"
     )
 }
 
@@ -7333,12 +7543,8 @@ fn valid_live_current_file(value: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
-pub async fn record_single_tape_data_live_io(
-    pool: &PgPool,
-    claim: &ClaimedSingleTapeDataRun,
-    sample: &SingleTapeLiveIoSample,
-) -> Result<bool, sqlx::Error> {
-    if sample.engine_job_id == 0
+fn valid_single_tape_live_io_sample(sample: &SingleTapeLiveIoSample) -> bool {
+    !(sample.engine_job_id == 0
         || sample.files_total.is_none()
         || !valid_single_tape_progress_basis(sample.progress_basis)
         || sample
@@ -7350,6 +7556,7 @@ pub async fn record_single_tape_data_live_io(
             "bacula_job_bytes_delta"
                 | "bacula_storage_running_job_bytes_delta"
                 | "native_archive_bytes"
+                | "native_v2_pack_bytes"
         )
         || sample
             .tape_basis
@@ -7362,6 +7569,7 @@ pub async fn record_single_tape_data_live_io(
                 basis,
                 "run_scoped_bacula_spool_regular_file_bytes"
                     | "run_scoped_native_archive_regular_file_bytes"
+                    | "run_scoped_native_v2_regular_file_bytes"
             )
         })
         || sample
@@ -7423,6 +7631,13 @@ pub async fn record_single_tape_data_live_io(
                     | "validating"
                     | "writing_native_volume"
                     | "reading_native_volume"
+                    | "refilling_spool"
+                    | "packing_pack"
+                    | "validating_pack"
+                    | "writing_native_pack"
+                    | "writing_native_volume_header"
+                    | "closing_native_volume"
+                    | "reading_native_pack"
             )
         })
         || sample
@@ -7436,8 +7651,15 @@ pub async fn record_single_tape_data_live_io(
             && sample
                 .progress_idle_ms
                 .zip(sample.no_progress_timeout_ms)
-                .is_none_or(|(idle, timeout)| idle < timeout)
-    {
+                .is_none_or(|(idle, timeout)| idle < timeout))
+}
+
+pub async fn record_single_tape_data_live_io(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    sample: &SingleTapeLiveIoSample,
+) -> Result<bool, sqlx::Error> {
+    if !valid_single_tape_live_io_sample(sample) {
         return Ok(false);
     }
 
@@ -8130,9 +8352,11 @@ pub async fn record_native_staged_segments(
         sqlx::query(
             "INSERT INTO single_tape_data_run_segments
                 (single_tape_data_run_id, segment_order, segment_kind,
-                 content_sha256, encoded_bytes, storage_ref, metadata)
+                 content_sha256, encoded_bytes, storage_ref, metadata,
+                 native_layout_version)
              VALUES ($1, $2, 'dar_slice', $3, $4, $5,
-                     jsonb_build_object('codec', 'dar'))",
+                     jsonb_build_object('codec', 'dar'), 1)
+             ",
         )
         .bind(claim.run.id)
         .bind(segment.segment_order)
@@ -8153,6 +8377,1491 @@ pub async fn record_native_staged_segments(
             "segment_count": segments.len(),
             "encoded_bytes": encoded_bytes,
             "detail": "the complete DAR archive is staged and hashed; tape streaming has not started"
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+fn native_digest_valid(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn native_digest_bytes(value: &str) -> Option<[u8; 32]> {
+    if !native_digest_valid(value) {
+        return None;
+    }
+    let mut raw = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16)? as u8;
+        let low = (pair[1] as char).to_digit(16)? as u8;
+        raw[index] = (high << 4) | low;
+    }
+    Some(raw)
+}
+
+fn native_ordered_digest<'a>(values: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut digest = Sha256::new();
+    let mut count = 0_u64;
+    for value in values {
+        digest.update(native_digest_bytes(value)?);
+        count = count.checked_add(1)?;
+    }
+    (count > 0).then(|| format!("{:x}", digest.finalize()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_archive_set_digest<'a>(
+    archive_id: Uuid,
+    source_manifest_sha256: &str,
+    pack_catalog_root_sha256: &str,
+    ordered_pack_sha256: &str,
+    volume_count: u32,
+    pack_count: u32,
+    total_encoded_bytes: u64,
+    total_logical_bytes: u64,
+    total_entries: u64,
+    volumes: impl IntoIterator<Item = (Uuid, &'a str)>,
+) -> Option<String> {
+    if archive_id.is_nil() || volume_count == 0 || pack_count == 0 || total_entries == 0 {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(archive_id.as_bytes());
+    digest.update(native_digest_bytes(source_manifest_sha256)?);
+    digest.update(native_digest_bytes(pack_catalog_root_sha256)?);
+    digest.update(native_digest_bytes(ordered_pack_sha256)?);
+    digest.update(volume_count.to_be_bytes());
+    digest.update(pack_count.to_be_bytes());
+    digest.update(total_encoded_bytes.to_be_bytes());
+    digest.update(total_logical_bytes.to_be_bytes());
+    digest.update(total_entries.to_be_bytes());
+    let mut actual_volume_count = 0_u32;
+    for (archive_volume_id, index_sha256) in volumes {
+        if archive_volume_id.is_nil() {
+            return None;
+        }
+        digest.update(archive_volume_id.as_bytes());
+        digest.update(native_digest_bytes(index_sha256)?);
+        actual_volume_count = actual_volume_count.checked_add(1)?;
+    }
+    (actual_volume_count == volume_count).then(|| format!("{:x}", digest.finalize()))
+}
+
+/// Establish the bounded-spool window before producing any Native v2 pack.
+/// Replays are accepted only when the exact fenced run already carries the
+/// same window; a caller cannot resize an in-progress archive implicitly.
+pub async fn begin_native_v2_producer(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    low_water_bytes: u64,
+    high_water_bytes: u64,
+) -> Result<bool, sqlx::Error> {
+    let (Ok(low), Ok(high)) = (
+        i64::try_from(low_water_bytes),
+        i64::try_from(high_water_bytes),
+    ) else {
+        return Ok(false);
+    };
+    if low <= 0 || low >= high || claim.run.format_version != "tapescale-native-v2" {
+        return Ok(false);
+    }
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let job_state =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(claim.run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    let current = sqlx::query_as::<_, (i16, String, Option<i64>, Option<i64>)>(
+        "SELECT native_layout_version, native_producer_state,
+                native_spool_low_water_bytes, native_spool_high_water_bytes
+           FROM single_tape_data_runs WHERE id = $1 FOR UPDATE",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if job_state != "writing" || current.0 != 2 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    if current.1 == "running" && current.2 == Some(low) && current.3 == Some(high) {
+        transaction.commit().await?;
+        return Ok(true);
+    }
+    if !matches!(current.1.as_str(), "not_started" | "paused") {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE single_tape_data_runs
+            SET native_producer_state = 'running',
+                native_spool_low_water_bytes = $1,
+                native_spool_high_water_bytes = $2
+          WHERE id = $3 AND native_layout_version = 2
+            AND native_producer_state IN ('not_started', 'paused')",
+    )
+    .bind(low)
+    .bind(high)
+    .bind(claim.run.id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "producer_resumed",
+        json!({
+            "native_layout_version": 2,
+            "low_water_bytes": low_water_bytes,
+            "high_water_bytes": high_water_bytes,
+            "detail": "bounded Native v2 pack production is active"
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// Incrementally retain one complete, fsynced and tested DAR pack. Exact
+/// retries are idempotent; changed content under an existing order or UUID is
+/// rejected rather than silently replacing recovery evidence.
+pub async fn record_native_v2_staged_pack(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    pack: &NativeV2StagedPack,
+) -> Result<bool, sqlx::Error> {
+    if pack.pack_ordinal <= 0
+        || pack.pack_id.is_nil()
+        || !native_digest_valid(&pack.content_sha256)
+        || !native_digest_valid(&pack.catalog_sha256)
+        || pack.encoded_bytes == 0
+        || pack.manifest_entry_start == 0
+        || pack.manifest_entry_count == 0
+        || pack.tape_file_count < 3
+        || pack.storage_ref.is_empty()
+        || pack.storage_ref.chars().any(char::is_control)
+        || i64::try_from(pack.logical_bytes).is_err()
+        || i64::try_from(pack.encoded_bytes).is_err()
+        || i64::try_from(pack.manifest_entry_start).is_err()
+        || i64::try_from(pack.manifest_entry_count).is_err()
+    {
+        return Ok(false);
+    }
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let run = sqlx::query_as::<_, (String, i16, String)>(
+        "SELECT job.state, data_run.native_layout_version,
+                data_run.native_producer_state
+           FROM job_runs job
+           JOIN single_tape_data_runs data_run ON data_run.job_run_id = job.id
+          WHERE data_run.id = $1 FOR UPDATE OF job, data_run",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if run.0 != "writing" || run.1 != 2 || run.2 != "running" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let existing = sqlx::query_as::<_, NativeV2PackRecord>(&format!(
+        "{NATIVE_V2_PACK_SELECT}
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+            AND (segment_order = $2 OR pack_id = $3)
+          FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(pack.pack_ordinal)
+    .bind(pack.pack_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if let Some(existing) = existing {
+        let exact = existing.pack_ordinal == pack.pack_ordinal
+            && existing.pack_id == pack.pack_id
+            && existing.content_sha256 == pack.content_sha256
+            && existing.catalog_sha256 == pack.catalog_sha256
+            && existing.logical_bytes == i64::try_from(pack.logical_bytes).expect("checked")
+            && existing.encoded_bytes == i64::try_from(pack.encoded_bytes).expect("checked")
+            && (existing.storage_ref.as_deref() == Some(&pack.storage_ref)
+                || existing.spool_state == "reclaimed")
+            && existing.manifest_entry_start
+                == i64::try_from(pack.manifest_entry_start).expect("checked")
+            && existing.manifest_entry_count
+                == i64::try_from(pack.manifest_entry_count).expect("checked")
+            && existing.tape_file_count == pack.tape_file_count;
+        transaction.commit().await?;
+        return Ok(exact);
+    }
+    let next_order = sqlx::query_scalar::<_, i32>(
+        "SELECT COALESCE(max(segment_order), 0) + 1
+           FROM single_tape_data_run_segments
+          WHERE single_tape_data_run_id = $1",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if next_order != pack.pack_ordinal {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let previous_manifest_end = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT manifest_entry_start + manifest_entry_count
+           FROM single_tape_data_run_segments
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+          ORDER BY segment_order DESC LIMIT 1",
+    )
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .flatten()
+    .unwrap_or(1);
+    if previous_manifest_end != i64::try_from(pack.manifest_entry_start).expect("checked") {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "INSERT INTO single_tape_data_run_segments
+            (single_tape_data_run_id, segment_order, segment_kind,
+             content_sha256, logical_bytes, encoded_bytes, storage_ref,
+             native_layout_version, pack_id, pack_kind, catalog_sha256,
+             manifest_entry_start, manifest_entry_count, spool_state, metadata)
+         VALUES ($1, $2, 'dar_pack', $3, $4, $5, $6,
+                 2, $7, 'dar_archive', $8, $9, $10, 'present',
+                 jsonb_build_object('codec', 'dar', 'tape_file_count', $11::integer))",
+    )
+    .bind(claim.run.id)
+    .bind(pack.pack_ordinal)
+    .bind(&pack.content_sha256)
+    .bind(i64::try_from(pack.logical_bytes).expect("checked"))
+    .bind(i64::try_from(pack.encoded_bytes).expect("checked"))
+    .bind(&pack.storage_ref)
+    .bind(pack.pack_id)
+    .bind(&pack.catalog_sha256)
+    .bind(i64::try_from(pack.manifest_entry_start).expect("checked"))
+    .bind(i64::try_from(pack.manifest_entry_count).expect("checked"))
+    .bind(pack.tape_file_count)
+    .execute(&mut *transaction)
+    .await?;
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "pack_staged",
+        json!({
+            "pack_ordinal": pack.pack_ordinal,
+            "pack_id": pack.pack_id,
+            "content_sha256": pack.content_sha256,
+            "catalog_sha256": pack.catalog_sha256,
+            "logical_bytes": pack.logical_bytes,
+            "encoded_bytes": pack.encoded_bytes,
+            "manifest_entry_start": pack.manifest_entry_start,
+            "manifest_entry_count": pack.manifest_entry_count,
+            "tape_file_count": pack.tape_file_count,
+            "detail": "one complete Native v2 DAR pack is staged and tested"
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+pub async fn native_v2_pack_ledger(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+) -> Result<Vec<NativeV2PackRecord>, sqlx::Error> {
+    sqlx::query_as::<_, NativeV2PackRecord>(&format!(
+        "{NATIVE_V2_PACK_SELECT}
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+          ORDER BY segment_order"
+    ))
+    .bind(claim.run.id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn native_v2_volume_ledger(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+) -> Result<Vec<NativeV2VolumeRecord>, sqlx::Error> {
+    sqlx::query_as::<_, NativeV2VolumeRecord>(&format!(
+        "{NATIVE_V2_VOLUME_SELECT}
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+          ORDER BY volume_order"
+    ))
+    .bind(claim.run.id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Return all durable state needed to resume a bounded-spool Native v2 run.
+/// The returned paths include only packs whose spool bytes still exist; a
+/// reclaimed pack retains its immutable hashes and tape position with a NULL
+/// `storage_ref`.
+pub async fn native_v2_resume_ledger(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+) -> Result<Option<NativeV2ResumeLedger>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+    let producer = sqlx::query_as::<
+        _,
+        (
+            i16,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+        ),
+    >(
+        "SELECT native_layout_version, native_producer_state,
+                native_spool_low_water_bytes, native_spool_high_water_bytes,
+                native_produced_pack_count, native_produced_encoded_bytes,
+                native_producer_root_sha256, native_producer_completed_at,
+                native_archive_seal_sha256, native_archive_sealed_at
+           FROM single_tape_data_runs WHERE id = $1 FOR SHARE",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if producer.0 != 2 {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+    let packs = sqlx::query_as::<_, NativeV2PackRecord>(&format!(
+        "{NATIVE_V2_PACK_SELECT}
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+          ORDER BY segment_order FOR SHARE"
+    ))
+    .bind(claim.run.id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let volumes = sqlx::query_as::<_, NativeV2VolumeRecord>(&format!(
+        "{NATIVE_V2_VOLUME_SELECT}
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+          ORDER BY volume_order FOR SHARE"
+    ))
+    .bind(claim.run.id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Some(NativeV2ResumeLedger {
+        producer_state: producer.1,
+        spool_low_water_bytes: producer.2,
+        spool_high_water_bytes: producer.3,
+        produced_pack_count: producer.4,
+        produced_encoded_bytes: producer.5,
+        producer_root_sha256: producer.6,
+        producer_completed_at: producer.7,
+        archive_seal_sha256: producer.8,
+        archive_sealed_at: producer.9,
+        packs,
+        volumes,
+    }))
+}
+
+pub async fn assign_native_v2_pack(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    pack_ordinal: i32,
+    volume_order: i32,
+    first_tape_file_number: i32,
+) -> Result<bool, sqlx::Error> {
+    if pack_ordinal <= 0 || volume_order <= 0 || first_tape_file_number < 2 {
+        return Ok(false);
+    }
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let pack = sqlx::query_as::<_, NativeV2PackRecord>(&format!(
+        "{NATIVE_V2_PACK_SELECT}
+          WHERE single_tape_data_run_id = $1 AND segment_order = $2
+            AND native_layout_version = 2 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(pack_ordinal)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(pack) = pack else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    if matches!(
+        pack.state.as_str(),
+        "assigned" | "write_started" | "written" | "verified"
+    ) && pack.volume_order == Some(volume_order)
+        && pack.first_tape_file_number == Some(first_tape_file_number)
+    {
+        transaction.commit().await?;
+        return Ok(true);
+    }
+    if pack.state != "staged" || pack.spool_state != "present" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let volume_state = sqlx::query_as::<_, (String, i16)>(
+        "SELECT state, native_layout_version
+           FROM single_tape_data_run_volumes
+          WHERE single_tape_data_run_id = $1 AND volume_order = $2 FOR UPDATE",
+    )
+    .bind(claim.run.id)
+    .bind(volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if !volume_state.is_some_and(|value| value.0 == "write_started" && value.1 == 2) {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let end = first_tape_file_number.checked_add(pack.tape_file_count);
+    let Some(end) = end else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    let overlap = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1 FROM single_tape_data_run_segments
+              WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+                AND volume_order = $2 AND tape_file_number IS NOT NULL
+                AND tape_file_number < $4
+                AND tape_file_number + (metadata->>'tape_file_count')::integer > $3
+         )",
+    )
+    .bind(claim.run.id)
+    .bind(volume_order)
+    .bind(first_tape_file_number)
+    .bind(end)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if overlap {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE single_tape_data_run_segments
+            SET state = 'assigned', volume_order = $1, tape_file_number = $2,
+                updated_at = now()
+          WHERE single_tape_data_run_id = $3 AND segment_order = $4
+            AND native_layout_version = 2 AND state = 'staged'
+            AND volume_order IS NULL AND tape_file_number IS NULL",
+    )
+    .bind(volume_order)
+    .bind(first_tape_file_number)
+    .bind(claim.run.id)
+    .bind(pack_ordinal)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "pack_assigned",
+        json!({
+            "pack_ordinal": pack_ordinal,
+            "pack_id": pack.pack_id,
+            "volume_order": volume_order,
+            "first_tape_file_number": first_tape_file_number,
+            "tape_file_count": pack.tape_file_count,
+            "detail": "pack tape-file range committed before physical write"
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+pub async fn mark_native_v2_pack_write_started(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    pack_ordinal: i32,
+) -> Result<bool, sqlx::Error> {
+    if pack_ordinal <= 0 {
+        return Ok(false);
+    }
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let state = sqlx::query_scalar::<_, String>(
+        "SELECT state FROM single_tape_data_run_segments
+          WHERE single_tape_data_run_id = $1 AND segment_order = $2
+            AND native_layout_version = 2 FOR UPDATE",
+    )
+    .bind(claim.run.id)
+    .bind(pack_ordinal)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if matches!(
+        state.as_deref(),
+        Some("write_started") | Some("written") | Some("verified")
+    ) {
+        transaction.commit().await?;
+        return Ok(true);
+    }
+    if state.as_deref() != Some("assigned") {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE single_tape_data_run_segments SET state = 'write_started', updated_at = now()
+          WHERE single_tape_data_run_id = $1 AND segment_order = $2
+            AND native_layout_version = 2 AND state = 'assigned'",
+    )
+    .bind(claim.run.id)
+    .bind(pack_ordinal)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+pub async fn mark_native_v2_pack_written(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    pack_ordinal: i32,
+) -> Result<bool, sqlx::Error> {
+    if pack_ordinal <= 0 {
+        return Ok(false);
+    }
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let state = sqlx::query_scalar::<_, String>(
+        "SELECT state FROM single_tape_data_run_segments
+          WHERE single_tape_data_run_id = $1 AND segment_order = $2
+            AND native_layout_version = 2 FOR UPDATE",
+    )
+    .bind(claim.run.id)
+    .bind(pack_ordinal)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if matches!(state.as_deref(), Some("written") | Some("verified")) {
+        transaction.commit().await?;
+        return Ok(true);
+    }
+    if state.as_deref() != Some("write_started") {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE single_tape_data_run_segments
+            SET state = 'written', written_at = now(), updated_at = now()
+          WHERE single_tape_data_run_id = $1 AND segment_order = $2
+            AND native_layout_version = 2 AND state = 'write_started'",
+    )
+    .bind(claim.run.id)
+    .bind(pack_ordinal)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "pack_written",
+        json!({
+            "pack_ordinal": pack_ordinal,
+            "detail": "all pack tape files and trailing filemark were written"
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// Forget the disposable spool pathname only after the pack has crossed its
+/// durable write boundary. The retained hash, size, media position and pack
+/// identity remain available for later full-volume readback.
+pub async fn mark_native_v2_pack_spool_reclaimed(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    pack_ordinal: i32,
+) -> Result<bool, sqlx::Error> {
+    if pack_ordinal <= 0 {
+        return Ok(false);
+    }
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let current = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT state, spool_state, encoded_bytes
+           FROM single_tape_data_run_segments
+          WHERE single_tape_data_run_id = $1 AND segment_order = $2
+            AND native_layout_version = 2 FOR UPDATE",
+    )
+    .bind(claim.run.id)
+    .bind(pack_ordinal)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some((state, spool_state, encoded_bytes)) = current else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    if spool_state == "reclaimed" {
+        transaction.commit().await?;
+        return Ok(true);
+    }
+    if !matches!(state.as_str(), "written" | "verified") || spool_state != "present" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE single_tape_data_run_segments
+            SET spool_state = 'reclaimed', storage_ref = NULL,
+                spool_reclaimed_at = now(), updated_at = now()
+          WHERE single_tape_data_run_id = $1 AND segment_order = $2
+            AND native_layout_version = 2 AND spool_state = 'present'
+            AND state IN ('written', 'verified')",
+    )
+    .bind(claim.run.id)
+    .bind(pack_ordinal)
+    .execute(&mut *transaction)
+    .await?;
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "spool_reclaimed",
+        json!({
+            "pack_ordinal": pack_ordinal,
+            "reclaimed_bytes": encoded_bytes,
+            "detail": "written pack bytes were reclaimed from the bounded spool"
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// Close the Native v2 producer ledger after the last pack is staged. This is
+/// independent of tape consumption: earlier packs may already be written and
+/// reclaimed, but their immutable commitments must still form one contiguous
+/// manifest and pack sequence.
+pub async fn mark_native_v2_producer_complete(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    expected_pack_count: u64,
+    expected_encoded_bytes: u64,
+    expected_root_sha256: &str,
+) -> Result<bool, sqlx::Error> {
+    let (Ok(pack_count), Ok(encoded_bytes)) = (
+        i64::try_from(expected_pack_count),
+        i64::try_from(expected_encoded_bytes),
+    ) else {
+        return Ok(false);
+    };
+    if pack_count <= 0 || encoded_bytes <= 0 || !native_digest_valid(expected_root_sha256) {
+        return Ok(false);
+    }
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let job_state =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(claim.run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    let producer = sqlx::query_as::<
+        _,
+        (
+            i16,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+        ),
+    >(
+        "SELECT native_layout_version, native_producer_state,
+                native_produced_pack_count, native_produced_encoded_bytes,
+                native_producer_root_sha256, native_producer_completed_at
+           FROM single_tape_data_runs WHERE id = $1 FOR UPDATE",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if producer.0 != 2 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    if producer.1 == "complete" {
+        let exact = producer.2 == Some(pack_count)
+            && producer.3 == Some(encoded_bytes)
+            && producer.4.as_deref() == Some(expected_root_sha256)
+            && producer.5.is_some();
+        transaction.commit().await?;
+        return Ok(exact);
+    }
+    if job_state != "writing" || producer.1 != "running" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let packs = sqlx::query_as::<_, NativeV2PackRecord>(&format!(
+        "{NATIVE_V2_PACK_SELECT}
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+          ORDER BY segment_order FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    if i64::try_from(packs.len()).ok() != Some(pack_count) {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let mut expected_manifest_start = 1_i64;
+    let mut actual_encoded_bytes = 0_i64;
+    for (position, pack) in packs.iter().enumerate() {
+        let expected_ordinal = i32::try_from(position + 1).unwrap_or(i32::MAX);
+        if pack.pack_ordinal != expected_ordinal
+            || pack.manifest_entry_start != expected_manifest_start
+            || pack.manifest_entry_count <= 0
+            || pack.encoded_bytes <= 0
+            || pack.state == "failed"
+            || !matches!(pack.spool_state.as_str(), "present" | "reclaimed")
+        {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let Some(next_manifest_start) =
+            expected_manifest_start.checked_add(pack.manifest_entry_count)
+        else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        let Some(next_encoded_bytes) = actual_encoded_bytes.checked_add(pack.encoded_bytes) else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        expected_manifest_start = next_manifest_start;
+        actual_encoded_bytes = next_encoded_bytes;
+    }
+    let actual_root = native_ordered_digest(packs.iter().map(|pack| pack.content_sha256.as_str()));
+    if actual_encoded_bytes != encoded_bytes || actual_root.as_deref() != Some(expected_root_sha256)
+    {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE single_tape_data_runs
+            SET native_producer_state = 'complete',
+                native_produced_pack_count = $1,
+                native_produced_encoded_bytes = $2,
+                native_producer_root_sha256 = $3,
+                native_producer_completed_at = now()
+          WHERE id = $4 AND native_layout_version = 2
+            AND native_producer_state = 'running'",
+    )
+    .bind(pack_count)
+    .bind(encoded_bytes)
+    .bind(expected_root_sha256)
+    .bind(claim.run.id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "producer_complete",
+        json!({
+            "native_layout_version": 2,
+            "pack_count": expected_pack_count,
+            "encoded_bytes": expected_encoded_bytes,
+            "ordered_pack_sha256": expected_root_sha256,
+            "detail": "the complete Native v2 producer ledger is committed"
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// Commit one Native v2 member after its complete on-tape pack range, index,
+/// chain link, and (for the final member) archive-set seal have been read back.
+pub async fn mark_native_v2_volume_verified(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    evidence: &NativeV2VerifiedVolume,
+) -> Result<bool, sqlx::Error> {
+    let chain_shape_valid = if evidence.volume_order == 1 {
+        evidence.previous_archive_volume_id.is_none() && evidence.previous_index_sha256.is_none()
+    } else {
+        evidence.previous_archive_volume_id.is_some()
+            && evidence
+                .previous_index_sha256
+                .as_deref()
+                .is_some_and(native_digest_valid)
+    };
+    let final_shape_valid = match (
+        evidence.archive_final,
+        evidence.archive_seal_sha256.as_deref(),
+    ) {
+        (false, None) => true,
+        (true, Some(digest)) => native_digest_valid(digest),
+        _ => false,
+    };
+    if evidence.volume_order <= 0
+        || evidence.archive_volume_id.is_nil()
+        || !chain_shape_valid
+        || !final_shape_valid
+        || evidence.engine_volume_name.is_empty()
+        || evidence.engine_volume_name.len() > 127
+        || !evidence
+            .engine_volume_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !native_digest_valid(&evidence.header_sha256)
+        || !native_digest_valid(&evidence.index_sha256)
+        || evidence.tape_file_count < 5
+        || evidence.encoded_bytes == 0
+        || i64::try_from(evidence.encoded_bytes).is_err()
+        || evidence.first_record.is_empty()
+        || evidence.first_record.chars().any(char::is_control)
+        || evidence.last_record.is_empty()
+        || evidence.last_record.chars().any(char::is_control)
+        || evidence.pack_files.is_empty()
+    {
+        return Ok(false);
+    }
+    let mut expected_pack_files = evidence.pack_files.clone();
+    expected_pack_files.sort_unstable();
+    if expected_pack_files
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0)
+        || expected_pack_files
+            .iter()
+            .any(|(pack_ordinal, tape_file)| *pack_ordinal <= 0 || *tape_file < 2)
+    {
+        return Ok(false);
+    }
+
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let job_state =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(claim.run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    let producer_state = sqlx::query_scalar::<_, String>(
+        "SELECT native_producer_state FROM single_tape_data_runs
+          WHERE id = $1 AND native_layout_version = 2 FOR UPDATE",
+    )
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if job_state != "writing"
+        || producer_state.is_none()
+        || (evidence.archive_final && producer_state.as_deref() != Some("complete"))
+    {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let volume = sqlx::query_as::<_, NativeV2VolumeRecord>(&format!(
+        "{NATIVE_V2_VOLUME_SELECT}
+          WHERE single_tape_data_run_id = $1 AND volume_order = $2
+            AND native_layout_version = 2 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(evidence.volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(volume) = volume else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    if !matches!(
+        volume.state.as_str(),
+        "write_started" | "written" | "verified"
+    ) || volume.engine_volume_name.as_deref() != Some(&evidence.engine_volume_name)
+    {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    if evidence.volume_order > 1 {
+        let previous = sqlx::query_as::<_, NativeV2VolumeRecord>(&format!(
+            "{NATIVE_V2_VOLUME_SELECT}
+              WHERE single_tape_data_run_id = $1 AND volume_order = $2
+                AND native_layout_version = 2 FOR UPDATE"
+        ))
+        .bind(claim.run.id)
+        .bind(evidence.volume_order - 1)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if !previous.is_some_and(|previous| {
+            previous.state == "verified"
+                && previous.archive_volume_id == evidence.previous_archive_volume_id
+                && previous.index_sha256 == evidence.previous_index_sha256
+                && !previous.archive_final
+        }) {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+    }
+    if evidence.archive_final {
+        let later_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM single_tape_data_run_volumes
+                  WHERE single_tape_data_run_id = $1 AND volume_order > $2
+             )",
+        )
+        .bind(claim.run.id)
+        .bind(evidence.volume_order)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if later_exists {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+    }
+    let packs = sqlx::query_as::<_, NativeV2PackRecord>(&format!(
+        "{NATIVE_V2_PACK_SELECT}
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+            AND volume_order = $2 ORDER BY segment_order FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(evidence.volume_order)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let actual_pack_files = packs
+        .iter()
+        .filter_map(|pack| {
+            pack.first_tape_file_number
+                .map(|tape_file| (pack.pack_ordinal, tape_file))
+        })
+        .collect::<Vec<_>>();
+    if packs.is_empty()
+        || actual_pack_files.len() != packs.len()
+        || actual_pack_files != expected_pack_files
+    {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let mut expected_tape_file = 2_i32;
+    let mut expected_pack_ordinal = packs[0].pack_ordinal;
+    let mut volume_encoded_bytes = 0_i64;
+    for pack in &packs {
+        if pack.pack_ordinal != expected_pack_ordinal
+            || pack.first_tape_file_number != Some(expected_tape_file)
+            || !matches!(pack.state.as_str(), "written" | "verified")
+        {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let (Some(next_tape_file), Some(next_encoded_bytes)) = (
+            expected_tape_file.checked_add(pack.tape_file_count),
+            volume_encoded_bytes.checked_add(pack.encoded_bytes),
+        ) else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        let Some(next_pack_ordinal) = expected_pack_ordinal.checked_add(1) else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        expected_pack_ordinal = next_pack_ordinal;
+        expected_tape_file = next_tape_file;
+        volume_encoded_bytes = next_encoded_bytes;
+    }
+    if expected_tape_file >= evidence.tape_file_count
+        || volume_encoded_bytes != i64::try_from(evidence.encoded_bytes).expect("checked")
+    {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    if volume.state == "verified" {
+        let exact = volume.archive_volume_id == Some(evidence.archive_volume_id)
+            && volume.previous_archive_volume_id == evidence.previous_archive_volume_id
+            && volume.previous_index_sha256 == evidence.previous_index_sha256
+            && volume.header_sha256.as_deref() == Some(&evidence.header_sha256)
+            && volume.index_sha256.as_deref() == Some(&evidence.index_sha256)
+            && volume.tape_file_count == Some(evidence.tape_file_count)
+            && volume.encoded_bytes == Some(volume_encoded_bytes)
+            && volume.first_record.as_deref() == Some(&evidence.first_record)
+            && volume.last_record.as_deref() == Some(&evidence.last_record)
+            && volume.archive_final == evidence.archive_final
+            && volume.archive_seal_sha256 == evidence.archive_seal_sha256
+            && packs.iter().all(|pack| pack.state == "verified");
+        transaction.commit().await?;
+        return Ok(exact);
+    }
+    let pack_update = sqlx::query(
+        "UPDATE single_tape_data_run_segments
+            SET state = 'verified', verified_at = now(), updated_at = now()
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+            AND volume_order = $2 AND state = 'written'",
+    )
+    .bind(claim.run.id)
+    .bind(evidence.volume_order)
+    .execute(&mut *transaction)
+    .await?;
+    if usize::try_from(pack_update.rows_affected()).ok() != Some(packs.len()) {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let volume_update = sqlx::query(
+        "UPDATE single_tape_data_run_volumes
+            SET state = 'verified', written_at = COALESCE(written_at, now()),
+                verified_at = now(), encoded_bytes = $1, first_record = $2,
+                last_record = $3, archive_volume_id = $4, header_sha256 = $5,
+                index_sha256 = $6, tape_file_count = $7,
+                native_layout_version = 2, previous_archive_volume_id = $8,
+                previous_index_sha256 = $9, archive_final = $10,
+                archive_seal_sha256 = $11, updated_at = now()
+          WHERE single_tape_data_run_id = $12 AND volume_order = $13
+            AND native_layout_version = 2 AND state IN ('write_started', 'written')",
+    )
+    .bind(volume_encoded_bytes)
+    .bind(&evidence.first_record)
+    .bind(&evidence.last_record)
+    .bind(evidence.archive_volume_id)
+    .bind(&evidence.header_sha256)
+    .bind(&evidence.index_sha256)
+    .bind(evidence.tape_file_count)
+    .bind(evidence.previous_archive_volume_id)
+    .bind(&evidence.previous_index_sha256)
+    .bind(evidence.archive_final)
+    .bind(&evidence.archive_seal_sha256)
+    .bind(claim.run.id)
+    .bind(evidence.volume_order)
+    .execute(&mut *transaction)
+    .await?;
+    if volume_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "media_verified",
+        json!({
+            "native_layout_version": 2,
+            "archive_id": claim.run.archive_id,
+            "archive_volume_id": evidence.archive_volume_id,
+            "previous_archive_volume_id": evidence.previous_archive_volume_id,
+            "previous_index_sha256": evidence.previous_index_sha256,
+            "volume_order": evidence.volume_order,
+            "cartridge_id": volume.cartridge_id,
+            "engine_volume_name": evidence.engine_volume_name,
+            "header_sha256": evidence.header_sha256,
+            "index_sha256": evidence.index_sha256,
+            "archive_final": evidence.archive_final,
+            "archive_seal_sha256": evidence.archive_seal_sha256,
+            "pack_count": packs.len(),
+            "tape_file_count": evidence.tape_file_count,
+            "encoded_bytes": evidence.encoded_bytes,
+            "physical_media_readback": true
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// Append the final Native v2 archive-set commitment. The seal can be stored
+/// only after production is closed, every pack has been read back and its
+/// disposable spool bytes reclaimed, and every ordered volume forms one
+/// verified hash chain ending in this exact seal.
+pub async fn commit_native_v2_archive_seal(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    evidence: &NativeV2ArchiveSealEvidence,
+) -> Result<bool, sqlx::Error> {
+    let (
+        Ok(pack_count),
+        Ok(pack_count_u32),
+        Ok(total_encoded_bytes),
+        Ok(total_logical_bytes),
+        Ok(total_entries),
+        Ok(volume_count_u32),
+    ) = (
+        i64::try_from(evidence.pack_count),
+        u32::try_from(evidence.pack_count),
+        i64::try_from(evidence.total_encoded_bytes),
+        i64::try_from(evidence.total_logical_bytes),
+        i64::try_from(evidence.total_entries),
+        u32::try_from(evidence.volume_count),
+    )
+    else {
+        return Ok(false);
+    };
+    let evidence_size = serde_json::to_vec(&evidence.evidence)
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX);
+    if evidence.final_archive_volume_id.is_nil()
+        || evidence.volume_count <= 0
+        || pack_count <= 0
+        || total_encoded_bytes <= 0
+        || total_logical_bytes < 0
+        || total_entries <= 0
+        || !evidence.evidence.is_object()
+        || evidence_size > 1_048_576
+        || [
+            evidence.source_manifest_sha256.as_str(),
+            evidence.pack_catalog_root_sha256.as_str(),
+            evidence.ordered_volume_index_sha256.as_str(),
+            evidence.ordered_pack_sha256.as_str(),
+            evidence.archive_set_sha256.as_str(),
+        ]
+        .iter()
+        .any(|digest| !native_digest_valid(digest))
+    {
+        return Ok(false);
+    }
+
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let job_state =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(claim.run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    let run = sqlx::query_as::<
+        _,
+        (
+            i16,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+        ),
+    >(
+        "SELECT native_layout_version, native_producer_state,
+                native_produced_pack_count, native_produced_encoded_bytes,
+                native_producer_root_sha256, native_producer_completed_at,
+                native_archive_seal_sha256, native_archive_sealed_at
+           FROM single_tape_data_runs WHERE id = $1 FOR UPDATE",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if run.0 != 2 || run.1 != "complete" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let existing = sqlx::query_as::<_, NativeV2ArchiveSealRecord>(&format!(
+        "{NATIVE_V2_ARCHIVE_SEAL_SELECT} WHERE single_tape_data_run_id = $1 FOR SHARE"
+    ))
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if let Some(existing) = existing {
+        let exact = existing.archive_id == claim.run.archive_id
+            && existing.final_archive_volume_id == evidence.final_archive_volume_id
+            && existing.source_manifest_sha256 == evidence.source_manifest_sha256
+            && existing.pack_catalog_root_sha256 == evidence.pack_catalog_root_sha256
+            && existing.volume_count == evidence.volume_count
+            && existing.pack_count == pack_count
+            && existing.total_encoded_bytes == total_encoded_bytes
+            && existing.total_logical_bytes == total_logical_bytes
+            && existing.total_entries == total_entries
+            && existing.ordered_volume_index_sha256 == evidence.ordered_volume_index_sha256
+            && existing.ordered_pack_sha256 == evidence.ordered_pack_sha256
+            && existing.archive_set_sha256 == evidence.archive_set_sha256
+            && existing.evidence == evidence.evidence
+            && existing.completed_at == evidence.completed_at
+            && run.6.as_deref() == Some(&evidence.archive_set_sha256)
+            && run.7.is_some();
+        transaction.commit().await?;
+        return Ok(exact);
+    }
+    if job_state != "writing"
+        || run.2 != Some(pack_count)
+        || run.3 != Some(total_encoded_bytes)
+        || run.4.as_deref() != Some(&evidence.ordered_pack_sha256)
+        || run.5.is_none()
+        || run
+            .5
+            .is_some_and(|completed_at| completed_at > evidence.completed_at)
+        || run.6.is_some()
+        || run.7.is_some()
+    {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let source_manifest_sha256 = sqlx::query_scalar::<_, String>(
+        "SELECT sha256
+           FROM single_tape_data_artifacts
+          WHERE single_tape_data_run_id = $1 AND artifact_kind = 'source_manifest'
+          FOR SHARE",
+    )
+    .bind(claim.run.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if source_manifest_sha256.as_deref() != Some(&evidence.source_manifest_sha256) {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+
+    let packs = sqlx::query_as::<_, NativeV2PackRecord>(&format!(
+        "{NATIVE_V2_PACK_SELECT}
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+          ORDER BY segment_order FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    if i64::try_from(packs.len()).ok() != Some(pack_count) {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let mut actual_encoded_bytes = 0_i64;
+    let mut actual_logical_bytes = 0_i64;
+    let mut actual_entries = 0_i64;
+    let mut expected_manifest_start = 1_i64;
+    for (position, pack) in packs.iter().enumerate() {
+        if pack.pack_ordinal != i32::try_from(position + 1).unwrap_or(i32::MAX)
+            || pack.state != "verified"
+            || pack.spool_state != "reclaimed"
+            || pack.storage_ref.is_some()
+            || pack.verified_at.is_none()
+            || pack.volume_order.is_none()
+            || pack.first_tape_file_number.is_none()
+            || pack.manifest_entry_start != expected_manifest_start
+        {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let (Some(encoded), Some(logical), Some(entries), Some(next_manifest_start)) = (
+            actual_encoded_bytes.checked_add(pack.encoded_bytes),
+            actual_logical_bytes.checked_add(pack.logical_bytes),
+            actual_entries.checked_add(pack.manifest_entry_count),
+            expected_manifest_start.checked_add(pack.manifest_entry_count),
+        ) else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        actual_encoded_bytes = encoded;
+        actual_logical_bytes = logical;
+        actual_entries = entries;
+        expected_manifest_start = next_manifest_start;
+    }
+    let ordered_pack_sha256 =
+        native_ordered_digest(packs.iter().map(|pack| pack.content_sha256.as_str()));
+    let pack_catalog_root_sha256 =
+        native_ordered_digest(packs.iter().map(|pack| pack.catalog_sha256.as_str()));
+    if actual_encoded_bytes != total_encoded_bytes
+        || actual_logical_bytes != total_logical_bytes
+        || actual_entries != total_entries
+        || ordered_pack_sha256.as_deref() != Some(&evidence.ordered_pack_sha256)
+        || pack_catalog_root_sha256.as_deref() != Some(&evidence.pack_catalog_root_sha256)
+    {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+
+    let volumes = sqlx::query_as::<_, NativeV2VolumeRecord>(&format!(
+        "{NATIVE_V2_VOLUME_SELECT}
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+          ORDER BY volume_order FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    if i32::try_from(volumes.len()).ok() != Some(evidence.volume_count) {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let mut previous_volume_id = None;
+    let mut previous_index_sha256: Option<String> = None;
+    let mut expected_pack_ordinal = 1_i32;
+    let mut volume_identities = Vec::with_capacity(volumes.len());
+    for (position, volume) in volumes.iter().enumerate() {
+        let is_final = position + 1 == volumes.len();
+        let Some(archive_volume_id) = volume.archive_volume_id else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        let Some(index_sha256) = volume.index_sha256.as_deref() else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        if volume.volume_order != i32::try_from(position + 1).unwrap_or(i32::MAX)
+            || volume.state != "verified"
+            || volume.verified_at.is_none()
+            || volume.previous_archive_volume_id != previous_volume_id
+            || volume.previous_index_sha256 != previous_index_sha256
+            || volume.archive_final != is_final
+            || (is_final
+                && (archive_volume_id != evidence.final_archive_volume_id
+                    || volume.archive_seal_sha256.as_deref() != Some(&evidence.archive_set_sha256)))
+            || (!is_final && volume.archive_seal_sha256.is_some())
+            || !native_digest_valid(index_sha256)
+        {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let volume_packs = packs
+            .iter()
+            .filter(|pack| pack.volume_order == Some(volume.volume_order))
+            .collect::<Vec<_>>();
+        if volume_packs.is_empty() || volume_packs[0].pack_ordinal != expected_pack_ordinal {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let volume_encoded_bytes = volume_packs
+            .iter()
+            .try_fold(0_i64, |total, pack| total.checked_add(pack.encoded_bytes));
+        if volume_encoded_bytes != volume.encoded_bytes {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let Some(next_pack_ordinal) = expected_pack_ordinal
+            .checked_add(i32::try_from(volume_packs.len()).unwrap_or(i32::MAX))
+        else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        expected_pack_ordinal = next_pack_ordinal;
+        previous_volume_id = Some(archive_volume_id);
+        previous_index_sha256 = Some(index_sha256.to_owned());
+        volume_identities.push((archive_volume_id, index_sha256));
+    }
+    if expected_pack_ordinal.checked_sub(1) != i32::try_from(evidence.pack_count).ok()
+        || previous_volume_id != Some(evidence.final_archive_volume_id)
+        || native_ordered_digest(volume_identities.iter().map(|(_, digest)| *digest)).as_deref()
+            != Some(&evidence.ordered_volume_index_sha256)
+        || native_archive_set_digest(
+            claim.run.archive_id,
+            &evidence.source_manifest_sha256,
+            &evidence.pack_catalog_root_sha256,
+            &evidence.ordered_pack_sha256,
+            volume_count_u32,
+            pack_count_u32,
+            evidence.total_encoded_bytes,
+            evidence.total_logical_bytes,
+            evidence.total_entries,
+            volume_identities.iter().map(|(id, digest)| (*id, *digest)),
+        )
+        .as_deref()
+            != Some(&evidence.archive_set_sha256)
+    {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+
+    let inserted = sqlx::query(
+        "INSERT INTO native_archive_set_seals
+            (single_tape_data_run_id, archive_id, format_version,
+             final_archive_volume_id, source_manifest_sha256,
+             pack_catalog_root_sha256, volume_count, pack_count,
+             total_encoded_bytes, total_logical_bytes, total_entries,
+             ordered_volume_index_sha256, ordered_pack_sha256,
+             archive_set_sha256, evidence, completed_at)
+         VALUES ($1, $2, 2, $3, $4, $5, $6, $7, $8, $9, $10,
+                 $11, $12, $13, $14, $15)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(claim.run.id)
+    .bind(claim.run.archive_id)
+    .bind(evidence.final_archive_volume_id)
+    .bind(&evidence.source_manifest_sha256)
+    .bind(&evidence.pack_catalog_root_sha256)
+    .bind(evidence.volume_count)
+    .bind(pack_count)
+    .bind(total_encoded_bytes)
+    .bind(total_logical_bytes)
+    .bind(total_entries)
+    .bind(&evidence.ordered_volume_index_sha256)
+    .bind(&evidence.ordered_pack_sha256)
+    .bind(&evidence.archive_set_sha256)
+    .bind(&evidence.evidence)
+    .bind(evidence.completed_at)
+    .execute(&mut *transaction)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let run_update = sqlx::query(
+        "UPDATE single_tape_data_runs
+            SET native_archive_seal_sha256 = $1, native_archive_sealed_at = $2
+          WHERE id = $3 AND native_layout_version = 2
+            AND native_producer_state = 'complete'
+            AND native_archive_seal_sha256 IS NULL
+            AND native_archive_sealed_at IS NULL",
+    )
+    .bind(&evidence.archive_set_sha256)
+    .bind(evidence.completed_at)
+    .bind(claim.run.id)
+    .execute(&mut *transaction)
+    .await?;
+    if run_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "archive_sealed",
+        json!({
+            "native_layout_version": 2,
+            "archive_id": claim.run.archive_id,
+            "archive_set_sha256": evidence.archive_set_sha256,
+            "final_archive_volume_id": evidence.final_archive_volume_id,
+            "volume_count": evidence.volume_count,
+            "pack_count": evidence.pack_count,
+            "total_encoded_bytes": evidence.total_encoded_bytes,
+            "total_logical_bytes": evidence.total_logical_bytes,
+            "total_entries": evidence.total_entries,
+            "detail": "the append-only Native v2 archive-set commitment is durable"
         }),
         "tapescale-worker",
     )
@@ -8761,6 +10470,240 @@ pub async fn finalize_single_tape_data_pass(
     })
 }
 
+async fn native_v2_finalization_blocker(
+    transaction: &mut Transaction<'_, Postgres>,
+    run_id: Uuid,
+    archive_id: Uuid,
+    source_manifest_sha256: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let run = sqlx::query_as::<
+        _,
+        (
+            i16,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+        ),
+    >(
+        "SELECT native_layout_version, native_producer_state,
+                native_produced_pack_count, native_produced_encoded_bytes,
+                native_producer_root_sha256, native_producer_completed_at,
+                native_archive_seal_sha256, native_archive_sealed_at
+           FROM single_tape_data_runs WHERE id = $1 FOR UPDATE",
+    )
+    .bind(run_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if run.0 == 1 {
+        return Ok(None);
+    }
+    if run.0 != 2
+        || run.1 != "complete"
+        || run.2.is_none()
+        || run.3.is_none()
+        || run.4.is_none()
+        || run.5.is_none()
+        || run.6.is_none()
+        || run.7.is_none()
+    {
+        return Ok(Some(
+            "Native v2 producer completion and final archive seal are required before finalization"
+                .to_owned(),
+        ));
+    }
+    let seal = sqlx::query_as::<_, NativeV2ArchiveSealRecord>(&format!(
+        "{NATIVE_V2_ARCHIVE_SEAL_SELECT} WHERE single_tape_data_run_id = $1 FOR SHARE"
+    ))
+    .bind(run_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(seal) = seal else {
+        return Ok(Some(
+            "Native v2 append-only archive-set seal is missing".to_owned(),
+        ));
+    };
+    if seal.archive_id != archive_id
+        || seal.source_manifest_sha256 != source_manifest_sha256
+        || run.6.as_deref() != Some(&seal.archive_set_sha256)
+        || run.7 != Some(seal.completed_at)
+        || run
+            .5
+            .is_some_and(|completed_at| completed_at > seal.completed_at)
+    {
+        return Ok(Some(
+            "Native v2 archive-set seal does not match the run or source manifest".to_owned(),
+        ));
+    }
+    let packs = sqlx::query_as::<_, NativeV2PackRecord>(&format!(
+        "{NATIVE_V2_PACK_SELECT}
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+          ORDER BY segment_order FOR SHARE"
+    ))
+    .bind(run_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if i64::try_from(packs.len()).ok() != Some(seal.pack_count)
+        || packs.iter().any(|pack| {
+            pack.state != "verified"
+                || pack.spool_state != "reclaimed"
+                || pack.storage_ref.is_some()
+                || pack.volume_order.is_none()
+                || pack.first_tape_file_number.is_none()
+                || pack.verified_at.is_none()
+        })
+    {
+        return Ok(Some(
+            "every Native v2 pack must be verified and reclaimed before finalization".to_owned(),
+        ));
+    }
+    let mut expected_manifest_start = 1_i64;
+    let mut encoded_bytes = 0_i64;
+    let mut logical_bytes = 0_i64;
+    let mut entries = 0_i64;
+    for (position, pack) in packs.iter().enumerate() {
+        if pack.pack_ordinal != i32::try_from(position + 1).unwrap_or(i32::MAX)
+            || pack.manifest_entry_start != expected_manifest_start
+        {
+            return Ok(Some(
+                "Native v2 pack ordinals or manifest ranges are not contiguous".to_owned(),
+            ));
+        }
+        let (Some(next_encoded), Some(next_logical), Some(next_entries), Some(next_manifest)) = (
+            encoded_bytes.checked_add(pack.encoded_bytes),
+            logical_bytes.checked_add(pack.logical_bytes),
+            entries.checked_add(pack.manifest_entry_count),
+            expected_manifest_start.checked_add(pack.manifest_entry_count),
+        ) else {
+            return Ok(Some("Native v2 pack totals overflowed".to_owned()));
+        };
+        encoded_bytes = next_encoded;
+        logical_bytes = next_logical;
+        entries = next_entries;
+        expected_manifest_start = next_manifest;
+    }
+    if encoded_bytes != seal.total_encoded_bytes
+        || logical_bytes != seal.total_logical_bytes
+        || entries != seal.total_entries
+        || run.2 != Some(seal.pack_count)
+        || run.3 != Some(seal.total_encoded_bytes)
+        || native_ordered_digest(packs.iter().map(|pack| pack.content_sha256.as_str())).as_deref()
+            != Some(&seal.ordered_pack_sha256)
+        || run.4.as_deref() != Some(&seal.ordered_pack_sha256)
+        || native_ordered_digest(packs.iter().map(|pack| pack.catalog_sha256.as_str())).as_deref()
+            != Some(&seal.pack_catalog_root_sha256)
+    {
+        return Ok(Some(
+            "Native v2 pack totals or digest commitments do not match the final seal".to_owned(),
+        ));
+    }
+    let volumes = sqlx::query_as::<_, NativeV2VolumeRecord>(&format!(
+        "{NATIVE_V2_VOLUME_SELECT}
+          WHERE single_tape_data_run_id = $1 AND native_layout_version = 2
+          ORDER BY volume_order FOR SHARE"
+    ))
+    .bind(run_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if i32::try_from(volumes.len()).ok() != Some(seal.volume_count) || volumes.is_empty() {
+        return Ok(Some(
+            "Native v2 verified volume count does not match the final seal".to_owned(),
+        ));
+    }
+    let mut previous_volume_id = None;
+    let mut previous_index_sha256: Option<String> = None;
+    let mut expected_pack_ordinal = 1_i32;
+    let mut volume_identities = Vec::with_capacity(volumes.len());
+    for (position, volume) in volumes.iter().enumerate() {
+        let is_final = position + 1 == volumes.len();
+        let (Some(volume_id), Some(index_sha256)) =
+            (volume.archive_volume_id, volume.index_sha256.as_deref())
+        else {
+            return Ok(Some(
+                "Native v2 volume identity or index is missing".to_owned(),
+            ));
+        };
+        if volume.volume_order != i32::try_from(position + 1).unwrap_or(i32::MAX)
+            || volume.state != "verified"
+            || volume.verified_at.is_none()
+            || volume.previous_archive_volume_id != previous_volume_id
+            || volume.previous_index_sha256 != previous_index_sha256
+            || volume.archive_final != is_final
+            || (is_final
+                && (volume_id != seal.final_archive_volume_id
+                    || volume.archive_seal_sha256.as_deref() != Some(&seal.archive_set_sha256)))
+            || (!is_final && volume.archive_seal_sha256.is_some())
+        {
+            return Ok(Some(
+                "Native v2 volume chain or final seal binding is invalid".to_owned(),
+            ));
+        }
+        let volume_packs = packs
+            .iter()
+            .filter(|pack| pack.volume_order == Some(volume.volume_order))
+            .collect::<Vec<_>>();
+        if volume_packs.is_empty()
+            || volume_packs[0].pack_ordinal != expected_pack_ordinal
+            || volume_packs
+                .iter()
+                .try_fold(0_i64, |total, pack| total.checked_add(pack.encoded_bytes))
+                != volume.encoded_bytes
+        {
+            return Ok(Some(
+                "Native v2 volume pack membership does not match its verified ledger".to_owned(),
+            ));
+        }
+        let Some(next_pack_ordinal) = expected_pack_ordinal
+            .checked_add(i32::try_from(volume_packs.len()).unwrap_or(i32::MAX))
+        else {
+            return Ok(Some("Native v2 pack ordinal overflowed".to_owned()));
+        };
+        expected_pack_ordinal = next_pack_ordinal;
+        previous_volume_id = Some(volume_id);
+        previous_index_sha256 = Some(index_sha256.to_owned());
+        volume_identities.push((volume_id, index_sha256));
+    }
+    if expected_pack_ordinal.checked_sub(1) != i32::try_from(seal.pack_count).ok() {
+        return Ok(Some(
+            "Native v2 volume chain does not cover every sealed pack".to_owned(),
+        ));
+    }
+    let (Ok(volume_count), Ok(pack_count), Ok(total_encoded), Ok(total_logical), Ok(total_entries)) = (
+        u32::try_from(seal.volume_count),
+        u32::try_from(seal.pack_count),
+        u64::try_from(seal.total_encoded_bytes),
+        u64::try_from(seal.total_logical_bytes),
+        u64::try_from(seal.total_entries),
+    ) else {
+        return Ok(Some("Native v2 seal totals are out of range".to_owned()));
+    };
+    if native_ordered_digest(volume_identities.iter().map(|(_, digest)| *digest)).as_deref()
+        != Some(&seal.ordered_volume_index_sha256)
+        || native_archive_set_digest(
+            archive_id,
+            source_manifest_sha256,
+            &seal.pack_catalog_root_sha256,
+            &seal.ordered_pack_sha256,
+            volume_count,
+            pack_count,
+            total_encoded,
+            total_logical,
+            total_entries,
+            volume_identities.iter().map(|(id, digest)| (*id, *digest)),
+        )
+        .as_deref()
+            != Some(&seal.archive_set_sha256)
+    {
+        return Ok(Some(
+            "Native v2 final archive seal failed digest validation".to_owned(),
+        ));
+    }
+    Ok(None)
+}
+
 /// Atomically promote one attended full-file backup into a verified recovery
 /// point. Unlike the G0.2 roundtrip finalizer, this intentionally records no
 /// restore-test claim: write completion, full media readback, and later restore
@@ -8863,6 +10806,17 @@ pub async fn finalize_single_tape_backup_pass(
             "backup evidence must prove a content-addressed manifest, finalized engine write, and complete physical-media readback"
                 .to_owned(),
         ));
+    }
+    if let Some(reason) = native_v2_finalization_blocker(
+        &mut transaction,
+        claim.run.id,
+        claim.run.archive_id,
+        &source_manifest.sha256,
+    )
+    .await?
+    {
+        transaction.rollback().await?;
+        return Ok(FinalizeSingleTapeDataResult::Rejected(reason));
     }
     let run_volumes = sqlx::query_as::<_, DataRunVolumeRecord>(&format!(
         "{DATA_RUN_VOLUME_SELECT}
@@ -9442,7 +11396,7 @@ async fn single_tape_qualification_passed_id_for(
            AND qualification.expected_media_generation IS NOT DISTINCT FROM cartridge.media_generation
            AND qualification.expected_media_format IS NOT DISTINCT FROM cartridge.media_format
            AND qualification.engine_name = 'TapeScale Native'
-           AND qualification.engine_version = '1'
+           AND qualification.engine_version IN ('1', '2')
            AND qualification.test_kind = 'native_tape_test'
            AND qualification.attempt > 0
          ORDER BY qualification.created_at DESC, qualification.id DESC
@@ -9920,7 +11874,7 @@ pub async fn get_recovery_point_aggregate(
                    AND candidate.expected_media_format
                        IS NOT DISTINCT FROM qualified_cartridge.media_format
                    AND candidate.engine_name = 'TapeScale Native'
-                   AND candidate.engine_version = '1'
+                   AND candidate.engine_version IN ('1', '2')
                    AND candidate.test_kind = 'native_tape_test'
                    AND candidate.attempt > 0
                  ORDER BY candidate.cartridge_id,
@@ -14500,5 +16454,171 @@ mod recovery_vault_tests {
         assert!(
             validate_catalog_written_volume_chain(&volumes, &["ARCHIVE-V0001".to_owned()]).is_err()
         );
+    }
+
+    #[test]
+    fn native_v2_live_samples_accept_pack_pipeline_and_rolling_spool_telemetry() {
+        let sample = SingleTapeLiveIoSample {
+            phase: SingleTapeLiveIoPhase::BackupWrite,
+            sampled_at: Utc::now(),
+            sample_window_ms: Some(5_000),
+            stale_after_seconds: 20,
+            engine_job_id: 42,
+            files_processed: 3,
+            files_total: Some(10),
+            progress_basis: "native_v2_complete_packs",
+            archive_entries_per_second: Some(12.5),
+            pipeline_bytes_processed: 512,
+            pipeline_bytes_total: Some(1_024),
+            pipeline_bytes_per_second: Some(128),
+            file_daemon_read_bytes_processed: None,
+            file_daemon_read_bytes_per_second: None,
+            current_file: Some("directory/current-file.bin".to_owned()),
+            file_daemon_basis: None,
+            tape_read_bytes_per_second: None,
+            tape_write_bytes_per_second: Some(100),
+            tape_read_counter_available: false,
+            tape_write_counter_available: false,
+            tape_counters_available: false,
+            pipeline_basis: "native_v2_pack_bytes",
+            tape_basis: None,
+            engine_state: Some("packing_pack"),
+            activity: Some(SingleTapeLiveActivity::Buffering),
+            progress_idle_ms: Some(0),
+            no_progress_timeout_ms: Some(1_800_000),
+            spool_bytes: Some(256),
+            spool_capacity_bytes: Some(1_024),
+            spool_target_bytes: Some(768),
+            spool_high_water_bytes: Some(768),
+            spool_low_water_bytes: Some(256),
+            spool_pack_count: Some(2),
+            spool_reclaimed_bytes: Some(2_048),
+            spool_file_count: Some(4),
+            spool_fill_bytes_per_second: Some(64),
+            spool_drain_bytes_per_second: None,
+            spool_basis: Some("run_scoped_native_v2_regular_file_bytes"),
+        };
+
+        for state in [
+            "packing",
+            "validating",
+            "writing_native_volume",
+            "reading_native_volume",
+            "refilling_spool",
+            "packing_pack",
+            "validating_pack",
+            "writing_native_pack",
+            "writing_native_volume_header",
+            "closing_native_volume",
+            "reading_native_pack",
+        ] {
+            let mut state_sample = sample.clone();
+            state_sample.engine_state = Some(state);
+            assert!(
+                valid_single_tape_live_io_sample(&state_sample),
+                "native-v2 live telemetry state {state} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn native_v2_ordered_digest_hashes_raw_commitments() {
+        let zero_digest = "00".repeat(32);
+        assert_eq!(
+            native_ordered_digest([zero_digest.as_str()]).as_deref(),
+            Some("66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925")
+        );
+        assert!(!native_digest_valid(&"AA".repeat(32)));
+        assert_eq!(native_ordered_digest(["not-a-digest"]), None);
+        assert_eq!(native_ordered_digest(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn native_v2_store_seal_digest_matches_the_wire_format() {
+        use crate::native_format::{NativeArchiveSetSeal, NativeSealedVolume};
+
+        let archive_id = Uuid::now_v7();
+        let first_volume_id = Uuid::now_v7();
+        let final_volume_id = Uuid::now_v7();
+        let source = "11".repeat(32);
+        let catalog_root = "22".repeat(32);
+        let pack_root = "33".repeat(32);
+        let first_index = "44".repeat(32);
+        let final_index = "55".repeat(32);
+        let completed_at = Utc::now();
+        let volumes = vec![
+            NativeSealedVolume {
+                volume_ordinal: 1,
+                archive_volume_id: first_volume_id,
+                previous_archive_volume_id: None,
+                previous_volume_index_sha256: None,
+                index_sha256: first_index.clone(),
+                first_pack_ordinal: 1,
+                pack_count: 1,
+                encoded_bytes: 10,
+                logical_bytes: 20,
+                entry_count: 2,
+            },
+            NativeSealedVolume {
+                volume_ordinal: 2,
+                archive_volume_id: final_volume_id,
+                previous_archive_volume_id: Some(first_volume_id),
+                previous_volume_index_sha256: Some(first_index.clone()),
+                index_sha256: final_index.clone(),
+                first_pack_ordinal: 2,
+                pack_count: 2,
+                encoded_bytes: 30,
+                logical_bytes: 50,
+                entry_count: 5,
+            },
+        ];
+        let wire_seal = NativeArchiveSetSeal::new(
+            archive_id,
+            source.clone(),
+            catalog_root.clone(),
+            pack_root.clone(),
+            40,
+            70,
+            7,
+            volumes,
+            completed_at,
+        )
+        .expect("valid wire-format seal");
+        let store_digest = native_archive_set_digest(
+            archive_id,
+            &source,
+            &catalog_root,
+            &pack_root,
+            2,
+            3,
+            40,
+            70,
+            7,
+            [
+                (first_volume_id, first_index.as_str()),
+                (final_volume_id, final_index.as_str()),
+            ],
+        );
+        assert_eq!(
+            store_digest.as_deref(),
+            Some(wire_seal.archive_set_sha256.as_str())
+        );
+
+        let changed = native_archive_set_digest(
+            archive_id,
+            &source,
+            &catalog_root,
+            &pack_root,
+            2,
+            3,
+            41,
+            70,
+            7,
+            [
+                (first_volume_id, first_index.as_str()),
+                (final_volume_id, final_index.as_str()),
+            ],
+        );
+        assert_ne!(changed, store_digest);
     }
 }

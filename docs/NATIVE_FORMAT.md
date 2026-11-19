@@ -1,160 +1,99 @@
-# TapeScale Native v1
+# TapeScale Native v2
 
-Status: **alpha; write/readback and independent full-archive recovery implemented, physical qualification pending**
+Status: **alpha; software write, readback, and clean-host recovery paths are implemented, but physical qualification is pending**
 
-TapeScale Native v1 is the media format selected by the TapeScale `0.2.0` alpha line. It replaces the failed Bacula-backed experiments for all new backups. It is designed so cartridge and archive identity, volume ordering, payload hashes, and the recovery catalog live on the media rather than existing only in PostgreSQL.
+TapeScale `0.2.0-alpha.6` writes `tapescale-native-v2`. Native v2 replaces Native v1's complete-archive disk stage with independently finalized DAR packs in a bounded rolling spool. New writes are v2. The recovery utility keeps explicit v1 read compatibility; neither native format is compatible with the earlier Bacula experiments.
 
-The implementation constants are the normative source during this alpha:
+The implementation constants are normative during alpha. DAR 2.8.6 is an archive codec only; TapeScale owns cartridge identity, tape layout, spanning, verification, and archive-set completion.
 
-- format name: `tapescale-native-v1`
-- metadata version: `1`
-- archive representation: `file_dar`
-- DAR codec version: `2.8.6`
-- maximum physical write record: 256 KiB
-- archive volumes and slice ordinals are one-based
+## Identity and completion
 
-## Identity model
-
-Four identifiers have distinct meanings:
+The format binds four identities:
 
 | Identity | Scope |
 |---|---|
-| cartridge UUID | One registered physical cartridge, first written in its preparation header |
-| archive UUID | One complete backup across all of its cartridges |
-| archive-volume UUID | One physical member of one archive set |
-| volume ordinal/count | The member's ordered position in the complete set |
+| cartridge UUID | One prepared physical cartridge |
+| archive UUID | One complete backup set |
+| archive-volume UUID | One physical member of that set |
+| pack UUID and ordinal | One independently finalized DAR pack in archive order |
 
-TapeScale does not infer cartridge identity from an operator-entered label at a write boundary. It rewinds the selected device, reads the native preparation record from tape file zero, verifies the record envelope, and requires its cartridge UUID to match the reserved database record. A native archive volume replaces that preparation record with an archive header carrying the same cartridge UUID.
+Preparation continues to write a durable TapeScale cartridge UUID at tape file zero. Before destructive I/O, the writer reads that UUID and requires it to match the reserved inventory record. Printed labels are not destructive authority.
 
-## Metadata envelope
+Each pack has its own isolated DAR catalog, source allocation, slice set, lengths, and SHA-256 commitments. A pack is valid independently of later packs, but a recovery point is valid only after every planned pack and volume has passed physical readback and the final archive-set seal is present and valid. A partially written set never becomes a complete recovery point.
 
-Preparation headers, archive headers, volume indexes, and trailers use a 48-byte binary envelope followed by a UTF-8 JSON payload:
+## Bounded rolling spool
 
-| Offset | Bytes | Value |
-|---:|---:|---|
-| 0 | 8 | ASCII magic `TSNV1REC` |
-| 8 | 2 | big-endian format version (`1`) |
-| 10 | 1 | record kind: header `1`, index `2`, trailer `3`, preparation `4` |
-| 11 | 1 | reserved flags, currently zero |
-| 12 | 4 | big-endian JSON payload length |
-| 16 | 32 | SHA-256 of the exact JSON payload bytes |
-| 48 | variable | JSON payload |
+The release defaults are:
 
-Metadata payloads are bounded to 16 MiB. Decoders reject unknown JSON fields, an unsupported version, an incorrect kind, trailing bytes, a length mismatch, a digest mismatch, nil UUIDs, invalid ordinals, and non-canonical SHA-256 text.
+| Control | Default |
+|---|---:|
+| pack target | 256 GiB (`274877906944`) |
+| spool high-water | 768 GiB (`824633720832`) |
+| spool low-water | 256 GiB (`274877906944`) |
+| derived ready-queue resume threshold | 384 GiB (high-water minus one maximum in-progress pack) |
+| filesystem free-space reserve | 8 GiB (`8589934592`) |
 
-## Prepared scratch cartridge
+The worker inventories the immutable source, groups hard links, and assigns hard-link-closed manifest intervals to ordered packs. It creates, tests, hashes, and seals packs sequentially on disk. Before initial tape motion, the consumer collects validated packs to the derived resume threshold, or waits for producer completion when the entire archive is smaller. Pack production then continues concurrently with tape consumption. After a pack's complete tape files close durably, its spool files can be reclaimed; the pack remains unverified until the containing volume is rewound and passes full physical readback.
 
-Native qualification is destructive. It writes deterministic 256 KiB records across two tape files, rewinds, rereads and hashes both files, and validates the filemark boundary. It then rewinds and replaces that test stream with one preparation metadata record at tape file zero.
+Low-water controls refill hysteresis, not merely telemetry. When validated ready bytes reach or fall below low-water, the writer stays at the clean filemark after the current pack until the queue reaches the resume threshold or the producer finishes. It never pauses halfway through a DAR slice or native record.
 
-The preparation payload contains:
+The spool therefore does **not** need to hold the whole archive. A 1 TiB spool supports the shipped 768/256/8 GiB policy, subject to filesystem overhead and other use. It must remain a dedicated writable POSIX-compatible filesystem outside the source, restore, and evidence trees.
 
-- format version
-- cartridge UUID
-- preparation timestamp
-- optional qualification-evidence digest
-- optional drive-identity digest
+### Allocation limit
 
-A preparation record is scratch identity only. It has no archive UUID and cannot be mistaken for a completed archive volume.
+One regular file, or one hard-link allocation group that must remain together, must fit both:
 
-## Archive-volume layout
+1. the configured pack maximum; and
+2. the usable payload of one supported cartridge after native metadata and safety allowance.
 
-Every native archive cartridge is self-identifying. The physical tape files are:
+TapeScale fails closed before writing that group if either condition is false. Native v2 does not split a single file or hard-link group across packs or cartridges. There is no total archive-size policy ceiling: an archive may span many packs and tapes without staging all source bytes at once.
 
-| Tape file | Contents |
-|---:|---|
-| 0 | Native volume-header envelope |
-| 1 | Complete isolated DAR catalog for the archive |
-| 2 | TapeScale source-manifest artifact |
-| 3 through `N` | One complete DAR archive slice per tape file |
-| `N + 1` | Native volume-index envelope |
-| `N + 2` | Native volume-trailer envelope |
+## Pack and volume layout
 
-Each item is terminated by a tape filemark. No DAR slice is divided between cartridges. The catalog and source manifest are repeated on every archive volume so a found member carries the information needed to identify and inspect its archive set.
+Every tape member starts with a checksummed v2 header binding the archive, cartridge, archive-volume, ordinal, codec, source-manifest commitment, and format version. Pack records then carry the descriptor, isolated catalog, and complete DAR slices. The volume indexes and final archive-set seal commit to the ordered pack digests, so a missing, duplicate, foreign, or reordered pack is detectable.
 
-The header binds:
+Every item is written as one or more bounded physical records and closed with a tape filemark. A DAR slice is never divided between cartridges. A pack may end before a cartridge is full when that is the next safe allocation boundary.
 
-- cartridge, archive, and archive-volume UUIDs
-- volume ordinal and total volume count
-- number of complete DAR slices on this volume
-- archive representation and compression codec
-- physical record ceiling
-- source-manifest and isolated-catalog SHA-256 digests
-- creation time
+At a volume boundary TapeScale closes and verifies the member, unloads it, and durably requests the next prepared cartridge. The next on-tape cartridge UUID is checked before overwrite. Operator wait time is not an active-transfer stall.
 
-The index maps each local slice to its global slice ordinal, physical tape-file number, contiguous encoded-archive offset, encoded length, logical length, entry count, and SHA-256 digest. The current writer records encoded lengths and hashes authoritatively; logical length and entry allocation remain archive-level facts in the manifest rather than estimates assigned to individual compressed slices.
+The last volume contains the final archive-set seal. The seal commits to the archive UUID, final pack/volume counts, ordered pack chain, source manifest, and completion facts. A trailer or per-pack index cannot substitute for the final set seal.
 
-The trailer repeats the volume bindings and totals, then commits to:
+## Physical write and readback
 
-- the SHA-256 of the canonical index payload
-- the SHA-256 of the ordered raw slice-digest values
-- the completion time
+TapeScale uses only the configured allowlisted non-rewinding `/dev/nstN` node and bounded 256 KiB physical writes. DAR never owns tape motion. Before writing, the worker verifies preparation identity and records the irreversible media boundary.
 
-Header, index, and trailer must agree on all volume identities. The index must contain strictly increasing slice and tape-file numbers, contiguous archive offsets, correct totals, and canonical digests. A trailer that does not verify against its index is invalid.
+Each completed volume is rewound and read back immediately. TapeScale verifies record envelopes, identities, pack descriptors, catalogs, slices, indexes, digest chain, file boundaries, and the volume trailer. The final member also verifies the archive-set seal. Reclaimed spool packs are verified from physical media, not assumed to remain available on disk.
 
-## Staging and spanning
+Physical readback proves that the exact encoded bytes and native metadata were readable from that drive/media pass. It does not by itself prove filesystem-level restore fidelity or qualify a hardware family.
 
-TapeScale does not feed DAR directly into the drive. It creates all DAR slices and the on-the-fly isolated catalog under one run-scoped spool directory, discovers only expected regular files, hashes every output, and runs DAR's archive test over the completed set.
+## Recovery without PostgreSQL
 
-Only then does TapeScale calculate cartridge allocation. It uses the selected media generation's native capacity with a fixed safety reserve and accounts for repeated catalog, manifest, header, index, and trailer overhead. Planning fails if any one complete slice cannot fit on an otherwise empty eligible volume.
+`tapescale-recovery` auto-detects Native v1 and Native v2 during capture. For v2 it:
 
-This policy intentionally uses more disk and repeats recovery metadata in exchange for three properties:
+1. captures each presented volume and authenticates its header, pack records, indexes, chain, and trailer;
+2. accepts volumes in presentation order independent of their declared archive order;
+3. rejects duplicate, missing, foreign, or inconsistent members;
+4. requires the complete ordered pack set and final archive-set seal;
+5. reconstructs and tests each independently finalized DAR pack;
+6. extracts into an existing empty destination and compares the result with the authenticated source manifest.
 
-- directory traversal, small-file metadata work, and compression happen before tape motion;
-- the active drive reads large completed files sequentially instead of depending on producer timing;
-- a volume boundary never bisects an archive slice.
+This clean-host path does not require the TapeScale database or the original spool. Keep the compatible TapeScale recovery binary, DAR 2.8.6, all cartridges, software digests, and this runbook with disaster-recovery materials.
 
-## Write and physical verification
+Native v1 media remains readable through its v1 decoder. Upgrading the application does not rewrite retained v1 tapes. New operational backups and untouched queued backup requests use v2; the separate G0.2 restore-comparison exercise and terminal, running, or media-touched v1 work retain their v1 format identity.
 
-Before writing a volume, the worker verifies the preparation UUID from tape and rewinds again. It writes each tape file through the exact allowlisted non-rewinding device using bounded 256 KiB records. TapeScale, not DAR, owns tape motion, file boundaries, cartridge selection, and volume handoff.
+## Failure rules
 
-After the trailer is committed, the worker rewinds the cartridge and reads every tape file in order. It verifies:
+- A failure before the first media boundary leaves tape unchanged and removes unneeded temporary packs.
+- After media writing starts, the touched cartridge is uncertain until reconciled or successfully verified.
+- A pack may be reclaimed from disk only after every one of its complete tape files closes durably; it is not verified and cannot support a recovery point until whole-volume physical readback passes.
+- Startup prefill occurs before tape motion, and later refill pauses occur only after a clean filemark; interruption never promotes a partial pack.
+- Missing continuation media waits durably for the required volume.
+- Unexpected end of media, malformed metadata, broken digest chains, missing final seal, or source mutation prevents recovery-point creation.
+- Native v2 does not append to an interrupted archive set; retry creates a new set.
+- Alpha.6 does not resume a partially written member after worker/container restart; touched media is quarantined and the retry restages from a new set.
 
-- header envelope, digest, type, and complete identity binding
-- isolated catalog length and SHA-256
-- source-manifest length and SHA-256
-- every slice length and SHA-256
-- index envelope and exact expected value
-- trailer envelope, exact expected value, and its index commitment
+## Alpha boundaries
 
-A volume is marked verified only after this complete physical pass. An archive recovery point is retained only after every planned volume is verified and the immutable source is rechecked for stability.
+Physical qualification is still pending. This release has no in-console restore or selected-file extraction, encryption, changer automation, incrementals, automatic snapshot lifecycle, or native ZFS-send format. It targets attended Full backups on one standalone SAS drive with manual tape changes.
 
-Physical readback establishes that the encoded archive bytes and recovery metadata can be read from the just-written cartridges. It does **not** establish filesystem-level restore fidelity.
-
-## Database independence and recovery plan
-
-The on-tape fields are sufficient in principle for a replacement-host reader to:
-
-1. scan tape file zero and group cartridges by archive UUID;
-2. reject duplicate, missing, foreign, or inconsistent volume members;
-3. verify every member's catalog, manifest, slices, index, and trailer;
-4. order the complete slice set by global ordinal and reconstruct DAR's expected slice names;
-5. use the repeated isolated catalog for listing and selection;
-6. extract through DAR into an isolated destination;
-7. compare the restored tree with the authenticated source manifest.
-
-`tapescale-recovery` implements that database-independent full-archive path in `0.2.0-alpha.5`:
-
-1. `capture-native-volume --device /dev/nstN --archive-dir /capture` rewinds one cartridge, reads the authenticated header, and uses its `slice_count` to stream the catalog, manifest, slices, index, and trailer without guessing at end of data.
-2. The capture rejects mismatched identities, ordinals, tape-file numbers, offsets, lengths, hashes, index commitments, duplicate media, or artifacts from another archive. It writes canonical DAR slice names into a private capture directory.
-3. Repeat capture for every declared volume. The volumes may be presented in any order; restore requires the complete contiguous volume and slice set.
-4. `restore-native-archive --archive-dir /capture --destination /empty` re-verifies every captured byte, requires pinned DAR 2.8.6, tests the reconstructed archive, extracts only into an existing empty destination, and independently compares the restored tree with the authenticated source manifest.
-
-This is an attended clean-host CLI, not yet an in-console restore worker or selected-file browser. Its tape behavior, filesystem metadata fidelity, multi-volume handoffs, and failure cases still require qualification on real supported hardware.
-
-## Failure behavior
-
-- Failure before the media-write boundary deletes the run-scoped staging area and does not touch tape.
-- Failure after tape writing begins retains the staged archive for diagnosis/retry and marks the touched cartridge uncertain.
-- A wrong or unreadable preparation UUID blocks before destructive I/O.
-- A missing continuation waits durably for the exact reserved ordinal without consuming an active-transfer timeout.
-- Partial, cancelled, mismatched, or unreadable volumes never create a recovery point.
-
-The first native release deliberately does not attempt append-after-interruption or physical end-of-media recovery. It plans within conservative capacity and treats an unexpected write boundary as a failed, uncertain volume.
-
-## Compatibility
-
-TapeScale Native v1 cannot read Bacula volumes, and Bacula cannot read TapeScale Native v1 volumes. The `0.2.0` transition assumes that the deployment has zero valid Bacula tapes: failed and touched Bacula runs remain audit history, not recovery points. The runtime does not include a legacy Bacula recovery engine.
-
-Legacy volume rows are retained for audit but retired from active protection and catalog-reconciliation decisions. A retired cartridge is never silently reused: it must still be loaded and explicitly authorized through the destructive **Prepare tape** workflow, which overwrites the old format with a verified TapeScale preparation identity.
-
-Do not destructively prepare older media merely to make it appear native. If an older cartridge might contain data worth recovering, remove it from this alpha workflow and preserve it with the software needed for its original format.
+The single-file/hard-link allocation limit is a real format constraint, not a UI limit. ACLs, xattrs, sparse files, unusual names, all compression modes, all LTO generations, wrong-media handling, controlled interruptions, refill behavior, and multi-tape clean-host recovery still require recorded physical qualification before production use.

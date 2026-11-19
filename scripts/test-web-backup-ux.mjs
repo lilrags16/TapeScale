@@ -136,7 +136,7 @@ test("creating a request continues directly into final tape authorization", () =
   assert.doesNotMatch(submit, /toast\("Full backup queued"/);
 });
 
-test("new backup policy always stages a native DAR archive before sequential tape streaming", () => {
+test("new backup policy uses bounded native DAR packs before sequential tape streaming", () => {
   const open = section("  function openBackupProfile(", "  async function submitBackupProfile(");
   const submit = section("  async function submitBackupProfile(", "  function backupCapacityPlan(");
 
@@ -152,15 +152,15 @@ test("new backup policy always stages a native DAR archive before sequential tap
   assert.match(open, /spans tapes as needed/);
   assert.match(open, /type="hidden" name="data_delivery" value="disk_spool"/);
   assert.doesNotMatch(open, /name="data_delivery" value="direct"/);
-  assert.match(open, /Pack once, then stream sequentially/);
-  assert.match(open, /DAR packages small files into large archive slices on disk/);
-  assert.match(open, /validates the complete staged archive before the tape moves/);
+  assert.match(open, /Bounded disk buffer, any archive size/);
+  assert.match(open, /independently validated archive packs/);
+  assert.match(open, /reclaims disk space as the verified set advances/);
   assert.match(submit, /compression_mode: String\(values\.get\("compression_mode"\) \|\| "auto"\)/);
   assert.match(submit, /data_delivery: String\(values\.get\("data_delivery"\) \|\| "disk_spool"\)/);
   assert.match(submit, /spanning_enabled: values\.get\("spanning_enabled"\) === "on"/);
 });
 
-test("delivery labels distinguish advanced direct, whole-archive staged, legacy, and unsupported plans", () => {
+test("delivery labels distinguish advanced direct, bounded rolling, legacy, and unsupported plans", () => {
   const helpers = section("  function backupDataDeliveryExplicit(", "  function backupSpanningEnabled(");
   const testPick = (object, ...keys) => {
     if (!object || typeof object !== "object") return null;
@@ -173,7 +173,7 @@ test("delivery labels distinguish advanced direct, whole-archive staged, legacy,
   )(testPick, () => null, () => null);
   assert.equal(values[0]({ data_delivery: "direct" }), "direct");
   assert.equal(values[2]({ data_delivery: "direct" }), "Direct streaming (advanced)");
-  assert.equal(values[2]({ data_delivery: "disk_spool" }), "Whole-archive staging");
+  assert.equal(values[2]({ data_delivery: "disk_spool" }), "Bounded rolling staging");
   assert.equal(values[2]({}), "Staged delivery (legacy)");
   assert.equal(values[1]({ data_delivery: "ram_ring" }), false);
   assert.equal(values[2]({ data_delivery: "ram_ring" }), "Unsupported (ram_ring)");
@@ -878,7 +878,7 @@ test("the operation hero renders phase-specific progress, rates, and tape action
   };
   const direct = render(directRun);
   assert.match(direct, /Step 4 of 8/);
-  assert.match(direct, /Streaming a native volume to tape/);
+  assert.match(direct, /Streaming an archive pack to tape/);
   assert.match(direct, /Archive entries reached/);
   assert.match(direct, /4 of 10 entries/);
   assert.match(direct, /400 B in the current archive stage/);
@@ -898,7 +898,7 @@ test("the operation hero renders phase-specific progress, rates, and tape action
   assert.doesNotMatch(direct, /<final>/, "the source-relative filename must be HTML escaped");
   assert.match(direct, /not retained after this phase/);
   assert.match(direct, /Legacy direct streaming record/);
-  assert.match(direct, /New TapeScale Native backups always build and validate a complete disk archive first/);
+  assert.match(direct, /New TapeScale Native backups use bounded, independently validated disk packs/);
 
   const readbackRun = {
     ...directRun,
@@ -940,11 +940,11 @@ test("the operation hero renders phase-specific progress, rates, and tape action
     })
   };
   const staged = render(stagedRun);
-  assert.match(staged, /Packing the complete archive on disk/);
-  assert.match(staged, /Archive staging/);
+  assert.match(staged, /Packing the rolling archive buffer/);
+  assert.match(staged, /Rolling spool/);
   assert.match(staged, /250 B \/ 1,000 B/);
-  assert.match(staged, /25% of estimated stage target · hard limit 1,200 B/);
-  assert.match(staged, /Complete archive on disk · tape idle/);
+  assert.match(staged, /25% of high-water mark · hard limit 1,200 B/);
+  assert.match(staged, /Concurrent bounded pack producer/);
   assert.doesNotMatch(staged, /Tape read/);
 
   const legacyStaged = render({
@@ -1115,9 +1115,11 @@ test("shared preparation and engine telemetry remain honest about stale or missi
     pipeline_basis: "native_dar_archive_bytes_delta",
     tape_basis: "linux_scsi_tape_sysfs_counter_delta",
     spool_bytes: 16777216,
-    spool_target_bytes: 67108864,
+    spool_high_water_bytes: 67108864,
+    spool_low_water_bytes: 8388608,
     spool_capacity_bytes: 83886080,
-    spool_file_count: 2,
+    spool_pack_count: 2,
+    spool_reclaimed_bytes: 134217728,
     spool_fill_bytes_per_second: 2097152,
     spool_drain_bytes_per_second: 0,
     spool_basis: "native_run_scoped_archive_slice_bytes"
@@ -1125,14 +1127,16 @@ test("shared preparation and engine telemetry remain honest about stale or missi
 
   assert.equal(stale(freshSample, now), false);
   const live = render({ state: "writing", result: { live_io: freshSample } });
-  assert.match(live, /Staging archive on disk/);
+  assert.match(live, /Filling the bounded archive buffer/);
   assert.match(live, /Buffering/);
-  assert.match(live, /Archive staging/);
+  assert.match(live, /Rolling spool/);
   assert.match(live, /16\.0 MiB \/ 64\.0 MiB/);
-  assert.match(live, /25\.0% of estimated stage target/);
+  assert.match(live, /25\.0% of high-water mark/);
+  assert.match(live, /refill at\/below 8\.0 MiB/);
+  assert.match(live, /128\.0 MiB reclaimed/);
   assert.match(live, /hard limit 80\.0 MiB/);
   assert.match(live, /Filling<\/span><strong>2\.0 MiB\/s/);
-  assert.match(live, /DAR is packaging source data into the complete staged archive before tape movement starts/);
+  assert.match(live, /DAR is filling a bounded disk window with independently validated archive packs/);
   assert.match(live, /Archive write stream/);
   assert.match(live, /Engine stream bytes · not source logical bytes/);
   assert.match(live, /1\.0 MiB\/s/);
@@ -1141,15 +1145,24 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   assert.doesNotMatch(live, /Tape read/);
   assert.match(live, /Rolling 5 second sample/);
   assert.match(live, /Engine progress: Native Dar Archive Bytes Delta/);
-  assert.match(live, /Archive staging: Native Run Scoped Archive Slice Bytes/);
+  assert.match(live, /Rolling spool: Native Run Scoped Archive Slice Bytes/);
   assert.match(live, /Linux Scsi Tape Sysfs Counter Delta/);
   assert.doesNotMatch(live, /Bacula/);
 
   const packing = render({ state: "writing", result: { live_io: { ...freshSample, engine_state: "packing", activity: "buffering" } } });
-  assert.match(packing, /Packing the complete archive on disk/);
-  assert.match(packing, /DAR archive packing/);
+  assert.match(packing, /Packing the archive buffer/);
+  assert.match(packing, /DAR pack production/);
   assert.match(packing, /Tape<\/span><strong>Idle/);
-  assert.match(packing, /tape is intentionally idle during this stage/i);
+  assert.match(packing, /validated reserve reaches its resume threshold/i);
+
+  const refilling = render({ state: "writing", result: { live_io: { ...freshSample, engine_state: "refilling_spool", activity: "refilling" } } });
+  assert.match(refilling, /Refilling the archive buffer/);
+  assert.match(refilling, /safe tape-file boundary/);
+
+  const packStreaming = render({ state: "writing", result: { live_io: { ...freshSample, engine_state: "writing_native_pack", activity: "streaming", spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 4194304, tape_write_bytes_per_second: 4194304 } } });
+  assert.match(packStreaming, /Streaming an archive pack to tape/);
+  assert.match(packStreaming, /Native pack stream/);
+  assert.match(packStreaming, /reclaimed only after the complete tape files and filemarks close/);
 
   const firstSpoolSample = { ...freshSample, activity: "starting", sample_window_ms: null };
   delete firstSpoolSample.spool_fill_bytes_per_second;
@@ -1166,7 +1179,7 @@ test("shared preparation and engine telemetry remain honest about stale or missi
 
   const despooling = render({ state: "writing", result: { live_io: { ...freshSample, engine_state: "writing_native_volume", activity: "despooling", spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 3145728, tape_write_counter_available: false, tape_write_bytes_per_second: null } } });
   assert.match(despooling, /Streaming a native volume to tape/);
-  assert.match(despooling, /Native volume stream/);
+  assert.match(despooling, /Native pack stream/);
   assert.match(despooling, /Tape write<\/span><strong>Unavailable/);
 
   const idle = render({ state: "writing", result: { live_io: { ...freshSample, activity: "idle", progress_idle_ms: 300000, pipeline_bytes_per_second: 0, spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 0 } } });
@@ -1184,7 +1197,7 @@ test("shared preparation and engine telemetry remain honest about stale or missi
 
   const legacyIdle = render({ state: "writing", result: { live_io: { sampled_at: new Date(now).toISOString(), sample_window_ms: 5000, phase: "backup_write", pipeline_bytes_per_second: 0, tape_write_bytes_per_second: 0, tape_read_bytes_per_second: 0, tape_counters_available: true, stale_after_seconds: 20 } } });
   assert.match(legacyIdle, /No data movement/);
-  assert.doesNotMatch(legacyIdle, /Archive staging<\/span>/);
+  assert.doesNotMatch(legacyIdle, /Rolling spool<\/span>/);
 
   const unavailable = render({ state: "writing", result: { live_io: { ...freshSample, tape_read_counter_available: false, tape_write_counter_available: false, tape_counters_available: false } } });
   assert.equal((unavailable.match(/Unavailable/g) || []).length, 1);
@@ -1252,16 +1265,16 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   assert.match(stalePreparation, /Rate hidden until next update/);
   assert.doesNotMatch(stalePreparation, /953\.7 MiB\/s/);
 
-  assert.match(renderPreparation({ state: "preparing", result: {} }), /Checking the immutable snapshot, native catalog, drive, tape, and staging path/);
+  assert.match(renderPreparation({ state: "preparing", result: {} }), /Checking the immutable snapshot, native catalog, drive, tape, and bounded-spool watermarks/);
   assert.match(renderPreparation({ state: "inventorying", result: {} }), /Waiting for the worker's first source-scan sample/);
   const stability = renderPreparation({ state: "verifying", result: { preparation_progress: { ...preparationSample, stage: "source_stability_check", step: "sorting" } } });
   assert.match(stability, /Sorting manifest entries/);
   assert.match(stability, /Tape readback is complete/);
-  assert.match(render({ state: "writing", result: { live_io: freshSample, preparation_progress: preparationSample } }), /Staging archive on disk/, "a retained inventory sample must not hide active write telemetry");
+  assert.match(render({ state: "writing", result: { live_io: freshSample, preparation_progress: preparationSample } }), /Filling the bounded archive buffer/, "a retained inventory sample must not hide active write telemetry");
 
   const direct = render({ state: "writing", data_delivery: "direct", result: { live_io: { ...freshSample, activity: "streaming", tape_write_bytes_per_second: 4194304 } } });
   assert.match(direct, /Streaming directly to tape/);
-  assert.doesNotMatch(direct, /Archive staging|Staging archive on disk|staged archive/);
+  assert.doesNotMatch(direct, /Rolling spool|bounded archive buffer|staged archive/);
   const directStarting = render({ state: "writing", data_delivery: "direct", result: { live_io: { ...freshSample, activity: "buffering" } } });
   assert.match(directStarting, /Starting the tape stream/);
   assert.match(directStarting, /legacy direct source-to-tape stream is starting/);
@@ -1604,10 +1617,10 @@ test("run summaries distinguish planned, active, complete, and failed readback",
   assert.match(app, /\{ name: "Confirm first tape", detail: "Choose the first archive volume"/);
   assert.match(app, /\{ name: "Preflight", detail: "Validate source, catalog, drive, tape, and staging path", aliases: \["queued", "media_assigned", "preparing"\] \}/);
   assert.match(app, /\{ name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: \["inventorying", "manifesting", "source_manifest", "source_inventory"\] \}/);
-  assert.match(app, /\{ name: "Pack archive", detail: "Build the complete DAR archive on disk; tape idle", aliases: \["native_packing"\] \}/);
-  assert.match(app, /\{ name: "Validate archive", detail: "Check staged slices before tape moves", aliases: \["native_validating"\] \}/);
-  assert.match(app, /\{ name: "Write & read back", detail: "Stream and immediately verify each native volume", aliases: \[[^\]]*"native_volume_write"[^\]]*"native_volume_readback"/);
-  assert.match(app, /\{ name: "Finalize", detail: "Confirm the source snapshot and seal evidence", aliases: \["written", "finalizing", "source_stability_check", "final_source_check"\] \}/);
+  assert.match(app, /\{ name: "Build archive packs", detail: "Build and test bounded DAR packs", aliases: \[[^\]]*"native_packing"[^\]]*"refilling_spool"/);
+  assert.match(app, /\{ name: "Validate pack", detail: "Check each completed pack before tape", aliases: \[[^\]]*"native_validating"[^\]]*"validating_pack"/);
+  assert.match(app, /\{ name: "Write & reclaim", detail: "Stream validated packs; reclaim after durable filemarks", aliases: \[[^\]]*"native_volume_write"[^\]]*"native_volume_readback"/);
+  assert.match(app, /\{ name: "Finalize", detail: "Seal the pack set and confirm the source", aliases: \[[^\]]*"native_archive_seal"[^\]]*"source_stability_check"/);
 });
 
 test("the eight-stage journey is complete on desktop and compact on mobile", () => {

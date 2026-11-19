@@ -3,29 +3,30 @@
 [![CI](https://github.com/lilrags16/TapeScale/actions/workflows/ci.yml/badge.svg)](https://github.com/lilrags16/TapeScale/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-TapeScale is a safety-first LTO backup control plane for TrueNAS. It manages standalone SAS tape drives, cartridges, staged file archives, physical verification evidence, recovery metadata, retention, holds, and custody through a graphical console.
+TapeScale is a safety-first LTO backup control plane for TrueNAS. It manages standalone SAS tape drives, cartridges, bounded rolling file archives, physical verification evidence, recovery metadata, retention, holds, and custody through a graphical console.
 
 > [!IMPORTANT]
-> Version `0.2.0-alpha.5` is an attended evaluation build, not production protection. It uses the incompatible **TapeScale Native v1** format. Native archive creation, multi-tape writing, immediate physical readback, and database-independent full-archive capture/restore are implemented. In-console restore and selected-file recovery are not. Do not make this alpha the only copy of any data.
+> Version `0.2.0-alpha.6` is an attended evaluation build, not production protection. New backups use **TapeScale Native v2**, a bounded rolling-spool format; existing Native v1 captures remain readable. Multi-tape writing, immediate physical readback, and database-independent full-archive capture/restore are implemented. In-console restore and selected-file recovery are not. Do not make this alpha the only copy of any data.
 
 ## What changed in 0.2
 
 New backups no longer use Bacula. TapeScale now owns the media format and physical workflow while invoking [DAR](https://dar.sourceforge.io/) as a separate archive-codec executable.
 
-The native path is intentionally stage-first:
+The Native v2 path uses independently finalized packs in a bounded spool window:
 
 1. Inventory and SHA-256 hash the selected immutable snapshot.
-2. Pack files and metadata into large compressed DAR slices on the spool filesystem.
-3. Test the completed staged archive before moving tape.
-4. Plan whole slices across one or more cartridges.
+2. Deterministically group manifest entries into independently recoverable DAR packs, keeping hard links together.
+3. Prefill a validated ready-pack reserve to the high-water mark minus one maximum in-progress pack (or finish producing a smaller archive) before the first tape motion.
+4. Stream only complete packs to tape, reclaim each pack after its tape files close durably, and refill from low-water to the resume threshold while parked at a clean filemark.
 5. Read the loaded tape's preparation UUID and reject the wrong cartridge.
-6. Write a TapeScale volume header, recovery catalog, source manifest, slices, volume index, and trailer.
-7. Rewind and immediately read every tape file back, validating its digest and identity bindings.
-8. Retain a recovery point only after every planned volume passes physical readback.
+6. Write a TapeScale volume header, source manifest, typed pack descriptors, isolated catalogs, payload slices, volume index, and trailer.
+7. Chain continuation-volume indexes and place a final archive-set seal on the last cartridge.
+8. Rewind and immediately read every tape file back, validating its digest and identity bindings.
+9. Retain a recovery point only after every volume, pack, chain link, and final seal passes physical readback.
 
-This separates slow small-file traversal and compression from tape motion. Once writing begins, the drive reads already completed large files from the spool instead of waiting on ZFS directory walks or a per-file backup engine.
+Small files are packaged into large sequential files before they reach tape. A 30 TB archive therefore does not need a 30 TB staging disk: only the configured rolling window is retained, and pack production overlaps tape consumption. If sustained production cannot keep up, TapeScale waits between complete pack tape files instead of starving a partially written tape file.
 
-See [TapeScale Native v1 format](docs/NATIVE_FORMAT.md) for the media contract and current recovery limitations.
+See [TapeScale Native v2 format](docs/NATIVE_FORMAT.md) for the media contract and current recovery limitations.
 
 ## Current functionality
 
@@ -36,9 +37,9 @@ See [TapeScale Native v1 format](docs/NATIVE_FORMAT.md) for the media contract a
 - Graphical source browser restricted to named ZFS snapshot directories beneath the read-only source mount
 - Bounded-memory source inventory and retained-manifest browsing without an artificial total file-count or logical-byte ceiling
 - DAR Full archives with automatic fast Zstandard, fast LZ4, balanced GZIP, or no compression
-- Full-disk staging and validation before tape motion
-- Ordered attended multi-cartridge continuation at complete archive-slice boundaries
-- Versioned self-identifying headers, indexes, trailers, per-file checksums, and per-segment database records
+- Bounded rolling-disk staging with 256 GiB target packs, startup prefill, and functional high/low-water refill hysteresis
+- Ordered attended multi-cartridge continuation at complete pack boundaries without whole-archive staging
+- Versioned self-identifying headers, typed pack records, chained indexes, final archive-set seal, per-file checksums, and per-pack database records
 - Immediate physical full readback of every written native volume
 - Live inventory, packing, staged-byte, current-file, tape-write, tape-read, and attended-handoff status
 - Media pools, retention, holds, overwrite evaluation, reservations, custody movements, audit history, and evidence artifacts
@@ -47,10 +48,10 @@ See [TapeScale Native v1 format](docs/NATIVE_FORMAT.md) for the media contract a
 
 Create two datasets before installing the app:
 
-- `/mnt/tapescale-spool`: a large, fast Generic/POSIX dataset used for complete archive staging. NVMe or SSD is strongly preferred.
+- `/mnt/tapescale-spool`: a fast Generic/POSIX dataset used as the bounded rolling-pack window. The release defaults are 768 GiB high-water, 256 GiB low-water, and 8 GiB reserved free space; the user's 1 TB spool is sufficient for those defaults.
 - `/mnt/tapescale-restores`: an isolated Generic/POSIX dataset reserved for future restore execution. Do not share it over SMB or NFS.
 
-The spool must be large enough for the complete encoded archive plus the configured free-space reserve. It must allow the container worker to create, write, and `fsync` files. TapeScale checks free space before packing and does not intentionally begin a tape pass with an incomplete archive.
+The spool does not need to match the source size. It must hold the configured high-water window plus reserve and allow the container worker to create, write, and `fsync` files. With the defaults, tape starts or resumes with at least 384 GiB of validated ready packs unless the producer has already finished a smaller archive. One individual file or hard-link allocation group must still fit both the configured pack maximum and a usable cartridge payload.
 
 In TrueNAS SCALE:
 
@@ -90,16 +91,16 @@ The current backup path protects one existing immutable snapshot with a manually
 6. When requested, unload the completed volume and load the next named prepared cartridge. TapeScale verifies its preparation UUID before accepting or writing it.
 7. After every volume passes, browse the retained source manifest and inspect the recorded volume and evidence set.
 
-Automatic compression selects fast Zstandard. Compression occurs while building the disk archive, not while feeding tape. DAR slices are configured independently of cartridge size and are assigned whole to volumes; an archive can span as many eligible prepared cartridges as its plan requires.
+Automatic compression selects fast Zstandard. Compression occurs while building each disk pack, not while feeding that pack to tape. Packs contain fixed-size DAR slices and are assigned whole to volumes; an archive can span as many eligible prepared cartridges as its plan requires without staging the complete set.
 
-Cancellation before physical writing leaves the selected tape unchanged. Once a media write starts, cancellation is cooperative and cannot stop kernel tape I/O instantaneously. An interrupted or failed write leaves that cartridge uncertain and no recovery point is created from it.
+Cancellation before physical writing leaves the selected tape unchanged. Once a media write starts, cancellation is cooperative and cannot stop kernel tape I/O instantaneously. An interrupted or failed write leaves that cartridge uncertain and no recovery point is created from it. Alpha.6 does not resume a partially written member; retry creates and restages a new archive set.
 
 ## Understanding progress
 
 The running-job page separates counters that mean different things:
 
 - **Inventory** reports source entries and logical bytes discovered.
-- **Packing** reports encoded bytes staged on disk and the source path currently reported by DAR.
+- **Packing** reports the active pack, bounded spool occupancy, high/low watermarks, reclaimed bytes, and the source path currently reported by DAR.
 - **Tape write** and **Tape read** use physical counters for the exact drive.
 - **Volume position** reports the current archive volume and completed native tape files.
 - **Waiting for tape** names the required continuation and does not consume the active-transfer timeout.
@@ -108,10 +109,11 @@ Source logical bytes, compressed archive bytes, and physical device bytes are de
 
 ## Format transition
 
-`tapescale-native-v1` is incompatible with prior Bacula-written experiments. This release assumes there are no valid Bacula recovery tapes to preserve:
+`tapescale-native-v2` is the default for new operational backups. It is incompatible with Native v1 at the write-layout level, but `tapescale-recovery` retains explicit v1 and v2 readers. Both native formats are incompatible with prior Bacula-written experiments. During upgrade:
 
-- Saved backup profiles migrate to the native engine.
-- Untouched queued requests migrate to native.
+- Saved backup profiles migrate to Native v2.
+- Untouched queued Native v1 backup requests migrate to v2. The separate G0.2 restore-comparison exercise remains v1 until that workflow has a v2 executor.
+- Running, terminal, or media-touched Native v1 rows keep their original format and remain readable as v1 history.
 - Failed or media-touched Bacula attempts remain audit history only and are not presented as recoverable archives.
 - Scratch media must pass native preparation before its next write.
 
@@ -124,6 +126,7 @@ Do not run preparation on any older cartridge whose contents must be recovered. 
 - Immediate readback proves that the exact bytes written to each volume can be read and authenticated; it does not prove that a restored filesystem matches the source.
 - Only attended, manually started Full file archives on a standalone drive are operational.
 - Tape libraries/changers, automatic snapshot creation, incrementals, encryption/key recovery, and native ZFS send streams are unavailable.
+- A single file or hard-link allocation group larger than the configured pack maximum or usable cartridge payload is rejected before tape write; native file-chunk records are not implemented yet.
 - Real hardware qualification remains required for supported drive generations, compression modes, spanning, wrong-media handling, interruptions, ACLs, xattrs, sparse files, hard links, and unusual filenames.
 - The web alpha has no application authentication or TLS termination. Run it only on an isolated trusted network.
 
@@ -163,7 +166,7 @@ node --check web/app.js
 
 ## Documentation
 
-- [TapeScale Native v1 format](docs/NATIVE_FORMAT.md)
+- [TapeScale Native v2 format](docs/NATIVE_FORMAT.md)
 - [Architecture and authority boundaries](docs/ARCHITECTURE.md)
 - [Tape engine decision record](docs/ENGINE-EVALUATION.md)
 - [Security and destructive-action gates](docs/SECURITY.md)
@@ -173,7 +176,7 @@ node --check web/app.js
 - [Operator workflows](docs/OPERATIONS.md)
 - [Product design system](docs/design-system.md)
 
-The qualification ledger and engine decision record describe the active Native v1 architecture and keep physical evidence distinct from implemented software behavior.
+The qualification ledger and engine decision record describe the active Native v2 architecture and keep physical evidence distinct from implemented software behavior.
 
 ## Contributing and security
 

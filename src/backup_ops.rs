@@ -377,7 +377,11 @@ pub async fn create_backup_profile(
     sqlx::query(
         "UPDATE single_tape_data_profiles
             SET workflow_kind = 'backup', policy_id = $1, media_pool_id = $2,
-                schedule_enabled = $3, retention_days = $4, updated_at = now()
+                schedule_enabled = $3, retention_days = $4,
+                engine_name = 'TapeScale Native', engine_version = '2',
+                adapter_version = 'native-v2',
+                format_version = 'tapescale-native-v2', archive_codec = 'dar',
+                updated_at = now()
           WHERE id = $5",
     )
     .bind(policy_id)

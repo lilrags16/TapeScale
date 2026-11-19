@@ -2,6 +2,21 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.2.0-alpha.6] - 2026-11-19
+
+### TapeScale Native v2 rolling archives
+
+- Makes `tapescale-native-v2` the format for new writes. Native v2 builds independently finalized DAR packs inside a bounded rolling spool instead of staging the complete archive before tape motion.
+- Ships a 256 GiB pack target, 768 GiB spool high-water, 256 GiB low-water, and 8 GiB free-space reserve. A pack's disk copy is reclaimed after all of its tape files and filemarks close; later full-volume readback remains mandatory before validity, so a multi-tape archive no longer requires disk capacity equal to the full source selection.
+- Prefills validated packs to the high-water mark minus one maximum in-progress pack before the first tape motion (or to producer completion for a smaller archive), then continues producing concurrently. At or below low-water it parks at a clean filemark and refills to that resume threshold, providing real startup/refill hysteresis instead of starting on the first pack. It preserves complete slices at media boundaries, immediately reads each volume back, chains ordered packs and volumes, and writes a final archive-set seal before retaining a recovery point.
+- Extends clean-host recovery to auto-detect and validate Native v2 packs and the final set seal while retaining Native v1 read compatibility. New and untouched queued operational backup work migrates to v2; the separate G0.2 restore-comparison exercise and running, terminal, or media-touched v1 history keep their v1 format.
+
+### Alpha limits
+
+- One file, or one hard-link allocation group, must fit both the configured pack maximum and one cartridge's usable payload. The writer fails closed rather than splitting that allocation group.
+- An interrupted media write is quarantined and is not resumed mid-volume; retry creates a new archive set from the immutable source.
+- Native v2 remains physically unqualified. In-console restore and selected-file extraction, encryption, changer automation, incrementals, automatic snapshots, and native ZFS send remain unavailable. This alpha must not be the only copy of data.
+
 ## [0.2.0-alpha.5] - 2026-11-19
 
 ### Native live-database contract completion
@@ -285,6 +300,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.2.0-alpha.6]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.6
 [0.2.0-alpha.5]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.5
 [0.2.0-alpha.4]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.4
 [0.2.0-alpha.3]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.3

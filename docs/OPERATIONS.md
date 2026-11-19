@@ -1,138 +1,75 @@
 # TapeScale Native operations
 
-This guide describes TapeScale `0.2.0-alpha.5`. It is an attended alpha for one standalone SAS tape drive, not a production-qualification claim. The active writer is **TapeScale Native v1** and DAR 2.8.6 is used only as the file-archive codec. Bacula is not installed or used by the current runtime.
+This guide covers TapeScale `0.2.0-alpha.6`, an attended alpha for one standalone SAS tape drive. New backups use **TapeScale Native v2** with DAR 2.8.6 as a separate archive codec. Native v1 media remains readable. Bacula is not part of the runtime.
 
-Do not make this alpha the only copy of data. A result is evidence for the exact source snapshot, drive, firmware, cartridge set, format, and software revision recorded by the run.
+Do not make this alpha the only copy of data. Physical qualification is pending.
 
-## Operating model
+## Backup flow
 
-A native Full backup follows one closed sequence:
+1. Select an existing named, read-only ZFS snapshot with the graphical browser.
+2. TapeScale inventories and hashes the immutable source and groups hard links.
+3. The worker creates and tests independently finalized DAR packs in a bounded spool.
+4. Before the first tape motion, TapeScale fills the validated ready queue to high-water minus one maximum in-progress pack, or reaches producer completion for an archive smaller than that threshold.
+5. TapeScale writes complete packs sequentially while the producer continues filling the ready window.
+6. Once a pack's complete tape files close durably, its disk space may be reclaimed. It remains unverified until the containing volume is rewound and read back completely.
+7. At or below low-water, the drive remains parked after a clean tape filemark until the ready queue reaches the resume threshold or the producer finishes.
+8. At a volume boundary, TapeScale verifies and unloads the member, then requests the next prepared cartridge.
+9. A recovery point is retained only after every volume passes and the final archive-set seal and source stability checks succeed.
 
-1. Select one existing named ZFS snapshot with the graphical browser.
-2. Inventory and SHA-256 hash the immutable source.
-3. Build large DAR slices and an isolated catalog on the dedicated spool dataset.
-4. Test the complete staged archive while tape remains idle.
-5. Plan whole slices across the required prepared cartridges.
-6. Read the loaded cartridge UUID from tape file zero and reject a mismatch.
-7. Stream completed large files sequentially to tape.
-8. Rewind and immediately read every tape file back, checking identities, lengths, and SHA-256 digests.
-9. Retain a recovery point only after every volume passes and the source snapshot is still unchanged.
+Multi-tape archives do not require whole-archive staging. One file, or one hard-link allocation group, must still fit both the configured pack maximum and one cartridge's usable payload. TapeScale fails closed rather than splitting that group.
 
-This design deliberately spends disk capacity to separate small-file traversal and compression from tape motion. It does not use a partial fill/drain spool or a small RAM buffer as a substitute for sustained throughput.
+## Rolling-spool controls
 
-## Required deployment flags
+The TrueNAS Compose supplies:
 
-The TrueNAS alpha Compose enables these canonical controls:
+| Environment variable | Release default |
+|---|---:|
+| `TAPESCALE_NATIVE_PACK_TARGET_BYTES` | `274877906944` (256 GiB) |
+| `TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES` | `824633720832` (768 GiB) |
+| `TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES` | `274877906944` (256 GiB) |
+| `TAPESCALE_NATIVE_SPOOL_RESERVE_BYTES` | `8589934592` (8 GiB) |
+| `TAPESCALE_NATIVE_SLICE_BYTES` | `68719476736` (64 GiB) |
 
-- `TAPESCALE_TAPE_MOTION_ENABLED=true` for guarded rewind and unload;
-- `TAPESCALE_TAPE_PREPARATION_ENABLED=true` for destructive native preparation;
-- `TAPESCALE_NATIVE_BACKUP_ENABLED=true` for native Full backups;
-- `TAPESCALE_DAR_PATH=/usr/local/bin/dar`;
-- `TAPESCALE_NATIVE_SPOOL_DIR=/var/lib/tapescale/spool`;
-- `TAPESCALE_NATIVE_SPOOL_RESERVE_BYTES=8589934592`;
-- `TAPESCALE_NATIVE_SLICE_BYTES=68719476736`;
-- `TAPESCALE_NATIVE_COMPRESSION_THREADS=4`.
+Use a dedicated, fast, writable POSIX-compatible spool outside the source, restore, and evidence trees. A 1 TiB spool supports the defaults, allowing for filesystem overhead and other use. The high-water value must fit alongside the reserve and leave a ready-pack resume threshold above low-water after reserving one maximum in-progress pack. With the defaults that threshold is 384 GiB. Smaller media generations may impose a lower effective pack maximum.
 
-Older `TAPESCALE_LAB_*` flag names remain compatibility aliases only. New deployments should use the canonical names above.
+Only packs whose complete tape files closed durably are eligible for disk reclamation. Reclamation is not verification; no recovery point exists until the whole volume and final archive-set seal pass physical readback. A write failure never silently promotes the last diagnostic state.
 
-## Prepare a cartridge
+## Prepare and identify tape
 
-> **Destructive operation:** preparation overwrites the loaded cartridge. Use only blank or expendable scratch media. Never prepare a retained, foreign, WORM, or irreplaceable tape.
+Preparation is destructive. Use only blank or expendable media. The single **Prepare tape** action writes and reads a deterministic qualification pattern, then writes a durable TapeScale cartridge UUID. At each later destructive boundary the worker reads that UUID from tape and matches it to the reservation; the operator does not repeatedly attest a printed label.
 
-1. Load one scratch cartridge and wait for the drive to report ready.
-2. Open **Prepare tape** from the drive or tape view.
-3. Register or select the inventory record and LTO generation.
-4. Review the exact detected drive and cartridge, then invoke the single destructive action.
-5. Leave the worker and drive available until the result is terminal.
+Preparation proves only that exact drive/media pass. It is not general hardware, spanning, restore, or filesystem-fidelity qualification.
 
-The worker uses the exact configured `/dev/nstN` path, enables variable-block I/O, writes deterministic 256 KiB records across two tape files, rewinds, and rereads every record and file boundary. A pass then replaces the test data with a TapeScale preparation record containing the cartridge UUID and reads it back. That UUID, not a repeated typed assertion, identifies the tape at later destructive boundaries.
+## Live job page
 
-A pass is narrow evidence for that drive/cartridge tuple. It is not backup, spanning, restore, ACL, or general hardware qualification.
+The live page reports separate, truthful measurements:
 
-## Create and run a backup
+- source inventory entries and logical bytes;
+- current source path and active pack;
+- ready/spooled/reclaimed bytes and high/low-water thresholds;
+- physical tape write and readback rates;
+- current volume, pack, safe refill state, and requested continuation tape.
 
-1. In **Backups**, browse beneath `/source` to a path such as `pool/dataset/.zfs/snapshot/snapshot-name`.
-2. Save the selection. TapeScale resolves it beneath the held source root and verifies kernel read-only mount flags.
-3. Choose retention, optional scratch pool, media spanning, and compression:
-   - **Automatic** → fast Zstandard;
-   - **Zstandard** → fast Zstd;
-   - **LZ4** → fast LZ4;
-   - **GZIP** → balanced GZIP;
-   - **None** → no archive compression.
-4. Create the request and review the server-calculated eligible drive/cartridge pair.
-5. Start the destructive run. The API and worker repeat the source, lease, reservation, media, hold, WORM, qualification, and on-tape identity checks under lock.
+Logical source bytes, compressed pack bytes, and physical device bytes are different bases. A stale or unavailable counter is shown as unavailable, not as an invented zero. Operator waits are distinct from transfer stalls.
 
-Only complete disk staging is supported by the native writer. Direct source-to-tape delivery is a legacy policy value and is rejected for new native runs.
+## Multi-tape handoff
 
-### Spool sizing
+When the job requests another cartridge, unload the verified member and load the requested prepared tape. TapeScale reads its on-tape UUID before overwrite. A wrong, unreadable, protected, WORM, held, reserved, or already-used cartridge is rejected. Waiting for attended media is durable and does not consume the active-transfer timeout.
 
-The spool must fit the complete encoded archive plus the configured reserve. Preflight conservatively budgets source logical bytes, compression headroom, entry overhead, the retained manifest, and native metadata. Actual compression may use less space, but TapeScale will not begin tape motion based on an incomplete archive.
+## Recovery and upgrade
 
-Use a dedicated fast SSD/NVMe dataset when possible. The stage is deleted after successful finalization. It is retained for diagnosis after a media-write failure; a pre-write failure removes the unused stage.
+The web console can browse retained manifests and evidence but does not yet execute a restore. On a clean host, run `tapescale-recovery capture-native-volume` once per member into one capture directory, then `restore-native-archive` into an existing empty destination. The tool auto-detects Native v1 and v2; v2 recovery requires every ordered pack/volume and the final archive-set seal. See [RECOVERY.md](RECOVERY.md).
 
-### Multi-tape handoff
+Upgrading does not rewrite retained media. Untouched queued v1 operational backups upgrade to v2. The separate G0.2 restore-comparison exercise remains v1; running, terminal, or media-touched v1 work also keeps its format and remains readable through the compatibility path.
 
-DAR slices are assigned whole to volumes. When another cartridge is required:
+## Failure and alpha limits
 
-1. the completed volume has already been rewound and fully verified;
-2. unload it and load the exact requested prepared cartridge;
-3. authorize the displayed continuation;
-4. TapeScale reads the new preparation UUID before accepting or overwriting it.
-
-The operator wait is durable and is not counted as an active-transfer stall. A wrong, missing, foreign, protected, held, unqualified, reserved, or already-used cartridge is rejected before data I/O.
-
-## Understand the live page
-
-The UI keeps incompatible counters separate:
-
-- **Inventory**: source entries and logical bytes discovered;
-- **Packing**: regular files and bytes created in the run-scoped disk stage;
-- **Current file**: the bounded source-relative path most recently reported by DAR;
-- **Tape write**: physical write rate for the exact SCSI tape device;
-- **Tape read**: physical rate during immediate volume readback;
-- **Waiting for tape**: the required next volume, with no invented transfer rate.
-
-Logical source bytes, compressed DAR bytes, and physical device bytes are not interchangeable. Compression, sparse files, hard links, metadata, record framing, and repeated per-volume metadata prevent a truthful single synthetic byte counter.
-
-If packing is slow, inspect source metadata latency, CPU/compression, and spool I/O. Tape should be idle during this phase. If the drive shoe-shines during the native tape pass, the completed spool filesystem, host contention, HBA/device path, media condition, or physical block behavior is the likely bottleneck; the source filesystem is no longer in the active data path.
-
-## Cancellation and failure
-
-- Before the media-write boundary, cancellation leaves tape unchanged.
-- Physical record I/O cannot always be interrupted safely. After cancellation, the worker finishes the current tape file before stopping when possible.
-- A failed or interrupted write creates no recovery point and leaves touched media uncertain/write-unverified.
-- A device reset, disconnect, lease loss, identity change, or unproven cleanup position requires reconciliation before further destructive work.
-- An unexpected end-of-media is a failed volume in this first native release; capacity planning intentionally leaves a reserve rather than relying on EOM continuation.
-
-## Recovery
-
-The web Recovery Vault can browse retained manifests and evidence. In-console restore dispatch remains pending for native points. The independent `tapescale-recovery` executable can operate without PostgreSQL:
-
-```sh
-tapescale-recovery capture-native-volume \
-  --device /dev/nst0 \
-  --archive-dir /recovery/archive
-
-tapescale-recovery restore-native-archive \
-  --archive-dir /recovery/archive \
-  --destination /recovery/restored
-```
-
-Run the capture command once for every cartridge in the archive. It reads and verifies the header, repeated catalog and source manifest, slices, volume index, and trailer. Restore is accepted only when every declared volume and every contiguous slice is present and all captured files still match their digests. The destination must be an existing empty real directory. DAR tests the reconstructed archive before extraction, then TapeScale inventories the result and compares it with the retained source manifest.
-
-This implemented utility still requires physical qualification across drive generations, failure modes, and metadata combinations. Follow [RECOVERY.md](RECOVERY.md) and do not publish restored data without review.
-
-## Media management
-
-Retention, holds, custody, pools, and overwrite evaluation are separate from physical tape identity. A server result that media appears reusable does not itself erase or prepare it. Archive and legal holds never silently expire. Unknown identity, incomplete dependency evidence, unverified writes, WORM state, active reservations, and retained recovery points block destructive reuse.
-
-## Current limits
-
-- attended manually started Full file archives only;
-- one standalone drive, with manual cartridge changes;
-- existing named snapshots only; no automatic snapshot creation or rolling selection;
-- no incrementals, encryption, tape library/changer automation, native ZFS send, or append-after-interruption;
-- in-console native restore and selected-file extraction are pending;
-- no production claim for ACL/xattr fidelity, hard links, sparse files, unusual names, compression, spanning, interruption, or clean-host recovery until the qualification ledger records physical evidence.
+- Before the media boundary, failure leaves tape unchanged.
+- After writing starts, a failed or interrupted member is uncertain until reconciled or verified.
+- Startup prefill occurs before tape motion; later low-water refills occur only at clean filemarks. Partial packs never become recovery points.
+- Unexpected end of media fails closed; normal spanning occurs at planned pack/slice boundaries.
+- Worker/container restart does not resume a partially written member in alpha.6; touched media is quarantined and retry creates a new archive set.
+- No in-console or selected-file restore, encryption, changer automation, incrementals, automatic snapshots, native ZFS send, or append-after-interruption is available.
+- ACLs, xattrs, sparse files, hard links, unusual names, all codecs/generations, spanning, refill, interruption, and clean-host recovery remain physically unqualified.
 
 See [NATIVE_FORMAT.md](NATIVE_FORMAT.md), [SECURITY.md](SECURITY.md), and [QUALIFICATION.md](QUALIFICATION.md).

@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Exercise the exact separately packaged DAR codec without claiming physical
-# tape qualification. This is the same stage-first shape used by the native
-# worker: create large numbered slices, create an isolated catalogue, test the
-# completed archive, then extract it with the original source unavailable.
+# tape qualification. The script covers both the Native v1 whole-archive
+# compatibility path and Native v2's independently tested pack/extract shape,
+# with the original source unavailable during recovery.
 
 readonly compression="${NATIVE_CI_COMPRESSION:-zstd}"
 case "$compression" in
@@ -21,6 +21,8 @@ readonly work_root="$(mktemp -d /tmp/tapescale-native-roundtrip.XXXXXX)"
 readonly source_root="$work_root/source"
 readonly stage_root="$work_root/stage"
 readonly restore_root="$work_root/restore"
+readonly pack_stage_root="$work_root/pack-stage"
+readonly pack_restore_root="$work_root/pack-restore"
 readonly held_source="$work_root/source-unavailable"
 
 cleanup() {
@@ -38,7 +40,14 @@ trap 'exit 143' TERM
 command -v dar >/dev/null
 test "$(dar -V 2>&1 | sed -n 's/^[[:space:]]*dar version \([^,[:space:]]*\).*/\1/p' | head -1)" = "2.8.6"
 
-install -d -m 0750 "$source_root/tree/nested" "$source_root/small" "$stage_root" "$restore_root"
+install -d -m 0750 \
+  "$source_root/tree/nested" \
+  "$source_root/small" \
+  "$stage_root" \
+  "$restore_root" \
+  "$pack_stage_root/pack-000001" \
+  "$pack_stage_root/pack-000002" \
+  "$pack_restore_root"
 printf '%s\n' 'TapeScale native DAR fixture.' >"$source_root/tree/nested/content.txt"
 printf '%s\n' 'hard-link payload' >"$source_root/tree/hard-link-origin.bin"
 ln "$source_root/tree/hard-link-origin.bin" "$source_root/tree/hard-link-peer.bin"
@@ -76,6 +85,44 @@ dar -N -Q -t "$stage_root/archive" \
   --min-digits 6 \
   --multi-thread 2
 
+# Exercise the exact Native v2 codec shape as well: disjoint literal path
+# lists, independent catalogs, and ordered extraction of multiple packs into
+# one destination. Directories are listed explicitly because DAR intentionally
+# treats a directory in --include-from-file as that entry only, not recursion.
+printf '%s\n' \
+  . \
+  tree \
+  tree/nested \
+  tree/nested/content.txt \
+  tree/hard-link-origin.bin \
+  tree/hard-link-peer.bin \
+  tree/content-link \
+  tree/sparse.bin \
+  >"$pack_stage_root/pack-000001/include.paths"
+{
+  printf '%s\n' . small
+  find "$source_root/small" -mindepth 1 -maxdepth 1 -type f \
+    -printf 'small/%f\n' | LC_ALL=C sort
+} >"$pack_stage_root/pack-000002/include.paths"
+
+for pack in 000001 000002; do
+  dar -N -Q -w \
+    -c "$pack_stage_root/pack-$pack/archive" \
+    -R "$source_root" \
+    --include-from-file "$pack_stage_root/pack-$pack/include.paths" \
+    -s 67108864 \
+    --min-digits 6 \
+    --on-fly-isolate "$pack_stage_root/pack-$pack/catalog" \
+    --compression="$compression_argument" \
+    --multi-thread 2
+  test -s "$pack_stage_root/pack-$pack/archive.000001.dar"
+  test -s "$pack_stage_root/pack-$pack/catalog.1.dar"
+  dar -N -Q -t "$pack_stage_root/pack-$pack/archive" \
+    --sequential-read \
+    --min-digits 6 \
+    --multi-thread 2
+done
+
 # Prove extraction is source-independent: the source tree is renamed before
 # DAR is asked to reconstruct the archive.
 mv "$source_root" "$held_source"
@@ -84,6 +131,14 @@ dar -N -Q -w \
   -R "$restore_root" \
   --min-digits 6 \
   --multi-thread 2
+
+for pack in 000001 000002; do
+  dar -N -Q -w \
+    -x "$pack_stage_root/pack-$pack/archive" \
+    -R "$pack_restore_root" \
+    --min-digits 6 \
+    --multi-thread 2
+done
 
 test "$(find "$restore_root/small" -type f | wc -l)" = "512"
 test "$(sha256sum "$held_source/tree/nested/content.txt" | cut -d' ' -f1)" = \
@@ -109,5 +164,13 @@ test "$(tail -c 4 "$restore_root/tree/sparse.bin")" = "tail"
   find . -type f -print0 | sort -z | xargs -0 sha256sum
 ) >"$work_root/restore.sha256"
 cmp "$work_root/source.sha256" "$work_root/restore.sha256"
+(
+  cd "$pack_restore_root"
+  find . -type f -print0 | sort -z | xargs -0 sha256sum
+) >"$work_root/pack-restore.sha256"
+cmp "$work_root/source.sha256" "$work_root/pack-restore.sha256"
+test "$(readlink "$pack_restore_root/tree/content-link")" = "nested/content.txt"
+test "$(stat -c '%i' "$pack_restore_root/tree/hard-link-origin.bin")" = \
+     "$(stat -c '%i' "$pack_restore_root/tree/hard-link-peer.bin")"
 
 printf 'TapeScale native DAR %s roundtrip passed.\n' "$compression"

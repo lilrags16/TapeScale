@@ -830,6 +830,10 @@ async fn publish_native_sample(
         spool_basis: sample
             .spool
             .map(|_| "run_scoped_native_archive_regular_file_bytes"),
+        spool_high_water_bytes: None,
+        spool_low_water_bytes: None,
+        spool_pack_count: None,
+        spool_reclaimed_bytes: None,
     };
     if let Err(error) = store::record_single_tape_data_live_io(pool, claim, &live).await {
         warn!(backup_run_id = %claim.run.id, %error, "could not publish native archive progress");
@@ -845,7 +849,7 @@ const fn native_job_id(archive_id: Uuid, progress_scope: u64) -> u64 {
         | 1
 }
 
-async fn request_next_write_volume(
+pub(super) async fn request_next_write_volume(
     pool: &PgPool,
     sas_config: &SasDiscoveryConfig,
     config: &Config,
@@ -924,7 +928,7 @@ async fn request_next_write_volume(
     }
 }
 
-async fn verify_native_preparation(
+pub(super) async fn verify_native_preparation(
     pool: &PgPool,
     sas_config: &SasDiscoveryConfig,
     _config: &Config,
@@ -1335,7 +1339,7 @@ async fn write_and_verify_volume(
     })
 }
 
-async fn set_variable_block_mode(
+pub(super) async fn set_variable_block_mode(
     sas_config: &SasDiscoveryConfig,
     device: &Path,
     cancellation: &CancellationToken,

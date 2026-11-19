@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 use crate::{
     native_format::{
-        NativePreparationHeader, NativeVolumeHeader, DEFAULT_TAPE_BLOCK_BYTES,
-        NATIVE_FORMAT_VERSION,
+        NativePreparationHeader, NativeV2VolumeHeader, NativeVolumeHeader,
+        DEFAULT_TAPE_BLOCK_BYTES, NATIVE_FORMAT_VERSION,
     },
     tool_runner::{self, ToolCommand, ToolError, ToolOutput},
 };
@@ -34,6 +34,7 @@ const METADATA_READ_LIMIT: usize = 16 * 1024 * 1024;
 const MT_OUTPUT_LIMIT: usize = 16 * 1024;
 const IDENTITY_PREFIX: &str = "TS-PREP-V1-";
 const ARCHIVE_IDENTITY_PREFIX: &str = "TSN1-";
+const ROLLING_ARCHIVE_IDENTITY_PREFIX: &str = "TSN2-";
 
 #[derive(Clone, Debug)]
 pub struct NativeTapeConfig {
@@ -107,6 +108,11 @@ pub fn preparation_identity_cartridge_id(identity: &str) -> Option<Uuid> {
 #[must_use]
 pub fn archive_volume_identity(archive_id: Uuid, volume_ordinal: u32) -> String {
     format!("{ARCHIVE_IDENTITY_PREFIX}{archive_id}-V{volume_ordinal:04}")
+}
+
+#[must_use]
+pub fn rolling_archive_volume_identity(archive_id: Uuid, volume_ordinal: u32) -> String {
+    format!("{ROLLING_ARCHIVE_IDENTITY_PREFIX}{archive_id}-V{volume_ordinal:04}")
 }
 
 impl NativeTapeConfig {
@@ -366,6 +372,28 @@ impl NativeTapeConfig {
                     "detail": "TapeScale archive-volume identity read from BOT",
                     "recognized": true,
                     "record_kind": "archive_volume",
+                    "identity": identity,
+                    "header": header,
+                    "initial_rewind": initial_rewind,
+                    "final_rewind": final_rewind
+                }),
+            };
+        }
+        if let Ok(header) = NativeV2VolumeHeader::decode(&bytes) {
+            let identity =
+                rolling_archive_volume_identity(header.archive_id, header.volume_ordinal);
+            return NativeTapeIdentityOutcome {
+                kind: NativeTapeOutcomeKind::Passed,
+                position_uncertain: false,
+                volume_name: Some(identity.clone()),
+                cartridge_id: Some(header.cartridge_id),
+                archive_id: Some(header.archive_id),
+                volume_ordinal: Some(header.volume_ordinal),
+                evidence: json!({
+                    "test": "native_identity_probe",
+                    "detail": "TapeScale Native v2 rolling archive-volume identity read from BOT",
+                    "recognized": true,
+                    "record_kind": "rolling_archive_volume",
                     "identity": identity,
                     "header": header,
                     "initial_rewind": initial_rewind,
@@ -785,6 +813,10 @@ mod tests {
         assert_eq!(
             archive_volume_identity(archive, 12),
             "TSN1-7c67cabb-f13e-45e6-888d-24ca614af54e-V0012"
+        );
+        assert_eq!(
+            rolling_archive_volume_identity(archive, 12),
+            "TSN2-7c67cabb-f13e-45e6-888d-24ca614af54e-V0012"
         );
     }
 

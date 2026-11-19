@@ -876,6 +876,11 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     assert_eq!(created_profile.logical_root, "/fixtures/immutable-001");
     assert!(created_profile.immutable_snapshot_confirmed);
     assert!(!created_profile.production_eligible);
+    assert_eq!(created_profile.engine_name, "TapeScale Native");
+    assert_eq!(created_profile.engine_version, "1");
+    assert_eq!(created_profile.adapter_version, "native-v1");
+    assert_eq!(created_profile.format_version, "tapescale-native-v1");
+    assert_eq!(created_profile.archive_codec, "dar");
     let source_binding = sqlx::query_as::<_, (String, String, String, Option<String>)>(
         "SELECT source.dataset_name, source.logical_root, snapshot.logical_root,
                 snapshot.physical_path
@@ -1294,6 +1299,10 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         spool_capacity_bytes: None,
         spool_target_bytes: None,
         spool_file_count: None,
+        spool_high_water_bytes: None,
+        spool_low_water_bytes: None,
+        spool_pack_count: None,
+        spool_reclaimed_bytes: None,
         spool_fill_bytes_per_second: None,
         spool_drain_bytes_per_second: None,
         spool_basis: None,
@@ -2940,6 +2949,10 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         spool_capacity_bytes: None,
         spool_target_bytes: None,
         spool_file_count: None,
+        spool_high_water_bytes: None,
+        spool_low_water_bytes: None,
+        spool_pack_count: None,
+        spool_reclaimed_bytes: None,
         spool_fill_bytes_per_second: None,
         spool_drain_bytes_per_second: None,
         spool_basis: None,

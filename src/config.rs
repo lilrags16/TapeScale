@@ -12,6 +12,9 @@ const DEFAULT_DATA_SPOOL_MAX_BYTES: u64 = 0;
 const DEFAULT_DATA_SPOOL_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_DATA_SPOOL_MIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_NATIVE_SLICE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const DEFAULT_NATIVE_PACK_TARGET_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+const DEFAULT_NATIVE_SPOOL_HIGH_WATER_BYTES: u64 = 768 * 1024 * 1024 * 1024;
+const DEFAULT_NATIVE_SPOOL_LOW_WATER_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -40,6 +43,9 @@ pub struct Config {
     pub dar_path: PathBuf,
     pub native_spool_dir: PathBuf,
     pub native_spool_reserve_bytes: u64,
+    pub native_pack_target_bytes: u64,
+    pub native_spool_high_water_bytes: u64,
+    pub native_spool_low_water_bytes: u64,
     pub native_slice_bytes: u64,
     pub native_compression_threads: u16,
 }
@@ -84,7 +90,7 @@ impl Config {
             "/var/lib/tapescale/recovery",
         ));
         let data_run_timeout =
-            Duration::from_secs(parse("TAPESCALE_DATA_RUN_TIMEOUT_SECS", 43_200)?);
+            Duration::from_secs(parse("TAPESCALE_DATA_RUN_TIMEOUT_SECS", 604_800)?);
         let transfer_stall_timeout =
             Duration::from_secs(parse("TAPESCALE_TRANSFER_STALL_TIMEOUT_SECS", 1_800)?);
         let bacula_spool_dir = PathBuf::from(DATA_SPOOL_DIRECTORY);
@@ -108,6 +114,18 @@ impl Config {
         let native_spool_reserve_bytes = parse(
             "TAPESCALE_NATIVE_SPOOL_RESERVE_BYTES",
             DEFAULT_DATA_SPOOL_RESERVE_BYTES,
+        )?;
+        let native_pack_target_bytes = parse(
+            "TAPESCALE_NATIVE_PACK_TARGET_BYTES",
+            DEFAULT_NATIVE_PACK_TARGET_BYTES,
+        )?;
+        let native_spool_high_water_bytes = parse(
+            "TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES",
+            DEFAULT_NATIVE_SPOOL_HIGH_WATER_BYTES,
+        )?;
+        let native_spool_low_water_bytes = parse(
+            "TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES",
+            DEFAULT_NATIVE_SPOOL_LOW_WATER_BYTES,
         )?;
         let native_slice_bytes = parse("TAPESCALE_NATIVE_SLICE_BYTES", DEFAULT_NATIVE_SLICE_BYTES)?;
         let native_compression_threads = parse("TAPESCALE_NATIVE_COMPRESSION_THREADS", 4_u16)?;
@@ -144,9 +162,9 @@ impl Config {
             );
         }
         anyhow::ensure!(
-            data_run_timeout >= Duration::from_secs(300)
-                && data_run_timeout <= Duration::from_secs(86_400),
-            "TAPESCALE_DATA_RUN_TIMEOUT_SECS must be between 300 and 86400"
+            data_run_timeout >= Duration::from_secs(3_600)
+                && data_run_timeout <= Duration::from_secs(2_592_000),
+            "TAPESCALE_DATA_RUN_TIMEOUT_SECS must be between 3600 and 2592000"
         );
         anyhow::ensure!(
             transfer_stall_timeout >= Duration::from_secs(300)
@@ -182,6 +200,42 @@ impl Config {
             (64 * 1024 * 1024..=1024_u64 * 1024 * 1024 * 1024).contains(&native_slice_bytes),
             "TAPESCALE_NATIVE_SLICE_BYTES must be between 64 MiB and 1 TiB"
         );
+        anyhow::ensure!(
+            (64_u64 * 1024 * 1024 * 1024..=1024_u64 * 1024 * 1024 * 1024)
+                .contains(&native_pack_target_bytes),
+            "TAPESCALE_NATIVE_PACK_TARGET_BYTES must be between 64 GiB and 1 TiB"
+        );
+        anyhow::ensure!(
+            native_pack_target_bytes >= native_slice_bytes,
+            "TAPESCALE_NATIVE_PACK_TARGET_BYTES must be at least TAPESCALE_NATIVE_SLICE_BYTES"
+        );
+        anyhow::ensure!(
+            native_spool_low_water_bytes >= native_pack_target_bytes,
+            "TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES must be at least TAPESCALE_NATIVE_PACK_TARGET_BYTES"
+        );
+        anyhow::ensure!(
+            native_spool_low_water_bytes < native_spool_high_water_bytes,
+            "TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES must be less than TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES"
+        );
+        // High-water reserves one maximum in-progress pack. The remaining
+        // ready-pack window must sit strictly above low-water so startup and
+        // refill have real hysteresis rather than immediately restarting on a
+        // single pack.
+        let maximum_pack_bytes = native_pack_target_bytes
+            .checked_add(native_pack_target_bytes / 2)
+            .context("TAPESCALE_NATIVE_PACK_TARGET_BYTES is too large")?
+            .min(1024_u64 * 1024 * 1024 * 1024);
+        let minimum_high_water = native_spool_low_water_bytes
+            .checked_add(maximum_pack_bytes)
+            .and_then(|value| value.checked_add(1))
+            .context("the Native v2 spool hysteresis window is too large")?;
+        anyhow::ensure!(
+            native_spool_high_water_bytes >= minimum_high_water,
+            "TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES must leave a ready-pack resume threshold above low-water after reserving one maximum-size in-progress pack"
+        );
+        native_spool_high_water_bytes
+            .checked_add(native_spool_reserve_bytes)
+            .context("native spool high-water mark plus reserve overflows the capacity range")?;
         anyhow::ensure!(
             (1..=64).contains(&native_compression_threads),
             "TAPESCALE_NATIVE_COMPRESSION_THREADS must be between 1 and 64"
@@ -222,6 +276,9 @@ impl Config {
             dar_path,
             native_spool_dir,
             native_spool_reserve_bytes,
+            native_pack_target_bytes,
+            native_spool_high_water_bytes,
+            native_spool_low_water_bytes,
             native_slice_bytes,
             native_compression_threads,
         })

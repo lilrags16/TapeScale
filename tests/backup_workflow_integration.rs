@@ -112,9 +112,14 @@ async fn create_backup_profile(
     request.schedule_enabled = scheduled;
     request.schedule_timezone = "America/New_York".to_owned();
     request.actor_label = "Backup integration operator".to_owned();
-    backup_ops::create_backup_profile(pool, &request)
+    let profile = backup_ops::create_backup_profile(pool, &request)
         .await
-        .expect("full-file backup profile should persist")
+        .expect("full-file backup profile should persist");
+    assert_eq!(profile.engine_name, "TapeScale Native");
+    assert_eq!(profile.engine_version, "2");
+    assert_eq!(profile.adapter_version, "native-v2");
+    assert_eq!(profile.format_version, "tapescale-native-v2");
+    profile
 }
 
 fn loaded_drive_observation() -> SasDriveObservation {
@@ -434,6 +439,19 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         false,
     )
     .await;
+    // The finalization fixture below exercises the preserved v1 evidence API.
+    // Native v2 finalization is intentionally gated on its pack/volume seal
+    // ledger and is covered by the v2 store and migration contracts.
+    sqlx::query(
+        "UPDATE single_tape_data_profiles
+            SET engine_version = '1', adapter_version = 'native-v1',
+                format_version = 'tapescale-native-v1'
+          WHERE id = $1",
+    )
+    .bind(assignment_profile.id)
+    .execute(&pool)
+    .await
+    .expect("legacy finalization fixture should retain its v1 binding");
     let assignment_request = backup_ops::create_manual_backup_request(
         &pool,
         assignment_profile.id,
@@ -675,6 +693,19 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         false,
     )
     .await;
+    // This fixture exercises the preserved generic/v1 handoff contract. Native
+    // v2 continuation authorization intentionally requires the preceding
+    // volume's UUID and index to have passed physical readback first.
+    sqlx::query(
+        "UPDATE single_tape_data_profiles
+            SET engine_version = '1', adapter_version = 'native-v1',
+                format_version = 'tapescale-native-v1'
+          WHERE id = $1",
+    )
+    .bind(continuation_profile.id)
+    .execute(&pool)
+    .await
+    .expect("legacy continuation fixture should retain its v1 binding");
     let continuation_request = backup_ops::create_manual_backup_request(
         &pool,
         continuation_profile.id,
@@ -764,6 +795,10 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         spool_capacity_bytes: None,
         spool_target_bytes: None,
         spool_file_count: None,
+        spool_high_water_bytes: None,
+        spool_low_water_bytes: None,
+        spool_pack_count: None,
+        spool_reclaimed_bytes: None,
         spool_fill_bytes_per_second: None,
         spool_drain_bytes_per_second: None,
         spool_basis: None,
@@ -1941,6 +1976,10 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         spool_capacity_bytes: Some(68_719_476_736),
         spool_target_bytes: Some(64_424_509_440),
         spool_file_count: Some(2),
+        spool_high_water_bytes: None,
+        spool_low_water_bytes: None,
+        spool_pack_count: None,
+        spool_reclaimed_bytes: None,
         spool_fill_bytes_per_second: None,
         spool_drain_bytes_per_second: Some(256),
         spool_basis: Some("run_scoped_bacula_spool_regular_file_bytes"),

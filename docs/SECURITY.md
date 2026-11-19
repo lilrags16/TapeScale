@@ -1,6 +1,6 @@
 # Security model
 
-TapeScale `0.2.0-alpha.5` is an attended, non-production release. The alpha web application has no accounts, authorization, or TLS termination. Anyone who can reach its HTTP port can inspect filenames and attempt to initiate the exposed workflows. Deploy it only on an isolated trusted network behind host-level access controls, and never load retained or unknown media while destructive features are enabled.
+TapeScale `0.2.0-alpha.6` is an attended, non-production release. The alpha web application has no accounts, authorization, or TLS termination. Anyone who can reach its HTTP port can inspect filenames and attempt to initiate the exposed workflows. Deploy it only on an isolated trusted network behind host-level access controls, and never load retained or unknown media while destructive features are enabled.
 
 ## Authority boundaries
 
@@ -33,16 +33,16 @@ Linux may commit a pending filemark when a tape descriptor closes or before moti
 
 ## Native backup safety gates
 
-New backups use TapeScale Native v1; Bacula is not installed in the runtime. Before tape motion, the worker:
+New backups use TapeScale Native v2; Native v1 remains read-compatible and Bacula is not installed in the runtime. Before tape motion, the worker:
 
 1. reopens and verifies the selected source is a contained named snapshot on a read-only mount;
 2. inventories and hashes the source with bounded-memory external sorting;
-3. creates a private run-scoped archive stage on the dedicated spool;
-4. completes and tests the DAR archive;
-5. verifies planned slices fit conservative native cartridge capacity;
+3. creates a private run-scoped bounded rolling spool on the dedicated filesystem;
+4. completes, tests, hashes, and durably records each independent DAR pack before that pack is consumed;
+5. verifies pack and cartridge allocation boundaries against conservative native capacity;
 6. rechecks leases, drive identity, cartridge eligibility, and the preparation UUID read from tape.
 
-The permanent media-write boundary is committed before overwriting the preparation record. After it, any failure or ambiguity quarantines touched media and prevents creation of a recovery point. Every volume is immediately rewound and read back before it is accepted as verified.
+The permanent media-write boundary is committed before overwriting the preparation record. After a complete pack's tape files close durably, its disk files may be reclaimed so the spool remains bounded; that does not verify the pack or create a recovery point. The containing volume must still be rewound and read back completely. Any failure or ambiguity quarantines touched media and prevents creation of a recovery point.
 
 An operator preview is advisory. Assignment and worker execution repeat eligibility checks under database locks and fencing tokens. Printed labels, UI selection, and typed text never substitute for the native UUID read from tape.
 
@@ -56,7 +56,7 @@ DAR input is still the contents and metadata of the selected filesystem tree. Un
 
 ## On-tape authenticity and integrity
 
-Native metadata records use a versioned binary envelope with record kind, payload length, and SHA-256. Headers, indexes, and trailers bind cartridge, archive, archive-volume, and ordinal identities. Every DAR slice has an expected length and SHA-256. The trailer commits to the canonical index and ordered slice digest set.
+Native metadata records use a versioned binary envelope with record kind, payload length, and SHA-256. Headers, pack descriptors, volume indexes, trailers, and the final archive-set seal bind cartridge, archive, archive-volume, pack, and ordinal identities. Every DAR catalog/slice has an expected commitment. The final seal commits to the complete ordered pack and volume roots.
 
 SHA-256 detects accidental corruption and inconsistent media; it is not a signature against a malicious party who can rewrite both data and metadata. The current unencrypted alpha has no key-backed media authentication or confidentiality. Treat physical custody and network isolation as part of the security boundary.
 
@@ -96,7 +96,7 @@ Do not log keys, passwords, usable recovery secrets, or raw configuration export
 
 ## Denial of service and resource limits
 
-The API bounds request bodies, pages, evidence values, manifest browsing, and concurrency. The worker bounds command output, metadata records, thread counts, slice sizes, timeouts, and retained JSON. Source inventory has no artificial total entry or logical-byte ceiling, so real storage, inode, CPU, staging, and time exhaustion remain possible. Use dataset quotas, container memory/CPU/PID limits, and network isolation.
+The API bounds request bodies, pages, evidence values, manifest browsing, and concurrency. The worker bounds command output, metadata records, thread counts, slice sizes, timeouts, retained JSON, and rolling-spool watermarks. Source inventory has no artificial total entry or logical-byte ceiling, so real storage, inode, CPU, spool, and time exhaustion remain possible. Use a dedicated dataset, quotas, container memory/CPU/PID limits, and network isolation.
 
 ## Known gaps
 
@@ -106,6 +106,7 @@ The API bounds request bodies, pages, evidence values, manifest browsing, and co
 - no changer support or unattended media selection;
 - in-console native restore is pending;
 - no automatic secure deletion of captured recovery plaintext;
+- no mid-volume writer restart/resume; an interrupted partial member is quarantined and a retry creates a new archive set;
 - legacy Bacula source modules remain for historical audit compatibility, but the 0.2 runtime neither packages nor uses Bacula for native backup or recovery.
 
 Report vulnerabilities through the private process described in the repository `SECURITY.md`, not a public issue.

@@ -39,10 +39,10 @@
     { name: "Confirm first tape", detail: "Choose the first archive volume", aliases: ["waiting_for_media"] },
     { name: "Preflight", detail: "Validate source, catalog, drive, tape, and staging path", aliases: ["queued", "media_assigned", "preparing"] },
     { name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: ["inventorying", "manifesting", "source_manifest", "source_inventory"] },
-    { name: "Pack archive", detail: "Build the complete DAR archive on disk; tape idle", aliases: ["native_packing"] },
-    { name: "Validate archive", detail: "Check staged slices before tape moves", aliases: ["native_validating"] },
-    { name: "Write & read back", detail: "Stream and immediately verify each native volume", aliases: ["writing", "backup_write", "media_write_started", "engine_dispatched", "native_volume_write", "native_volume_readback", "waiting_for_next_media", "next_media", "media_required", "verifying", "reading", "readback", "full_readback"] },
-    { name: "Finalize", detail: "Confirm the source snapshot and seal evidence", aliases: ["written", "finalizing", "source_stability_check", "final_source_check"] },
+    { name: "Build archive packs", detail: "Build and test bounded DAR packs", aliases: ["native_packing", "packing_pack", "refilling_spool", "native_pack_packing", "native_spool_refill"] },
+    { name: "Validate pack", detail: "Check each completed pack before tape", aliases: ["native_validating", "validating_pack", "native_pack_validating"] },
+    { name: "Write & reclaim", detail: "Stream validated packs; reclaim after durable filemarks", aliases: ["writing", "backup_write", "media_write_started", "engine_dispatched", "native_pack_write", "native_volume_write", "native_pack_readback", "native_volume_readback", "native_spool_reclaimed", "waiting_for_next_media", "next_media", "media_required", "verifying", "reading", "readback", "full_readback"] },
+    { name: "Finalize", detail: "Seal the pack set and confirm the source", aliases: ["written", "finalizing", "native_archive_seal", "native_set_seal", "source_stability_check", "final_source_check"] },
     { name: "Protected", detail: "Retain recovery evidence", aliases: ["verified", "passed", "completed", "complete"] }
   ];
   const BACKUP_TERMINAL_STATES = new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
@@ -698,7 +698,7 @@
     const mode = backupDataDelivery(source);
     if (!backupDataDeliverySupported(source)) return "Unsupported (" + mode + ")";
     if (mode === "direct") return "Direct streaming (advanced)";
-    return backupDataDeliveryExplicit(source) ? "Whole-archive staging" : "Staged delivery (legacy)";
+    return backupDataDeliveryExplicit(source) ? "Bounded rolling staging" : "Staged delivery (legacy)";
   }
 
   function backupSpanningEnabled(source) {
@@ -1031,7 +1031,10 @@
     const aliases = {
       filling_disk_buffer: "buffering",
       spooling: "buffering",
+      refilling: "buffering",
+      refilling_spool: "buffering",
       despooling_to_tape: "despooling",
+      reclaiming_spool: "despooling",
       no_data_movement: "idle",
       waiting_for_resource: "waiting"
     };
@@ -1063,17 +1066,22 @@
 
   function backupLiveActivityLabel(activity, livePhase, directDelivery, engineState) {
     const nativeLabels = {
-      packing: "Packing the complete archive on disk",
-      validating: "Validating the staged archive",
+      packing: "Packing the archive buffer",
+      packing_pack: "Packing the next archive pack",
+      refilling_spool: "Refilling the archive buffer",
+      validating: "Validating the archive buffer",
+      validating_pack: "Validating the next archive pack",
       writing_native_volume: "Streaming a native volume to tape",
-      reading_native_volume: "Reading the volume back now"
+      writing_native_pack: "Streaming an archive pack to tape",
+      reading_native_volume: "Reading the volume back now",
+      reading_native_pack: "Reading the written pack back"
     };
     if (nativeLabels[engineState]) return nativeLabels[engineState];
     const labels = {
       starting: "Starting the data pipeline",
-      buffering: directDelivery ? "Starting the tape stream" : "Staging archive on disk",
-      streaming: directDelivery ? "Streaming directly to tape" : "Writing the staged archive to tape",
-      despooling: directDelivery ? "Streaming directly to tape" : "Writing the staged archive to tape",
+      buffering: directDelivery ? "Starting the tape stream" : "Filling the bounded archive buffer",
+      streaming: directDelivery ? "Streaming directly to tape" : "Writing verified archive packs to tape",
+      despooling: directDelivery ? "Streaming directly to tape" : "Writing verified archive packs to tape",
       idle: "No data movement",
       stalled: "Transfer stalled",
       waiting: "Waiting for the archive engine",
@@ -1116,7 +1124,7 @@
       const preflight = runState === "preparing";
       const heading = preflight ? "Validating backup inputs" : "Starting source inventory";
       const detail = preflight
-        ? "Checking the immutable snapshot, native catalog, drive, tape, and staging path before the source scan begins. Tape writing has not started."
+        ? "Checking the immutable snapshot, native catalog, drive, tape, and bounded-spool watermarks before the source scan begins. Tape writing has not started."
         : "Waiting for the worker's first source-scan sample. Tape writing has not started.";
       return '<section class="backup-live-io backup-preparation measuring" role="status"><div class="backup-live-io-head"><div><span>Backup preparation</span><h3>' + esc(heading) + '</h3></div><strong>' + (preflight ? "Preflight" : "Starting…") + '</strong></div><p>' + esc(detail) + "</p></section>";
     }
@@ -1202,28 +1210,28 @@
     const engineState = backupNativeEngineState(liveIo);
     const directDelivery = backupDataDelivery(run) === "direct";
     let activity = backupLiveActivity(liveIo, livePhase);
-    const nativePacking = engineState === "packing";
-    const nativeValidating = engineState === "validating";
-    const nativeWriting = engineState === "writing_native_volume";
-    const nativeReadback = engineState === "reading_native_volume";
+    const nativePacking = ["packing", "packing_pack", "refilling_spool"].includes(engineState);
+    const nativeValidating = ["validating", "validating_pack"].includes(engineState);
+    const nativeWriting = ["writing_native_volume", "writing_native_pack"].includes(engineState);
+    const nativeReadback = ["reading_native_volume", "reading_native_pack"].includes(engineState);
     if ((nativePacking || nativeValidating) && activity === "idle") activity = "buffering";
     const backupPipeline = !nativeReadback && ["backup_write", "tape_write", "writing", "spooling"].includes(livePhase);
     const readPipeline = nativeReadback || ["full_readback", "tape_read", "tape_readback", "verifying", "restore"].includes(livePhase);
     const pipelineLabel = nativePacking
-      ? "DAR archive packing"
+      ? "DAR pack production"
       : nativeValidating
-        ? "Staged archive validation"
+        ? "Archive-pack validation"
         : nativeWriting
-          ? "Native volume stream"
+          ? "Native pack stream"
           : nativeReadback
             ? "Physical readback"
             : backupPipeline ? "Archive write stream" : readPipeline ? "Archive read stream" : "Archive engine stream";
     const pipelineDetail = nativePacking
-      ? "Source files packaged into large DAR slices on disk · tape idle"
+      ? "Source files packaged into a bounded rolling disk buffer · ready packs may stream in parallel"
       : nativeValidating
-        ? "Complete staged archive checked before tape movement · tape idle"
+        ? "A completed archive pack is checked before it joins the tape-ready queue"
         : nativeWriting
-          ? "TapeScale Native v1 volume bytes"
+          ? "Completed TapeScale Native pack bytes"
           : nativeReadback
             ? "Immediate readback of the just-written physical volume"
             : "Engine stream bytes · not source logical bytes";
@@ -1238,16 +1246,23 @@
     const tapeReadRate = pick(liveIo, "tape_read_bytes_per_second");
     const spoolBytesValue = pick(liveIo, "spool_bytes");
     const spoolCapacityValue = pick(liveIo, "spool_capacity_bytes");
-    const spoolTargetValue = pick(liveIo, "spool_target_bytes");
-    const spoolFilesValue = pick(liveIo, "spool_file_count");
+    const spoolTargetValue = pick(liveIo, "spool_high_water_bytes", "spool_target_bytes");
+    const spoolLowWaterValue = pick(liveIo, "spool_low_water_bytes");
+    const spoolReclaimedValue = pick(liveIo, "spool_reclaimed_bytes");
+    const spoolPackCountValue = pick(liveIo, "spool_pack_count");
+    const spoolFileCountValue = pick(liveIo, "spool_file_count");
+    const spoolFilesValue = spoolPackCountValue ?? spoolFileCountValue;
     const spoolFillRate = pick(liveIo, "spool_fill_bytes_per_second");
     const spoolDrainRate = pick(liveIo, "spool_drain_bytes_per_second");
     const spoolBytes = spoolBytesValue === null ? Number.NaN : Number(spoolBytesValue);
     const spoolCapacity = spoolCapacityValue === null ? Number.NaN : Number(spoolCapacityValue);
     const spoolTarget = spoolTargetValue === null ? Number.NaN : Number(spoolTargetValue);
+    const spoolLowWater = spoolLowWaterValue === null ? Number.NaN : Number(spoolLowWaterValue);
+    const spoolReclaimed = spoolReclaimedValue === null ? Number.NaN : Number(spoolReclaimedValue);
     const spoolDenominator = Number.isFinite(spoolTarget) && spoolTarget > 0 ? spoolTarget : spoolCapacity;
     const targetReported = Number.isFinite(spoolTarget) && spoolTarget > 0;
     const spoolFiles = spoolFilesValue === null ? Number.NaN : Number(spoolFilesValue);
+    const spoolCountLabel = spoolPackCountValue !== null ? " ready packs" : " spool files";
     const spoolMeasured = !directDelivery && (Boolean(spoolBasis) || Number.isFinite(spoolBytes) || Number.isFinite(spoolDenominator));
     const occupancy = Number.isFinite(spoolBytes) && Number.isFinite(spoolDenominator) && spoolBytes >= 0 && spoolDenominator > 0
       ? Math.min(100, spoolBytes / spoolDenominator * 100)
@@ -1265,7 +1280,7 @@
         ? rate(spoolFillRate, true)
         : spoolFillRate != null || spoolDrainRate != null ? "0 B/s" : "Measuring…";
     const spoolCards = spoolMeasured
-      ? '<div class="backup-spool-occupancy"><span>Archive staging</span><strong>' + esc(spoolAmount) + '</strong><small>' + (Number.isFinite(occupancy) ? esc(occupancy.toFixed(1) + (targetReported ? "% of estimated stage target" : "% of reported spool capacity (legacy sample)")) : targetReported ? "Estimated stage target" : "Reported spool capacity") + esc(spoolLimit) + (Number.isFinite(spoolFiles) && spoolFiles >= 0 ? " · " + esc(Math.trunc(spoolFiles).toLocaleString()) + " spool files" : "") + '</small></div><div><span>' + esc(spoolDirection) + '</span><strong>' + esc(spoolRate) + '</strong><small>Measured from this backup\'s isolated staging area</small></div>'
+      ? '<div class="backup-spool-occupancy"><span>Rolling spool</span><strong>' + esc(spoolAmount) + '</strong><small>' + (Number.isFinite(occupancy) ? esc(occupancy.toFixed(1) + (targetReported ? "% of high-water mark" : "% of reported spool capacity (legacy sample)")) : targetReported ? "Configured high-water mark" : "Reported spool capacity") + (Number.isFinite(spoolLowWater) && spoolLowWater >= 0 ? " · refill at/below " + esc(bytes(spoolLowWater)) : "") + esc(spoolLimit) + (Number.isFinite(spoolFiles) && spoolFiles >= 0 ? " · " + esc(Math.trunc(spoolFiles).toLocaleString()) + spoolCountLabel : "") + (Number.isFinite(spoolReclaimed) && spoolReclaimed > 0 ? " · " + esc(bytes(spoolReclaimed)) + " reclaimed" : "") + '</small></div><div><span>' + esc(spoolDirection) + '</span><strong>' + esc(spoolRate) + '</strong><small>Measured from this backup\'s bounded spool window</small></div>'
       : "";
     const idleMillisecondsValue = pick(liveIo, "progress_idle_ms");
     const timeoutMillisecondsValue = pick(liveIo, "no_progress_timeout_ms");
@@ -1281,14 +1296,19 @@
         : " The no-progress safety threshold has been reached."
       : "";
     const nativeActivityDetail = {
-      packing: "DAR is packaging the complete source into large archive slices on disk. The tape is intentionally idle during this stage.",
-      validating: "TapeScale is validating the completed staged archive before allowing the tape to move. The tape is intentionally idle.",
+      packing: "DAR is packaging the next bounded archive pack on disk. Before startup or after low-water, tape stays at a safe boundary until the validated reserve reaches its resume threshold.",
+      packing_pack: "DAR is packaging the next bounded archive pack while TapeScale enforces the spool high-water mark and streams ready packs in parallel.",
+      refilling_spool: "TapeScale is prefilling or replenishing the validated ready reserve; tape stays at a safe tape-file boundary until the resume threshold or producer completion.",
+      validating: "TapeScale is validating a completed archive pack before allowing it onto tape.",
+      validating_pack: "TapeScale is validating a completed archive pack before allowing it onto tape.",
       writing_native_volume: "The staged TapeScale Native volume is streaming sequentially to the physical tape.",
-      reading_native_volume: "TapeScale is immediately reading the just-written volume from physical media before it requests another tape or finalizes the backup."
+      writing_native_pack: "A completed archive pack is streaming sequentially to tape; its disk copy is reclaimed only after the complete tape files and filemarks close.",
+      reading_native_volume: "TapeScale is immediately reading the just-written volume from physical media before it requests another tape or finalizes the backup.",
+      reading_native_pack: "TapeScale is hashing the written pack from physical media after its disposable disk copy was reclaimed."
     }[engineState];
     const activityDetail = nativeActivityDetail || {
       starting: "The worker is connected and waiting for the first measured byte movement.",
-      buffering: directDelivery ? "The legacy direct source-to-tape stream is starting." : "DAR is packaging source data into the complete staged archive before tape movement starts.",
+      buffering: directDelivery ? "The legacy direct source-to-tape stream is starting." : "DAR is filling a bounded disk window with independently validated archive packs.",
       streaming: "The physical tape-write counter is advancing.",
       despooling: directDelivery ? "The legacy physical tape-write path is active without disk staging." : "TapeScale Native is sending the completed staged volume to tape. Physical tape rate and archive progress remain visible separately.",
       idle: "The worker is responding, but no measured " + (directDelivery ? "engine or tape" : "disk-buffer, engine, or tape") + " bytes have moved for " + idleLabel + ". This heartbeat is not counted as progress." + safety,
@@ -1299,9 +1319,14 @@
     }[activity];
     const activityBadge = ({
       packing: "Packing",
+      packing_pack: "Packing",
+      refilling_spool: "Refilling",
       validating: "Validating",
+      validating_pack: "Validating",
       writing_native_volume: "Tape active",
-      reading_native_volume: "Readback"
+      writing_native_pack: "Tape active",
+      reading_native_volume: "Readback",
+      reading_native_pack: "Readback"
     }[engineState]) || ({
       starting: "Starting…",
       buffering: "Buffering",
@@ -1315,12 +1340,12 @@
     }[activity] || "Updated");
     const basis = [
       pipelineBasis ? "Engine progress: " + human(pipelineBasis) : null,
-      !directDelivery && spoolBasis ? "Archive staging: " + human(spoolBasis) : null,
+      !directDelivery && spoolBasis ? "Rolling spool: " + human(spoolBasis) : null,
       tapeBasis ? "Physical tape I/O: " + human(tapeBasis) : tapeCountersAvailable === false ? "Physical tape counters unavailable on this host or drive" : "Physical tape counters measuring",
       engineState ? "Native engine: " + human(engineState) : null
     ].filter(Boolean).join(" · ");
     const tapeRateCard = nativePacking || nativeValidating
-      ? '<div><span>Tape</span><strong>Idle</strong><small>Archive is still on disk</small></div>'
+      ? '<div><span>Tape</span><strong>Idle</strong><small>Preparing the next verified pack</small></div>'
       : readPipeline
       ? '<div><span>Tape read</span><strong>' + esc(rate(tapeReadRate, tapeReadAvailable)) + "</strong></div>"
       : backupPipeline
@@ -1408,8 +1433,12 @@
     };
     const livePhase = backupTransferPhase(pick(liveIo, "phase"));
     const engineState = backupNativeEngineState(liveIo);
+    const nativePacking = ["packing", "packing_pack", "refilling_spool"].includes(engineState);
+    const nativeValidating = ["validating", "validating_pack"].includes(engineState);
+    const nativeWriting = ["writing_native_volume", "writing_native_pack"].includes(engineState);
+    const nativeReadback = ["reading_native_volume", "reading_native_pack"].includes(engineState);
     let activity = progress.sampleFresh && livePhase ? backupLiveActivity(liveIo, livePhase) : null;
-    if (["packing", "validating"].includes(engineState) && activity === "idle") activity = "buffering";
+    if ((nativePacking || nativeValidating) && activity === "idle") activity = "buffering";
     const preparationStep = String(pick(preparation, "step") || "");
     const step = Math.max(0, backupPhaseIndex(run));
     let heading = backupRunStateLabel(run);
@@ -1444,7 +1473,7 @@
     } else if (runState === "preparing") {
       heading = "Validating backup inputs";
       badge = "Preflight";
-      detail = "Checking the snapshot, native catalog, drive, tape, and complete-archive staging path before source inventory begins.";
+      detail = "Checking the snapshot, native catalog, drive, tape, and bounded-spool watermarks before source inventory begins.";
     } else if (runState === "inventorying" || progress.phase === "source_inventory") {
       const postScan = {
         sorting: ["Sorting manifest entries", "Organizing", "The source scan and hash pass are complete. TapeScale is ordering the fixed entry set without rereading file data."],
@@ -1456,13 +1485,18 @@
       detail = postScan ? postScan[2] : "The source total grows while the tree is walked, so TapeScale does not guess a completion percentage.";
     } else if (runState === "writing") {
       const nativeStages = {
-        packing: ["Packing the complete archive on disk", "Packing", "DAR is packaging source files into large sequential slices. The tape is intentionally idle until the complete archive exists on disk."],
-        validating: ["Validating the staged archive", "Validating", "TapeScale is checking the completed DAR archive before any tape movement. The tape is intentionally idle."],
+        packing: ["Packing the rolling archive buffer", "Packing", "DAR is packaging the next bounded archive pack. Tape remains at a safe boundary until the validated startup or refill reserve is ready."],
+        packing_pack: ["Packing the next archive pack", "Packing", "DAR is building an independently finalized pack while TapeScale streams already validated packs when available."],
+        refilling_spool: ["Refilling the archive buffer", "Refilling", "TapeScale is prefilling or replenishing the validated reserve; tape remains at a safe tape-file boundary until the resume threshold or producer completion."],
+        validating: ["Validating an archive pack", "Validating", "TapeScale is checking a completed DAR pack before allowing it onto tape."],
+        validating_pack: ["Validating the next archive pack", "Validating", "TapeScale is checking a completed DAR pack before allowing it onto tape."],
         writing_native_volume: ["Streaming a native volume to tape", "Tape active", "TapeScale Native v1 is writing the staged volume sequentially to the loaded cartridge."],
-        reading_native_volume: ["Reading the volume back now", "Verifying", "TapeScale is immediately reading the just-written physical volume before it requests another tape or finalizes the archive."]
+        writing_native_pack: ["Streaming an archive pack to tape", "Tape active", "TapeScale Native v2 is writing one completed pack and retaining its durable hash and position."],
+        reading_native_volume: ["Reading the volume back now", "Verifying", "TapeScale is immediately reading the just-written physical volume before it requests another tape or finalizes the archive."],
+        reading_native_pack: ["Reading the written pack back", "Verifying", "TapeScale is hashing the physical pack after its disposable spool copy was reclaimed."]
       }[engineState];
-      const headings = { starting: "Starting the native archive pipeline", buffering: "Packing the complete archive on disk", streaming: "Streaming a native volume to tape", despooling: "Streaming a native volume to tape", idle: "No data movement", stalled: "Transfer stalled", waiting: "Waiting for the archive engine", reading: "Reading the volume back now" };
-      heading = nativeStages ? nativeStages[0] : headings[activity] || (progress.sampleFresh ? "Advancing the native archive" : "Starting complete-archive staging");
+      const headings = { starting: "Starting the native archive pipeline", buffering: "Filling the rolling archive buffer", streaming: "Streaming an archive pack to tape", despooling: "Streaming an archive pack to tape", idle: "No data movement", stalled: "Transfer stalled", waiting: "Waiting for the archive engine", reading: "Reading tape back now" };
+      heading = nativeStages ? nativeStages[0] : headings[activity] || (progress.sampleFresh ? "Advancing the native archive" : "Starting bounded rolling staging");
       badge = activity === "stalled" ? "Action required" : activity === "idle" ? "No movement" : activity === "waiting" ? "Waiting" : progress.stale ? "Update delayed" : progress.sampleFresh ? "Active" : "Measuring";
       if (nativeStages && activity !== "stalled" && activity !== "waiting" && !progress.stale) {
         badge = nativeStages[1];
@@ -1478,9 +1512,9 @@
           : "";
         detail = "The worker is responding, but no measured source, engine, buffer, or tape bytes have moved" + (Number.isFinite(idle) ? " for " + backupDurationLabel(idle) : "") + ". The retained position will not advance until data movement resumes." + safety;
       }
-      else if (direct) detail = "This legacy record used direct streaming. New TapeScale Native backups always build and validate a complete disk archive first.";
-      else if (activity === "buffering") detail = "DAR is packaging small files into large sequential archive slices on disk before the tape moves.";
-      else detail = "TapeScale Native is advancing the staged archive while retaining archive progress separately from physical tape rates.";
+      else if (direct) detail = "This legacy record used direct streaming. New TapeScale Native backups use bounded, independently validated disk packs.";
+      else if (activity === "buffering") detail = "DAR is packaging small files into bounded sequential archive packs before a safe tape-file write.";
+      else detail = "TapeScale Native is advancing the rolling pack set while retaining archive progress separately from physical tape rates.";
     } else if (["written", "finalizing"].includes(runState)) {
       heading = "Closing archive";
       badge = "Write complete";
@@ -1563,13 +1597,17 @@
       const spoolSource = progress.sampleFresh ? liveIo : progress.sample;
       const spoolBytes = number(spoolSource, "spool_bytes");
       const spoolCapacity = number(spoolSource, "spool_capacity_bytes");
-      const spoolTarget = number(spoolSource, "spool_target_bytes");
+      const spoolTarget = number(spoolSource, "spool_high_water_bytes") ?? number(spoolSource, "spool_target_bytes");
+      const spoolLowWater = number(spoolSource, "spool_low_water_bytes");
+      const spoolReclaimed = number(spoolSource, "spool_reclaimed_bytes");
       const targetReported = spoolTarget !== null && spoolTarget > 0;
       const denominator = targetReported ? spoolTarget : spoolCapacity;
       if (spoolBytes !== null || denominator !== null) {
         const occupancy = spoolBytes !== null && denominator > 0 ? Math.min(100, spoolBytes / denominator * 100) : null;
+        const lowDetail = spoolLowWater !== null ? " · refill at/below " + bytes(spoolLowWater) : "";
+        const reclaimedDetail = spoolReclaimed !== null && spoolReclaimed > 0 ? " · " + bytes(spoolReclaimed) + " reclaimed" : "";
         const limitDetail = targetReported && spoolCapacity > 0 ? " · hard limit " + bytes(spoolCapacity) : "";
-        metrics.push({ label: "Archive staging", value: spoolBytes === null ? "Measuring…" : bytes(spoolBytes) + (denominator > 0 ? " / " + bytes(denominator) : ""), detail: occupancy === null ? targetReported ? "Conservative stage target" : "Reported spool capacity" : backupPercentLabel(occupancy) + (targetReported ? " of estimated stage target" : " of reported spool capacity (legacy sample)") + limitDetail });
+        metrics.push({ label: "Rolling spool", value: spoolBytes === null ? "Measuring…" : bytes(spoolBytes) + (denominator > 0 ? " / " + bytes(denominator) : ""), detail: occupancy === null ? targetReported ? "Configured high-water mark" : "Reported spool capacity" : backupPercentLabel(occupancy) + (targetReported ? " of high-water mark" : " of reported spool capacity (legacy sample)") + lowDetail + reclaimedDetail + limitDetail });
       }
     }
 
@@ -1581,7 +1619,7 @@
       progress,
       metrics,
       action: cancellationRequested ? null : backupOperatorAction(run),
-      modeNote: runState === "writing" ? direct ? "Legacy direct streaming record" : engineState === "packing" || engineState === "validating" ? "Complete archive on disk · tape idle" : engineState === "reading_native_volume" ? "Immediate physical readback before the next volume" : "TapeScale Native v1 · staged sequential tape stream" : null,
+      modeNote: runState === "writing" ? direct ? "Legacy direct streaming record" : nativePacking || nativeValidating ? "Concurrent bounded pack producer" : nativeReadback ? "Physical readback after durable spool reclamation" : "TapeScale Native v2 · bounded rolling tape stream" : null,
       activity,
       preparationStep,
       cancellationRequested,
@@ -1645,10 +1683,10 @@
     if (["verified", "passed", "completed", "complete"].includes(runState)) return BACKUP_PHASES.length - 1;
     if (backupTransferPhase(pick(backupPreparationProgress(run), "stage")) === "source_stability_check") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("source_stability_check"));
     const nativeState = backupNativeEngineState(backupLiveIo(run));
-    if (nativeState === "packing") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_packing"));
-    if (nativeState === "validating") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_validating"));
-    if (nativeState === "writing_native_volume") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_volume_write"));
-    if (nativeState === "reading_native_volume") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_volume_readback"));
+    if (["packing", "packing_pack", "refilling_spool"].includes(nativeState)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_packing"));
+    if (["validating", "validating_pack"].includes(nativeState)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_validating"));
+    if (["writing_native_volume", "writing_native_pack"].includes(nativeState)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_volume_write"));
+    if (["reading_native_volume", "reading_native_pack"].includes(nativeState)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_volume_readback"));
     if (backupMediaIsReadback(run)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("readback"));
     if (backupNeedsNextMedia(run)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("next_media"));
     const rawExplicit = backupEvidenceValue(run, "phase_index");
@@ -3238,7 +3276,7 @@
     const pointDetail = recoveryPointDetail(pointId);
     const pointRecord = pointDetail && pointDetail.recovery_point && typeof pointDetail.recovery_point === "object" ? pointDetail.recovery_point : pointSummary;
     const pointOrigin = pointDetail && pointDetail.origin && typeof pointDetail.origin === "object" ? pointDetail.origin : {};
-    const nativeRestorePending = String(pick(pointRecord, "format_version") || "") === "tapescale-native-v1" || String(pick(pointOrigin, "engine_name") || "") === "TapeScale Native";
+    const nativeRestorePending = String(pick(pointRecord, "format_version") || "").startsWith("tapescale-native-v") || String(pick(pointOrigin, "engine_name") || "") === "TapeScale Native";
     const pointVerified = recoveryPointState(pointRecord) === "verified";
     const runs = restoreRehearsalsForPoint(pointId);
     if (!runs.length) return '<section class="vault-dossier-section restore-rehearsals"><div class="vault-section-head"><div><h3>Restore runs</h3><p>' + (!pointVerified ? "This unsuccessful or retired outcome is audit history, not a recovery source." : nativeRestorePending ? "Offline recovery is available with the independent tapescale-recovery utility. In-console native restore execution is still pending." : "A compatible legacy recovery point can run an attended restore only when the server offers that exact execution contract.") + '</p></div><span>0 runs</span></div><div class="vault-section-empty">' + (!pointVerified ? "Recovery planning is unavailable because this point is not verified." : nativeRestorePending ? "Use tapescale-recovery offline; console restore pending." : "No Restore run has been started for this recovery point.") + '</div></section>';
@@ -3267,7 +3305,7 @@
     const artifacts = detail ? list(detail, "artifacts") : [];
     const events = detail ? list(detail, "events") : [];
     const origin = detail && detail.origin && typeof detail.origin === "object" ? detail.origin : {};
-    const nativeRestorePending = String(pick(point, "format_version") || "") === "tapescale-native-v1" || String(pick(origin, "engine_name") || "") === "TapeScale Native";
+    const nativeRestorePending = String(pick(point, "format_version") || "").startsWith("tapescale-native-v") || String(pick(origin, "engine_name") || "") === "TapeScale Native";
     const pointState = recoveryPointState(point);
     const pointVerified = pointState === "verified";
     const detailError = state.errors["recoveryPoint:" + id];
@@ -5647,9 +5685,9 @@
       '<div class="form-field"><label for="backup-media-pool">Tape pool <small>(optional)</small></label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div>',
       '<div class="form-field"><label for="backup-compression">Compression</label><select class="select" id="backup-compression" name="compression_mode"><option value="auto" selected>Automatic · Zstandard fast (recommended)</option><option value="zstd">Zstandard · fast</option><option value="lz4">LZ4 · fastest</option><option value="gzip">GZIP · compatible</option><option value="none">None</option></select><small>Automatic uses Zstandard level 1. LZ4 favors maximum packing speed; GZIP favors compatibility. Already-compressed files may not shrink.</small></div>',
       '<input type="hidden" name="data_delivery" value="disk_spool">',
-      '<div class="form-field full backup-boundary info"><span aria-hidden="true">2</span><div><strong>Pack once, then stream sequentially</strong><p>DAR packages small files into large archive slices on disk. TapeScale validates the complete staged archive before the tape moves, then immediately reads each written volume back.</p></div></div>',
+      '<div class="form-field full backup-boundary info"><span aria-hidden="true">2</span><div><strong>Bounded disk buffer, any archive size</strong><p>DAR builds independently validated archive packs inside fixed high- and low-water limits. TapeScale streams complete packs at safe tape-file boundaries and reclaims disk space as the verified set advances.</p></div></div>',
       '<div class="form-field"><label>Archive size</label><label class="check-option backup-span-option"><input type="checkbox" id="backup-media-spanning" name="spanning_enabled" checked> Continue onto additional prepared tapes when this archive fills a cartridge.</label></div>',
-      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · Zstandard fast · complete archive staging · spans tapes as needed</strong><small>Pack and validate on disk, stream each native volume once, read it back immediately, and request another tape only when needed.</small></div></div></div>',
+      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · Zstandard fast · bounded rolling staging · spans tapes as needed</strong><small>Fill and validate a bounded disk window, stream complete packs, reclaim verified space, and request another tape only when needed.</small></div></div></div>',
       '</div>',
       '<p class="notice danger" id="backup-profile-error" role="alert" aria-live="assertive" hidden></p>',
       '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Continue to tape</button></div>',
@@ -5675,8 +5713,8 @@
     const detail = form.querySelector("#backup-plan-summary small");
     if (summary) summary.textContent = "Full backup · " + compression + " · " + delivery.toLowerCase() + " · " + (spanning ? "spans tapes as needed" : "one tape maximum");
     if (detail) detail.textContent = deliveryMode === "direct"
-      ? "This legacy mode is retained only for old profile display; new native backups use complete archive staging."
-      : "DAR packs small files into large slices on disk. TapeScale validates the complete archive, streams each native volume sequentially, and reads it back immediately.";
+      ? "This legacy mode is retained only for old profile display; new native backups use bounded rolling staging."
+      : "DAR builds independently validated packs inside a bounded disk window. TapeScale streams and verifies them sequentially while reclaiming spool space.";
   }
 
   async function submitBackupProfile(form) {

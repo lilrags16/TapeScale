@@ -1,12 +1,12 @@
 # Independent TapeScale Native recovery
 
-Status: the database-independent native volume capture and full DAR restore path is implemented in `0.2.0-alpha.5`. It has not completed the physical G2 qualification matrix. A successful run is evidence for its exact host, drive, media, archive, metadata, and software revision; it is not a general production claim.
+Status: the database-independent Native v1/v2 volume capture and full DAR restore path is implemented in `0.2.0-alpha.6`. It has not completed the physical G2 qualification matrix. A successful run is evidence for its exact host, drive, media, archive, metadata, and software revision; it is not a general production claim.
 
 The current web console does not dispatch native restores. Use the separately installed `tapescale-recovery` executable on an isolated recovery host.
 
 ## What must survive a disaster
 
-Every TapeScale Native cartridge contains its own archive/volume identity, the complete isolated DAR catalog, the authenticated source manifest, whole DAR slices, a volume index, and a trailer. PostgreSQL is useful but is not required by the recovery utility.
+Every TapeScale Native cartridge contains its own archive/volume identity and authenticated recovery metadata. Native v2 members carry the source manifest, independently finalized pack descriptors/catalogs/slices, a chained volume index, and a trailer; the final member carries the archive-set seal. PostgreSQL and the original rolling spool are useful operational state but are not required by the recovery utility.
 
 Protect these separately:
 
@@ -16,7 +16,7 @@ Protect these separately:
 4. custody records that let an operator find the cartridges;
 5. enough isolated disk capacity for the complete encoded archive and restored tree.
 
-Native v1 is unencrypted, so there is no key package for this format. Captured slices and restored files are plaintext and must receive source-equivalent protection.
+Native v1 and v2 are unencrypted, so there is no key package for either format. Captured pack data and restored files are plaintext and must receive source-equivalent protection.
 
 ## Recovery commands
 
@@ -66,7 +66,7 @@ mkdir -p /recovery/archive /recovery/restored
 chmod 0700 /recovery/archive /recovery/restored
 ```
 
-The capture filesystem must hold the complete encoded archive plus repeated metadata and receipts. The destination must hold the restored logical tree. Account for sparse-file expansion and filesystem metadata.
+The capture filesystem must hold the complete encoded archive plus metadata and receipts. Unlike the backup writer's bounded 1 TiB rolling spool, clean-host capture retains all packs required for restore. The destination must hold the restored logical tree. Account for sparse-file expansion and filesystem metadata.
 
 ### 4. Capture every volume
 
@@ -82,8 +82,8 @@ The capture command:
 
 - rejects device paths outside exact `/dev/nstN` syntax;
 - enables variable-block mode and rewinds through fixed `mt-st` arguments;
-- decodes the TapeScale header to learn archive, cartridge, volume, and slice identities;
-- streams catalog, manifest, and slices to disk rather than buffering them in memory;
+- auto-detects Native v1 or v2 and decodes its typed identity records;
+- streams v1 catalog/slices or v2 pack descriptors/catalogs/slices to disk rather than buffering them in memory;
 - reads and decodes the index and trailer;
 - checks every identity, ordinal, offset, length, and SHA-256 binding;
 - rejects a duplicate or inconsistent member already present in the directory;
@@ -96,17 +96,17 @@ Volume loading order is not security authority; receipts are sorted and checked 
 
 After every required volume has been captured, run `restore-native-archive`. It refuses to proceed unless:
 
-- the number of receipts equals the header-declared volume count;
+- the captured set contains every member required by the v1 header or v2 final archive-set seal;
 - volume ordinals are complete and contiguous;
 - cartridge and archive-volume UUIDs are unique;
-- every member has the same archive UUID, representation, compression, catalog digest, and manifest digest;
-- global slice ordinals and encoded offsets are complete and contiguous;
+- every member has the same archive UUID, representation, compression, and manifest commitment;
+- v1 global slice ordinals or v2 pack ordinals, volume predecessor links, catalog roots, and ordered commitments are complete and contiguous;
 - every captured artifact still matches its retained length and SHA-256;
 - native header/index/trailer records still decode and bind consistently;
 - the destination is an existing empty real directory;
 - the DAR executable is the exact expected basename and an absolute executable path.
 
-DAR tests the reconstructed archive before extraction. After extraction, TapeScale independently inventories the destination and compares it to the retained source manifest. A mismatch returns failure even when DAR itself exited successfully.
+DAR tests the reconstructed v1 archive or each ordered v2 pack before extraction. After extraction, TapeScale independently inventories the destination and compares it to the retained source manifest. A mismatch returns failure even when DAR itself exited successfully.
 
 ### 6. Review before publication
 
@@ -135,6 +135,7 @@ Record the fields required by [QUALIFICATION.md](QUALIFICATION.md), including ar
 - **DAR test/extract failure:** retain the capture set read-only for diagnosis. Never present partial output as recovered.
 - **Manifest mismatch:** fail the recovery scope, even when every native tape hash and DAR test passed.
 - **Unsupported format/version/representation:** use a maintained compatible reader; never migrate the only copy in place.
+- **Interrupted writer or partial member:** the alpha writer does not resume or append mid-volume. Quarantine the touched cartridge and create a new archive set; clean-host recovery never treats the partial set as complete.
 
 ## Recovery bundle compatibility
 
@@ -154,6 +155,7 @@ Bundle inspection validates its outer manifest and references; it does not read 
 - no native ZFS-send recovery;
 - no web-console native restore execution;
 - no automatic catalog import back into a new TapeScale database;
+- no writer restart/resume within a partially written v2 volume;
 - no general qualification yet for ACLs, xattrs, sparse files, hard links, unusual names, all compression modes, all LTO generations, multi-volume boundaries, wrong-media handling, or controlled interruption.
 
 Older Bacula-formatted experimental media is incompatible and cannot be recovered by the native utility. This deployment declared zero valid Bacula tapes; Bacula is therefore not packaged in the 0.2 runtime.

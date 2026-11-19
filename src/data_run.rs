@@ -1,6 +1,7 @@
 //! Attended physical backup and recovery execution.
 
 mod native;
+mod native_v2;
 
 use std::{
     fs,
@@ -481,6 +482,10 @@ impl LiveIoSampler {
             spool_capacity_bytes: spool.map(|(_, capacity, _)| capacity),
             spool_target_bytes: spool.map(|(_, _, target)| target),
             spool_file_count: spool_usage.map(|usage| usage.file_count),
+            spool_high_water_bytes: None,
+            spool_low_water_bytes: None,
+            spool_pack_count: None,
+            spool_reclaimed_bytes: None,
             spool_fill_bytes_per_second,
             spool_drain_bytes_per_second,
             spool_basis: spool_usage.map(|_| "run_scoped_bacula_spool_regular_file_bytes"),
@@ -857,6 +862,9 @@ async fn execute_claimed(
     }
 
     if claim.run.archive_codec == "dar" {
+        if claim.run.format_version == crate::native_archive::NATIVE_ROLLING_FORMAT_NAME {
+            return native_v2::execute_claimed(pool, sas_config, config, claim, cancellation).await;
+        }
         return native::execute_claimed(pool, sas_config, config, claim, cancellation).await;
     }
 
@@ -4439,6 +4447,9 @@ mod tests {
             dar_path: PathBuf::from("/usr/bin/dar"),
             native_spool_dir: spool_directory.to_owned(),
             native_spool_reserve_bytes: 0,
+            native_pack_target_bytes: 256 * 1024 * 1024 * 1024,
+            native_spool_high_water_bytes: 768 * 1024 * 1024 * 1024,
+            native_spool_low_water_bytes: 256 * 1024 * 1024 * 1024,
             native_slice_bytes: 64 * 1024 * 1024,
             native_compression_threads: 1,
         }

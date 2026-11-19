@@ -49,8 +49,8 @@ use crate::{
     error::AppError,
     media_ops,
     native_archive::{
-        DAR_CODEC_VERSION, NATIVE_ADAPTER_VERSION, NATIVE_ENGINE_NAME, NATIVE_ENGINE_VERSION,
-        NATIVE_FORMAT_NAME,
+        is_native_format, DAR_CODEC_VERSION, NATIVE_ADAPTER_VERSION, NATIVE_ENGINE_NAME,
+        NATIVE_ENGINE_VERSION, NATIVE_FORMAT_NAME,
     },
     qualification,
     source_browser::{self, RetainedManifestReference, SourceBrowserError},
@@ -272,7 +272,7 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
         "lab_tape_qualification_enabled":state.lab_tape_qualification_enabled,
         "lab_file_roundtrip_enabled":state.lab_file_roundtrip_enabled,
         "native_backup_scope": if state.lab_file_roundtrip_enabled {
-            "attended_multivolume_full_backup_with_immediate_volume_readback"
+            "attended_bounded_spool_multivolume_full_backup_with_immediate_volume_readback"
         } else {
             "disabled"
         },
@@ -292,8 +292,10 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
             "backup_level": "full",
             "compression_modes": ["auto", "zstd", "lz4", "gzip", "none"],
             "default_compression": "auto_zstd_fast",
-            "data_delivery_modes": ["disk_spool"],
-            "default_data_delivery": "disk_spool",
+            "data_delivery_modes": ["bounded_rolling_disk_spool"],
+            "default_data_delivery": "bounded_rolling_disk_spool",
+            "archive_packaging": "independently_finalized_dar_packs",
+            "whole_archive_staging_required": false,
             "manual_media_spanning": true,
             "per_volume_immediate_physical_readback": true,
             "offline_recovery_utility": "tapescale-recovery",
@@ -370,7 +372,7 @@ async fn system_engine_metadata(
                 (
                     "format".to_owned(),
                     format!(
-                        "TapeScale Native v1 with DAR {DAR_CODEC_VERSION}; the independent tapescale-recovery utility is available while in-console restore remains pending, and the format is not production-qualified"
+                        "TapeScale Native v2 with bounded DAR packs and DAR {DAR_CODEC_VERSION}; the independent tapescale-recovery utility is available while in-console restore remains pending, and the format is not production-qualified"
                     ),
                 ),
                 (
@@ -3308,7 +3310,7 @@ async fn plan_restore(
     };
     let native_restore_pending = aggregate.origin.engine_name.as_deref()
         == Some(NATIVE_ENGINE_NAME)
-        || aggregate.recovery_point.format_version == NATIVE_FORMAT_NAME;
+        || is_native_format(&aggregate.recovery_point.format_version);
     let execution_supported = state.lab_file_roundtrip_enabled
         && plan_ready
         && !selected_multi_volume
@@ -3353,7 +3355,7 @@ async fn plan_restore(
                 "The selected retained paths support an attended, read-only restore from this single-volume recovery point into the isolated destination.".to_owned(),
         }
     } else if native_restore_pending {
-        "This TapeScale Native v1 recovery point is cataloged and browseable. Offline recovery is available through the independent tapescale-recovery utility; in-console restore execution remains pending and will not be dispatched from this plan. Any retained planning blockers remain visible for review.".to_owned()
+        "This TapeScale Native recovery point is cataloged and browseable. Offline recovery is available through the independent tapescale-recovery utility; in-console restore execution remains pending and will not be dispatched from this plan. Any retained planning blockers remain visible for review.".to_owned()
     } else if !plan_ready {
         "Resolve every restore-planning blocker and generate a fresh plan before execution can be considered.".to_owned()
     } else {
@@ -4199,7 +4201,7 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
             "Tape backup engine",
             engine_status,
             if state.lab_file_roundtrip_enabled {
-                "TapeScale Native v1 with DAR 2.8.6 is enabled for staged, compressed, ordered multi-tape Full backups with immediate per-volume physical readback; offline recovery uses tapescale-recovery and in-console restore is pending"
+                "TapeScale Native v2 with DAR 2.8.6 is enabled for bounded-spool, independently packed, compressed, ordered multi-tape Full backups with immediate per-volume physical readback; offline recovery uses tapescale-recovery and in-console restore is pending"
             } else {
                 "The TapeScale Native backup data path is disabled"
             },
