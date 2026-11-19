@@ -282,6 +282,18 @@ async fn native_archive_upgrade_preserves_legacy_rows_and_accepts_native_segment
         )
     );
 
+    // The queued legacy fixture has served its migration assertion. Retire it
+    // before inserting a second active run on the same physical drive and
+    // cartridge so the production one-active-run safety indexes remain intact.
+    sqlx::query(
+        "UPDATE single_tape_data_runs
+            SET state = 'failed', started_at = now(), finished_at = now()
+          WHERE id = '00000000-0000-0000-0000-000000001916'",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy queued fixture should be retired before native insertion");
+
     let legacy_policy = sqlx::query_as::<_, (String, bool)>(
         "SELECT policy.compression_mode, constraint_row.convalidated
            FROM protection_policies policy

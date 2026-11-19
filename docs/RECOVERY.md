@@ -1,6 +1,6 @@
 # Independent TapeScale Native recovery
 
-Status: the database-independent native volume capture and full DAR restore path is implemented in `0.2.0-alpha.2`. It has not completed the physical G2 qualification matrix. A successful run is evidence for its exact host, drive, media, archive, metadata, and software revision; it is not a general production claim.
+Status: the database-independent native volume capture and full DAR restore path is implemented in `0.2.0-alpha.3`. It has not completed the physical G2 qualification matrix. A successful run is evidence for its exact host, drive, media, archive, metadata, and software revision; it is not a general production claim.
 
 The current web console does not dispatch native restores. Use the separately installed `tapescale-recovery` executable on an isolated recovery host.
 

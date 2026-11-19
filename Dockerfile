@@ -7,7 +7,7 @@ COPY src ./src
 COPY migrations ./migrations
 RUN cargo build --locked --release --bins
 
-FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS dar-builder
+FROM debian:bookworm-20250721-slim@sha256:2424c1850714a4d94666ec928e24d86de958646737b1d113f5b2207be44d37d8 AS dar-builder
 ARG DEBIAN_SNAPSHOT=20250730T000000Z
 ENV DAR_VERSION=2.8.6 \
     DAR_SHA256=d56caeb6c86f751cb454d8fef45f3daecc508f208290d9f51e8c75bba5dc46c5 \
@@ -114,8 +114,8 @@ RUN install -D -m 0644 \
       "/build/libthreadar-${LIBTHREADAR_VERSION}/COPYING.LESSER" \
       /opt/runtime-docs/libthreadar/COPYING.LESSER
 
-FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
-ARG TAPESCALE_VERSION=0.2.0-alpha.2
+FROM debian:bookworm-20250721-slim@sha256:2424c1850714a4d94666ec928e24d86de958646737b1d113f5b2207be44d37d8 AS runtime
+ARG TAPESCALE_VERSION=0.2.0-alpha.3
 ARG TAPESCALE_REVISION=unknown
 ARG DEBIAN_SNAPSHOT=20250730T000000Z
 LABEL org.opencontainers.image.title="TapeScale" \

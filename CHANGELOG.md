@@ -2,6 +2,14 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.2.0-alpha.3] - 2026-11-19
+
+### Reproducible container and live-upgrade fixes
+
+- Aligns both Debian container stages with the official `bookworm-20250721-slim` image used by the pinned July 2025 package snapshot, eliminating libc and Perl development-package skew without downgrading essential packages.
+- Corrects the live PostgreSQL migration fixture so its native-run insertion continues to exercise the production one-active-run safety indexes instead of colliding with the earlier queued fixture.
+- Supersedes `v0.2.0-alpha.2`, whose native implementation passed local validation but whose container and live-database release gates did not complete.
+
 ## [0.2.0-alpha.2] - 2026-11-19
 
 ### Release pipeline and legacy-media cutover fixes
@@ -261,6 +269,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.2.0-alpha.3]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.3
 [0.2.0-alpha.2]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.2
 [0.2.0-alpha.1]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.1
 [0.1.0-alpha.15]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.15
