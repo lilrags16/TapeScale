@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-16/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-16/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-17/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-17/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -1831,4 +1831,31 @@ test("verified backups lead directly to the retained file browser", () => {
   assert.match(detail, /data-action="browse-backup-files"/);
   assert.match(detail, /Browse backed-up files/);
   assert.match(detail, /<details class="backup-technical">/);
+});
+
+test("terminal jobs can be deleted without erasing backup evidence", () => {
+  const table = section("  function renderBackupRunTable(", "  function renderBackupEvidence(");
+  const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
+  const deletion = section("  function openDeleteBackupRun(", "  function captureBackupRouteUiState(");
+
+  assert.match(detail, /pick\(allowedActions, "delete"\) === true/);
+  assert.match(detail, /data-action="delete-backup-run"/);
+  assert.match(detail, />Delete job</);
+  assert.doesNotMatch(table, /delete-backup-run/, "clickable history rows must not contain nested delete actions");
+
+  assert.match(deletion, /Delete this job from Backup Center\?/);
+  assert.match(deletion, /does not erase tape data, delete a recovery point, release protected cartridges, or remove retained audit evidence/);
+  assert.doesNotMatch(deletion, /type="text"|type="checkbox"|name="confirmation"/, "job deletion needs one ordinary confirmation, not typed attestation");
+  assert.match(deletion, /method: "DELETE"/);
+  assert.match(deletion, /encodeURIComponent\(runId\)/);
+  assert.match(deletion, /state\.deletedBackupRunIds\.add\(runId\)/);
+  assert.match(deletion, /delete state\.data\.backupRunDetails\[runId\]/);
+  assert.match(deletion, /location\.hash = "#jobs"/);
+  assert.match(deletion, /Promise\.allSettled/);
+  assert.match(deletion, /\["backupRuns", "jobs", "overview"\]\.map\(loadOne\)/);
+  assert.match(deletion, /Tape and recovery evidence remain retained/);
+  assert.match(app, /pick\(run, "is_latest_attempt"\) !== false/);
+
+  assert.match(app, /if \(action === "delete-backup-run"\) openDeleteBackupRun\(target\.dataset\.id\)/);
+  assert.match(app, /if \(event\.target\.id === "delete-backup-form"\)/);
 });

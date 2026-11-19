@@ -1,6 +1,6 @@
 # TrueNAS custom-app deployment
 
-TapeScale `0.2.0-alpha.8` is an attended evaluation build for TrueNAS SCALE on x86-64. It is not production-qualified. The repository-root [`compose.truenas.yaml`](../compose.truenas.yaml) is the complete pasteable custom-app definition.
+TapeScale `0.2.0-alpha.9` is an attended evaluation build for TrueNAS SCALE on x86-64. It is not production-qualified. The repository-root [`compose.truenas.yaml`](../compose.truenas.yaml) is the complete pasteable custom-app definition.
 
 The active data path is TapeScale Native v2 with DAR 2.8.6. Native v1 remains readable; the runtime does not install or start Bacula.
 
@@ -153,7 +153,7 @@ See [RECOVERY.md](RECOVERY.md) for commands and evidence requirements. In-consol
 
 Never point an older application image at a database that has already migrated and call that rollback. Restore a consistent database backup with the matching release instead.
 
-An interrupted partial Native v2 member is not resumed in place by alpha.8. TapeScale quarantines touched media, and retry creates and restages a new archive set. Do not delete a retained failed spool until its diagnostic evidence has been reviewed.
+An interrupted partial Native v2 member is not resumed in place by alpha.9. TapeScale quarantines touched media, and retry creates and restages a new archive set. Do not delete a retained failed spool until its diagnostic evidence has been reviewed.
 
 ## Security warning
 

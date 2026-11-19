@@ -63,6 +63,47 @@ async fn isolated_database() -> Option<(PgPool, PgPool, String)> {
         .connect(&database_url)
         .await
         .expect("test database should accept an administrative connection");
+
+    // pgcrypto is database-scoped, while these tests migrate isolated schemas in
+    // parallel. Keep the extension in public so every isolated search path can
+    // resolve digest()/gen_random_uuid() without racing to own the extension.
+    let mut extension_guard = admin
+        .begin()
+        .await
+        .expect("pgcrypto setup transaction should start");
+    sqlx::query("SELECT pg_advisory_xact_lock(607172003)")
+        .execute(&mut *extension_guard)
+        .await
+        .expect("pgcrypto setup should be serialized");
+    let extension_schema = sqlx::query_scalar::<_, String>(
+        "SELECT namespace.nspname
+           FROM pg_extension extension
+           JOIN pg_namespace namespace ON namespace.oid = extension.extnamespace
+          WHERE extension.extname = 'pgcrypto'",
+    )
+    .fetch_optional(&mut *extension_guard)
+    .await
+    .expect("pgcrypto schema should be queryable");
+    match extension_schema.as_deref() {
+        None => {
+            sqlx::query("CREATE EXTENSION pgcrypto WITH SCHEMA public")
+                .execute(&mut *extension_guard)
+                .await
+                .expect("pgcrypto should install in public");
+        }
+        Some("public") => {}
+        Some(_) => {
+            sqlx::query("ALTER EXTENSION pgcrypto SET SCHEMA public")
+                .execute(&mut *extension_guard)
+                .await
+                .expect("pgcrypto should move to public");
+        }
+    }
+    extension_guard
+        .commit()
+        .await
+        .expect("pgcrypto setup should commit");
+
     let schema = format!("backup_workflow_{}", Uuid::now_v7().simple());
     sqlx::query(&format!("CREATE SCHEMA {schema}"))
         .execute(&admin)
@@ -2608,6 +2649,249 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert!(queue_body["error"]["message"]
         .as_str()
         .is_some_and(|message| message.contains("not ready or still contains blockers")));
+
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .expect("isolated integration schema should clean up");
+    admin.close().await;
+}
+
+#[tokio::test]
+async fn terminal_backup_jobs_can_be_deleted_without_erasing_evidence() {
+    let Some((pool, admin, schema)) = isolated_database().await else {
+        return;
+    };
+    let profile =
+        create_backup_profile(&pool, "Deletion integration", "deletion-source", false).await;
+    let older = backup_ops::create_manual_backup_request(
+        &pool,
+        profile.id,
+        "deletion-integration-older-failure",
+        "Deletion integration operator",
+    )
+    .await
+    .expect("older deletion fixture should queue");
+    let CreateBackupRequestResult::Created(older_request) = older else {
+        panic!("older deletion fixture should be new");
+    };
+    sqlx::query(
+        "UPDATE job_runs
+            SET state = 'failed', started_at = now() - interval '2 hours',
+                finished_at = now() - interval '2 hours',
+                created_at = now() - interval '2 hours',
+                failure_class = 'older_integration_fixture',
+                failure_detail = '{\"detail\":\"older terminal deletion fixture\"}'::jsonb
+          WHERE id = $1",
+    )
+    .bind(older_request.job_run_id)
+    .execute(&pool)
+    .await
+    .expect("older deletion fixture should become terminal");
+
+    let created = backup_ops::create_manual_backup_request(
+        &pool,
+        profile.id,
+        "deletion-integration-failed",
+        "Deletion integration operator",
+    )
+    .await
+    .expect("deletion fixture should queue");
+    let CreateBackupRequestResult::Created(failed_request) = created else {
+        panic!("deletion fixture should be new");
+    };
+    sqlx::query(
+        "UPDATE job_runs
+            SET state = 'failed', started_at = now(), finished_at = now(),
+                failure_class = 'integration_fixture',
+                failure_detail = '{\"detail\":\"terminal deletion fixture\"}'::jsonb
+          WHERE id = $1",
+    )
+    .bind(failed_request.job_run_id)
+    .execute(&pool)
+    .await
+    .expect("deletion fixture should become terminal");
+
+    let web_directory = tempfile::tempdir().expect("temporary web directory should exist");
+    let application = api::router(
+        AppState::new(
+            Some(pool.clone()),
+            false,
+            true,
+            true,
+            true,
+            PathBuf::from("/source"),
+            PathBuf::from("/restore"),
+        ),
+        web_directory.path().to_path_buf(),
+    );
+
+    let before = api_request(
+        &application,
+        Method::GET,
+        format!("/api/v1/backup-runs/{}", failed_request.id),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(before.status(), StatusCode::OK);
+    let before = response_json(before).await;
+    assert_eq!(before["run"]["allowed_actions"]["delete"], true);
+    assert_eq!(before["run"]["allowed_actions"]["cancel"], false);
+
+    let deleted = api_request(
+        &application,
+        Method::DELETE,
+        format!("/api/v1/backup-runs/{}", failed_request.id),
+        json!({"actor_label": "Deletion integration operator"}),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let deleted = response_json(deleted).await;
+    assert_eq!(deleted["deleted"], true);
+    assert_eq!(deleted["idempotent_replay"], false);
+    assert_eq!(deleted["scope"], "operator_history_only");
+    assert_eq!(deleted["retained"]["tape_data"], true);
+    assert_eq!(deleted["retained"]["recovery_points"], true);
+    assert_eq!(deleted["retained"]["audit_evidence"], true);
+
+    let hidden_detail = api_request(
+        &application,
+        Method::GET,
+        format!("/api/v1/backup-runs/{}", failed_request.id),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(hidden_detail.status(), StatusCode::NOT_FOUND);
+    let hidden_list = api_request(
+        &application,
+        Method::GET,
+        "/api/v1/backup-runs".to_owned(),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(hidden_list.status(), StatusCode::OK);
+    let hidden_list = response_json(hidden_list).await;
+    let remaining_runs = hidden_list["runs"]
+        .as_array()
+        .expect("older history should remain an array");
+    assert_eq!(remaining_runs.len(), 1);
+    assert_eq!(remaining_runs[0]["id"], older_request.id.to_string());
+    assert_eq!(remaining_runs[0]["is_latest_attempt"], false);
+
+    let deleted_idempotency_replay = api_request(
+        &application,
+        Method::POST,
+        format!("/api/v1/backup-profiles/{}/runs", profile.id),
+        json!({
+            "idempotency_key": "deletion-integration-failed",
+            "requested_by_label": "Deletion integration operator"
+        }),
+    )
+    .await;
+    assert_eq!(deleted_idempotency_replay.status(), StatusCode::CONFLICT);
+    assert!(
+        response_json(deleted_idempotency_replay).await["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("deleted from job history"))
+    );
+
+    let replay = api_request(
+        &application,
+        Method::DELETE,
+        format!("/api/v1/backup-runs/{}", failed_request.id),
+        json!({"actor_label": "Deletion integration operator"}),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(response_json(replay).await["idempotent_replay"], true);
+
+    let retained_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        "SELECT
+            (SELECT count(*) FROM jobs WHERE id = $1),
+            (SELECT count(*) FROM job_runs WHERE id = $2),
+            (SELECT count(*) FROM backup_requests WHERE id = $3),
+            (SELECT count(*) FROM job_transitions WHERE run_id = $2)",
+    )
+    .bind(profile.job_id)
+    .bind(failed_request.job_run_id)
+    .bind(failed_request.id)
+    .fetch_one(&pool)
+    .await
+    .expect("dismissed job evidence should remain queryable");
+    assert_eq!(retained_counts, (1, 1, 1, 1));
+    let deleted_events = backup_ops::backup_request_events(&pool, failed_request.id)
+        .await
+        .expect("deleted request events should remain queryable");
+    assert_eq!(
+        deleted_events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["requested", "waiting_for_media", "deleted"]
+    );
+    let deletion_audits = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM audit_events
+          WHERE action = 'backup.request.delete' AND object_id = $1",
+    )
+    .bind(failed_request.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("deletion audit should remain queryable");
+    assert_eq!(deletion_audits, 1);
+    assert_eq!(
+        store::overview_counts(&pool)
+            .await
+            .expect("overview counts should reload after deletion")
+            .required_actions,
+        0
+    );
+    assert!(store::list_jobs(&pool)
+        .await
+        .expect("generic jobs should reload after deletion")
+        .iter()
+        .all(|job| job.job_id != profile.job_id));
+
+    let active = backup_ops::create_manual_backup_request(
+        &pool,
+        profile.id,
+        "deletion-integration-active",
+        "Deletion integration operator",
+    )
+    .await
+    .expect("active deletion fixture should queue");
+    let CreateBackupRequestResult::Created(active_request) = active else {
+        panic!("active deletion fixture should be new");
+    };
+    let conflict = api_request(
+        &application,
+        Method::DELETE,
+        format!("/api/v1/backup-runs/{}", active_request.id),
+        json!({"actor_label": "Deletion integration operator"}),
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert!(response_json(conflict).await["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("cancel")));
+
+    let cancelled = backup_ops::cancel_waiting_backup_request(
+        &pool,
+        active_request.id,
+        "Deletion integration operator",
+        "remove unused queued job",
+    )
+    .await
+    .expect("unassigned job should cancel immediately");
+    assert!(matches!(cancelled, CancelBackupRequestResult::Cancelled(_)));
+    let deleted_cancelled = api_request(
+        &application,
+        Method::DELETE,
+        format!("/api/v1/backup-runs/{}", active_request.id),
+        json!({"actor_label": "Deletion integration operator"}),
+    )
+    .await;
+    assert_eq!(deleted_cancelled.status(), StatusCode::OK);
 
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))

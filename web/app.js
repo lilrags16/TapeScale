@@ -108,6 +108,7 @@
     backupReadinessModalToken: 0,
     pendingBackupSetup: null,
     selectedBackupRunId: null,
+    deletedBackupRunIds: new Set(),
     backupRunDetailLoading: new Set(),
     backupQuery: "",
     backupStateFilter: "all",
@@ -242,7 +243,7 @@
     }
     if (key === "jobs") return list(payload, "jobs");
     if (key === "backupProfiles") return list(payload, "profiles");
-    if (key === "backupRuns") return list(payload, "runs");
+    if (key === "backupRuns") return list(payload, "runs").filter((run) => !state.deletedBackupRunIds || !state.deletedBackupRunIds.has(recordId(run)));
     if (key === "media") return list(payload, "media");
     if (key === "mediaPools") {
       const pools = list(payload, "pools");
@@ -798,7 +799,7 @@
   }
 
   function orderedBackupRuns() {
-    return state.data.backupRuns.map(backupRunRecord).sort((left, right) => {
+    return state.data.backupRuns.filter((run) => !state.deletedBackupRunIds || !state.deletedBackupRunIds.has(recordId(run))).map(backupRunRecord).sort((left, right) => {
       const timeDifference = new Date(pick(right, "created_at", "started_at") || 0) - new Date(pick(left, "created_at", "started_at") || 0);
       return timeDifference || recordId(right).localeCompare(recordId(left));
     });
@@ -821,13 +822,13 @@
   }
 
   async function loadBackupRunDetail(id, force, renderAfter) {
-    if (!id || state.backupRunDetailLoading.has(id) || (!force && state.data.backupRunDetails[id])) return;
+    if (!id || state.deletedBackupRunIds && state.deletedBackupRunIds.has(id) || state.backupRunDetailLoading.has(id) || (!force && state.data.backupRunDetails[id])) return;
     const errorKey = "backupRun:" + id;
     state.backupRunDetailLoading.add(id);
     delete state.errors[errorKey];
     try {
       const detail = await request(endpoints.backupRuns + "/" + encodeURIComponent(id));
-      state.data.backupRunDetails[id] = detail && typeof detail === "object" ? detail : {};
+      if (!state.deletedBackupRunIds || !state.deletedBackupRunIds.has(id)) state.data.backupRunDetails[id] = detail && typeof detail === "object" ? detail : {};
       delete state.errors[errorKey];
     } catch (error) {
       state.errors[errorKey] = error;
@@ -854,7 +855,7 @@
   }
 
   function rememberBackupRun(run) {
-    if (!run || typeof run !== "object" || !recordId(run)) return;
+    if (!run || typeof run !== "object" || !recordId(run) || state.deletedBackupRunIds && state.deletedBackupRunIds.has(recordId(run))) return;
     state.data.backupRuns = [run].concat(state.data.backupRuns.filter((item) => recordId(item) !== recordId(run)));
     state.received.add("backupRuns");
     delete state.errors.backupRuns;
@@ -1818,7 +1819,7 @@
 
   function latestBackupAttempts() {
     const seen = new Set();
-    return orderedBackupRuns().filter((run) => {
+    return orderedBackupRuns().filter((run) => pick(run, "is_latest_attempt") !== false).filter((run) => {
       const key = backupProfileKey(run);
       if (seen.has(key)) return false;
       seen.add(key);
@@ -2053,6 +2054,7 @@
     const detailError = state.errors["backupRun:" + id];
     const allowedActions = objectValue(run, "allowed_actions");
     const canCancel = backupRunActive(run) && !pick(run, "cancel_requested_at") && pick(allowedActions, "cancel") === true;
+    const canDelete = pick(allowedActions, "delete") === true;
     const successful = ["verified", "passed", "completed", "complete"].includes(runState);
     const terminal = BACKUP_TERMINAL_STATES.has(runState);
     const failed = BACKUP_TERMINAL_STATES.has(runState) && !successful && !["cancelled", "canceled"].includes(runState);
@@ -2081,7 +2083,8 @@
       : "";
     const repeat = terminal && repeatAllowed ? '<button class="button button-primary button-small" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">' + (successful ? "Back up same snapshot" : legacyWholeArchive ? "Retry with Native v2" : "Retry same snapshot") + "</button>" : "";
     const newer = terminal ? '<button class="button button-small" type="button" data-action="create-backup-profile">Choose newer snapshot</button>' : "";
-    const actions = cancel || repeat || newer ? '<div class="backup-run-actions">' + cancel + repeat + newer + "</div>" : "";
+    const remove = canDelete ? '<button class="button button-danger button-small" type="button" data-action="delete-backup-run" data-id="' + esc(id) + '">Delete job</button>' : "";
+    const actions = cancel || repeat || newer || remove ? '<div class="backup-run-actions">' + cancel + repeat + newer + remove + "</div>" : "";
     const timing = startedAt ? "Started " + date(startedAt) : "Requested " + date(requestedAt);
     return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span><span class="backup-kind-badge secondary">' + esc(backupDataDeliveryLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>' + esc(timing) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header><div class="panel-body backup-primary-body">' + detailFailure + notice + legacyUpgrade + renderBackupCurrentOperation(run) + actions + "</div>" + renderBackupPhaseTrack(run) + '<div class="panel-body backup-secondary-body">' + outcome + technical + "</div></article>";
   }
@@ -6322,6 +6325,50 @@
     }
   }
 
+  function openDeleteBackupRun(runId) {
+    const run = orderedBackupRuns().find((item) => recordId(item) === runId);
+    const allowedActions = objectValue(run, "allowed_actions");
+    if (!run || pick(allowedActions, "delete") !== true) return;
+    const body = '<form id="delete-backup-form" data-run-id="' + esc(runId) + '"><div class="backup-boundary warning"><span aria-hidden="true">×</span><div><strong>Delete this job from Backup Center?</strong><p>This removes the terminal attempt from job history. It does not erase tape data, delete a recovery point, release protected cartridges, or remove retained audit evidence.</p></div></div><dl class="vault-facts"><dt>Backup</dt><dd>' + esc(backupRunProfileName(run)) + '</dd><dt>Status</dt><dd>' + esc(backupRunStateLabel(run)) + '</dd><dt>Request ID</dt><dd class="mono">' + esc(runId) + '</dd></dl><p class="notice danger" id="backup-delete-error" hidden></p><div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Keep job</button><button class="button button-danger" type="submit">Delete job</button></div></form>';
+    openModal("Delete job", body);
+    document.querySelector('#delete-backup-form [type="submit"]').focus();
+  }
+
+  async function submitDeleteBackup(form) {
+    const runId = form.dataset.runId;
+    const submit = form.querySelector('[type="submit"]');
+    const errorBox = form.querySelector("#backup-delete-error");
+    submit.disabled = true;
+    submit.textContent = "Deleting…";
+    errorBox.hidden = true;
+    try {
+      await request(endpoints.backupRuns + "/" + encodeURIComponent(runId), {
+        method: "DELETE",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ actor_label: "Web operator" })
+      });
+    } catch (error) {
+      errorBox.textContent = errorMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+      submit.textContent = "Delete job";
+      return;
+    }
+    state.deletedBackupRunIds.add(runId);
+    state.data.backupRuns = state.data.backupRuns.filter((item) => recordId(item) !== runId);
+    delete state.data.backupRunDetails[runId];
+    delete state.data.backupMediaReadiness[runId];
+    delete state.errors["backupRun:" + runId];
+    if (state.selectedBackupRunId === runId) state.selectedBackupRunId = null;
+    closeModal();
+    if (location.hash !== "#jobs") location.hash = "#jobs";
+    await Promise.allSettled(["backupRuns", "jobs", "overview"].map(loadOne));
+    updateChrome();
+    render();
+    scheduleBackupRunPoll();
+    toast("Job deleted", "Tape and recovery evidence remain retained.");
+  }
+
   function captureBackupRouteUiState() {
     if (!["jobs", "overview"].includes(state.route)) return null;
     const technical = main.querySelector(".backup-technical");
@@ -7267,6 +7314,7 @@
     if (action === "prepare-backup-tape") prepareBackupTape(target);
     if (action === "refresh-backup-readiness") refreshBackupReadiness(target);
     if (action === "cancel-backup-run") openCancelBackupRun(target.dataset.id);
+    if (action === "delete-backup-run") openDeleteBackupRun(target.dataset.id);
     if (action === "add-media") openAddMedia();
     if (action === "initialize-tape") openTapeInitialization(target);
     if (action === "create-media-pool") openMediaPoolForm();
@@ -7341,6 +7389,10 @@
     if (event.target.id === "cancel-backup-form") {
       event.preventDefault();
       submitCancelBackup(event.target);
+    }
+    if (event.target.id === "delete-backup-form") {
+      event.preventDefault();
+      submitDeleteBackup(event.target);
     }
     if (event.target.id === "recovery-profile-form") {
       event.preventDefault();

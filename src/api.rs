@@ -128,7 +128,10 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         )
         .route("/api/v1/backup-profiles/{id}/runs", post(create_backup_run))
         .route("/api/v1/backup-runs", get(backup_runs))
-        .route("/api/v1/backup-runs/{id}", get(backup_run))
+        .route(
+            "/api/v1/backup-runs/{id}",
+            get(backup_run).delete(delete_backup_run),
+        )
         .route(
             "/api/v1/backup-runs/{id}/media-readiness",
             get(backup_run_media_readiness),
@@ -773,6 +776,12 @@ async fn backup_run_response(
     pool: &PgPool,
     disposition: backup_ops::CreateBackupRequestResult,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
+    if disposition.record().dismissed_at.is_some() {
+        return Err(AppError::Conflict(
+            "this idempotent backup request was deleted from job history; submit a new request"
+                .to_owned(),
+        ));
+    }
     let created = matches!(
         &disposition,
         backup_ops::CreateBackupRequestResult::Created(_)
@@ -1378,6 +1387,41 @@ struct CancelBackupRunRequest {
     requested_by_label: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DeleteBackupRunRequest {
+    #[serde(default)]
+    actor_label: Option<String>,
+}
+
+async fn delete_backup_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<DeleteBackupRunRequest>,
+) -> Result<Json<Value>, AppError> {
+    let pool = require_pool(&state)?;
+    let request_id = parse_uuid_path(&id, "backup run")?;
+    let actor = backup_actor_label(request.actor_label.as_deref())?;
+    let disposition = backup_ops::delete_backup_request(pool, request_id, &actor)
+        .await
+        .map_err(map_backup_ops_error)?;
+    let idempotent_replay = matches!(
+        disposition,
+        backup_ops::DeleteBackupRequestResult::AlreadyDeleted(_)
+    );
+    Ok(Json(json!({
+        "deleted": true,
+        "deletion": disposition.record(),
+        "scope": "operator_history_only",
+        "retained": {
+            "tape_data": true,
+            "recovery_points": true,
+            "audit_evidence": true
+        },
+        "audit": if idempotent_replay { "existing" } else { "appended" },
+        "idempotent_replay": idempotent_replay
+    })))
+}
+
 async fn cancel_backup_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1526,7 +1570,11 @@ async fn build_backup_run_view(
                     || continuation_readback_pending),
             "assign_next_media": request.state == "waiting_for_media"
                 && continuation_write_pending,
-            "cancel": !matches!(request.state.as_str(), "verified" | "failed" | "cancelled" | "completed")
+            "cancel": !matches!(
+                request.state.as_str(),
+                "verified" | "failed" | "blocked" | "interrupted" | "cancelled" | "completed"
+            ),
+            "delete": backup_ops::backup_request_can_be_deleted(request)
         }),
     );
     object.insert("production_eligible".to_owned(), Value::Bool(false));

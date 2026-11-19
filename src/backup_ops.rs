@@ -503,6 +503,13 @@ pub struct BackupRequestRecord {
     pub failure_detail: Option<Value>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    pub is_latest_attempt: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dismissed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dismissed_by_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dismissal_reason: Option<String>,
 }
 
 const BACKUP_REQUEST_SELECT: &str = r#"
@@ -527,7 +534,17 @@ const BACKUP_REQUEST_SELECT: &str = r#"
            job_run.failure_class,
            job_run.failure_detail,
            job_run.started_at,
-           job_run.finished_at
+           job_run.finished_at,
+           NOT EXISTS (
+               SELECT 1
+                 FROM backup_requests newer_request
+                WHERE newer_request.profile_id = request.profile_id
+                  AND (newer_request.created_at, newer_request.id) >
+                      (request.created_at, request.id)
+           ) AS is_latest_attempt,
+           job_run.dismissed_at,
+           job_run.dismissed_by_label,
+           job_run.dismissal_reason
       FROM backup_requests request
       JOIN single_tape_data_profiles profile ON profile.id = request.profile_id
       JOIN job_runs job_run ON job_run.id = request.job_run_id
@@ -875,6 +892,7 @@ pub async fn list_backup_requests(
     Ok(sqlx::query_as::<_, BackupRequestRecord>(&format!(
         "{BACKUP_REQUEST_SELECT}
          AND ($1::uuid IS NULL OR request.profile_id = $1)
+         AND job_run.dismissed_at IS NULL
          ORDER BY request.created_at DESC LIMIT $2"
     ))
     .bind(profile_id)
@@ -888,7 +906,9 @@ pub async fn get_backup_request(
     id: Uuid,
 ) -> Result<Option<BackupRequestRecord>, BackupOpsError> {
     Ok(sqlx::query_as::<_, BackupRequestRecord>(&format!(
-        "{BACKUP_REQUEST_SELECT} AND request.id = $1"
+        "{BACKUP_REQUEST_SELECT}
+         AND request.id = $1
+         AND job_run.dismissed_at IS NULL"
     ))
     .bind(id)
     .fetch_optional(pool)
@@ -1144,6 +1164,41 @@ pub enum CancelBackupRequestResult {
     AlreadyCancelled(BackupRequestRecord),
 }
 
+#[must_use]
+pub fn backup_request_can_be_deleted(request: &BackupRequestRecord) -> bool {
+    request.dismissed_at.is_none()
+        && request.finished_at.is_some()
+        && matches!(
+            request.state.as_str(),
+            "verified" | "completed" | "failed" | "blocked" | "interrupted" | "cancelled"
+        )
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DeletedBackupRequestRecord {
+    pub request_id: Uuid,
+    pub job_run_id: Uuid,
+    pub state: String,
+    pub dismissed_at: DateTime<Utc>,
+    pub dismissed_by_label: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "disposition", content = "deletion", rename_all = "snake_case")]
+pub enum DeleteBackupRequestResult {
+    Deleted(DeletedBackupRequestRecord),
+    AlreadyDeleted(DeletedBackupRequestRecord),
+}
+
+impl DeleteBackupRequestResult {
+    #[must_use]
+    pub const fn record(&self) -> &DeletedBackupRequestRecord {
+        match self {
+            Self::Deleted(record) | Self::AlreadyDeleted(record) => record,
+        }
+    }
+}
+
 pub async fn cancel_waiting_backup_request(
     pool: &PgPool,
     request_id: Uuid,
@@ -1259,6 +1314,130 @@ pub async fn cancel_waiting_backup_request(
         .ok_or(BackupOpsError::NotFound)?;
     transaction.commit().await?;
     Ok(CancelBackupRequestResult::Cancelled(record))
+}
+
+/// Remove a terminal attempt from operator-facing job history while retaining
+/// every physical-media, recovery, transition, artifact, and audit record.
+pub async fn delete_backup_request(
+    pool: &PgPool,
+    request_id: Uuid,
+    actor_label: &str,
+) -> Result<DeleteBackupRequestResult, BackupOpsError> {
+    validate_label(actor_label, "actor_label")?;
+    let mut transaction = pool.begin().await?;
+
+    #[derive(FromRow)]
+    struct DeletionRequest {
+        job_run_id: Uuid,
+        correlation_id: Uuid,
+        state: String,
+        finished_at: Option<DateTime<Utc>>,
+        dismissed_at: Option<DateTime<Utc>>,
+        dismissed_by_label: Option<String>,
+    }
+
+    let request = sqlx::query_as::<_, DeletionRequest>(
+        "SELECT request.job_run_id, request.correlation_id,
+                job_run.state, job_run.finished_at,
+                job_run.dismissed_at, job_run.dismissed_by_label
+           FROM backup_requests request
+           JOIN job_runs job_run ON job_run.id = request.job_run_id
+          WHERE request.id = $1
+          FOR UPDATE OF request, job_run",
+    )
+    .bind(request_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(BackupOpsError::NotFound)?;
+
+    if let Some(dismissed_at) = request.dismissed_at {
+        let record = DeletedBackupRequestRecord {
+            request_id,
+            job_run_id: request.job_run_id,
+            state: request.state,
+            dismissed_at,
+            dismissed_by_label: request
+                .dismissed_by_label
+                .unwrap_or_else(|| actor_label.to_owned()),
+        };
+        transaction.commit().await?;
+        return Ok(DeleteBackupRequestResult::AlreadyDeleted(record));
+    }
+
+    let terminal = matches!(
+        request.state.as_str(),
+        "verified" | "completed" | "failed" | "blocked" | "interrupted" | "cancelled"
+    );
+    if !terminal || request.finished_at.is_none() {
+        transaction.rollback().await?;
+        return Err(BackupOpsError::Conflict(
+            "active backup jobs cannot be deleted; cancel the job and wait for its terminal state first"
+                .to_owned(),
+        ));
+    }
+
+    let dismissed_at = Utc::now();
+    let dismissal_reason = "operator removed terminal job from Backup Center";
+    sqlx::query(
+        "UPDATE job_runs
+            SET dismissed_at = $1, dismissed_by_label = $2,
+                dismissal_reason = $3
+          WHERE id = $4 AND dismissed_at IS NULL",
+    )
+    .bind(dismissed_at)
+    .bind(actor_label)
+    .bind(dismissal_reason)
+    .bind(request.job_run_id)
+    .execute(&mut *transaction)
+    .await?;
+    append_request_event(
+        &mut transaction,
+        request_id,
+        "deleted",
+        json!({
+            "detail": "removed from operator-facing Backup Center history",
+            "job_run_id": request.job_run_id,
+            "terminal_state": request.state,
+            "tape_data_deleted": false,
+            "recovery_points_deleted": false,
+            "audit_evidence_deleted": false
+        }),
+        actor_label,
+        request.correlation_id,
+    )
+    .await?;
+    append_audit(
+        &mut transaction,
+        actor_label,
+        "backup.request.delete",
+        "backup_request",
+        request_id.to_string(),
+        json!({
+            "job_run_id": request.job_run_id,
+            "terminal_state": request.state,
+            "scope": "operator_history_only",
+            "retained": [
+                "tape_and_volume_records",
+                "recovery_points",
+                "manifests_and_artifacts",
+                "job_transitions",
+                "audit_events"
+            ]
+        }),
+        "deleted",
+        request.correlation_id,
+    )
+    .await?;
+
+    let record = DeletedBackupRequestRecord {
+        request_id,
+        job_run_id: request.job_run_id,
+        state: request.state,
+        dismissed_at,
+        dismissed_by_label: actor_label.to_owned(),
+    };
+    transaction.commit().await?;
+    Ok(DeleteBackupRequestResult::Deleted(record))
 }
 
 #[derive(Clone, Debug, Serialize)]

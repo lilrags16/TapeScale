@@ -6,7 +6,7 @@
 TapeScale is a safety-first LTO backup control plane for TrueNAS. It manages standalone SAS tape drives, cartridges, bounded rolling file archives, physical verification evidence, recovery metadata, retention, holds, and custody through a graphical console.
 
 > [!IMPORTANT]
-> Version `0.2.0-alpha.8` is an attended evaluation build, not production protection. New backups use **TapeScale Native v2**, a bounded rolling-spool format; existing Native v1 captures remain readable. Multi-tape writing, immediate physical readback, and database-independent full-archive capture/restore are implemented. In-console restore and selected-file recovery are not. Do not make this alpha the only copy of any data.
+> Version `0.2.0-alpha.9` is an attended evaluation build, not production protection. New backups use **TapeScale Native v2**, a bounded rolling-spool format; existing Native v1 captures remain readable. Multi-tape writing, immediate physical readback, and database-independent full-archive capture/restore are implemented. In-console restore and selected-file recovery are not. Do not make this alpha the only copy of any data.
 
 ## What changed in 0.2
 
@@ -93,7 +93,9 @@ The current backup path protects one existing immutable snapshot with a manually
 
 Automatic compression selects fast Zstandard. Compression occurs while building each disk pack, not while feeding that pack to tape. Packs contain fixed-size DAR slices and are assigned whole to volumes; an archive can span as many eligible prepared cartridges as its plan requires without staging the complete set.
 
-Cancellation before physical writing leaves the selected tape unchanged. Once a media write starts, cancellation is cooperative and cannot stop kernel tape I/O instantaneously. An interrupted or failed write leaves that cartridge uncertain and no recovery point is created from it. Alpha.6 does not resume a partially written member; retry creates and restages a new archive set.
+Cancellation before physical writing leaves the selected tape unchanged. Once a media write starts, cancellation is cooperative and cannot stop kernel tape I/O instantaneously. An interrupted or failed write leaves that cartridge uncertain and no recovery point is created from it. Alpha.9 does not resume a partially written member; retry creates and restages a new archive set.
+
+Terminal jobs can be removed from **Backup Center** with **Delete job**. This is a history-management action: it does not erase tape data, delete recovery points, release protected cartridges, remove manifests, or mutate append-only audit evidence. Active work must be cancelled and reach a terminal state before deletion becomes available.
 
 ## Understanding progress
 

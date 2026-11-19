@@ -2025,9 +2025,11 @@ pub async fn overview_counts(pool: &PgPool) -> Result<OverviewCounts, sqlx::Erro
             (SELECT count(*) FROM sources WHERE enabled) AS protected_sources,
             (SELECT count(*) FROM latest_job_runs
              WHERE state IN ('queued','preparing','inventorying','waiting_for_media','writing','written','verifying','restoring','comparing','blocked','interrupted')
+               AND dismissed_at IS NULL
                AND finished_at IS NULL) AS active_jobs,
             ((SELECT count(*) FROM latest_job_runs
               WHERE state IN ('waiting_for_media','blocked','interrupted','failed')
+                AND dismissed_at IS NULL
                 AND (finished_at IS NULL OR finished_at >= now() - interval '7 days')) +
              (SELECT count(*) FROM movement_tasks
               WHERE state IN ('ready','departed','partially_confirmed','overdue','blocked')) +
@@ -2106,6 +2108,7 @@ pub async fn list_required_actions(
              JOIN jobs job ON job.id = run.job_id
              LEFT JOIN backup_requests request ON request.job_run_id = run.id
              WHERE run.state IN ('waiting_for_media', 'blocked', 'interrupted', 'failed')
+               AND run.dismissed_at IS NULL
                AND (run.finished_at IS NULL OR run.finished_at >= now() - interval '7 days')
              UNION ALL
              SELECT 'media:' || cartridge.id::text,
@@ -2213,7 +2216,8 @@ const JOB_SELECT: &str = "SELECT j.id AS job_id, j.external_id, j.kind, j.priori
      LEFT JOIN sources rehearsal_source ON rehearsal_source.id = rehearsal_point.source_id
      LEFT JOIN LATERAL (
          SELECT jr.id, jr.state, jr.attempt, jr.correlation_id,
-                jr.started_at, jr.finished_at, jr.failure_class, jr.created_at
+                jr.started_at, jr.finished_at, jr.failure_class, jr.created_at,
+                jr.dismissed_at
          FROM job_runs jr
          WHERE jr.job_id = j.id
          ORDER BY jr.created_at DESC
@@ -2222,7 +2226,9 @@ const JOB_SELECT: &str = "SELECT j.id AS job_id, j.external_id, j.kind, j.priori
 
 pub async fn list_jobs(pool: &PgPool) -> Result<Vec<JobRecord>, sqlx::Error> {
     sqlx::query_as(&format!(
-        "{JOB_SELECT} ORDER BY COALESCE(latest.created_at, j.created_at) DESC"
+        "{JOB_SELECT}
+         WHERE latest.dismissed_at IS NULL
+         ORDER BY COALESCE(latest.created_at, j.created_at) DESC"
     ))
     .fetch_all(pool)
     .await
@@ -2230,7 +2236,9 @@ pub async fn list_jobs(pool: &PgPool) -> Result<Vec<JobRecord>, sqlx::Error> {
 
 pub async fn get_job(pool: &PgPool, id: &str) -> Result<Option<JobRecord>, sqlx::Error> {
     sqlx::query_as(&format!(
-        "{JOB_SELECT} WHERE j.external_id = $1 OR j.id::text = $1"
+        "{JOB_SELECT}
+         WHERE (j.external_id = $1 OR j.id::text = $1)
+           AND latest.dismissed_at IS NULL"
     ))
     .bind(id)
     .fetch_optional(pool)

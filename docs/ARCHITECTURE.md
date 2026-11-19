@@ -1,6 +1,6 @@
 # Architecture
 
-TapeScale is a control plane for durable LTO protection on TrueNAS. `0.2.0-alpha.8` writes **TapeScale Native v2**, a self-describing on-tape format owned by TapeScale. Native v2 replaces v1's whole-archive disk stage with independently finalized DAR packs in a bounded rolling spool. DAR 2.8.6 is a separately executed archive codec; it does not own cartridge identity, tape motion, media handoff, verification evidence, retention, or recovery policy.
+TapeScale is a control plane for durable LTO protection on TrueNAS. `0.2.0-alpha.9` writes **TapeScale Native v2**, a self-describing on-tape format owned by TapeScale. Native v2 replaces v1's whole-archive disk stage with independently finalized DAR packs in a bounded rolling spool. DAR 2.8.6 is a separately executed archive codec; it does not own cartridge identity, tape motion, media handoff, verification evidence, retention, or recovery policy.
 
 The active runtime has no Bacula package or daemon dependency. Bacula-specific source modules and historical database values remain only so failed earlier-alpha rows can be read as audit history; new profiles, preparation runs, backups, and recovery media use the native contract.
 

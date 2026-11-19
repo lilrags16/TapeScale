@@ -1,6 +1,6 @@
 # TapeScale Native operations
 
-This guide covers TapeScale `0.2.0-alpha.8`, an attended alpha for one standalone SAS tape drive. New backups use **TapeScale Native v2** with DAR 2.8.6 as a separate archive codec. Native v1 media remains readable. Bacula is not part of the runtime.
+This guide covers TapeScale `0.2.0-alpha.9`, an attended alpha for one standalone SAS tape drive. New backups use **TapeScale Native v2** with DAR 2.8.6 as a separate archive codec. Native v1 media remains readable. Bacula is not part of the runtime.
 
 Do not make this alpha the only copy of data. Physical qualification is pending.
 
@@ -56,6 +56,12 @@ Logical source bytes, compressed pack bytes, and physical device bytes are diffe
 
 When the job requests another cartridge, unload the verified member and load the requested prepared tape. TapeScale reads its on-tape UUID before overwrite. A wrong, unreadable, protected, WORM, held, reserved, or already-used cartridge is rejected. Waiting for attended media is durable and does not consume the active-transfer timeout.
 
+## Manage job history
+
+A terminal backup attempt exposes **Delete job** on its detail page. One confirmation removes it from Backup Center, overview counts, and job-action feeds. Deletion is deliberately non-destructive to retained data: tape and volume records, recovery points, manifests, artifacts, transitions, cartridge protection, and audit events remain intact.
+
+Active jobs cannot be deleted. Cancel the job first and wait for the worker to record a terminal state. Failed or interrupted media can still require reconciliation after its job is removed; cartridge safety state remains visible independently in **Tapes**.
+
 ## Recovery and upgrade
 
 The web console can browse retained manifests and evidence but does not yet execute a restore. On a clean host, run `tapescale-recovery capture-native-volume` once per member into one capture directory, then `restore-native-archive` into an existing empty destination. The tool auto-detects Native v1 and v2; v2 recovery requires every ordered pack/volume and the final archive-set seal. See [RECOVERY.md](RECOVERY.md).
@@ -68,7 +74,7 @@ Upgrading does not rewrite retained media. Untouched queued v1 operational backu
 - After writing starts, a failed or interrupted member is uncertain until reconciled or verified.
 - Startup prefill occurs before tape motion; later low-water refills occur only at clean filemarks. Partial packs never become recovery points.
 - Unexpected end of media fails closed; normal spanning occurs at planned pack/slice boundaries.
-- Worker/container restart does not resume a partially written member in alpha.7; touched media is quarantined and retry creates a new archive set.
+- Worker/container restart does not resume a partially written member in alpha.9; touched media is quarantined and retry creates a new archive set.
 - No in-console or selected-file restore, encryption, changer automation, incrementals, automatic snapshots, native ZFS send, or append-after-interruption is available.
 - ACLs, xattrs, sparse files, hard links, unusual names, all codecs/generations, spanning, refill, interruption, and clean-host recovery remain physically unqualified.
 

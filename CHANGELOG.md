@@ -2,6 +2,14 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.2.0-alpha.9] - 2026-11-19
+
+### Deletable backup jobs
+
+- Adds a server-authorized **Delete job** action for terminal backup attempts. Active work must be cancelled and reach a terminal state before the action is offered or accepted.
+- Removes deleted attempts from Backup Center, overview counts, generic job views, and required-action feeds without erasing physical media state. Tape and volume records, recovery points, manifests, Native archive seals, transitions, cartridge protection, and append-only audit evidence remain intact.
+- Makes deletion transactional, audited, and idempotent. The console uses one ordinary confirmation, returns to refreshed backup history immediately, and prevents an older in-flight poll from resurrecting the deleted row.
+
 ## [0.2.0-alpha.8] - 2026-11-19
 
 ### Simplified TrueNAS deployment
@@ -319,6 +327,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.2.0-alpha.9]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.9
 [0.2.0-alpha.8]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.8
 [0.2.0-alpha.7]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.7
 [0.2.0-alpha.6]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.6
