@@ -1,6 +1,6 @@
 # Qualification and acceptance ledger
 
-This ledger separates implemented behavior from evidence collected on physical tape hardware. It applies to TapeScale `0.2.0-alpha.3` and TapeScale Native v1.
+This ledger separates implemented behavior from evidence collected on physical tape hardware. It applies to TapeScale `0.2.0-alpha.4` and TapeScale Native v1.
 
 ## Status vocabulary
 

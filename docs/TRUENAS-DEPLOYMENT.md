@@ -1,6 +1,6 @@
 # TrueNAS custom-app deployment
 
-TapeScale `0.2.0-alpha.3` is an attended evaluation build for TrueNAS SCALE on x86-64. It is not production-qualified. The repository-root [`compose.truenas.yaml`](../compose.truenas.yaml) is the complete pasteable custom-app definition.
+TapeScale `0.2.0-alpha.4` is an attended evaluation build for TrueNAS SCALE on x86-64. It is not production-qualified. The repository-root [`compose.truenas.yaml`](../compose.truenas.yaml) is the complete pasteable custom-app definition.
 
 The active data path is TapeScale Native v1 with DAR 2.8.6. The runtime does not install or start Bacula.
 
@@ -52,7 +52,7 @@ This broad read-only bind is an alpha convenience. A qualified deployment should
 4. Install the app.
 5. Open `http://TRUENAS-IP:18080` from the isolated management network.
 
-The release Compose builds the immutable Git tag `v0.2.0-alpha.3` and labels the image with the same revision. `pull_policy: build` makes TrueNAS fetch and build that tagged source.
+The release Compose builds the immutable Git tag `v0.2.0-alpha.4` and labels the image with the same revision. `pull_policy: build` makes TrueNAS fetch and build that tagged source.
 
 ## Native worker configuration
 

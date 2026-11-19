@@ -409,7 +409,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         "cartridge_id": scratch.id,
         "cartridge_label": scratch.internal_label,
         "confirmation": format!(
-            "DESTROY {} WITH BACULA BTAPE TEST",
+            "DESTROY {} WITH TAPESCALE NATIVE TEST",
             scratch.internal_label
         ),
         "scratch_media_confirmed": true,
@@ -498,7 +498,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         .expect("qualification request should reload")
         .expect("qualification request should persist");
     assert_eq!(queued_qualification.state, "queued");
-    assert_eq!(queued_qualification.engine_version, "15.0.3");
+    assert_eq!(queued_qualification.engine_version, "1");
     let mut changed_qualification_request = qualification_request.clone();
     changed_qualification_request["cartridge_id"] = json!(created.id);
     let changed_replay = api_request(
@@ -546,9 +546,9 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         &claimed_qualification,
         QualificationTerminalState::Passed,
         json!({
-            "detail":"integration btape evidence fixture",
+            "detail":"integration native tape evidence fixture",
             "position_uncertain":false,
-            "engine_version":"15.0.3",
+            "engine_version":"1",
             "maximum_block_size_bytes":262144
         }),
     )
@@ -740,7 +740,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         json!({
             "detail": "integration qualification restored after terminal replay matrix",
             "position_uncertain": false,
-            "engine_version": "15.0.3",
+            "engine_version": "1",
             "maximum_block_size_bytes": 262144
         }),
     )

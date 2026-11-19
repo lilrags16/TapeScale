@@ -2,6 +2,13 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.2.0-alpha.4] - 2026-11-19
+
+### Native qualification release-fixture fix
+
+- Updates the live PostgreSQL end-to-end qualification fixture to use the TapeScale Native v1 destructive confirmation and engine evidence contract instead of the retired Bacula values.
+- Supersedes `v0.2.0-alpha.3`; its complete container/DAR validation passed, while this stale live-database fixture correctly failed closed before queueing media work.
+
 ## [0.2.0-alpha.3] - 2026-11-19
 
 ### Reproducible container and live-upgrade fixes
@@ -269,6 +276,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.2.0-alpha.4]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.4
 [0.2.0-alpha.3]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.3
 [0.2.0-alpha.2]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.2
 [0.2.0-alpha.1]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.1
