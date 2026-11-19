@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-15/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-15/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-16/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-16/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -170,10 +170,15 @@ test("delivery labels distinguish advanced direct, bounded rolling, legacy, and 
   const values = Function(
     "pick", "backupProfileForRun", "backupEvidenceValue",
     '"use strict";\n' + helpers + "\nreturn [backupDataDelivery, backupDataDeliverySupported, backupDataDeliveryLabel];"
-  )(testPick, () => null, () => null);
+  )(testPick, () => null, testPick);
   assert.equal(values[0]({ data_delivery: "direct" }), "direct");
   assert.equal(values[2]({ data_delivery: "direct" }), "Direct streaming (advanced)");
   assert.equal(values[2]({ data_delivery: "disk_spool" }), "Bounded rolling staging");
+  assert.equal(values[2]({ data_delivery: "disk_spool", engine_name: "TapeScale Native", engine_version: "1", format_version: "tapescale-native-v1" }), "Legacy whole-archive staging");
+  assert.equal(values[2]({
+    data_delivery: "disk_spool",
+    data_run: { engine_name: "TapeScale Native", engine_version: "1", adapter_version: "native-v1", format_version: "tapescale-native-v1" }
+  }), "Legacy whole-archive staging");
   assert.equal(values[2]({}), "Staged delivery (legacy)");
   assert.equal(values[1]({ data_delivery: "ram_ring" }), false);
   assert.equal(values[2]({ data_delivery: "ram_ring" }), "Unsupported (ram_ring)");
@@ -1626,12 +1631,16 @@ test("run summaries distinguish planned, active, complete, and failed readback",
 test("the eight-stage journey is complete on desktop and compact on mobile", () => {
   const phases = section("  const BACKUP_PHASES = [", "  const BACKUP_TERMINAL_STATES");
   const phaseList = Function('"use strict";\n' + phases + "\nreturn BACKUP_PHASES;")();
+  const legacyPhases = section("  const LEGACY_BACKUP_PHASES = [", "  const BACKUP_RECORD_PROGRESS_BASES");
+  const legacyPhaseList = Function('"use strict";\n' + legacyPhases + "\nreturn LEGACY_BACKUP_PHASES;")();
   const phaseIndexSource = section("  function backupPhaseIndex(", "  function renderBackupPhaseTrack(");
   const phaseIndex = Function(
-    "BACKUP_PHASES", "backupRunState", "backupPreparationProgress", "pick", "backupMediaIsReadback", "backupNeedsNextMedia", "backupEvidenceValue", "backupRunEvents", "backupTransferPhase", "backupExpectedTransferPhase", "objectValue", "backupNativeEngineState", "backupLiveIo",
+    "BACKUP_PHASES", "LEGACY_BACKUP_PHASES", "backupUsesLegacyWholeArchive", "backupRunState", "backupPreparationProgress", "pick", "backupMediaIsReadback", "backupNeedsNextMedia", "backupEvidenceValue", "backupRunEvents", "backupTransferPhase", "backupExpectedTransferPhase", "objectValue", "backupNativeEngineState", "backupLiveIo",
     '"use strict";\n' + phaseIndexSource + "\nreturn backupPhaseIndex;"
   )(
     phaseList,
+    legacyPhaseList,
+    (run) => Boolean(run.legacy),
     (run) => run.state,
     (run) => run.preparation || {},
     (object, ...keys) => {
@@ -1673,10 +1682,13 @@ test("the eight-stage journey is complete on desktop and compact on mobile", () 
   assert.equal(phaseIndex({ state: "failed", events: [{ event_type: "engine_dispatched", evidence: { phase: "full_readback" } }] }), 5, "canonical event evidence drives the journey");
   assert.equal(phaseIndex({ state: "failed", events: [{ event_type: "engine_dispatched", evidence: { phase: "source_inventory" } }] }), 2);
   assert.equal(phaseIndex({ state: "writing", phase_index: 0 }), 0, "an explicit phase index remains authoritative");
+  assert.equal(phaseIndex({ state: "writing", legacy: true }), 5, "legacy tape write remains the write stage");
+  assert.equal(phaseIndex({ state: "verifying", legacy: true }), 6, "legacy full readback uses the separate readback stage");
+  assert.equal(phaseIndex({ state: "verifying", legacy: true, result: { live_io: { engine_state: "reading_native_volume" } } }), 6, "legacy native read telemetry stays on readback");
   assert.match(css, /\.phase-track\.backup-phase-track\s*\{[^}]*grid-template-columns:\s*repeat\(8,/s);
   assert.match(renderer, /class="phase-track backup-phase-track backup-phase-desktop"/);
   assert.match(renderer, /<details class="backup-phase-mobile">/);
-  assert.match(renderer, /Step .* of .*BACKUP_PHASES\.length/);
+  assert.match(renderer, /Step .* of .*phaseDefinitions\.length/);
   assert.match(css, /\.backup-phase-mobile\s*\{\s*display:\s*none;/s);
   assert.match(css, /\.backup-phase-desktop\s*\{\s*display:\s*none !important;/s);
   assert.match(css, /\.backup-phase-mobile\s*\{\s*display:\s*block;/s);
@@ -1713,6 +1725,9 @@ test("lease failures explain tape state without exposing raw JSON", () => {
   const beforeWrite = operatorFailure({ failure_detail: JSON.stringify(recorded), result: { media_write_started: false, position_uncertain: false } });
   const legacyBeforeWrite = operatorFailure({ failure_detail: JSON.stringify(recorded), result: { media_write_started: false, position_uncertain: true } });
   const afterWrite = operatorFailure({ failure_detail: recorded.detail, result: { media_write_started: true } });
+  const legacyCapacity = operatorFailure({
+    failure_detail: "complete archive staging needs approximately 2112779023008 bytes before tape motion, but only 956971745280 bytes are available after the configured reserve"
+  });
 
   assert.match(beforeWrite, /before any tape-motion or data-write command was dispatched/);
   assert.match(beforeWrite, /loaded tape and known drive position were preserved/);
@@ -1721,6 +1736,23 @@ test("lease failures explain tape state without exposing raw JSON", () => {
   assert.match(legacyBeforeWrite, /reconcile it once/);
   assert.match(afterWrite, /Treat tape position as uncertain/);
   assert.match(afterWrite, /reconcile the drive/);
+  assert.match(legacyCapacity, /complete archive to fit on the staging disk/);
+  assert.match(legacyCapacity, /tape was not changed/i);
+  assert.match(legacyCapacity, /Retry with Native v2/);
+  assert.doesNotMatch(legacyCapacity, /drive or tape changed/i);
+});
+
+test("historical Native v1 attempts remain explicit while retry advances to Native v2", () => {
+  const detail = section("  function renderBackupRunDetail(", "  function renderJobs(");
+  const phase = section("  function renderBackupPhaseTrack(", "  function backupTableProgressLabel(");
+
+  assert.match(app, /const LEGACY_BACKUP_PHASES =/);
+  assert.match(app, /Stage complete archive/);
+  assert.match(app, /Build the entire DAR archive on disk; tape remains idle/);
+  assert.match(phase, /backupUsesLegacyWholeArchive\(run\) \? LEGACY_BACKUP_PHASES : BACKUP_PHASES/);
+  assert.match(detail, /This is a retained Native v1 attempt/);
+  assert.match(detail, /A new retry uses Native v2 bounded rolling packs/);
+  assert.match(detail, /Retry with Native v2/);
 });
 
 test("multi-tape runs ask for each ordered continuation volume", () => {

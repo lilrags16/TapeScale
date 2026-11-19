@@ -1,6 +1,6 @@
 # Qualification and acceptance ledger
 
-This ledger separates implemented behavior from evidence collected on physical tape hardware. It applies to TapeScale `0.2.0-alpha.6` and TapeScale Native v2; Native v1 is recovery-compatible history.
+This ledger separates implemented behavior from evidence collected on physical tape hardware. It applies to TapeScale `0.2.0-alpha.7` and TapeScale Native v2; Native v1 is recovery-compatible history.
 
 ## Status vocabulary
 

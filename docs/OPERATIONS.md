@@ -1,6 +1,6 @@
 # TapeScale Native operations
 
-This guide covers TapeScale `0.2.0-alpha.6`, an attended alpha for one standalone SAS tape drive. New backups use **TapeScale Native v2** with DAR 2.8.6 as a separate archive codec. Native v1 media remains readable. Bacula is not part of the runtime.
+This guide covers TapeScale `0.2.0-alpha.7`, an attended alpha for one standalone SAS tape drive. New backups use **TapeScale Native v2** with DAR 2.8.6 as a separate archive codec. Native v1 media remains readable. Bacula is not part of the runtime.
 
 Do not make this alpha the only copy of data. Physical qualification is pending.
 
@@ -68,7 +68,7 @@ Upgrading does not rewrite retained media. Untouched queued v1 operational backu
 - After writing starts, a failed or interrupted member is uncertain until reconciled or verified.
 - Startup prefill occurs before tape motion; later low-water refills occur only at clean filemarks. Partial packs never become recovery points.
 - Unexpected end of media fails closed; normal spanning occurs at planned pack/slice boundaries.
-- Worker/container restart does not resume a partially written member in alpha.6; touched media is quarantined and retry creates a new archive set.
+- Worker/container restart does not resume a partially written member in alpha.7; touched media is quarantined and retry creates a new archive set.
 - No in-console or selected-file restore, encryption, changer automation, incrementals, automatic snapshots, native ZFS send, or append-after-interruption is available.
 - ACLs, xattrs, sparse files, hard links, unusual names, all codecs/generations, spanning, refill, interruption, and clean-host recovery remain physically unqualified.
 

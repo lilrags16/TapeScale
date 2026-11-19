@@ -403,6 +403,64 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         json!("integration cancellation before cartridge assignment")
     );
 
+    let stale_profile = create_backup_profile(
+        &pool,
+        "Native v1 retry upgrade integration",
+        "native-v1-retry-source",
+        false,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE single_tape_data_profiles
+            SET engine_version = '1', adapter_version = 'native-v1',
+                format_version = 'tapescale-native-v1'
+          WHERE id = $1",
+    )
+    .bind(stale_profile.id)
+    .execute(&pool)
+    .await
+    .expect("stale Native v1 backup profile fixture should persist");
+    let upgraded_request = backup_ops::create_manual_backup_request(
+        &pool,
+        stale_profile.id,
+        "integration-native-v2-upgrade-001",
+        "Backup integration operator",
+    )
+    .await
+    .expect("a retry from a stale profile should create a Native v2 request")
+    .record()
+    .clone();
+    let upgraded_profile = backup_ops::get_backup_profile(&pool, stale_profile.id)
+        .await
+        .expect("upgraded backup profile should reload")
+        .expect("upgraded backup profile should remain present");
+    assert_eq!(upgraded_profile.engine_name, "TapeScale Native");
+    assert_eq!(upgraded_profile.engine_version, "2");
+    assert_eq!(upgraded_profile.adapter_version, "native-v2");
+    assert_eq!(upgraded_profile.format_version, "tapescale-native-v2");
+    let upgrade_audit = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM audit_events
+          WHERE action = 'backup.profile.engine_upgrade'
+            AND object_id = $1",
+    )
+    .bind(stale_profile.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("profile upgrade audit should be queryable");
+    assert_eq!(upgrade_audit, 1);
+    let cancelled_upgrade = backup_ops::cancel_waiting_backup_request(
+        &pool,
+        upgraded_request.id,
+        "Backup integration operator",
+        "profile upgrade contract completed",
+    )
+    .await
+    .expect("upgrade contract request should cancel cleanly");
+    assert!(matches!(
+        cancelled_upgrade,
+        CancelBackupRequestResult::Cancelled(_)
+    ));
+
     let scheduled_profile = create_backup_profile(
         &pool,
         "Scheduled backup integration",
@@ -439,19 +497,6 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         false,
     )
     .await;
-    // The finalization fixture below exercises the preserved v1 evidence API.
-    // Native v2 finalization is intentionally gated on its pack/volume seal
-    // ledger and is covered by the v2 store and migration contracts.
-    sqlx::query(
-        "UPDATE single_tape_data_profiles
-            SET engine_version = '1', adapter_version = 'native-v1',
-                format_version = 'tapescale-native-v1'
-          WHERE id = $1",
-    )
-    .bind(assignment_profile.id)
-    .execute(&pool)
-    .await
-    .expect("legacy finalization fixture should retain its v1 binding");
     let assignment_request = backup_ops::create_manual_backup_request(
         &pool,
         assignment_profile.id,
@@ -461,6 +506,19 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     .await
     .expect("assignment request should persist");
     let assignment_request = assignment_request.record().clone();
+    // Model a request retained in waiting_for_media by an older container.
+    // Assignment must repair its mutable profile before deriving a physical
+    // run even when no new request is created after the upgrade.
+    sqlx::query(
+        "UPDATE single_tape_data_profiles
+            SET engine_version = '1', adapter_version = 'native-v1',
+                format_version = 'tapescale-native-v1'
+          WHERE id = $1",
+    )
+    .bind(assignment_profile.id)
+    .execute(&pool)
+    .await
+    .expect("waiting Native v1 request fixture should persist");
     let drive = create_loaded_drive(&pool).await;
 
     let protected_media = store::create_media(
@@ -693,19 +751,6 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         false,
     )
     .await;
-    // This fixture exercises the preserved generic/v1 handoff contract. Native
-    // v2 continuation authorization intentionally requires the preceding
-    // volume's UUID and index to have passed physical readback first.
-    sqlx::query(
-        "UPDATE single_tape_data_profiles
-            SET engine_version = '1', adapter_version = 'native-v1',
-                format_version = 'tapescale-native-v1'
-          WHERE id = $1",
-    )
-    .bind(continuation_profile.id)
-    .execute(&pool)
-    .await
-    .expect("legacy continuation fixture should retain its v1 binding");
     let continuation_request = backup_ops::create_manual_backup_request(
         &pool,
         continuation_profile.id,
@@ -737,6 +782,38 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     let QueueSingleTapeDataRunResult::Queued(continuation_run) = continuation_run else {
         panic!("the spanning integration run should queue");
     };
+    // This fixture exercises the preserved generic/v1 handoff contract. A
+    // public operational assignment must always create v2, so synthesize the
+    // historical v1 binding only after the v2 assignment contract is proven.
+    sqlx::query(
+        "UPDATE single_tape_data_profiles
+            SET engine_version = '1', adapter_version = 'native-v1',
+                format_version = 'tapescale-native-v1'
+          WHERE id = $1",
+    )
+    .bind(continuation_profile.id)
+    .execute(&pool)
+    .await
+    .expect("historical v1 continuation profile fixture should persist");
+    sqlx::query(
+        "UPDATE single_tape_data_runs
+            SET engine_version = '1', adapter_version = 'native-v1',
+                format_version = 'tapescale-native-v1', native_layout_version = 1
+          WHERE id = $1",
+    )
+    .bind(continuation_run.id)
+    .execute(&pool)
+    .await
+    .expect("historical v1 continuation run fixture should persist");
+    sqlx::query(
+        "UPDATE single_tape_data_run_volumes
+            SET native_layout_version = 1
+          WHERE single_tape_data_run_id = $1",
+    )
+    .bind(continuation_run.id)
+    .execute(&pool)
+    .await
+    .expect("historical v1 continuation volume fixture should persist");
     assert_eq!(continuation_run.data_delivery, "disk_spool");
     let continuation_claim = store::claim_next_single_tape_data_run(&pool, Uuid::now_v7())
         .await
@@ -1622,6 +1699,27 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(assignment.resolved_compression, "zstd");
     assert!(assignment.spanning_enabled);
     assert_eq!(assignment.data_delivery, "disk_spool");
+    assert_eq!(assignment.engine_name, "TapeScale Native");
+    assert_eq!(assignment.engine_version, "2");
+    assert_eq!(assignment.adapter_version, "native-v2");
+    assert_eq!(assignment.format_version, "tapescale-native-v2");
+    let assignment_layout = sqlx::query_scalar::<_, i16>(
+        "SELECT native_layout_version FROM single_tape_data_runs WHERE id = $1",
+    )
+    .bind(assignment.id)
+    .fetch_one(&pool)
+    .await
+    .expect("assigned Native v2 layout should be queryable");
+    assert_eq!(assignment_layout, 2);
+    let repaired_assignment_profile = backup_ops::get_backup_profile(&pool, assignment_profile.id)
+        .await
+        .expect("repaired assignment profile should reload")
+        .expect("repaired assignment profile should remain present");
+    assert_eq!(repaired_assignment_profile.engine_version, "2");
+    assert_eq!(
+        repaired_assignment_profile.format_version,
+        "tapescale-native-v2"
+    );
     let assignment_volumes = store::data_run_volumes(&pool, assignment.id)
         .await
         .expect("the ordered initial tape assignment should reload");
@@ -1818,6 +1916,38 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     let QueueSingleTapeDataRunResult::Queued(final_run) = final_run else {
         panic!("the finalization fixture should queue");
     };
+    // The generic finalization assertions below exercise retained Native v1
+    // history. Public assignment has already proven it creates v2 above, so
+    // synthesize the old immutable run identity only after that boundary.
+    sqlx::query(
+        "UPDATE single_tape_data_profiles
+            SET engine_version = '1', adapter_version = 'native-v1',
+                format_version = 'tapescale-native-v1'
+          WHERE id = $1",
+    )
+    .bind(assignment_profile.id)
+    .execute(&pool)
+    .await
+    .expect("historical v1 finalization profile fixture should persist");
+    sqlx::query(
+        "UPDATE single_tape_data_runs
+            SET engine_version = '1', adapter_version = 'native-v1',
+                format_version = 'tapescale-native-v1', native_layout_version = 1
+          WHERE id = $1",
+    )
+    .bind(final_run.id)
+    .execute(&pool)
+    .await
+    .expect("historical v1 finalization run fixture should persist");
+    sqlx::query(
+        "UPDATE single_tape_data_run_volumes
+            SET native_layout_version = 1
+          WHERE single_tape_data_run_id = $1",
+    )
+    .bind(final_run.id)
+    .execute(&pool)
+    .await
+    .expect("historical v1 finalization volume fixture should persist");
     assert_eq!(final_run.data_delivery, "disk_spool");
     let claimed = store::claim_next_single_tape_data_run(&pool, Uuid::now_v7())
         .await

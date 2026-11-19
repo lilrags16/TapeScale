@@ -46,6 +46,16 @@
     { name: "Protected", detail: "Retain recovery evidence", aliases: ["verified", "passed", "completed", "complete"] }
   ];
   const BACKUP_TERMINAL_STATES = new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
+  const LEGACY_BACKUP_PHASES = [
+    { name: "Confirm first tape", detail: "Choose the first archive volume", aliases: ["waiting_for_media"] },
+    { name: "Preflight", detail: "Validate source, catalog, drive, tape, and staging path", aliases: ["queued", "media_assigned", "preparing"] },
+    { name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: ["inventorying", "manifesting", "source_manifest", "source_inventory"] },
+    { name: "Stage complete archive", detail: "Build the entire DAR archive on disk; tape remains idle", aliases: ["native_packing", "packing_pack", "refilling_spool", "native_pack_packing", "native_spool_refill"] },
+    { name: "Validate staged archive", detail: "Check the complete staged archive before tape moves", aliases: ["native_validating", "validating_pack", "native_pack_validating"] },
+    { name: "Write tape", detail: "Copy the complete staged archive to tape", aliases: ["writing", "backup_write", "media_write_started", "engine_dispatched", "native_pack_write", "native_volume_write", "waiting_for_next_media", "next_media", "media_required"] },
+    { name: "Read back", detail: "Verify the physical tape", aliases: ["verifying", "reading", "readback", "full_readback", "native_pack_readback", "native_volume_readback", "source_stability_check", "final_source_check"] },
+    { name: "Protected", detail: "Retain recovery evidence", aliases: ["verified", "passed", "completed", "complete"] }
+  ];
   const BACKUP_RECORD_PROGRESS_BASES = new Set([
     "bacula_job_files_over_manifest_entries",
     "bacula_job_files_over_backup_job_files",
@@ -694,10 +704,28 @@
     return ["direct", "disk_spool"].includes(backupDataDelivery(source));
   }
 
+  function backupUsesLegacyWholeArchive(source) {
+    const dataRun = source && typeof source === "object" && source.data_run && typeof source.data_run === "object" ? source.data_run : {};
+    const identity = (...keys) => {
+      const direct = pick(source, ...keys);
+      if (direct !== null) return direct;
+      const nested = pick(dataRun, ...keys);
+      return nested !== null ? nested : backupEvidenceValue(source, ...keys);
+    };
+    const format = String(identity("format_version") || "").toLowerCase();
+    const adapter = String(identity("adapter_version") || "").toLowerCase();
+    const engine = String(identity("engine_name") || "").toLowerCase();
+    const version = String(identity("engine_version") || "").toLowerCase();
+    return format === "tapescale-native-v1"
+      || adapter === "native-v1"
+      || (engine === "tapescale native" && version === "1");
+  }
+
   function backupDataDeliveryLabel(source) {
     const mode = backupDataDelivery(source);
     if (!backupDataDeliverySupported(source)) return "Unsupported (" + mode + ")";
     if (mode === "direct") return "Direct streaming (advanced)";
+    if (backupUsesLegacyWholeArchive(source)) return "Legacy whole-archive staging";
     return backupDataDeliveryExplicit(source) ? "Bounded rolling staging" : "Staged delivery (legacy)";
   }
 
@@ -1680,31 +1708,32 @@
 
   function backupPhaseIndex(run) {
     const runState = backupRunState(run);
-    if (["verified", "passed", "completed", "complete"].includes(runState)) return BACKUP_PHASES.length - 1;
-    if (backupTransferPhase(pick(backupPreparationProgress(run), "stage")) === "source_stability_check") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("source_stability_check"));
+    const phaseDefinitions = backupUsesLegacyWholeArchive(run) ? LEGACY_BACKUP_PHASES : BACKUP_PHASES;
+    if (["verified", "passed", "completed", "complete"].includes(runState)) return phaseDefinitions.length - 1;
+    if (backupTransferPhase(pick(backupPreparationProgress(run), "stage")) === "source_stability_check") return phaseDefinitions.findIndex((phase) => phase.aliases.includes("source_stability_check"));
     const nativeState = backupNativeEngineState(backupLiveIo(run));
-    if (["packing", "packing_pack", "refilling_spool"].includes(nativeState)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_packing"));
-    if (["validating", "validating_pack"].includes(nativeState)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_validating"));
-    if (["writing_native_volume", "writing_native_pack"].includes(nativeState)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_volume_write"));
-    if (["reading_native_volume", "reading_native_pack"].includes(nativeState)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_volume_readback"));
-    if (backupMediaIsReadback(run)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("readback"));
-    if (backupNeedsNextMedia(run)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("next_media"));
+    if (["packing", "packing_pack", "refilling_spool"].includes(nativeState)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("native_packing"));
+    if (["validating", "validating_pack"].includes(nativeState)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("native_validating"));
+    if (["writing_native_volume", "writing_native_pack"].includes(nativeState)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("native_volume_write"));
+    if (["reading_native_volume", "reading_native_pack"].includes(nativeState)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("native_volume_readback"));
+    if (backupMediaIsReadback(run)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("readback"));
+    if (backupNeedsNextMedia(run)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("next_media"));
     const rawExplicit = backupEvidenceValue(run, "phase_index");
     const explicit = rawExplicit === null || rawExplicit === undefined || rawExplicit === "" ? Number.NaN : Number(rawExplicit);
-    if (Number.isInteger(explicit) && explicit >= 0 && explicit < BACKUP_PHASES.length) return explicit;
+    if (Number.isInteger(explicit) && explicit >= 0 && explicit < phaseDefinitions.length) return explicit;
     const evidencePhase = backupTransferPhase(backupEvidenceValue(run, "phase", "event_type") || runState);
-    const fromEvidence = BACKUP_PHASES.findIndex((phase) => phase.aliases.includes(evidencePhase));
+    const fromEvidence = phaseDefinitions.findIndex((phase) => phase.aliases.includes(evidencePhase));
     if (fromEvidence >= 0) return fromEvidence;
     if (runState !== "waiting_for_media") {
       const expectedPhase = backupExpectedTransferPhase(run);
-      const fromExpected = BACKUP_PHASES.findIndex((phase) => phase.aliases.includes(expectedPhase));
+      const fromExpected = phaseDefinitions.findIndex((phase) => phase.aliases.includes(expectedPhase));
       if (fromExpected >= 0) return fromExpected;
     }
     const events = backupRunEvents(run).slice().reverse();
     for (const event of events) {
       const evidence = objectValue(event, "evidence");
       const eventName = backupTransferPhase(pick(evidence, "phase", "to_state") || pick(event, "to_state", "phase", "event_type"));
-      const eventIndex = BACKUP_PHASES.findIndex((phase) => phase.aliases.includes(eventName));
+      const eventIndex = phaseDefinitions.findIndex((phase) => phase.aliases.includes(eventName));
       if (eventIndex >= 0) return eventIndex;
     }
     return 0;
@@ -1714,12 +1743,13 @@
     const current = backupPhaseIndex(run);
     const completed = ["verified", "passed", "completed", "complete"].includes(backupRunState(run));
     const failed = BACKUP_TERMINAL_STATES.has(backupRunState(run)) && !completed;
-    const phases = BACKUP_PHASES.map((phase, index) => {
+    const phaseDefinitions = backupUsesLegacyWholeArchive(run) ? LEGACY_BACKUP_PHASES : BACKUP_PHASES;
+    const phases = phaseDefinitions.map((phase, index) => {
       const phaseClass = completed || index < current ? " done" : index === current ? failed ? " failed" : " current" : "";
       const marker = completed || index < current ? "✓" : index + 1;
       return '<div class="phase' + phaseClass + '"' + (index === current && !completed ? ' aria-current="step"' : "") + '><span class="phase-marker">' + esc(marker) + '</span><strong>' + esc(phase.name) + '</strong><small>' + esc(phase.detail) + "</small></div>";
     }).join("");
-    const summary = "Step " + (current + 1) + " of " + BACKUP_PHASES.length + " · " + BACKUP_PHASES[current].name;
+    const summary = "Step " + (current + 1) + " of " + phaseDefinitions.length + " · " + phaseDefinitions[current].name;
     return '<div class="phase-track backup-phase-track backup-phase-desktop" aria-label="Backup phases">' + phases + '</div><details class="backup-phase-mobile"><summary><span>Backup journey</span><strong>' + esc(summary) + '</strong></summary><div class="phase-track backup-phase-track" aria-label="All backup phases">' + phases + "</div></details>";
   }
 
@@ -1832,7 +1862,7 @@
     const progress = backupTableProgressLabel(run);
     const primary = item.kind === "waiting" ? "Continue backup" : item.kind === "active" ? "View live progress" : "Review attempt";
     let actions = '<a class="button button-small' + (item.kind === "failed" ? "" : " button-primary") + '" href="#jobs/' + esc(id) + '">' + esc(primary) + "</a>";
-    if (item.kind === "failed" && repeatAllowed) actions += '<button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">Retry same snapshot</button>';
+    if (item.kind === "failed" && repeatAllowed) actions += '<button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">' + (backupUsesLegacyWholeArchive(run) ? "Retry with Native v2" : "Retry same snapshot") + "</button>";
     if (item.kind === "failed") actions += '<button class="button button-small button-quiet" type="button" data-action="create-backup-profile">Choose newer snapshot</button>';
     const activityAt = item.kind === "failed" ? pick(run, "finished_at", "started_at", "created_at") : pick(run, "started_at", "created_at", "finished_at");
     return '<article class="backup-work-card ' + esc(item.kind) + '"><header><span>' + status(backupRunStateLabel(run)) + '</span><time>' + esc(date(activityAt)) + '</time></header><h3>' + esc(item.title) + '</h3><code>' + esc(source) + '</code><p>' + esc(item.detail) + '</p><div class="backup-work-facts"><span><small>Tape</small><strong>' + esc(backupTapeSummary(run)) + '</strong></span><span><small>Progress</small><strong>' + esc(progress || backupRunStateLabel(run)) + '</strong></span></div><footer>' + actions + "</footer></article>";
@@ -1990,6 +2020,9 @@
   function backupOperatorFailure(run) {
     const raw = String(backupFailureDetail(run) || "");
     if (!raw) return "TapeScale stopped before it could create a verified recovery point. Open technical details for the recorded cause.";
+    if (/complete (?:archive )?staging.*(?:needs?|requires?).*bytes|whole[- ]archive.*stag(?:e|ing).*(?:capacity|available|reserve)|staging needs approximately.*bytes.*available/i.test(raw)) {
+      return "This legacy attempt required the complete archive to fit on the staging disk before tape motion, but the disk did not have enough usable space. The tape was not changed. Retry with Native v2, which uses a bounded rolling buffer instead of staging the whole backup.";
+    }
     if (/\blease\b.*\b(?:expir|lost|fenc)|\b(?:expir|lost)\w*\b.*\blease\b|fencing token/i.test(raw)) {
       const writeBoundary = backupEvidenceValue(run, "media_write_started");
       const mediaWriteStarted = writeBoundary === true || String(writeBoundary).toLowerCase() === "true";
@@ -2042,11 +2075,15 @@
     const profile = backupProfileForRun(run);
     const profileId = String(pick(run, "profile_id", "backup_profile_id") || recordId(profile));
     const repeatAllowed = Boolean(profileId && profile && pick(profile, "enabled") !== false && backupCompressionSupported(profile) && backupDataDeliverySupported(profile) && backupDataDelivery(profile) === "disk_spool");
-    const repeat = terminal && repeatAllowed ? '<button class="button button-primary button-small" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">' + (successful ? "Back up same snapshot" : "Retry same snapshot") + "</button>" : "";
+    const legacyWholeArchive = backupUsesLegacyWholeArchive(run);
+    const legacyUpgrade = terminal && legacyWholeArchive
+      ? '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">↻</span><div class="notice-copy"><strong>This is a retained Native v1 attempt</strong><span>Its whole-archive staging rule remains visible as historical evidence. A new retry uses Native v2 bounded rolling packs and does not require the entire backup to fit on the staging disk.</span></div></div>'
+      : "";
+    const repeat = terminal && repeatAllowed ? '<button class="button button-primary button-small" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">' + (successful ? "Back up same snapshot" : legacyWholeArchive ? "Retry with Native v2" : "Retry same snapshot") + "</button>" : "";
     const newer = terminal ? '<button class="button button-small" type="button" data-action="create-backup-profile">Choose newer snapshot</button>' : "";
     const actions = cancel || repeat || newer ? '<div class="backup-run-actions">' + cancel + repeat + newer + "</div>" : "";
     const timing = startedAt ? "Started " + date(startedAt) : "Requested " + date(requestedAt);
-    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span><span class="backup-kind-badge secondary">' + esc(backupDataDeliveryLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>' + esc(timing) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header><div class="panel-body backup-primary-body">' + detailFailure + notice + renderBackupCurrentOperation(run) + actions + "</div>" + renderBackupPhaseTrack(run) + '<div class="panel-body backup-secondary-body">' + outcome + technical + "</div></article>";
+    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span><span class="backup-kind-badge secondary">' + esc(backupDataDeliveryLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>' + esc(timing) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header><div class="panel-body backup-primary-body">' + detailFailure + notice + legacyUpgrade + renderBackupCurrentOperation(run) + actions + "</div>" + renderBackupPhaseTrack(run) + '<div class="panel-body backup-secondary-body">' + outcome + technical + "</div></article>";
   }
 
   function renderBackupWorkQueue() {

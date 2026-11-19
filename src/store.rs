@@ -14,6 +14,9 @@ use uuid::Uuid;
 use crate::{
     device::{MissingSasDrive, SasDriveObservation, SasMotionOperation},
     domain::lto::{can_read, DriveGeneration, MediaFormat},
+    native_archive::{
+        NATIVE_ADAPTER_VERSION, NATIVE_ENGINE_NAME, NATIVE_ENGINE_VERSION, NATIVE_FORMAT_NAME,
+    },
     native_tape::{preparation_identity_cartridge_id, preparation_volume_identity},
 };
 
@@ -5793,7 +5796,7 @@ async fn queue_single_tape_data_run_inner(
     .bind(profile_id)
     .fetch_optional(&mut *transaction)
     .await?;
-    let Some(profile) = profile else {
+    let Some(mut profile) = profile else {
         transaction.rollback().await?;
         return Ok(QueueSingleTapeDataRunResult::NotFound);
     };
@@ -5893,6 +5896,77 @@ async fn queue_single_tape_data_run_inner(
             return Ok(QueueSingleTapeDataRunResult::Blocked(
                 "the backup request is no longer waiting for media".to_owned(),
             ));
+        }
+        if profile.workflow_kind == "backup"
+            && (profile.engine_name != NATIVE_ENGINE_NAME
+                || profile.engine_version != NATIVE_ENGINE_VERSION
+                || profile.adapter_version != NATIVE_ADAPTER_VERSION
+                || profile.format_version != NATIVE_FORMAT_NAME
+                || profile.archive_codec != "dar")
+        {
+            let request_correlation_id =
+                sqlx::query_scalar::<_, Uuid>("SELECT correlation_id FROM job_runs WHERE id = $1")
+                    .bind(request.job_run_id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+            let previous_binding = json!({
+                "engine_name": &profile.engine_name,
+                "engine_version": &profile.engine_version,
+                "adapter_version": &profile.adapter_version,
+                "format_version": &profile.format_version,
+                "archive_codec": &profile.archive_codec
+            });
+            let updated = sqlx::query(
+                "UPDATE single_tape_data_profiles
+                    SET engine_name = $1, engine_version = $2,
+                        adapter_version = $3, format_version = $4,
+                        archive_codec = 'dar', updated_at = now()
+                  WHERE id = $5 AND workflow_kind = 'backup'",
+            )
+            .bind(NATIVE_ENGINE_NAME)
+            .bind(NATIVE_ENGINE_VERSION)
+            .bind(NATIVE_ADAPTER_VERSION)
+            .bind(NATIVE_FORMAT_NAME)
+            .bind(profile_id)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() != 1 {
+                transaction.rollback().await?;
+                return Ok(QueueSingleTapeDataRunResult::Blocked(
+                    "the operational backup profile could not be upgraded to TapeScale Native v2"
+                        .to_owned(),
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO audit_events
+                    (id, actor_label, action, object_type, object_id,
+                     requested, result, correlation_id)
+                 VALUES ($1, 'TapeScale backup controller',
+                         'backup.profile.engine_upgrade',
+                         'single_tape_data_profile', $2, $3, 'upgraded', $4)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(profile_id.to_string())
+            .bind(json!({
+                "from": previous_binding,
+                "to": {
+                    "engine_name": NATIVE_ENGINE_NAME,
+                    "engine_version": NATIVE_ENGINE_VERSION,
+                    "adapter_version": NATIVE_ADAPTER_VERSION,
+                    "format_version": NATIVE_FORMAT_NAME,
+                    "archive_codec": "dar"
+                },
+                "reason": "media assignment requires the bounded rolling-spool writer",
+                "backup_request_id": request.request_id
+            }))
+            .bind(request_correlation_id)
+            .execute(&mut *transaction)
+            .await?;
+            profile.engine_name = NATIVE_ENGINE_NAME.to_owned();
+            profile.engine_version = NATIVE_ENGINE_VERSION.to_owned();
+            profile.adapter_version = NATIVE_ADAPTER_VERSION.to_owned();
+            profile.format_version = NATIVE_FORMAT_NAME.to_owned();
+            profile.archive_codec = "dar".to_owned();
         }
     }
 
@@ -6061,14 +6135,10 @@ async fn queue_single_tape_data_run_inner(
             None,
         )
     };
-    let native_layout_version = if profile.engine_name == "TapeScale Native"
-        && profile.engine_version == "2"
-        && profile.format_version == "tapescale-native-v2"
-    {
-        2_i16
-    } else {
-        1_i16
-    };
+    // New operational work always uses the bounded rolling layout. The
+    // mutable profile was normalized above, while already-created run rows
+    // remain untouched as immutable historical evidence.
+    let native_layout_version = if is_backup { 2_i16 } else { 1_i16 };
     sqlx::query(
         "INSERT INTO single_tape_data_runs
             (id, profile_id, job_run_id, source_snapshot_id, drive_id, cartridge_id,

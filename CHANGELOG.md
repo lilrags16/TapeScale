@@ -2,6 +2,17 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.2.0-alpha.7] - 2026-11-19
+
+### Native v2 upgrade enforcement
+
+- Fixes the alpha.6 browser-cache collision that could keep serving the alpha.5 whole-archive-staging console after a container upgrade. Console assets now use a new cache key and every response is marked `no-store`, so the UI and API cannot silently drift across future redeployments.
+- Normalizes every mutable operational backup profile to TapeScale Native v2 when a request is created and again when tape is assigned. A retained alpha.5 waiting request therefore cannot create another Native v1 whole-archive run; new physical work always receives layout v2 and the bounded rolling spool.
+- Re-runs the safe database cutover for profiles and untouched queued work to close an old/new-container overlap window. Running, terminal, or media-touched Native v1 records remain immutable historical evidence.
+- Makes retained Native v1 failures explicit in the console. The exact staging-capacity failure is no longer misreported as a drive or tape change, the historical journey is labeled as legacy whole-archive staging, and the action is **Retry with Native v2**.
+
+The failed attempt shown by alpha.5 did not move or alter the tape: its capacity gate stopped before tape motion. After deploying alpha.7, retrying the same immutable snapshot creates a new Native v2 attempt and uses only the bounded rolling spool window.
+
 ## [0.2.0-alpha.6] - 2026-11-19
 
 ### TapeScale Native v2 rolling archives
@@ -300,6 +311,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.2.0-alpha.7]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.7
 [0.2.0-alpha.6]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.6
 [0.2.0-alpha.5]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.5
 [0.2.0-alpha.4]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.4

@@ -14,7 +14,12 @@ use serde_json::{json, Value};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::domain::schedule::{default_occurrence, RunKind};
+use crate::{
+    domain::schedule::{default_occurrence, RunKind},
+    native_archive::{
+        NATIVE_ADAPTER_VERSION, NATIVE_ENGINE_NAME, NATIVE_ENGINE_VERSION, NATIVE_FORMAT_NAME,
+    },
+};
 
 pub const DEFAULT_FULL_SCHEDULE: &str = "0 2 * * 6";
 pub const DEFAULT_RETENTION_DAYS: i32 = 28;
@@ -618,6 +623,11 @@ async fn create_backup_request(
         spanning_enabled: bool,
         data_delivery: String,
         verification_mode: String,
+        engine_name: String,
+        engine_version: String,
+        adapter_version: String,
+        format_version: String,
+        archive_codec: String,
     }
     let profile = sqlx::query_as::<_, RequestProfile>(
         "SELECT data_profile.job_id, data_profile.source_snapshot_id,
@@ -625,7 +635,9 @@ async fn create_backup_request(
                 data_profile.production_eligible, policy.representation,
                 policy.encryption_enabled, policy.compression_mode,
                 policy.spanning_enabled, policy.data_delivery,
-                policy.verification_mode
+                policy.verification_mode, data_profile.engine_name,
+                data_profile.engine_version, data_profile.adapter_version,
+                data_profile.format_version, data_profile.archive_codec
            FROM single_tape_data_profiles data_profile
            JOIN protection_policies policy ON policy.id = data_profile.policy_id
           WHERE data_profile.id = $1 AND data_profile.workflow_kind = 'backup'
@@ -635,6 +647,60 @@ async fn create_backup_request(
     .fetch_optional(&mut *transaction)
     .await?
     .ok_or(BackupOpsError::NotFound)?;
+
+    // A backup profile is mutable configuration; only an already-created run
+    // is immutable physical evidence. Normalize the profile at every request
+    // boundary so a profile retained by Native v1 (for example while an old
+    // run was active during the upgrade) cannot launch another whole-archive
+    // staging attempt after that run stops.
+    if profile.engine_name != NATIVE_ENGINE_NAME
+        || profile.engine_version != NATIVE_ENGINE_VERSION
+        || profile.adapter_version != NATIVE_ADAPTER_VERSION
+        || profile.format_version != NATIVE_FORMAT_NAME
+        || profile.archive_codec != "dar"
+    {
+        sqlx::query(
+            "UPDATE single_tape_data_profiles
+                SET engine_name = $1, engine_version = $2,
+                    adapter_version = $3, format_version = $4,
+                    archive_codec = 'dar', updated_at = now()
+              WHERE id = $5 AND workflow_kind = 'backup'",
+        )
+        .bind(NATIVE_ENGINE_NAME)
+        .bind(NATIVE_ENGINE_VERSION)
+        .bind(NATIVE_ADAPTER_VERSION)
+        .bind(NATIVE_FORMAT_NAME)
+        .bind(profile_id)
+        .execute(&mut *transaction)
+        .await?;
+        append_audit(
+            &mut transaction,
+            requested_by_label,
+            "backup.profile.engine_upgrade",
+            "single_tape_data_profile",
+            profile_id.to_string(),
+            json!({
+                "from": {
+                    "engine_name": profile.engine_name,
+                    "engine_version": profile.engine_version,
+                    "adapter_version": profile.adapter_version,
+                    "format_version": profile.format_version,
+                    "archive_codec": profile.archive_codec
+                },
+                "to": {
+                    "engine_name": NATIVE_ENGINE_NAME,
+                    "engine_version": NATIVE_ENGINE_VERSION,
+                    "adapter_version": NATIVE_ADAPTER_VERSION,
+                    "format_version": NATIVE_FORMAT_NAME,
+                    "archive_codec": "dar"
+                },
+                "reason": "new backup requests require the bounded rolling-spool writer"
+            }),
+            "upgraded",
+            Uuid::now_v7(),
+        )
+        .await?;
+    }
     if !profile.enabled
         || profile.production_eligible
         || profile.representation != "file"

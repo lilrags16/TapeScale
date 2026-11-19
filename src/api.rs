@@ -19,6 +19,7 @@ use tokio::sync::Semaphore;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     services::{ServeDir, ServeFile},
+    set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
 use tracing::info;
@@ -217,6 +218,13 @@ pub fn router(state: AppState, web_dir: PathBuf) -> Router {
         .fallback(ServeFile::new(web_dir.join("index.html")));
 
     api.fallback_service(static_files)
+        // The console and API evolve together.  Never let a browser retain an
+        // older app.js across a container upgrade and present obsolete backup
+        // behavior against the new control plane.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        ))
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
         .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
@@ -1483,6 +1491,11 @@ async fn build_backup_run_view(
                     "resolved_compression",
                     "spanning_enabled",
                     "data_delivery",
+                    "engine_name",
+                    "engine_version",
+                    "adapter_version",
+                    "format_version",
+                    "native_layout_version",
                 ] {
                     if let Some(item) = data.get(key) {
                         object.insert(key.to_owned(), item.clone());
@@ -4958,6 +4971,7 @@ fn derived_preflight_status(checks: &[Value]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
 
     fn valid_request() -> CreateMediaRequest {
         CreateMediaRequest {
@@ -4967,6 +4981,40 @@ mod tests {
             media_format: None,
             worm: false,
         }
+    }
+
+    #[tokio::test]
+    async fn console_assets_are_never_reused_across_container_upgrades() {
+        let directory = tempfile::tempdir().expect("temporary web root");
+        std::fs::write(directory.path().join("app.js"), "current-console")
+            .expect("test console asset");
+        std::fs::write(directory.path().join("index.html"), "current-index")
+            .expect("test console index");
+        let state = AppState::new(
+            None,
+            true,
+            false,
+            false,
+            false,
+            PathBuf::from("/source"),
+            PathBuf::from("/restore"),
+        );
+
+        let response = router(state, directory.path().to_path_buf())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/app.js")
+                    .body(Body::empty())
+                    .expect("asset request"),
+            )
+            .await
+            .expect("asset response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
+        );
     }
 
     #[test]

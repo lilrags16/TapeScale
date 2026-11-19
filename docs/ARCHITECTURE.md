@@ -1,6 +1,6 @@
 # Architecture
 
-TapeScale is a control plane for durable LTO protection on TrueNAS. `0.2.0-alpha.6` writes **TapeScale Native v2**, a self-describing on-tape format owned by TapeScale. Native v2 replaces v1's whole-archive disk stage with independently finalized DAR packs in a bounded rolling spool. DAR 2.8.6 is a separately executed archive codec; it does not own cartridge identity, tape motion, media handoff, verification evidence, retention, or recovery policy.
+TapeScale is a control plane for durable LTO protection on TrueNAS. `0.2.0-alpha.7` writes **TapeScale Native v2**, a self-describing on-tape format owned by TapeScale. Native v2 replaces v1's whole-archive disk stage with independently finalized DAR packs in a bounded rolling spool. DAR 2.8.6 is a separately executed archive codec; it does not own cartridge identity, tape motion, media handoff, verification evidence, retention, or recovery policy.
 
 The active runtime has no Bacula package or daemon dependency. Bacula-specific source modules and historical database values remain only so failed earlier-alpha rows can be read as audit history; new profiles, preparation runs, backups, and recovery media use the native contract.
 
@@ -156,7 +156,7 @@ Inventory labels and barcodes are human/custody metadata; the native UUID read f
 - pre-write failures delete unused temporary packs and leave tape untouched;
 - after a complete pack's tape files close durably, its disk copy may be reclaimed to keep the spool bounded; the archive remains invalid until the containing volume passes full physical readback;
 - post-boundary failures mark touched media uncertain and never promote a partial set;
-- an interrupted partial volume is quarantined; alpha.6 does not resume or append mid-volume, so a retry creates and restages a new archive set;
+- an interrupted partial volume is quarantined; alpha.7 does not resume or append mid-volume, so a retry creates and restages a new archive set;
 - cancellation is cooperative at safe boundaries because blocking kernel tape I/O cannot be forcibly made atomic;
 - wrong tape, identity conflict, lease loss, device replacement, reset position, malformed native metadata, length/hash mismatch, source mutation, or failed cleanup prevents recovery-point creation;
 - terminal evidence never upgrades a broader hardware/format qualification state.
