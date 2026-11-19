@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -44,8 +44,9 @@ use crate::{
         read_and_hash_tape_file_with_progress, read_tape_file_with_progress, sha256_bytes,
         write_dar_pack_inclusion_list, write_tape_bytes, write_tape_path, DarCompression,
         DarPackCreateInvocation, DarPackInput, DarPackSizing, DarTestInvocation,
-        NativeArchiveError, PlannedDarPack, StagedDarPack, StagedSlice,
-        MAX_NATIVE_PACK_TARGET_BYTES, MIN_NATIVE_PACK_TARGET_BYTES, NATIVE_ROLLING_FORMAT_NAME,
+        NativeArchiveError, PlannedDarPack, StagedDarPack, StagedDarPackDiscoveryProgress,
+        StagedSlice, MAX_NATIVE_PACK_TARGET_BYTES, MIN_NATIVE_PACK_TARGET_BYTES,
+        NATIVE_ROLLING_FORMAT_NAME,
     },
     native_format::{
         ordered_sha256_digest, NativeArchiveRepresentation, NativeArchiveSetSeal,
@@ -164,6 +165,19 @@ struct ReadyNativePacks {
     physical_bytes: u64,
 }
 
+/// `spawn_blocking` tasks cannot be force-aborted once hashing has started.
+/// Make dropping their async supervisor a cooperative cancellation signal so
+/// a lease failure or outer task abort cannot leave a detached spool reader.
+struct BlockingDiscoveryCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for BlockingDiscoveryCancellation {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
 impl ReadyNativePacks {
     fn push(&mut self, pack: StagedPack) -> Result<(), ExerciseFailure> {
         let physical_bytes = staged_pack_physical_bytes(&pack)?;
@@ -259,18 +273,44 @@ pub(super) async fn execute_claimed(
     let stage_directory = config.native_spool_dir.join(claim.run.id.to_string());
     let mut tape_touched = false;
     let mut media_write_started = false;
-    let operation = perform_native_v2_backup(
-        pool,
-        sas_config,
-        config,
-        claim,
-        cancellation,
-        &evidence_directory,
-        &stage_directory,
-        &mut tape_touched,
-        &mut media_write_started,
-    )
-    .await;
+    // The writer performs several long CPU- and disk-bound phases before the
+    // first tape command.  Keep the fenced hardware assignment alive from a
+    // run-level heartbeat rather than relying on each individual phase to do
+    // so.  A new phase can therefore never recreate the lease-expiry gap that
+    // previously existed while a large staged pack was being hashed.
+    let operation_cancellation = cancellation.child_token();
+    let operation = {
+        let operation = perform_native_v2_backup(
+            pool,
+            sas_config,
+            config,
+            claim,
+            &operation_cancellation,
+            &evidence_directory,
+            &stage_directory,
+            &mut tape_touched,
+            &mut media_write_started,
+        );
+        tokio::pin!(operation);
+        let mut lease_heartbeat = tokio::time::interval(LIVE_SAMPLE_INTERVAL);
+        lease_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                result = &mut operation => break result,
+                _ = lease_heartbeat.tick() => {
+                    if let Err(error) = renew_claim(
+                        pool,
+                        claim,
+                        "during Native v2 archive preparation and streaming",
+                    ).await {
+                        operation_cancellation.cancel();
+                        break Err(error);
+                    }
+                }
+            }
+        }
+    };
+    operation_cancellation.cancel();
     let cleanup = if tape_touched {
         cleanup_drive(pool, sas_config, claim).await
     } else {
@@ -678,17 +718,15 @@ async fn perform_native_v2_backup(
                     )
                     .await?
                 };
-                if order == 1 {
-                    native::verify_native_preparation(
-                        pool,
-                        sas_config,
-                        config,
-                        claim,
-                        &record,
-                        cancellation,
-                    )
-                    .await?;
-                }
+                revalidate_volume_before_write(
+                    pool,
+                    sas_config,
+                    config,
+                    claim,
+                    &record,
+                    cancellation,
+                )
+                .await?;
                 current_volume = Some(
                     open_volume(
                         pool,
@@ -1116,6 +1154,148 @@ fn ordered_sha256<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn discover_staged_pack_with_progress(
+    pool: &PgPool,
+    sas_config: &SasDiscoveryConfig,
+    config: &Config,
+    claim: &store::ClaimedSingleTapeDataRun,
+    cancellation: &CancellationToken,
+    stage_directory: &Path,
+    pack_directory: &Path,
+    inclusion_path: &Path,
+    plan: &PlannedDarPack,
+    compression: DarCompression,
+    spool: SpoolWindow,
+) -> Result<StagedDarPack, ExerciseFailure> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancellation_guard = BlockingDiscoveryCancellation {
+        cancelled: Arc::clone(&cancelled),
+    };
+    let progress = Arc::new(StagedDarPackDiscoveryProgress::default());
+    let worker_cancelled = Arc::clone(&cancelled);
+    let worker_progress = Arc::clone(&progress);
+    let worker_pack_directory = pack_directory.to_owned();
+    let worker_inclusion_path = inclusion_path.to_owned();
+    let pack_ordinal = plan.pack_ordinal;
+    let mut discovery = tokio::task::spawn_blocking(move || {
+        StagedDarPack::discover_with_cancel_and_progress(
+            &worker_pack_directory,
+            &worker_inclusion_path,
+            pack_ordinal,
+            compression,
+            &worker_cancelled,
+            &worker_progress,
+        )
+    });
+    let mut tick = tokio::time::interval(LIVE_SAMPLE_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    let mut previous = (0_u64, Instant::now());
+    let mut last_movement = previous.1;
+
+    loop {
+        tokio::select! {
+            result = &mut discovery => {
+                return result
+                    .map_err(|error| ExerciseFailure::failed(format!(
+                        "Native v2 pack {} hash worker stopped unexpectedly: {error}",
+                        plan.pack_ordinal,
+                    )))?
+                    .map_err(|error| match error {
+                        NativeArchiveError::Cancelled if cancellation.is_cancelled() => {
+                            ExerciseFailure::interrupted(format!(
+                                "worker shutdown interrupted hashing Native v2 pack {}",
+                                plan.pack_ordinal,
+                            ))
+                        }
+                        other => ExerciseFailure::failed(format!(
+                            "could not hash Native v2 pack {}: {other}",
+                            plan.pack_ordinal,
+                        )),
+                    });
+            }
+            () = cancellation.cancelled() => {
+                cancelled.store(true, Ordering::Release);
+                let _ = discovery.await;
+                return Err(ExerciseFailure::interrupted(format!(
+                    "worker shutdown interrupted hashing Native v2 pack {}",
+                    plan.pack_ordinal,
+                )));
+            }
+            _ = tick.tick() => {
+                // The run-level heartbeat is authoritative. This boundary
+                // renewal also makes this long operation safe if it is ever
+                // reused outside the current producer lifecycle.
+                if let Err(error) = renew_claim(
+                    pool,
+                    claim,
+                    "while hashing a completed Native v2 pack",
+                ).await {
+                    cancelled.store(true, Ordering::Release);
+                    let _ = discovery.await;
+                    return Err(error);
+                }
+                let snapshot = progress.snapshot();
+                if snapshot.total_bytes == 0 || snapshot.files_total == 0 {
+                    continue;
+                }
+                let now = Instant::now();
+                if snapshot.bytes_hashed != previous.0 {
+                    last_movement = now;
+                }
+                let rate = bytes_per_second(
+                    previous.0,
+                    snapshot.bytes_hashed,
+                    now.saturating_duration_since(previous.1),
+                );
+                previous = (snapshot.bytes_hashed, now);
+                let idle = now.saturating_duration_since(last_movement);
+                if idle >= config.transfer_stall_timeout {
+                    cancelled.store(true, Ordering::Release);
+                    let _ = discovery.await;
+                    return Err(ExerciseFailure::failed(format!(
+                        "hashing Native v2 pack {} made no disk-read progress before the transfer-stall deadline",
+                        plan.pack_ordinal,
+                    )));
+                }
+                let current_file = snapshot.current_slice_ordinal.map(|ordinal| {
+                    format!(
+                        "pack-{:08}/archive.{ordinal:06}.dar",
+                        plan.pack_ordinal,
+                    )
+                });
+                let usage = match spool_usage(stage_directory) {
+                    Ok(usage) => usage,
+                    Err(error) => {
+                        cancelled.store(true, Ordering::Release);
+                        let _ = discovery.await;
+                        return Err(error);
+                    }
+                };
+                let mut sample = V2Sample::spool(
+                    "hashing_pack",
+                    store::SingleTapeLiveActivity::Buffering,
+                    usage,
+                    spool,
+                    snapshot.files_hashed,
+                    snapshot.files_total,
+                    snapshot.bytes_hashed,
+                    current_file,
+                );
+                sample.pipeline_total = Some(snapshot.total_bytes);
+                sample.pipeline_rate = rate;
+                sample.progress_scope = u64::from(plan.pack_ordinal)
+                    .saturating_mul(1_000_000)
+                    .saturating_add(2);
+                sample.progress_idle_ms = duration_millis_u64(idle);
+                sample.no_progress_timeout_ms = duration_millis_u64(config.transfer_stall_timeout);
+                publish_v2_sample(pool, sas_config, claim, sample).await;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn stage_one_pack(
     pool: &PgPool,
     sas_config: &SasDiscoveryConfig,
@@ -1165,13 +1345,20 @@ async fn stage_one_pack(
         "packing_pack",
     )
     .await?;
-    let archive = StagedDarPack::discover(
+    let archive = discover_staged_pack_with_progress(
+        pool,
+        sas_config,
+        config,
+        claim,
+        cancellation,
+        stage_directory,
         &pack_directory,
         &inclusion_path,
-        plan.pack_ordinal,
+        plan,
         compression,
+        spool,
     )
-    .map_err(|error| ExerciseFailure::failed(error.to_string()))?;
+    .await?;
     let test = DarTestInvocation::new(
         &config.dar_path,
         &archive.archive_base,
@@ -1800,6 +1987,82 @@ async fn write_tape_file(
     Ok(())
 }
 
+/// Re-establish the complete physical precondition immediately before a
+/// volume crosses the durable write boundary.  Pack production may run for
+/// hours after the original assignment, so neither the startup observation
+/// nor an earlier attended-media check is sufficient evidence here.
+async fn revalidate_volume_before_write(
+    pool: &PgPool,
+    sas_config: &SasDiscoveryConfig,
+    config: &Config,
+    claim: &store::ClaimedSingleTapeDataRun,
+    record: &store::DataRunVolumeRecord,
+    cancellation: &CancellationToken,
+) -> Result<(), ExerciseFailure> {
+    let observations = discover_and_persist(pool, sas_config)
+        .await
+        .map_err(|error| {
+            ExerciseFailure::interrupted(format!(
+                "could not refresh the assigned drive immediately before tape writing: {error}"
+            ))
+        })?;
+    let observation = matching_observation(
+        &observations,
+        &claim.run.expected_path,
+        &claim.run.expected_stable_id,
+    )
+    .ok_or_else(|| {
+        ExerciseFailure::blocked(
+            "the exact assigned tape drive disappeared before the Native v2 write",
+        )
+    })?;
+    if let Some(reason) = observation_blocker(observation, &claim.run) {
+        return Err(ExerciseFailure::blocked(format!(
+            "the selected drive or loaded tape changed before the Native v2 write: {reason}"
+        )));
+    }
+
+    // This reads TapeScale's preparation identity from the physical medium;
+    // the UUID, rather than an operator acknowledgement, proves which tape is
+    // actually loaded.
+    native::verify_native_preparation(pool, sas_config, config, claim, record, cancellation)
+        .await?;
+
+    let observations = discover_and_persist(pool, sas_config)
+        .await
+        .map_err(|error| {
+            ExerciseFailure::interrupted(format!(
+                "could not verify the assigned drive after reading the tape identity: {error}"
+            ))
+        })?;
+    let observation = matching_observation(
+        &observations,
+        &claim.run.expected_path,
+        &claim.run.expected_stable_id,
+    )
+    .ok_or_else(|| {
+        ExerciseFailure::blocked(
+            "the exact assigned tape drive disappeared after loaded-tape verification",
+        )
+    })?;
+    if let Some(reason) = observation_blocker(observation, &claim.run) {
+        return Err(ExerciseFailure::blocked(format!(
+            "the selected drive or loaded tape changed during loaded-tape verification: {reason}"
+        )));
+    }
+    if observation.at_bot != Some(true) || observation.position_lost == Some(true) {
+        return Err(ExerciseFailure::blocked(
+            "loaded-tape verification did not leave the exact selected tape at a known beginning-of-tape position",
+        ));
+    }
+    renew_claim(
+        pool,
+        claim,
+        "after proving the loaded TapeScale identity and before tape writing",
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_volume(
     pool: &PgPool,
@@ -1818,6 +2081,12 @@ async fn open_volume(
     let volume_ordinal = u32::try_from(record.volume_order)
         .map_err(|_| ExerciseFailure::failed("invalid Native v2 volume order"))?;
     let volume_name = rolling_archive_volume_identity(claim.run.archive_id, volume_ordinal);
+    renew_claim(
+        pool,
+        claim,
+        "after loaded-tape verification and immediately before the Native v2 media-write boundary",
+    )
+    .await?;
     if !store::mark_data_run_volume_write_started(pool, claim, record.volume_order, &volume_name)
         .await
         .map_err(|error| ExerciseFailure::interrupted(error.to_string()))?
@@ -3006,10 +3275,16 @@ async fn finalize_native_v2_backup(
 mod tests {
     use super::{
         dar_current_file, native_v2_spool_telemetry, ready_queue_needs_refill,
-        ready_queue_resume_bytes, SpoolWindow,
+        ready_queue_resume_bytes, BlockingDiscoveryCancellation, SpoolWindow,
     };
     use crate::native_archive::DarPackSizing;
-    use std::path::Path;
+    use std::{
+        path::Path,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
 
     #[test]
     fn dar_progress_is_source_relative() {
@@ -3027,6 +3302,17 @@ mod tests {
             Some("photos/one.jpg")
         );
         assert!(dar_current_file(root, "Adding file to archive: /etc/shadow").is_none());
+    }
+
+    #[test]
+    fn dropping_pack_hash_supervision_requests_blocking_cancellation() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = BlockingDiscoveryCancellation {
+            cancelled: Arc::clone(&cancelled),
+        };
+        assert!(!cancelled.load(Ordering::Acquire));
+        drop(guard);
+        assert!(cancelled.load(Ordering::Acquire));
     }
 
     #[test]

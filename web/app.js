@@ -39,8 +39,8 @@
     { name: "Confirm first tape", detail: "Choose the first archive volume", aliases: ["waiting_for_media"] },
     { name: "Preflight", detail: "Validate source, catalog, drive, tape, and staging path", aliases: ["queued", "media_assigned", "preparing"] },
     { name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: ["inventorying", "manifesting", "source_manifest", "source_inventory"] },
-    { name: "Build archive packs", detail: "Build and test bounded DAR packs", aliases: ["native_packing", "packing_pack", "refilling_spool", "native_pack_packing", "native_spool_refill"] },
-    { name: "Validate pack", detail: "Check each completed pack before tape", aliases: ["native_validating", "validating_pack", "native_pack_validating"] },
+    { name: "Build archive packs", detail: "Build and test bounded DAR packs", aliases: ["native_packing", "packing", "packing_pack", "refilling_spool", "native_pack_packing", "native_spool_refill", "producer_started", "producer_resumed"] },
+    { name: "Validate pack", detail: "Check each completed pack before tape", aliases: ["native_validating", "validating", "validating_pack", "hashing_pack", "native_pack_validating"] },
     { name: "Write & reclaim", detail: "Stream validated packs; reclaim after durable filemarks", aliases: ["writing", "backup_write", "media_write_started", "engine_dispatched", "native_pack_write", "native_volume_write", "native_pack_readback", "native_volume_readback", "native_spool_reclaimed", "waiting_for_next_media", "next_media", "media_required", "verifying", "reading", "readback", "full_readback"] },
     { name: "Finalize", detail: "Seal the pack set and confirm the source", aliases: ["written", "finalizing", "native_archive_seal", "native_set_seal", "source_stability_check", "final_source_check"] },
     { name: "Protected", detail: "Retain recovery evidence", aliases: ["verified", "passed", "completed", "complete"] }
@@ -50,8 +50,8 @@
     { name: "Confirm first tape", detail: "Choose the first archive volume", aliases: ["waiting_for_media"] },
     { name: "Preflight", detail: "Validate source, catalog, drive, tape, and staging path", aliases: ["queued", "media_assigned", "preparing"] },
     { name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: ["inventorying", "manifesting", "source_manifest", "source_inventory"] },
-    { name: "Stage complete archive", detail: "Build the entire DAR archive on disk; tape remains idle", aliases: ["native_packing", "packing_pack", "refilling_spool", "native_pack_packing", "native_spool_refill"] },
-    { name: "Validate staged archive", detail: "Check the complete staged archive before tape moves", aliases: ["native_validating", "validating_pack", "native_pack_validating"] },
+    { name: "Stage complete archive", detail: "Build the entire DAR archive on disk; tape remains idle", aliases: ["native_packing", "packing", "packing_pack", "refilling_spool", "native_pack_packing", "native_spool_refill", "producer_started", "producer_resumed"] },
+    { name: "Validate staged archive", detail: "Check the complete staged archive before tape moves", aliases: ["native_validating", "validating", "validating_pack", "hashing_pack", "native_pack_validating"] },
     { name: "Write tape", detail: "Copy the complete staged archive to tape", aliases: ["writing", "backup_write", "media_write_started", "engine_dispatched", "native_pack_write", "native_volume_write", "waiting_for_next_media", "next_media", "media_required"] },
     { name: "Read back", detail: "Verify the physical tape", aliases: ["verifying", "reading", "readback", "full_readback", "native_pack_readback", "native_volume_readback", "source_stability_check", "final_source_check"] },
     { name: "Protected", detail: "Retain recovery evidence", aliases: ["verified", "passed", "completed", "complete"] }
@@ -1018,6 +1018,7 @@
       rawPercent,
       percentBasis,
       progressBasis,
+      pipelineBasis: String(pick(sample, "pipeline_basis") || ""),
       phaseComplete: rawPercent === 100,
       sampleFresh,
       stale,
@@ -1100,6 +1101,7 @@
       refilling_spool: "Refilling the archive buffer",
       validating: "Validating the archive buffer",
       validating_pack: "Validating the next archive pack",
+      hashing_pack: "Hashing the completed archive pack",
       writing_native_volume: "Streaming a native volume to tape",
       writing_native_pack: "Streaming an archive pack to tape",
       reading_native_volume: "Reading the volume back now",
@@ -1240,7 +1242,7 @@
     const directDelivery = backupDataDelivery(run) === "direct";
     let activity = backupLiveActivity(liveIo, livePhase);
     const nativePacking = ["packing", "packing_pack", "refilling_spool"].includes(engineState);
-    const nativeValidating = ["validating", "validating_pack"].includes(engineState);
+    const nativeValidating = ["validating", "validating_pack", "hashing_pack"].includes(engineState);
     const nativeWriting = ["writing_native_volume", "writing_native_pack"].includes(engineState);
     const nativeReadback = ["reading_native_volume", "reading_native_pack"].includes(engineState);
     if ((nativePacking || nativeValidating) && activity === "idle") activity = "buffering";
@@ -1248,22 +1250,26 @@
     const readPipeline = nativeReadback || ["full_readback", "tape_read", "tape_readback", "verifying", "restore"].includes(livePhase);
     const pipelineLabel = nativePacking
       ? "DAR pack production"
-      : nativeValidating
-        ? "Archive-pack validation"
-        : nativeWriting
-          ? "Native pack stream"
-          : nativeReadback
-            ? "Physical readback"
-            : backupPipeline ? "Archive write stream" : readPipeline ? "Archive read stream" : "Archive engine stream";
+      : engineState === "hashing_pack"
+        ? "Archive-pack SHA-256"
+        : nativeValidating
+          ? "Archive-pack validation"
+          : nativeWriting
+            ? "Native pack stream"
+            : nativeReadback
+              ? "Physical readback"
+              : backupPipeline ? "Archive write stream" : readPipeline ? "Archive read stream" : "Archive engine stream";
     const pipelineDetail = nativePacking
       ? "Source files packaged into a bounded rolling disk buffer · ready packs may stream in parallel"
-      : nativeValidating
-        ? "A completed archive pack is checked before it joins the tape-ready queue"
-        : nativeWriting
-          ? "Completed TapeScale Native pack bytes"
-          : nativeReadback
-            ? "Immediate readback of the just-written physical volume"
-            : "Engine stream bytes · not source logical bytes";
+      : engineState === "hashing_pack"
+        ? "The completed disk pack is hashed before it joins the tape-ready queue"
+        : nativeValidating
+          ? "A completed archive pack is checked before it joins the tape-ready queue"
+          : nativeWriting
+            ? "Completed TapeScale Native pack bytes"
+            : nativeReadback
+              ? "Immediate readback of the just-written physical volume"
+              : "Engine stream bytes · not source logical bytes";
     const rate = (value, available) => {
       if (available === false) return "Unavailable";
       if (value === null || value === undefined || value === "") return "Measuring…";
@@ -1330,6 +1336,7 @@
       refilling_spool: "TapeScale is prefilling or replenishing the validated ready reserve; tape stays at a safe tape-file boundary until the resume threshold or producer completion.",
       validating: "TapeScale is validating a completed archive pack before allowing it onto tape.",
       validating_pack: "TapeScale is validating a completed archive pack before allowing it onto tape.",
+      hashing_pack: "TapeScale is hashing the completed disk pack before allowing it onto tape.",
       writing_native_volume: "The staged TapeScale Native volume is streaming sequentially to the physical tape.",
       writing_native_pack: "A completed archive pack is streaming sequentially to tape; its disk copy is reclaimed only after the complete tape files and filemarks close.",
       reading_native_volume: "TapeScale is immediately reading the just-written volume from physical media before it requests another tape or finalizes the backup.",
@@ -1352,6 +1359,7 @@
       refilling_spool: "Refilling",
       validating: "Validating",
       validating_pack: "Validating",
+      hashing_pack: "Hashing",
       writing_native_volume: "Tape active",
       writing_native_pack: "Tape active",
       reading_native_volume: "Readback",
@@ -1397,6 +1405,17 @@
       return hours + "h" + (remainder ? " " + remainder + "m" : "");
     }
     return Math.max(1, Math.round(minutes / 60)) + "h";
+  }
+
+  function backupMediaWriteStarted(run) {
+    const boundary = backupEvidenceValue(run, "media_write_started");
+    if (boundary === true || String(boundary).toLowerCase() === "true") return true;
+    if (boundary === false || String(boundary).toLowerCase() === "false") return false;
+    return null;
+  }
+
+  function backupTerminalBeforeMediaWrite(run) {
+    return BACKUP_TERMINAL_STATES.has(backupRunState(run)) && backupMediaWriteStarted(run) === false;
   }
 
   function backupPercentLabel(value) {
@@ -1449,6 +1468,8 @@
     const preparation = progress.preparation;
     const successful = ["verified", "passed", "completed", "complete"].includes(runState);
     const terminal = BACKUP_TERMINAL_STATES.has(runState);
+    const prewriteTerminal = backupTerminalBeforeMediaWrite(run);
+    const stagedDiskPackWork = prewriteTerminal && progress.pipelineBasis === "native_v2_pack_bytes";
     const cancellationRequested = Boolean(pick(run, "cancel_requested_at"));
     const waiting = progress.paused;
     const mediaAccepted = waiting && ["authorized", "loaded"].includes(backupMediaRequestState(run));
@@ -1463,7 +1484,7 @@
     const livePhase = backupTransferPhase(pick(liveIo, "phase"));
     const engineState = backupNativeEngineState(liveIo);
     const nativePacking = ["packing", "packing_pack", "refilling_spool"].includes(engineState);
-    const nativeValidating = ["validating", "validating_pack"].includes(engineState);
+    const nativeValidating = ["validating", "validating_pack", "hashing_pack"].includes(engineState);
     const nativeWriting = ["writing_native_volume", "writing_native_pack"].includes(engineState);
     const nativeReadback = ["reading_native_volume", "reading_native_pack"].includes(engineState);
     let activity = progress.sampleFresh && livePhase ? backupLiveActivity(liveIo, livePhase) : null;
@@ -1483,6 +1504,9 @@
       if (progress.processedBytes === null && progress.processedFiles === null) {
         heading = backupRunStateLabel(run);
         detail = "No transfer progress was recorded before this attempt stopped.";
+      } else if (stagedDiskPackWork) {
+        heading = "Last confirmed disk-pack work";
+        detail = "This is temporary pack production retained before the backup stopped. The selected tape is untouched, and restarting rebuilds staging from the saved snapshot.";
       } else {
         heading = "Last confirmed progress";
         detail = "This is the last cumulative position retained before the backup stopped.";
@@ -1519,6 +1543,7 @@
         refilling_spool: ["Refilling the archive buffer", "Refilling", "TapeScale is prefilling or replenishing the validated reserve; tape remains at a safe tape-file boundary until the resume threshold or producer completion."],
         validating: ["Validating an archive pack", "Validating", "TapeScale is checking a completed DAR pack before allowing it onto tape."],
         validating_pack: ["Validating the next archive pack", "Validating", "TapeScale is checking a completed DAR pack before allowing it onto tape."],
+        hashing_pack: ["Hashing the completed archive pack", "Hashing", "TapeScale is computing and retaining the completed disk pack's SHA-256 before allowing it onto tape."],
         writing_native_volume: ["Streaming a native volume to tape", "Tape active", "TapeScale Native v1 is writing the staged volume sequentially to the loaded cartridge."],
         writing_native_pack: ["Streaming an archive pack to tape", "Tape active", "TapeScale Native v2 is writing one completed pack and retaining its durable hash and position."],
         reading_native_volume: ["Reading the volume back now", "Verifying", "TapeScale is immediately reading the just-written physical volume before it requests another tape or finalizes the archive."],
@@ -1581,6 +1606,7 @@
       const numeric = Number(value);
       return value !== null && value !== undefined && value !== "" && Number.isFinite(numeric) && numeric >= 0 ? numeric : null;
     };
+    if (prewriteTerminal) metrics.push({ label: "Tape written", value: "0 B", detail: "Selected tape untouched · no tape command dispatched" });
     if (progress.phase === "source_inventory") {
       const filesDiscovered = number(preparation, "files_discovered");
       const discoveredBytes = number(preparation, "logical_bytes_discovered");
@@ -1590,14 +1616,14 @@
       metrics.push({ label: "Source bytes found", value: discoveredBytes === null ? "Measuring…" : bytes(discoveredBytes), detail: ["sorting", "writing_manifest", "digesting_manifest"].includes(preparationStep) ? "Final source total" : "Growing total" });
       metrics.push({ label: "Elapsed", value: elapsed === null ? "Measuring…" : backupDurationLabel(elapsed), detail: "Source inventory" });
     } else if (((progress.phase === "backup_write" && runState === "writing") || (progress.phase === "full_readback" && runState === "verifying") || progress.phase === "source_stability_check") && !terminal && !waiting) {
-      const pipelineLabel = engineState === "packing" ? "DAR archive pack" : engineState === "validating" ? "Archive validation" : engineState === "writing_native_volume" ? "Native volume stream" : engineState === "reading_native_volume" ? "Physical readback" : progress.phase === "backup_write" ? "Archive write stream" : progress.phase === "full_readback" ? "Archive read stream" : "Source check";
+      const pipelineLabel = nativePacking ? "DAR archive pack" : engineState === "hashing_pack" ? "Archive-pack SHA-256" : nativeValidating ? "Archive validation" : engineState === "writing_native_volume" ? "Native volume stream" : engineState === "reading_native_volume" ? "Physical readback" : progress.phase === "backup_write" ? "Archive write stream" : progress.phase === "full_readback" ? "Archive read stream" : "Source check";
       metrics.push({ label: pipelineLabel, value: progress.sampleFresh && progress.rate !== null ? bytes(progress.rate) + "/s" : progress.stale ? "Unavailable" : "Measuring…", detail: progress.phase === "source_stability_check" ? "SHA-256 source bytes" : "Engine stream bytes · not source logical bytes" });
       if (progress.phase === "backup_write") {
         const sourceReadRate = number(liveIo, "source_read_bytes_per_second") ?? number(liveIo, "file_daemon_read_bytes_per_second");
         if (sourceReadRate !== null) metrics.push({ label: "Source read", value: bytes(sourceReadRate) + "/s", detail: engineState ? "Live DAR source-read counter" : "Legacy engine source-read counter" });
         const available = pick(liveIo, "tape_write_counter_available", "tape_counters_available");
         const tapeRate = number(liveIo, "tape_write_bytes_per_second");
-        if (engineState === "packing" || engineState === "validating") metrics.push({ label: "Tape", value: "Idle", detail: "Archive is still on disk" });
+        if (nativePacking || nativeValidating) metrics.push({ label: "Tape", value: "Idle", detail: "Archive is still on disk" });
         else if (engineState === "reading_native_volume") {
           const readAvailable = pick(liveIo, "tape_read_counter_available", "tape_counters_available");
           const readRate = number(liveIo, "tape_read_bytes_per_second");
@@ -1648,11 +1674,13 @@
       progress,
       metrics,
       action: cancellationRequested ? null : backupOperatorAction(run),
-      modeNote: runState === "writing" ? direct ? "Legacy direct streaming record" : nativePacking || nativeValidating ? "Concurrent bounded pack producer" : nativeReadback ? "Physical readback after durable spool reclamation" : "TapeScale Native v2 · bounded rolling tape stream" : null,
+      modeNote: prewriteTerminal ? "Selected tape untouched · staging starts over on restart" : runState === "writing" ? direct ? "Legacy direct streaming record" : nativePacking || nativeValidating ? "Concurrent bounded pack producer" : nativeReadback ? "Physical readback after durable spool reclamation" : "TapeScale Native v2 · bounded rolling tape stream" : null,
       activity,
       preparationStep,
       cancellationRequested,
       currentFile: progress.sampleFresh ? pick(liveIo, "current_file", "current_archive_member", "current_path") : null,
+      prewriteTerminal,
+      stagedDiskPackWork,
       successful,
       terminal
     };
@@ -1662,7 +1690,9 @@
     const operation = backupCurrentOperation(run);
     if (operation.successful) return "";
     const progress = operation.progress;
-    const progressLabel = progress.phase === "full_readback"
+    const progressLabel = operation.stagedDiskPackWork
+      ? "Staged / hashed disk-pack work"
+      : progress.phase === "full_readback"
       ? progress.percentBasis === "records" ? "Archive entries read back" : "Archive read stream position"
       : progress.phase === "source_stability_check" ? "Source snapshot checked"
         : progress.phase === "source_inventory" ? "Source inventory"
@@ -1676,7 +1706,9 @@
     } else if (progress.percentBasis === "records" && progress.processedFiles !== null && progress.totalFiles !== null && progress.totalFiles > 0 && progress.percent !== null) {
       const percent = backupPercentLabel(progress.percent);
       const displayedEntries = Math.min(progress.processedFiles, progress.totalFiles);
-      const stream = progress.phaseComplete && !operation.terminal
+      const stream = operation.stagedDiskPackWork && progress.processedBytes !== null
+        ? bytes(progress.processedBytes) + " staged or hashed on disk · 0 B written to tape"
+        : progress.phaseComplete && !operation.terminal
         ? "All entries reached · phase finalization pending"
         : progress.processedBytes === null ? "Archive stream position unavailable" : bytes(progress.processedBytes) + " in the current archive stage";
       progressMarkup = '<div class="backup-operation-progress"><div class="progress-track" role="progressbar" aria-label="' + esc(progressLabel) + '" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + esc(progress.percent.toFixed(1)) + '"><div class="progress-value" style="width:' + esc(progress.percent.toFixed(3)) + '%"></div></div><div class="progress-meta"><strong>' + esc(progressLabel) + '</strong><strong>' + esc(percent) + '</strong><span>' + esc(Math.trunc(displayedEntries).toLocaleString()) + ' of ' + esc(Math.trunc(progress.totalFiles).toLocaleString()) + ' entries</span><span>' + esc(stream) + "</span></div></div>";
@@ -1689,7 +1721,7 @@
       const files = progress.processedFiles !== null ? Math.trunc(progress.processedFiles).toLocaleString() + " engine entries processed" : "";
       progressMarkup = '<div class="backup-operation-progress"><div class="progress-track" role="progressbar" aria-label="' + esc(progressLabel) + '" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + esc(progress.percent.toFixed(1)) + '"><div class="progress-value" style="width:' + esc(progress.percent.toFixed(3)) + '%"></div></div><div class="progress-meta"><strong>' + esc(progressLabel) + '</strong><strong>' + esc(percent) + '</strong><span>' + esc(bytes(progress.processedBytes)) + ' of ' + esc(bytes(progress.totalBytes)) + '</span><span>' + esc(files) + "</span></div></div>";
     } else if (progress.processedBytes !== null) {
-      progressMarkup = '<div class="backup-operation-position"><span>' + esc(progressLabel) + '</span><strong>' + esc(bytes(progress.processedBytes)) + '</strong><small>' + (progress.phase === "backup_write" || progress.phase === "full_readback" ? "Engine stream position · not archive completion" : progress.totalBytes === 0 ? "Manifest total is 0 B; no percentage estimated" : "Total not available; no percentage estimated") + "</small></div>";
+      progressMarkup = '<div class="backup-operation-position"><span>' + esc(progressLabel) + '</span><strong>' + esc(bytes(progress.processedBytes)) + '</strong><small>' + (operation.stagedDiskPackWork ? "Temporary disk-pack work · not tape bytes or archive completion" : progress.phase === "backup_write" || progress.phase === "full_readback" ? "Engine stream position · not archive completion" : progress.totalBytes === 0 ? "Manifest total is 0 B; no percentage estimated" : "Total not available; no percentage estimated") + "</small></div>";
     }
     const metrics = operation.metrics.length
       ? '<div class="backup-operation-metrics">' + operation.metrics.map((metric) => '<div><span>' + esc(metric.label) + '</span><strong>' + esc(metric.value) + '</strong>' + (metric.detail ? '<small>' + esc(metric.detail) + "</small>" : "") + "</div>").join("") + "</div>"
@@ -1714,11 +1746,36 @@
     if (backupTransferPhase(pick(backupPreparationProgress(run), "stage")) === "source_stability_check") return phaseDefinitions.findIndex((phase) => phase.aliases.includes("source_stability_check"));
     const nativeState = backupNativeEngineState(backupLiveIo(run));
     if (["packing", "packing_pack", "refilling_spool"].includes(nativeState)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("native_packing"));
-    if (["validating", "validating_pack"].includes(nativeState)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("native_validating"));
+    if (["validating", "validating_pack", "hashing_pack"].includes(nativeState)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("native_validating"));
     if (["writing_native_volume", "writing_native_pack"].includes(nativeState)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("native_volume_write"));
     if (["reading_native_volume", "reading_native_pack"].includes(nativeState)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("native_volume_readback"));
     if (backupMediaIsReadback(run)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("readback"));
     if (backupNeedsNextMedia(run)) return phaseDefinitions.findIndex((phase) => phase.aliases.includes("next_media"));
+    const terminal = BACKUP_TERMINAL_STATES.has(runState);
+    if (terminal) {
+      const retained = objectValue(objectValue(run, "result"), "transfer_progress");
+      const retainedPhase = backupTransferPhase(pick(retained, "phase"));
+      const retainedPipelineBasis = String(pick(retained, "pipeline_basis") || "");
+      const prewriteNativePacks = backupMediaWriteStarted(run) === false && retainedPipelineBasis === "native_v2_pack_bytes";
+      const durableStages = [pick(retained, "last_durable_stage", "last_engine_state", "engine_state", "stage")];
+      for (const event of backupRunEvents(run).slice().reverse()) {
+        const evidence = objectValue(event, "evidence");
+        durableStages.push(
+          pick(evidence, "last_durable_stage", "last_engine_state", "engine_state", "stage", "phase", "to_state"),
+          pick(event, "event_type", "to_state", "phase")
+        );
+      }
+      for (const durableStage of durableStages) {
+        const normalized = backupTransferPhase(durableStage);
+        const stageIndex = phaseDefinitions.findIndex((phase) => phase.aliases.includes(normalized));
+        if (stageIndex < 0) continue;
+        if (prewriteNativePacks && normalized === "backup_write") continue;
+        return stageIndex;
+      }
+      if (prewriteNativePacks && retainedPhase === "backup_write") return phaseDefinitions.findIndex((phase) => phase.aliases.includes("native_packing"));
+      const retainedIndex = phaseDefinitions.findIndex((phase) => phase.aliases.includes(retainedPhase));
+      if (retainedIndex >= 0) return retainedIndex;
+    }
     const rawExplicit = backupEvidenceValue(run, "phase_index");
     const explicit = rawExplicit === null || rawExplicit === undefined || rawExplicit === "" ? Number.NaN : Number(rawExplicit);
     if (Number.isInteger(explicit) && explicit >= 0 && explicit < phaseDefinitions.length) return explicit;
@@ -1759,7 +1816,7 @@
     const progress = backupTransferProgress(run);
     if (progress.percent === null) return null;
     const nativeState = backupNativeEngineState(backupLiveIo(run));
-    const phase = nativeState === "packing" ? "Packing" : nativeState === "validating" ? "Validating" : nativeState === "writing_native_volume" ? "Tape write" : nativeState === "reading_native_volume" ? "Readback" : progress.phase === "full_readback" ? "Readback" : progress.phase === "source_stability_check" ? "Final check" : progress.phase === "backup_write" ? "Write" : null;
+    const phase = ["packing", "packing_pack", "refilling_spool"].includes(nativeState) ? "Packing" : nativeState === "hashing_pack" ? "Hashing" : ["validating", "validating_pack"].includes(nativeState) ? "Validating" : ["writing_native_volume", "writing_native_pack"].includes(nativeState) ? "Tape write" : ["reading_native_volume", "reading_native_pack"].includes(nativeState) ? "Readback" : progress.phase === "full_readback" ? "Readback" : progress.phase === "source_stability_check" ? "Final check" : progress.phase === "backup_write" ? "Write" : null;
     return phase ? phase + " " + backupPercentLabel(progress.percent) : null;
   }
 
@@ -1861,12 +1918,13 @@
     const repeatAllowed = Boolean(profileId && profile && pick(profile, "enabled") !== false && backupCompressionSupported(profile) && backupDataDeliverySupported(profile) && backupDataDelivery(profile) === "disk_spool");
     const source = pick(run, "source_subpath", "source_path", "logical_root") || pick(profile, "source_subpath", "source_path", "logical_root") || "Source not reported";
     const progress = backupTableProgressLabel(run);
+    const prewriteTerminal = backupTerminalBeforeMediaWrite(run);
     const primary = item.kind === "waiting" ? "Continue backup" : item.kind === "active" ? "View live progress" : "Review attempt";
     let actions = '<a class="button button-small' + (item.kind === "failed" ? "" : " button-primary") + '" href="#jobs/' + esc(id) + '">' + esc(primary) + "</a>";
-    if (item.kind === "failed" && repeatAllowed) actions += '<button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">' + (backupUsesLegacyWholeArchive(run) ? "Retry with Native v2" : "Retry same snapshot") + "</button>";
+    if (item.kind === "failed" && repeatAllowed) actions += '<button class="button button-small button-primary" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">' + (backupUsesLegacyWholeArchive(run) ? "Retry with Native v2" : prewriteTerminal ? "Restart backup" : "Retry same snapshot") + "</button>";
     if (item.kind === "failed") actions += '<button class="button button-small button-quiet" type="button" data-action="create-backup-profile">Choose newer snapshot</button>';
     const activityAt = item.kind === "failed" ? pick(run, "finished_at", "started_at", "created_at") : pick(run, "started_at", "created_at", "finished_at");
-    return '<article class="backup-work-card ' + esc(item.kind) + '"><header><span>' + status(backupRunStateLabel(run)) + '</span><time>' + esc(date(activityAt)) + '</time></header><h3>' + esc(item.title) + '</h3><code>' + esc(source) + '</code><p>' + esc(item.detail) + '</p><div class="backup-work-facts"><span><small>Tape</small><strong>' + esc(backupTapeSummary(run)) + '</strong></span><span><small>Progress</small><strong>' + esc(progress || backupRunStateLabel(run)) + '</strong></span></div><footer>' + actions + "</footer></article>";
+    return '<article class="backup-work-card ' + esc(item.kind) + '"><header><span>' + status(backupRunStateLabel(run)) + '</span><time>' + esc(date(activityAt)) + '</time></header><h3>' + esc(item.title) + '</h3><code>' + esc(source) + '</code><p>' + esc(item.detail) + '</p><div class="backup-work-facts"><span><small>' + (prewriteTerminal ? "Selected tape" : "Tape") + '</small><strong>' + esc(prewriteTerminal ? backupCurrentTapeLabel(run) + " · untouched" : backupTapeSummary(run)) + '</strong></span><span><small>Progress</small><strong>' + esc(progress || backupRunStateLabel(run)) + '</strong></span></div><footer>' + actions + "</footer></article>";
   }
 
   function backupFilterMatches(run, filter) {
@@ -1985,12 +2043,15 @@
     const runState = backupRunState(run);
     const successful = ["verified", "passed", "completed", "complete"].includes(runState);
     const unsuccessful = BACKUP_TERMINAL_STATES.has(runState) && !successful;
+    const prewriteTerminal = backupTerminalBeforeMediaWrite(run);
+    const selectedTape = backupCurrentTapeLabel(run);
     const measurement = (value, formatter) => value == null ? unsuccessful ? "Not measured" : successful ? "Not reported" : ["queued", "waiting_for_media", "preparing"].includes(runState) ? "Pending" : "Measuring…" : formatter(value);
-    const readback = successful ? "Complete" : runState === "verifying" ? "In progress" : unsuccessful ? "Not completed" : "Pending";
+    const readback = successful ? "Complete" : runState === "verifying" ? "In progress" : prewriteTerminal ? "Not started · tape untouched" : unsuccessful ? "Not completed" : "Pending";
     const values = [
       [entries == null ? "Files" : "Files and folders", measurement(entries == null ? files : entries, (value) => value)],
       ["Data", measurement(logical, bytes)],
-      [volumes.length === 1 ? "Tape" : "Archive tapes", tape || "Not selected"],
+      [prewriteTerminal ? "Selected tape" : volumes.length === 1 ? "Tape" : "Archive tapes", prewriteTerminal ? (selectedTape === "Not assigned" ? "Not selected" : selectedTape + " · untouched") : tape || "Not selected"],
+      ...(prewriteTerminal ? [["Tape written", "0 B"]] : []),
       ["Compression", backupCompressionLabel(run)],
       ["Delivery", backupDataDeliveryLabel(run)],
       ["Physical readback", readback]
@@ -2032,9 +2093,9 @@
         const position = backupEvidenceValue(run, "position_uncertain");
         const positionUncertain = position === true || String(position).toLowerCase() === "true";
         const positionKnown = position === false || String(position).toLowerCase() === "false";
-        if (positionUncertain) return "The backup stopped before any tape-motion or data-write command was dispatched, so the loaded tape was not changed. This older record marked the drive uncertain; reconcile it once, then retry the backup.";
-        if (positionKnown) return "The backup stopped before any tape-motion or data-write command was dispatched. The loaded tape and known drive position were preserved; retry the backup.";
-        return "The backup stopped before any tape-motion or data-write command was dispatched, so the loaded tape was not changed. Confirm the drive is reconciled, then retry the backup.";
+        if (positionUncertain) return "The backup stopped before any tape-motion or data-write command was dispatched, so the selected tape is untouched. This older record marked the drive uncertain; reconcile it once. Restarting the backup means temporary disk-pack staging starts over from the saved snapshot.";
+        if (positionKnown) return "The backup stopped before any tape-motion or data-write command was dispatched. The selected tape is untouched and the known drive position was preserved. Restarting the backup means temporary disk-pack staging starts over from the saved snapshot.";
+        return "The backup stopped before any tape-motion or data-write command was dispatched, so the selected tape is untouched. Confirm the drive is reconciled before restarting; temporary disk-pack staging starts over from the saved snapshot.";
       }
       if (mediaWriteStarted) return "A drive or tape lease expired after tape work began. Treat tape position as uncertain: inspect the loaded tape and reconcile the drive before preparing media and retrying.";
       return "A drive or tape lease expired while the backup was active. Inspect the loaded tape and reconcile the drive before retrying.";
@@ -2057,6 +2118,7 @@
     const canDelete = pick(allowedActions, "delete") === true;
     const successful = ["verified", "passed", "completed", "complete"].includes(runState);
     const terminal = BACKUP_TERMINAL_STATES.has(runState);
+    const prewriteTerminal = backupTerminalBeforeMediaWrite(run);
     const failed = BACKUP_TERMINAL_STATES.has(runState) && !successful && !["cancelled", "canceled"].includes(runState);
     const failure = backupOperatorFailure(run);
     const recoveryPointId = String(backupEvidenceValue(run, "recovery_point_id") || pick(run, "recovery_point_id") || "");
@@ -2066,9 +2128,11 @@
     else if (["cancelled", "canceled"].includes(runState)) notice = '<div class="notice warning backup-run-notice"><span class="notice-icon" aria-hidden="true">×</span><div class="notice-copy"><strong>Backup cancelled</strong><span>' + esc(failure || "The attempt did not establish a recovery point. Previously valid backups remain unchanged.") + "</span></div></div>";
     const cancel = canCancel ? '<button class="button button-danger button-small" type="button" data-action="cancel-backup-run" data-id="' + esc(id) + '">Cancel run</button>' : "";
     const volumes = backupRunVolumes(run);
-    const assignment = volumes.length
-      ? '<span><strong>' + esc(volumes.length + " tape" + (volumes.length === 1 ? "" : "s")) + '</strong><small class="backup-volume-summary">' + volumes.map((volume) => esc(volume.sequence + ". " + volume.label)).join(" · ") + "</small></span>"
-      : '<span><strong>Not selected</strong><small>Choose a prepared scratch tape</small></span>';
+    const assignment = prewriteTerminal
+      ? '<span><strong>' + esc(backupCurrentTapeLabel(run) + " · untouched") + '</strong><small class="backup-volume-summary">No tape-motion or data-write command was dispatched</small></span>'
+      : volumes.length
+        ? '<span><strong>' + esc(volumes.length + " tape" + (volumes.length === 1 ? "" : "s")) + '</strong><small class="backup-volume-summary">' + volumes.map((volume) => esc(volume.sequence + ". " + volume.label)).join(" · ") + "</small></span>"
+        : '<span><strong>Not selected</strong><small>Choose a prepared scratch tape</small></span>';
     const detailFailure = detailError ? '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load retained run evidence</strong><span>' + esc(errorMessage(detailError)) + ' Live progress may be incomplete until this succeeds.</span></div><button class="button button-small" type="button" data-action="retry-backup-run" data-id="' + esc(id) + '">Reload details</button></div>' : "";
     const requestedAt = pick(run, "created_at");
     const startedAt = pick(run, "started_at");
@@ -2081,12 +2145,12 @@
     const legacyUpgrade = terminal && legacyWholeArchive
       ? '<div class="notice info backup-run-notice"><span class="notice-icon" aria-hidden="true">↻</span><div class="notice-copy"><strong>This is a retained Native v1 attempt</strong><span>Its whole-archive staging rule remains visible as historical evidence. A new retry uses Native v2 bounded rolling packs and does not require the entire backup to fit on the staging disk.</span></div></div>'
       : "";
-    const repeat = terminal && repeatAllowed ? '<button class="button button-primary button-small" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">' + (successful ? "Back up same snapshot" : legacyWholeArchive ? "Retry with Native v2" : "Retry same snapshot") + "</button>" : "";
+    const repeat = terminal && repeatAllowed ? '<button class="button button-primary button-small" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">' + (successful ? "Back up same snapshot" : legacyWholeArchive ? "Retry with Native v2" : prewriteTerminal ? "Restart backup" : "Retry same snapshot") + "</button>" : "";
     const newer = terminal ? '<button class="button button-small" type="button" data-action="create-backup-profile">Choose newer snapshot</button>' : "";
     const remove = canDelete ? '<button class="button button-danger button-small" type="button" data-action="delete-backup-run" data-id="' + esc(id) + '">Delete job</button>' : "";
     const actions = cancel || repeat || newer || remove ? '<div class="backup-run-actions">' + cancel + repeat + newer + remove + "</div>" : "";
     const timing = startedAt ? "Started " + date(startedAt) : "Requested " + date(requestedAt);
-    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span><span class="backup-kind-badge secondary">' + esc(backupDataDeliveryLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>' + esc(timing) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>Archive tapes</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header><div class="panel-body backup-primary-body">' + detailFailure + notice + legacyUpgrade + renderBackupCurrentOperation(run) + actions + "</div>" + renderBackupPhaseTrack(run) + '<div class="panel-body backup-secondary-body">' + outcome + technical + "</div></article>";
+    return '<article class="panel backup-run-detail"><header class="job-header backup-job-header"><div><div class="job-kicker"><span class="backup-kind-badge">Full backup</span><span class="backup-kind-badge secondary">' + esc(backupCompressionLabel(run)) + '</span><span class="backup-kind-badge secondary">' + esc(backupDataDeliveryLabel(run)) + '</span>' + status(backupRunStateLabel(run)) + '</div><h1>' + esc(backupRunProfileName(run)) + '</h1><p>' + esc(timing) + '</p></div><div class="job-summary"><div><span>Source snapshot</span><strong>' + esc(label(pick(run, "source_subpath", "source_path", "logical_root") || pick(backupProfileForRun(run), "source_subpath", "source_path", "logical_root"))) + '</strong></div><div><span>' + (prewriteTerminal ? "Selected tape" : "Archive tapes") + '</span>' + assignment + '</div><div><span>Media policy</span><strong>' + esc(backupSpanningEnabled(run) ? "Span as needed" : "Single tape") + '</strong></div><div><span>Verification</span><strong>' + esc(backupReadbackSummary(run)) + '</strong></div></div></header><div class="panel-body backup-primary-body">' + detailFailure + notice + legacyUpgrade + renderBackupCurrentOperation(run) + actions + "</div>" + renderBackupPhaseTrack(run) + '<div class="panel-body backup-secondary-body">' + outcome + technical + "</div></article>";
   }
 
   function renderBackupWorkQueue() {

@@ -9,7 +9,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -781,6 +781,71 @@ pub struct StagedDarPack {
     pub pack_sha256: String,
 }
 
+/// Lock-free progress published while a completed DAR pack is discovered and
+/// content-addressed. Pack slices can be hundreds of GiB, so callers must be
+/// able to renew durable leases and present truthful progress while hashing is
+/// running on a blocking worker thread.
+#[derive(Debug, Default)]
+pub struct StagedDarPackDiscoveryProgress {
+    bytes_hashed: AtomicU64,
+    total_bytes: AtomicU64,
+    files_hashed: AtomicU64,
+    files_total: AtomicU64,
+    current_slice_ordinal: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct StagedDarPackDiscoverySnapshot {
+    pub bytes_hashed: u64,
+    pub total_bytes: u64,
+    pub files_hashed: u64,
+    pub files_total: u64,
+    pub current_slice_ordinal: Option<u32>,
+}
+
+impl StagedDarPackDiscoveryProgress {
+    #[must_use]
+    pub fn snapshot(&self) -> StagedDarPackDiscoverySnapshot {
+        let current_slice = self.current_slice_ordinal.load(Ordering::Acquire);
+        StagedDarPackDiscoverySnapshot {
+            bytes_hashed: self.bytes_hashed.load(Ordering::Acquire),
+            total_bytes: self.total_bytes.load(Ordering::Acquire),
+            files_hashed: self.files_hashed.load(Ordering::Acquire),
+            files_total: self.files_total.load(Ordering::Acquire),
+            current_slice_ordinal: u32::try_from(current_slice)
+                .ok()
+                .filter(|ordinal| *ordinal != 0),
+        }
+    }
+
+    fn begin(&self, total_bytes: u64, files_total: u64) {
+        self.bytes_hashed.store(0, Ordering::Release);
+        self.files_hashed.store(0, Ordering::Release);
+        self.current_slice_ordinal.store(0, Ordering::Release);
+        self.total_bytes.store(total_bytes, Ordering::Release);
+        self.files_total.store(files_total, Ordering::Release);
+    }
+
+    fn start_file(&self, current_slice_ordinal: Option<u32>) {
+        self.current_slice_ordinal.store(
+            u64::from(current_slice_ordinal.unwrap_or(0)),
+            Ordering::Release,
+        );
+    }
+
+    fn add_bytes(&self, bytes: u64) {
+        self.bytes_hashed.fetch_add(bytes, Ordering::Release);
+    }
+
+    fn finish_file(&self) {
+        self.files_hashed.fetch_add(1, Ordering::Release);
+    }
+
+    fn finish(&self) {
+        self.current_slice_ordinal.store(0, Ordering::Release);
+    }
+}
+
 impl StagedDarPack {
     pub fn discover(
         pack_directory: &Path,
@@ -788,6 +853,29 @@ impl StagedDarPack {
         pack_ordinal: u32,
         compression: DarCompression,
     ) -> Result<Self, NativeArchiveError> {
+        let cancellation = AtomicBool::new(false);
+        let progress = StagedDarPackDiscoveryProgress::default();
+        Self::discover_with_cancel_and_progress(
+            pack_directory,
+            inclusion_list_path,
+            pack_ordinal,
+            compression,
+            &cancellation,
+            &progress,
+        )
+    }
+
+    pub fn discover_with_cancel_and_progress(
+        pack_directory: &Path,
+        inclusion_list_path: &Path,
+        pack_ordinal: u32,
+        compression: DarCompression,
+        cancellation: &AtomicBool,
+        progress: &StagedDarPackDiscoveryProgress,
+    ) -> Result<Self, NativeArchiveError> {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(NativeArchiveError::Cancelled);
+        }
         if pack_ordinal == 0 {
             return Err(NativeArchiveError::Invalid(
                 "DAR pack ordinal must be one-based".to_owned(),
@@ -811,9 +899,12 @@ impl StagedDarPack {
             ));
         }
 
-        let mut slices = Vec::new();
+        let mut slices = Vec::<(u32, PathBuf, u64)>::new();
         let mut catalogs = Vec::new();
         for entry in fs::read_dir(pack_directory)? {
+            if cancellation.load(Ordering::Acquire) {
+                return Err(NativeArchiveError::Cancelled);
+            }
             let entry = entry?;
             let path = entry.path();
             let entry_metadata = fs::symlink_metadata(&path)?;
@@ -837,26 +928,21 @@ impl StagedDarPack {
                         "DAR pack slice {ordinal} is empty"
                     )));
                 }
-                slices.push(StagedSlice {
-                    ordinal,
-                    encoded_bytes: entry_metadata.len(),
-                    sha256: sha256_file(&path)?,
-                    path,
-                });
+                slices.push((ordinal, path, entry_metadata.len()));
             } else if dar_slice_ordinal(name, "catalog").is_some() {
-                catalogs.push(path);
+                catalogs.push((path, entry_metadata.len()));
             } else {
                 return Err(NativeArchiveError::Invalid(format!(
                     "DAR produced an unexpected pack file {name}"
                 )));
             }
         }
-        slices.sort_by_key(|slice| slice.ordinal);
+        slices.sort_by_key(|slice| slice.0);
         if slices.is_empty()
             || slices
                 .iter()
                 .enumerate()
-                .any(|(index, slice)| slice.ordinal != u32::try_from(index + 1).unwrap_or(u32::MAX))
+                .any(|(index, slice)| slice.0 != u32::try_from(index + 1).unwrap_or(u32::MAX))
         {
             return Err(NativeArchiveError::Invalid(
                 "DAR pack slices are missing or non-contiguous".to_owned(),
@@ -868,21 +954,56 @@ impl StagedDarPack {
                 catalogs.len()
             )));
         }
-        let catalog_path = catalogs.remove(0);
-        let catalog_bytes = fs::metadata(&catalog_path)?.len();
+        let (catalog_path, catalog_bytes) = catalogs.remove(0);
         if catalog_bytes == 0 {
             return Err(NativeArchiveError::Invalid(
                 "DAR pack isolated catalog is empty".to_owned(),
             ));
         }
         let encoded_bytes = slices.iter().try_fold(0_u64, |total, slice| {
-            total.checked_add(slice.encoded_bytes).ok_or_else(|| {
+            total.checked_add(slice.2).ok_or_else(|| {
                 NativeArchiveError::Invalid("DAR pack byte total overflowed".to_owned())
             })
         })?;
-        let inclusion_list_sha256 = sha256_file(inclusion_list_path)?;
-        let catalog_sha256 = sha256_file(&catalog_path)?;
-        let pack_sha256 = dar_pack_content_sha256(pack_ordinal, &catalog_sha256, &slices)?;
+        let total_bytes = encoded_bytes
+            .checked_add(inclusion_metadata.len())
+            .and_then(|total| total.checked_add(catalog_bytes))
+            .ok_or_else(|| {
+                NativeArchiveError::Invalid("DAR pack discovery byte total overflowed".to_owned())
+            })?;
+        let files_total = u64::try_from(slices.len())
+            .ok()
+            .and_then(|files| files.checked_add(2))
+            .ok_or_else(|| {
+                NativeArchiveError::Invalid("DAR pack discovery file total overflowed".to_owned())
+            })?;
+        progress.begin(total_bytes, files_total);
+
+        // Directory enumeration order is filesystem-specific. Hash slice
+        // payloads only after sorting their ordinals so progress and failure
+        // evidence are deterministic across hosts.
+        let mut discovered_slices = Vec::with_capacity(slices.len());
+        for (ordinal, path, encoded_bytes) in slices {
+            progress.start_file(Some(ordinal));
+            let sha256 = sha256_file_with_cancel_and_progress(&path, cancellation, progress)?;
+            progress.finish_file();
+            discovered_slices.push(StagedSlice {
+                ordinal,
+                path,
+                encoded_bytes,
+                sha256,
+            });
+        }
+        progress.start_file(None);
+        let inclusion_list_sha256 =
+            sha256_file_with_cancel_and_progress(inclusion_list_path, cancellation, progress)?;
+        progress.finish_file();
+        let catalog_sha256 =
+            sha256_file_with_cancel_and_progress(&catalog_path, cancellation, progress)?;
+        progress.finish_file();
+        progress.finish();
+        let pack_sha256 =
+            dar_pack_content_sha256(pack_ordinal, &catalog_sha256, &discovered_slices)?;
         Ok(Self {
             pack_ordinal,
             representation: NativeArchiveRepresentation::FileDar,
@@ -893,7 +1014,7 @@ impl StagedDarPack {
             catalog_path,
             catalog_bytes,
             catalog_sha256,
-            slices,
+            slices: discovered_slices,
             encoded_bytes,
             pack_sha256,
         })
@@ -1292,6 +1413,38 @@ pub fn sha256_file(path: &Path) -> Result<String, NativeArchiveError> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn sha256_file_with_cancel_and_progress(
+    path: &Path,
+    cancellation: &AtomicBool,
+    progress: &StagedDarPackDiscoveryProgress,
+) -> Result<String, NativeArchiveError> {
+    sha256_reader_with_cancel_and_progress(File::open(path)?, cancellation, progress)
+}
+
+fn sha256_reader_with_cancel_and_progress(
+    mut reader: impl Read,
+    cancellation: &AtomicBool,
+    progress: &StagedDarPackDiscoveryProgress,
+) -> Result<String, NativeArchiveError> {
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(NativeArchiveError::Cancelled);
+        }
+        let read = reader.read(&mut buffer)?;
+        if cancellation.load(Ordering::Acquire) {
+            return Err(NativeArchiveError::Cancelled);
+        }
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        progress.add_bytes(read as u64);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 #[must_use]
 pub fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -1366,6 +1519,8 @@ fn validate_non_rewinding_device_path(device: &Path) -> Result<(), NativeArchive
 pub enum NativeArchiveError {
     #[error("native archive input is invalid: {0}")]
     Invalid(String),
+    #[error("native archive operation was cancelled")]
+    Cancelled,
     #[error("native archive I/O failed: {0}")]
     Io(#[from] io::Error),
 }
@@ -1375,6 +1530,21 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    struct CancellingReader<'a> {
+        cancellation: &'a AtomicBool,
+        requested_bytes: &'a AtomicU64,
+    }
+
+    impl Read for CancellingReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.requested_bytes
+                .store(buffer.len() as u64, Ordering::Release);
+            buffer.fill(b'x');
+            self.cancellation.store(true, Ordering::Release);
+            Ok(buffer.len())
+        }
+    }
 
     fn slice(ordinal: u32, bytes: u64) -> StagedSlice {
         StagedSlice {
@@ -1570,21 +1740,57 @@ mod tests {
         let inclusion_path = pack_directory.join("include.list");
         write_dar_pack_inclusion_list(&inclusion_path, &["file.bin".to_owned()])
             .expect("inclusion list");
-        fs::write(pack_directory.join("archive.000001.dar"), b"first").expect("first slice");
         fs::write(pack_directory.join("archive.000002.dar"), b"second").expect("second slice");
+        fs::write(pack_directory.join("archive.000001.dar"), b"first").expect("first slice");
         fs::write(pack_directory.join("catalog.000001.dar"), b"catalog").expect("catalog");
+        let expected_hashed_bytes = [
+            inclusion_path.clone(),
+            pack_directory.join("archive.000001.dar"),
+            pack_directory.join("archive.000002.dar"),
+            pack_directory.join("catalog.000001.dar"),
+        ]
+        .iter()
+        .map(|path| fs::metadata(path).expect("pack input metadata").len())
+        .sum::<u64>();
 
-        let pack = StagedDarPack::discover(
+        let cancellation = AtomicBool::new(false);
+        let progress = StagedDarPackDiscoveryProgress::default();
+        let pack = StagedDarPack::discover_with_cancel_and_progress(
+            &pack_directory,
+            &inclusion_path,
+            7,
+            DarCompression::ZstdFast,
+            &cancellation,
+            &progress,
+        )
+        .expect("completed pack");
+        assert_eq!(pack.pack_ordinal, 7);
+        assert_eq!(pack.slices.len(), 2);
+        assert_eq!(
+            pack.slices
+                .iter()
+                .map(|slice| slice.ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(pack.encoded_bytes, 11);
+        assert_eq!(pack.pack_sha256.len(), 64);
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.bytes_hashed, snapshot.total_bytes);
+        assert_eq!(snapshot.total_bytes, expected_hashed_bytes);
+        assert_eq!(snapshot.files_hashed, 4);
+        assert_eq!(snapshot.files_total, 4);
+        assert_eq!(snapshot.current_slice_ordinal, None);
+
+        let compatibility = StagedDarPack::discover(
             &pack_directory,
             &inclusion_path,
             7,
             DarCompression::ZstdFast,
         )
-        .expect("completed pack");
-        assert_eq!(pack.pack_ordinal, 7);
-        assert_eq!(pack.slices.len(), 2);
-        assert_eq!(pack.encoded_bytes, 11);
-        assert_eq!(pack.pack_sha256.len(), 64);
+        .expect("compatibility discovery");
+        assert_eq!(compatibility.pack_sha256, pack.pack_sha256);
+        assert_eq!(compatibility.slices, pack.slices);
 
         fs::write(pack_directory.join("unexpected"), b"nope").expect("unexpected file");
         assert!(StagedDarPack::discover(
@@ -1594,6 +1800,56 @@ mod tests {
             DarCompression::ZstdFast,
         )
         .is_err());
+    }
+
+    #[test]
+    fn pack_hashing_checks_cancellation_at_one_mebibyte_read_boundaries() {
+        let cancellation = AtomicBool::new(false);
+        let requested_bytes = AtomicU64::new(0);
+        let progress = StagedDarPackDiscoveryProgress::default();
+        progress.begin(2 * 1024 * 1024, 1);
+        progress.start_file(Some(9));
+        let error = sha256_reader_with_cancel_and_progress(
+            CancellingReader {
+                cancellation: &cancellation,
+                requested_bytes: &requested_bytes,
+            },
+            &cancellation,
+            &progress,
+        )
+        .expect_err("cancellation raised during a hash read must stop discovery");
+        assert!(matches!(error, NativeArchiveError::Cancelled));
+        assert_eq!(requested_bytes.load(Ordering::Acquire), 1024 * 1024);
+        assert_eq!(
+            progress.snapshot(),
+            StagedDarPackDiscoverySnapshot {
+                bytes_hashed: 0,
+                total_bytes: 2 * 1024 * 1024,
+                files_hashed: 0,
+                files_total: 1,
+                current_slice_ordinal: Some(9),
+            }
+        );
+    }
+
+    #[test]
+    fn pack_discovery_honors_cancellation_before_filesystem_work() {
+        let cancellation = AtomicBool::new(true);
+        let progress = StagedDarPackDiscoveryProgress::default();
+        let error = StagedDarPack::discover_with_cancel_and_progress(
+            Path::new("/not/inspected"),
+            Path::new("/not/inspected/include.list"),
+            1,
+            DarCompression::ZstdFast,
+            &cancellation,
+            &progress,
+        )
+        .expect_err("pre-cancelled discovery must stop before path inspection");
+        assert!(matches!(error, NativeArchiveError::Cancelled));
+        assert_eq!(
+            progress.snapshot(),
+            StagedDarPackDiscoverySnapshot::default()
+        );
     }
 
     #[test]

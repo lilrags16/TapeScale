@@ -673,6 +673,7 @@ test("transfer progress uses the current phase's cumulative counters without inv
     sample_window_ms: 5000,
     stale_after_seconds: 20,
     progress_basis: "bacula_job_files_over_manifest_entries",
+    pipeline_basis: "bacula_job_bytes_delta",
     pipeline_bytes_processed: 400,
     files_processed: 4,
     files_total: 10,
@@ -696,6 +697,7 @@ test("transfer progress uses the current phase's cumulative counters without inv
   assert.equal(fresh.totalFiles, 10);
   assert.equal(fresh.percent, 40);
   assert.equal(fresh.percentBasis, "records");
+  assert.equal(fresh.pipelineBasis, "bacula_job_bytes_delta");
   assert.equal(fresh.rate, 100);
   assert.equal(fresh.entryRate, 2);
   assert.equal(fresh.etaSeconds, null, "uneven archive entries must not produce a countdown");
@@ -786,6 +788,10 @@ test("transfer progress uses the current phase's cumulative counters without inv
   const failed = progress({ state: "failed", result: { transfer_progress: sample({ pipeline_bytes_processed: 300, files_processed: 3 }) } }, now);
   assert.equal(failed.percent, 30, "failure preserves its last confirmed phase position rather than becoming complete");
 
+  const prewritePackWork = progress({ state: "interrupted", result: { transfer_progress: sample({ progress_basis: "native_v2_complete_packs", pipeline_basis: "native_v2_pack_bytes", pipeline_bytes_processed: 272515153920, files_processed: 0, files_total: null }) } }, now);
+  assert.equal(prewritePackWork.pipelineBasis, "native_v2_pack_bytes", "retained Native v2 pack work keeps its non-tape byte basis");
+  assert.equal(prewritePackWork.processedBytes, 272515153920);
+
   const terminalComplete = progress({ state: "failed", result: { transfer_progress: sample({ files_processed: 10 }) } }, now);
   assert.equal(terminalComplete.percent, 100, "a terminal run may show the complete retained phase position");
 
@@ -808,7 +814,7 @@ test("the operation hero renders phase-specific progress, rates, and tape action
   };
   const objectValue = (object, key) => object && object[key] && typeof object[key] === "object" && !Array.isArray(object[key]) ? object[key] : {};
   const [operation, render] = Function(
-    "pick", "objectValue", "backupRunState", "backupTransferProgress", "BACKUP_TERMINAL_STATES", "backupMediaRequestState", "backupDataDelivery", "backupTransferPhase", "backupLiveActivity", "backupNativeEngineState", "backupPhaseIndex", "backupRunStateLabel", "backupNeedsNextMedia", "backupMediaIsReadback", "backupNextVolumeSequence", "recordId", "esc", "backupRunVolumes", "bytes", "backupDurationLabel", "date", "BACKUP_PHASES",
+    "pick", "objectValue", "backupRunState", "backupTransferProgress", "BACKUP_TERMINAL_STATES", "backupMediaRequestState", "backupDataDelivery", "backupTransferPhase", "backupLiveActivity", "backupNativeEngineState", "backupPhaseIndex", "backupRunStateLabel", "backupNeedsNextMedia", "backupMediaIsReadback", "backupNextVolumeSequence", "recordId", "esc", "backupRunVolumes", "bytes", "backupDurationLabel", "date", "BACKUP_PHASES", "backupEvidenceValue",
     '"use strict";\n' + helpers + "\nreturn [backupCurrentOperation, renderBackupCurrentOperation];"
   )(
     testPick,
@@ -837,7 +843,14 @@ test("the operation hero renders phase-specific progress, rates, and tape action
     (value) => Number(value).toLocaleString() + " B",
     (milliseconds) => Math.floor(Number(milliseconds) / 1000) + "s",
     String,
-    Array.from({ length: 8 }, (_, index) => ({ name: "Phase " + (index + 1) }))
+    Array.from({ length: 8 }, (_, index) => ({ name: "Phase " + (index + 1) })),
+    (run, ...keys) => {
+      for (const source of [run, run && run.result, run && run.result && run.result.evidence]) {
+        const value = testPick(source, ...keys);
+        if (value !== null) return value;
+      }
+      return null;
+    }
   );
 
   const progress = (overrides = {}) => ({
@@ -850,6 +863,7 @@ test("the operation hero renders phase-specific progress, rates, and tape action
     rawPercent: 40,
     percentBasis: "records",
     progressBasis: "bacula_job_files_over_manifest_entries",
+    pipelineBasis: "bacula_job_bytes_delta",
     phaseComplete: false,
     sampleFresh: true,
     stale: false,
@@ -1067,6 +1081,36 @@ test("the operation hero renders phase-specific progress, rates, and tape action
   assert.match(failed, /3 of 10 entries/);
   assert.match(failed, /30%/);
   assert.doesNotMatch(failed, /Estimated remaining/);
+
+  const prewriteNativeFailure = render({
+    ...stagedRun,
+    state: "interrupted",
+    step: 3,
+    result: { media_write_started: false },
+    _progress: progress({
+      processedBytes: 272515153920,
+      processedFiles: null,
+      totalFiles: null,
+      percent: null,
+      rawPercent: null,
+      percentBasis: null,
+      progressBasis: "native_v2_complete_packs",
+      pipelineBasis: "native_v2_pack_bytes",
+      sampleFresh: false,
+      stale: true,
+      rate: null,
+      entryRate: null,
+      etaSeconds: null,
+      sample: { phase: "backup_write", pipeline_basis: "native_v2_pack_bytes" },
+      liveIo: {}
+    })
+  });
+  assert.match(prewriteNativeFailure, /Last confirmed disk-pack work/);
+  assert.match(prewriteNativeFailure, /Staged \/ hashed disk-pack work/);
+  assert.match(prewriteNativeFailure, /Temporary disk-pack work · not tape bytes or archive completion/);
+  assert.match(prewriteNativeFailure, /Tape written/);
+  assert.match(prewriteNativeFailure, />0 B</);
+  assert.match(prewriteNativeFailure, /Selected tape untouched · staging starts over on restart/);
 
   const failedBeforeTransfer = render({ ...directRun, state: "failed", _progress: progress({ processedBytes: null, totalBytes: null, processedFiles: null, totalFiles: null, percent: null, rawPercent: null, percentBasis: null, sampleFresh: false, rate: null, entryRate: null, etaSeconds: null, liveIo: {} }) });
   assert.match(failedBeforeTransfer, /No transfer progress was recorded before this attempt stopped/);
@@ -1624,6 +1668,8 @@ test("run summaries distinguish planned, active, complete, and failed readback",
   assert.match(app, /\{ name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: \["inventorying", "manifesting", "source_manifest", "source_inventory"\] \}/);
   assert.match(app, /\{ name: "Build archive packs", detail: "Build and test bounded DAR packs", aliases: \[[^\]]*"native_packing"[^\]]*"refilling_spool"/);
   assert.match(app, /\{ name: "Validate pack", detail: "Check each completed pack before tape", aliases: \[[^\]]*"native_validating"[^\]]*"validating_pack"/);
+  assert.match(app, /\{ name: "Validate pack",[^\n]*"hashing_pack"/);
+  assert.match(app, /hashing_pack: "Hashing the completed archive pack"/);
   assert.match(app, /\{ name: "Write & reclaim", detail: "Stream validated packs; reclaim after durable filemarks", aliases: \[[^\]]*"native_volume_write"[^\]]*"native_volume_readback"/);
   assert.match(app, /\{ name: "Finalize", detail: "Seal the pack set and confirm the source", aliases: \[[^\]]*"native_archive_seal"[^\]]*"source_stability_check"/);
 });
@@ -1635,7 +1681,7 @@ test("the eight-stage journey is complete on desktop and compact on mobile", () 
   const legacyPhaseList = Function('"use strict";\n' + legacyPhases + "\nreturn LEGACY_BACKUP_PHASES;")();
   const phaseIndexSource = section("  function backupPhaseIndex(", "  function renderBackupPhaseTrack(");
   const phaseIndex = Function(
-    "BACKUP_PHASES", "LEGACY_BACKUP_PHASES", "backupUsesLegacyWholeArchive", "backupRunState", "backupPreparationProgress", "pick", "backupMediaIsReadback", "backupNeedsNextMedia", "backupEvidenceValue", "backupRunEvents", "backupTransferPhase", "backupExpectedTransferPhase", "objectValue", "backupNativeEngineState", "backupLiveIo",
+    "BACKUP_PHASES", "LEGACY_BACKUP_PHASES", "backupUsesLegacyWholeArchive", "backupRunState", "backupPreparationProgress", "pick", "backupMediaIsReadback", "backupNeedsNextMedia", "backupEvidenceValue", "backupRunEvents", "backupTransferPhase", "backupExpectedTransferPhase", "objectValue", "backupNativeEngineState", "backupLiveIo", "BACKUP_TERMINAL_STATES", "backupMediaWriteStarted",
     '"use strict";\n' + phaseIndexSource + "\nreturn backupPhaseIndex;"
   )(
     phaseList,
@@ -1666,7 +1712,12 @@ test("the eight-stage journey is complete on desktop and compact on mobile", () 
     (run) => run.expected_phase || run.result && run.result.transfer_progress && run.result.transfer_progress.phase || "",
     (object, key) => object && object[key] && typeof object[key] === "object" && !Array.isArray(object[key]) ? object[key] : {},
     (liveIo) => String(liveIo && liveIo.engine_state || "").toLowerCase(),
-    (run) => run.result && run.result.live_io || {}
+    (run) => run.result && run.result.live_io || {},
+    new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]),
+    (run) => {
+      const value = run && run.result && run.result.media_write_started;
+      return value === true || value === false ? value : null;
+    }
   );
   const renderer = section("  function renderBackupPhaseTrack(", "  function backupTableProgressLabel(");
   assert.equal((phases.match(/\{ name:/g) || []).length, 8);
@@ -1675,12 +1726,39 @@ test("the eight-stage journey is complete on desktop and compact on mobile", () 
   assert.equal(phaseIndex({ state: "writing" }), 5);
   assert.equal(phaseIndex({ state: "writing", result: { live_io: { engine_state: "packing" } } }), 3);
   assert.equal(phaseIndex({ state: "writing", result: { live_io: { engine_state: "validating" } } }), 4);
+  assert.equal(phaseIndex({ state: "writing", result: { live_io: { engine_state: "hashing_pack" } } }), 4, "pack hashing is an explicit validation stage");
   assert.equal(phaseIndex({ state: "written" }), 6);
   assert.equal(phaseIndex({ state: "verifying" }), 5);
   assert.equal(phaseIndex({ state: "verifying", readback_media: true, preparation: { stage: "final_source_check" } }), 6, "the final-check alias supersedes retained readback media state");
   assert.equal(phaseIndex({ state: "failed", result: { transfer_progress: { phase: "full_readback" } } }), 5, "a terminal detail stays on its retained canonical transfer phase");
   assert.equal(phaseIndex({ state: "failed", events: [{ event_type: "engine_dispatched", evidence: { phase: "full_readback" } }] }), 5, "canonical event evidence drives the journey");
   assert.equal(phaseIndex({ state: "failed", events: [{ event_type: "engine_dispatched", evidence: { phase: "source_inventory" } }] }), 2);
+  assert.equal(phaseIndex({
+    state: "interrupted",
+    phase_index: 1,
+    result: {
+      media_write_started: false,
+      transfer_progress: { phase: "backup_write", pipeline_basis: "native_v2_pack_bytes", pipeline_bytes_processed: 272515153920 }
+    },
+    events: [
+      { event_type: "writing" },
+      { event_type: "producer_resumed" },
+      { event_type: "interrupted" }
+    ]
+  }), 3, "retained pre-write pack production supersedes a stale preflight index");
+  assert.equal(phaseIndex({
+    state: "interrupted",
+    phase_index: 1,
+    result: {
+      media_write_started: false,
+      transfer_progress: { phase: "backup_write", pipeline_basis: "native_v2_pack_bytes", pipeline_bytes_processed: 272515153920 }
+    },
+    events: [
+      { event_type: "producer_resumed" },
+      { event_type: "hashing_pack" },
+      { event_type: "interrupted" }
+    ]
+  }), 4, "the latest durable hashing stage lands on pack validation");
   assert.equal(phaseIndex({ state: "writing", phase_index: 0 }), 0, "an explicit phase index remains authoritative");
   assert.equal(phaseIndex({ state: "writing", legacy: true }), 5, "legacy tape write remains the write stage");
   assert.equal(phaseIndex({ state: "verifying", legacy: true }), 6, "legacy full readback uses the separate readback stage");
@@ -1730,16 +1808,74 @@ test("lease failures explain tape state without exposing raw JSON", () => {
   });
 
   assert.match(beforeWrite, /before any tape-motion or data-write command was dispatched/);
-  assert.match(beforeWrite, /loaded tape and known drive position were preserved/);
+  assert.match(beforeWrite, /selected tape is untouched/);
+  assert.match(beforeWrite, /known drive position was preserved/);
+  assert.match(beforeWrite, /staging starts over from the saved snapshot/);
   assert.doesNotMatch(beforeWrite, /reconcile/i);
   assert.match(legacyBeforeWrite, /older record marked the drive uncertain/);
   assert.match(legacyBeforeWrite, /reconcile it once/);
+  assert.match(legacyBeforeWrite, /staging starts over from the saved snapshot/);
   assert.match(afterWrite, /Treat tape position as uncertain/);
   assert.match(afterWrite, /reconcile the drive/);
   assert.match(legacyCapacity, /complete archive to fit on the staging disk/);
   assert.match(legacyCapacity, /tape was not changed/i);
   assert.match(legacyCapacity, /Retry with Native v2/);
   assert.doesNotMatch(legacyCapacity, /drive or tape changed/i);
+});
+
+test("an interrupted Native v2 pre-write attempt distinguishes disk-pack work from tape data", () => {
+  const outcomeSource = section("  function renderBackupOutcome(", "  function renderBackupTimeline(");
+  const renderOutcome = Function(
+    "backupEvidenceValue", "backupRunVolumes", "backupTapeSummary", "backupRunState", "BACKUP_TERMINAL_STATES", "backupTerminalBeforeMediaWrite", "backupCurrentTapeLabel", "backupCompressionLabel", "backupDataDeliveryLabel", "bytes", "esc",
+    '"use strict";\n' + outcomeSource + "\nreturn renderBackupOutcome;"
+  )(
+    (run, ...keys) => {
+      for (const source of [run, run.result, run.result && run.result.evidence]) {
+        if (!source) continue;
+        for (const key of keys) if (source[key] !== undefined && source[key] !== null && source[key] !== "") return source[key];
+      }
+      return null;
+    },
+    (run) => run.volumes || [],
+    (run) => run.expected_cartridge_label || "Not assigned",
+    (run) => run.state,
+    new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]),
+    (run) => run.state === "interrupted" && run.result.media_write_started === false,
+    (run) => run.expected_cartridge_label || "Not assigned",
+    () => "No compression",
+    () => "Bounded rolling staging",
+    (value) => Number(value).toLocaleString() + " B",
+    (value) => String(value)
+  );
+  const interrupted = {
+    state: "interrupted",
+    expected_cartridge_label: "AA0336",
+    volumes: [{ sequence: 1, label: "AA0336" }],
+    result: {
+      media_write_started: false,
+      source_entry_count: 10985,
+      logical_bytes: 1869169767219,
+      transfer_progress: {
+        phase: "backup_write",
+        pipeline_basis: "native_v2_pack_bytes",
+        pipeline_bytes_processed: 272515153920
+      }
+    }
+  };
+  const outcome = renderOutcome(interrupted);
+  assert.match(outcome, /Selected tape/);
+  assert.match(outcome, /AA0336 · untouched/);
+  assert.match(outcome, /Tape written/);
+  assert.match(outcome, />0 B</);
+  assert.match(outcome, /Not started · tape untouched/);
+  assert.doesNotMatch(outcome, /<span>Archive tapes<\/span>/);
+
+  const detail = section("  function renderBackupRunDetail(", "  function renderBackupWorkQueue(");
+  const workCard = section("  function renderBackupWorkCard(", "  function backupFilterMatches(");
+  assert.match(detail, /prewriteTerminal \? "Restart backup" : "Retry same snapshot"/);
+  assert.match(workCard, /prewriteTerminal \? "Restart backup" : "Retry same snapshot"/);
+  assert.match(detail, /prewriteTerminal \? "Selected tape" : "Archive tapes"/);
+  assert.match(detail, /No tape-motion or data-write command was dispatched/);
 });
 
 test("historical Native v1 attempts remain explicit while retry advances to Native v2", () => {

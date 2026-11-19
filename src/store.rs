@@ -7711,6 +7711,7 @@ fn valid_single_tape_live_io_sample(sample: &SingleTapeLiveIoSample) -> bool {
                     | "reading_native_volume"
                     | "refilling_spool"
                     | "packing_pack"
+                    | "hashing_pack"
                     | "validating_pack"
                     | "writing_native_pack"
                     | "writing_native_volume_header"
@@ -8579,6 +8580,11 @@ pub async fn begin_native_v2_producer(
         transaction.rollback().await?;
         return Ok(false);
     }
+    let producer_event = if current.1 == "not_started" {
+        "producer_started"
+    } else {
+        "producer_resumed"
+    };
     let updated = sqlx::query(
         "UPDATE single_tape_data_runs
             SET native_producer_state = 'running',
@@ -8600,12 +8606,16 @@ pub async fn begin_native_v2_producer(
         &mut transaction,
         claim.run.id,
         claim.run.correlation_id,
-        "producer_resumed",
+        producer_event,
         json!({
             "native_layout_version": 2,
             "low_water_bytes": low_water_bytes,
             "high_water_bytes": high_water_bytes,
-            "detail": "bounded Native v2 pack production is active"
+            "detail": if producer_event == "producer_started" {
+                "bounded Native v2 pack production started"
+            } else {
+                "bounded Native v2 pack production resumed"
+            }
         }),
         "tapescale-worker",
     )
@@ -16584,6 +16594,7 @@ mod recovery_vault_tests {
             "reading_native_volume",
             "refilling_spool",
             "packing_pack",
+            "hashing_pack",
             "validating_pack",
             "writing_native_pack",
             "writing_native_volume_header",

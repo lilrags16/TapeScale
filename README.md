@@ -6,7 +6,7 @@
 TapeScale is a safety-first LTO backup control plane for TrueNAS. It manages standalone SAS tape drives, cartridges, bounded rolling file archives, physical verification evidence, recovery metadata, retention, holds, and custody through a graphical console.
 
 > [!IMPORTANT]
-> Version `0.2.0-alpha.9` is an attended evaluation build, not production protection. New backups use **TapeScale Native v2**, a bounded rolling-spool format; existing Native v1 captures remain readable. Multi-tape writing, immediate physical readback, and database-independent full-archive capture/restore are implemented. In-console restore and selected-file recovery are not. Do not make this alpha the only copy of any data.
+> Version `0.2.0-alpha.10` is an attended evaluation build, not production protection. New backups use **TapeScale Native v2**, a bounded rolling-spool format; existing Native v1 captures remain readable. Multi-tape writing, immediate physical readback, and database-independent full-archive capture/restore are implemented. In-console restore and selected-file recovery are not. Do not make this alpha the only copy of any data.
 
 ## What changed in 0.2
 

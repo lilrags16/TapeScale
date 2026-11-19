@@ -1168,6 +1168,100 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         2,
         "the drive and first cartridge lease must both be extended by each heartbeat"
     );
+
+    // Exercise the Native v2 producer lifecycle on this already fenced run,
+    // then restore its legacy G0.2 fixture shape before the remaining test.
+    sqlx::query(
+        "UPDATE single_tape_data_runs
+            SET engine_version = '2', adapter_version = 'native-v2',
+                format_version = 'tapescale-native-v2', native_layout_version = 2,
+                native_producer_state = 'not_started',
+                native_spool_low_water_bytes = NULL,
+                native_spool_high_water_bytes = NULL
+          WHERE id = $1",
+    )
+    .bind(data_claim.run.id)
+    .execute(&pool)
+    .await
+    .expect("Native v2 producer event fixture should update the fenced run");
+    sqlx::query("UPDATE job_runs SET state = 'writing' WHERE id = $1")
+        .bind(data_claim.run.job_run_id)
+        .execute(&pool)
+        .await
+        .expect("Native v2 producer event fixture should enter writing");
+    let mut producer_claim = (*data_claim).clone();
+    producer_claim.run.engine_version = "2".to_owned();
+    producer_claim.run.adapter_version = "native-v2".to_owned();
+    producer_claim.run.format_version = "tapescale-native-v2".to_owned();
+    assert!(store::begin_native_v2_producer(
+        &pool,
+        &producer_claim,
+        256 * 1024 * 1024,
+        768 * 1024 * 1024,
+    )
+    .await
+    .expect("initial Native v2 producer activation should persist"));
+    sqlx::query("UPDATE single_tape_data_runs SET native_producer_state = 'paused' WHERE id = $1")
+        .bind(data_claim.run.id)
+        .execute(&pool)
+        .await
+        .expect("Native v2 producer pause fixture should persist");
+    assert!(store::begin_native_v2_producer(
+        &pool,
+        &producer_claim,
+        256 * 1024 * 1024,
+        768 * 1024 * 1024,
+    )
+    .await
+    .expect("paused Native v2 producer should resume"));
+    assert!(store::begin_native_v2_producer(
+        &pool,
+        &producer_claim,
+        256 * 1024 * 1024,
+        768 * 1024 * 1024,
+    )
+    .await
+    .expect("running Native v2 producer replay should be idempotent"));
+    let producer_events = store::single_tape_data_events(&pool, data_claim.run.id)
+        .await
+        .expect("Native v2 producer events should reload")
+        .into_iter()
+        .filter(|event| event.event_type.starts_with("producer_"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        producer_events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["producer_started", "producer_resumed"]
+    );
+    assert_eq!(
+        producer_events[0].evidence["detail"],
+        "bounded Native v2 pack production started"
+    );
+    assert_eq!(
+        producer_events[1].evidence["detail"],
+        "bounded Native v2 pack production resumed"
+    );
+    sqlx::query(
+        "UPDATE single_tape_data_runs
+            SET engine_version = '1', adapter_version = 'native-v1',
+                format_version = 'tapescale-native-v1', native_layout_version = 1,
+                native_producer_state = 'not_started',
+                native_spool_low_water_bytes = NULL,
+                native_spool_high_water_bytes = NULL
+          WHERE id = $1",
+    )
+    .bind(data_claim.run.id)
+    .execute(&pool)
+    .await
+    .expect("G0.2 fixture should restore its Native v1 shape");
+    sqlx::query("UPDATE job_runs SET state = 'preparing' WHERE id = $1")
+        .bind(data_claim.run.job_run_id)
+        .execute(&pool)
+        .await
+        .expect("G0.2 fixture should restore its preparing state");
+
     assert!(store::running_drive_operation_paths(&pool)
         .await
         .expect("active physical paths should query")
@@ -2068,6 +2162,8 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         vec![
             "queued",
             "started",
+            "producer_started",
+            "producer_resumed",
             "writing",
             "media_write_started",
             "media_prepared",

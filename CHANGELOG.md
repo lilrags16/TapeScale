@@ -2,6 +2,15 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.2.0-alpha.10] - 2026-11-19
+
+### Lease-safe Native v2 preparation
+
+- Keeps the drive and cartridge leases alive throughout long Native v2 preparation so a large pack cannot expire its hardware assignment before the first tape motion.
+- Makes completed-pack hashing cancellable and exposes live byte, file, and slice progress in deterministic slice order; the new `producer_started` event also makes the beginning of expensive pack production explicit.
+- Freshly revalidates the loaded tape's on-media UUID immediately before the irreversible write boundary, rejecting stale hardware assumptions before data moves.
+- Reports failures before the first tape command truthfully as pre-write preparation failures, preserving actionable progress without implying that the tape was changed or written.
+
 ## [0.2.0-alpha.9] - 2026-11-19
 
 ### Deletable backup jobs
@@ -327,6 +336,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.2.0-alpha.10]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.10
 [0.2.0-alpha.9]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.9
 [0.2.0-alpha.8]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.8
 [0.2.0-alpha.7]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.7
