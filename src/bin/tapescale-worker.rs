@@ -19,7 +19,7 @@ use tapescale::{
         simulator::SimulatorEngine,
         QualificationStatus, TapeEngine,
     },
-    qualification::{BtapeOutcomeKind, BtapeQualificationConfig},
+    native_tape::{NativeTapeConfig, NativeTapeOutcomeKind},
     restore_rehearsal, store,
     tool_runner::ToolError,
 };
@@ -180,31 +180,32 @@ async fn main() -> Result<()> {
         );
     }
     if config.lab_tape_motion_enabled {
-        warn!("unqualified lab tape motion is enabled; only rewind and unload are allowlisted");
+        warn!("manual tape motion is enabled; only rewind and unload are allowlisted");
     }
     if config.lab_tape_qualification_enabled {
         warn!(
-            btape = %config.btape_path.display(),
-            "destructive Bacula btape qualification is enabled for attended scratch-media tests"
+            mt = %sas_config.mt_path.display(),
+            "destructive TapeScale native qualification is enabled for attended scratch-media tests"
         );
     }
     if config.lab_file_roundtrip_enabled {
         warn!(
             source_root = %config.source_root.display(),
             restore_root = %config.restore_root.display(),
-            spool_directory = %config.bacula_spool_dir.display(),
-            spool_maximum_bytes = config.bacula_spool_max_bytes,
-            spool_reserve_bytes = config.bacula_spool_reserve_bytes,
-            spool_minimum_bytes = config.bacula_spool_min_bytes,
+            dar = %config.dar_path.display(),
+            spool_directory = %config.native_spool_dir.display(),
+            spool_reserve_bytes = config.native_spool_reserve_bytes,
+            slice_bytes = config.native_slice_bytes,
+            compression_threads = config.native_compression_threads,
             timeout_seconds = config.data_run_timeout.as_secs(),
             transfer_stall_timeout_seconds = config.transfer_stall_timeout.as_secs(),
-            "attended Bacula compressed multi-tape Full backup with selectable direct or disk-staged delivery, ordered physical readback, and recovery-exercise execution are enabled; they are not production-qualified"
+            "attended TapeScale Native staged Full backup, ordered multi-tape writes, and immediate physical readback are enabled; they are not production-qualified"
         );
     }
-    let btape_config = BtapeQualificationConfig {
+    let native_tape_config = NativeTapeConfig {
         enabled: config.lab_tape_qualification_enabled,
-        program: config.btape_path.clone(),
-        state_dir: config.bacula_state_dir.clone(),
+        mt_program: sas_config.mt_path.clone(),
+        allowed_devices: sas_config.devices.clone(),
         timeout: config.qualification_timeout,
     };
     let engine = SimulatorEngine::new();
@@ -212,7 +213,7 @@ async fn main() -> Result<()> {
     if engine_identity.qualification != QualificationStatus::PhysicallyQualified {
         warn!(
             qualification = ?engine_identity.qualification,
-            "the legacy generic job engine remains an unqualified simulator; attended Full backups use the separately gated pinned Bacula data path"
+            "the legacy generic job engine remains an unqualified simulator; attended Full backups use the separately gated TapeScale Native archive path"
         );
     }
     let worker_id = Uuid::now_v7();
@@ -231,7 +232,7 @@ async fn main() -> Result<()> {
             pool.as_ref(),
             &sas_config,
             &config,
-            &btape_config,
+            &native_tape_config,
             worker_id,
             &shutdown,
         )
@@ -257,11 +258,11 @@ async fn reconcile_once(
     pool: Option<&sqlx::PgPool>,
     sas_config: &SasDiscoveryConfig,
     config: &Config,
-    btape_config: &BtapeQualificationConfig,
+    native_tape_config: &NativeTapeConfig,
     worker_id: Uuid,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    reconcile_sas_devices(pool, sas_config, btape_config, cancellation).await?;
+    reconcile_sas_devices(pool, sas_config, native_tape_config, cancellation).await?;
 
     if let Some(pool) = pool {
         // Restore requests outrank queued writes at this safe, between-job boundary. A running
@@ -276,7 +277,14 @@ async fn reconcile_once(
         .await?;
         data_run::process_single_tape_data_runs(pool, sas_config, config, worker_id, cancellation)
             .await?;
-        process_qualification_runs(pool, sas_config, btape_config, worker_id, cancellation).await?;
+        process_qualification_runs(
+            pool,
+            sas_config,
+            native_tape_config,
+            worker_id,
+            cancellation,
+        )
+        .await?;
         process_drive_operations(
             pool,
             sas_config,
@@ -314,7 +322,7 @@ async fn reconcile_once(
 async fn reconcile_sas_devices(
     pool: Option<&sqlx::PgPool>,
     config: &SasDiscoveryConfig,
-    btape_config: &BtapeQualificationConfig,
+    native_tape_config: &NativeTapeConfig,
     cancellation: &CancellationToken,
 ) -> Result<()> {
     if !config.is_enabled() {
@@ -344,7 +352,7 @@ async fn reconcile_sas_devices(
         probe_idle_loaded_tape_identities(
             pool,
             &discovery_config,
-            btape_config,
+            native_tape_config,
             &results,
             cancellation,
         )
@@ -367,11 +375,13 @@ fn loaded_tape_identity_probe_due(drive: &store::DriveRecord) -> bool {
 async fn probe_idle_loaded_tape_identities(
     pool: &sqlx::PgPool,
     config: &SasDiscoveryConfig,
-    btape_config: &BtapeQualificationConfig,
+    native_tape_config: &NativeTapeConfig,
     observations: &[SasProbeResult],
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    if !btape_config.enabled || cancellation.is_cancelled() {
+    // `enabled` gates destructive qualification, not the bounded read-only
+    // identity probe used to reconcile an idle tape at BOT.
+    if cancellation.is_cancelled() {
         return Ok(());
     }
     let drives = store::list_drives(pool).await?;
@@ -400,12 +410,8 @@ async fn probe_idle_loaded_tape_identities(
             {
                 continue;
             }
-            let probe = btape_config
-                .probe_volume_label(
-                    Uuid::now_v7(),
-                    Path::new(&observation.observed_path),
-                    cancellation,
-                )
+            let probe = native_tape_config
+                .probe_identity(Path::new(&observation.observed_path), cancellation)
                 .await;
             let mut exact_config = config.clone();
             exact_config
@@ -442,7 +448,7 @@ async fn probe_idle_loaded_tape_identities(
                 &observation.stable_id,
                 &observation.observed_path,
                 probe.volume_name.as_deref(),
-                probe.kind == BtapeOutcomeKind::Passed && postcondition_ok,
+                probe.kind == NativeTapeOutcomeKind::Passed && postcondition_ok,
                 detail,
                 after_observation.observed_at,
             )
@@ -496,7 +502,7 @@ async fn persist_sas_results(
 async fn process_qualification_runs(
     pool: &sqlx::PgPool,
     config: &SasDiscoveryConfig,
-    btape_config: &BtapeQualificationConfig,
+    native_tape_config: &NativeTapeConfig,
     worker_id: Uuid,
     cancellation: &CancellationToken,
 ) -> Result<()> {
@@ -507,7 +513,7 @@ async fn process_qualification_runs(
             "expired destructive qualification runs require drive reconciliation"
         );
     }
-    if !btape_config.enabled {
+    if !native_tape_config.enabled {
         let blocked = store::block_queued_qualification_runs(
             pool,
             "destructive lab tape qualification was disabled before worker execution",
@@ -526,8 +532,14 @@ async fn process_qualification_runs(
     }
     match store::claim_next_qualification_run(pool, worker_id).await? {
         store::ClaimQualificationRunResult::Claimed(claim) => {
-            execute_claimed_qualification_run(pool, config, btape_config, &claim, cancellation)
-                .await?;
+            execute_claimed_qualification_run(
+                pool,
+                config,
+                native_tape_config,
+                &claim,
+                cancellation,
+            )
+            .await?;
         }
         store::ClaimQualificationRunResult::Blocked { id, reason } => {
             warn!(qualification_run_id = %id, %reason, "tape qualification was blocked during worker revalidation");
@@ -540,7 +552,7 @@ async fn process_qualification_runs(
 async fn execute_claimed_qualification_run(
     pool: &sqlx::PgPool,
     config: &SasDiscoveryConfig,
-    btape_config: &BtapeQualificationConfig,
+    native_tape_config: &NativeTapeConfig,
     claim: &store::ClaimedQualificationRun,
     cancellation: &CancellationToken,
 ) -> Result<()> {
@@ -584,7 +596,7 @@ async fn execute_claimed_qualification_run(
         store::recover_expired_qualification_runs(pool).await?;
         warn!(
             qualification_run_id = %claim.run.id,
-            "qualification lease expired before btape dispatch; no command was executed"
+            "qualification lease expired before native tape dispatch; no command was executed"
         );
         return Ok(());
     }
@@ -594,7 +606,7 @@ async fn execute_claimed_qualification_run(
             claim,
             store::QualificationTerminalState::Blocked,
             json!({
-                "detail": "worker shutdown was requested before btape dispatch",
+                "detail": "worker shutdown was requested before native tape dispatch",
                 "position_uncertain": false,
                 "command_dispatched": false
             }),
@@ -611,15 +623,15 @@ async fn execute_claimed_qualification_run(
         stable_id = %claim.run.expected_stable_id,
         device = %claim.run.expected_path,
         fencing_token = claim.fencing_token,
-        "starting destructive Bacula btape test on operator-designated scratch media"
+        "starting destructive TapeScale native test on operator-designated scratch media"
     );
     let (outcome, lease_heartbeat_failure) =
-        run_btape_with_lease_heartbeat(pool, btape_config, claim, cancellation).await;
+        run_native_test_with_lease_heartbeat(pool, native_tape_config, claim, cancellation).await;
     let mut terminal = match outcome.kind {
-        BtapeOutcomeKind::Passed => store::QualificationTerminalState::Passed,
-        BtapeOutcomeKind::Failed => store::QualificationTerminalState::Failed,
-        BtapeOutcomeKind::Blocked => store::QualificationTerminalState::Blocked,
-        BtapeOutcomeKind::Interrupted => store::QualificationTerminalState::Interrupted,
+        NativeTapeOutcomeKind::Passed => store::QualificationTerminalState::Passed,
+        NativeTapeOutcomeKind::Failed => store::QualificationTerminalState::Failed,
+        NativeTapeOutcomeKind::Blocked => store::QualificationTerminalState::Blocked,
+        NativeTapeOutcomeKind::Interrupted => store::QualificationTerminalState::Interrupted,
     };
     // Keep the qualification evidence fields at the durable result root. Readiness queries use
     // the proven block size directly and must not depend on a second nested `evidence` object.
@@ -647,12 +659,12 @@ async fn execute_claimed_qualification_run(
         store::recover_expired_qualification_runs(pool).await?;
         warn!(
             qualification_run_id = %claim.run.id,
-            "qualification lease expired before btape evidence could be committed"
+            "qualification lease expired before native tape evidence could be committed"
         );
         return Ok(());
     }
 
-    if outcome.kind == BtapeOutcomeKind::Passed && !lease_heartbeat_failed {
+    if outcome.kind == NativeTapeOutcomeKind::Passed && !lease_heartbeat_failed {
         if cancellation.is_cancelled() {
             terminal = store::QualificationTerminalState::Interrupted;
             insert_result_field(&mut result, "kind", json!("interrupted"));
@@ -663,54 +675,18 @@ async fn execute_claimed_qualification_run(
                 json!("worker shutdown was requested before the required post-test rewind"),
             );
         } else {
-            // A label/readback is a short bounded phase after the long general
-            // test. Keep its deadline comfortably inside the freshly renewed
-            // 30-minute drive lease so it cannot outlive its fencing authority.
-            let identity_config = BtapeQualificationConfig {
-                timeout: btape_config.timeout.min(Duration::from_secs(10 * 60)),
-                ..btape_config.clone()
-            };
-            let identity_label = identity_config
-                .write_and_verify_preparation_label(
-                    claim.run.id,
-                    Path::new(&claim.run.expected_path),
-                    claim.run.cartridge_id,
-                    cancellation,
-                )
-                .await;
-            insert_result_field(
-                &mut result,
-                "identity_label",
-                serde_json::to_value(&identity_label)?,
-            );
             let expected_identity =
-                tapescale::qualification::preparation_volume_label(claim.run.cartridge_id);
-            if identity_label.kind == BtapeOutcomeKind::Passed
-                && identity_label.volume_name.as_deref() == Some(expected_identity.as_str())
+                tapescale::native_tape::preparation_volume_identity(claim.run.cartridge_id);
+            if result.get("on_tape_identity").and_then(Value::as_str)
+                != Some(expected_identity.as_str())
             {
-                insert_result_field(&mut result, "on_tape_identity", json!(expected_identity));
-            } else {
-                terminal = match identity_label.kind {
-                    BtapeOutcomeKind::Interrupted => store::QualificationTerminalState::Interrupted,
-                    BtapeOutcomeKind::Blocked => store::QualificationTerminalState::Blocked,
-                    BtapeOutcomeKind::Passed | BtapeOutcomeKind::Failed => {
-                        store::QualificationTerminalState::Failed
-                    }
-                };
-                insert_result_field(
-                    &mut result,
-                    "kind",
-                    json!(qualification_terminal_label(terminal)),
-                );
-                insert_result_field(
-                    &mut result,
-                    "position_uncertain",
-                    json!(identity_label.position_uncertain),
-                );
+                terminal = store::QualificationTerminalState::Failed;
+                insert_result_field(&mut result, "kind", json!("failed"));
+                insert_result_field(&mut result, "position_uncertain", json!(true));
                 insert_result_field(
                     &mut result,
                     "detail",
-                    json!("btape passed, but TapeScale could not write and read back the cartridge's stable internal identity"),
+                    json!("native qualification passed its data readback but did not retain the exact cartridge preparation identity"),
                 );
             }
             let cleanup = execute_sas_motion(
@@ -799,16 +775,18 @@ async fn execute_claimed_qualification_run(
     finish_qualification(pool, claim, terminal, result).await
 }
 
-async fn run_btape_with_lease_heartbeat(
+async fn run_native_test_with_lease_heartbeat(
     pool: &sqlx::PgPool,
-    btape_config: &BtapeQualificationConfig,
+    native_tape_config: &NativeTapeConfig,
     claim: &store::ClaimedQualificationRun,
     cancellation: &CancellationToken,
-) -> (tapescale::qualification::BtapeOutcome, Option<String>) {
+) -> (tapescale::native_tape::NativeTapeOutcome, Option<String>) {
     let operation_cancellation = cancellation.child_token();
-    let execution = btape_config.run(
+    let execution = native_tape_config.qualify_and_prepare(
         claim.run.id,
         Path::new(&claim.run.expected_path),
+        claim.run.cartridge_id,
+        &claim.run.expected_stable_id,
         &operation_cancellation,
     );
     tokio::pin!(execution);
@@ -826,7 +804,7 @@ async fn run_btape_with_lease_heartbeat(
                         let outcome = execution.await;
                         return (
                             outcome,
-                            Some("the fenced drive lease could not be renewed during btape; execution was cancelled".to_owned()),
+                            Some("the fenced drive lease could not be renewed during native tape qualification; execution was cancelled".to_owned()),
                         );
                     }
                     Err(error) => {
@@ -834,7 +812,7 @@ async fn run_btape_with_lease_heartbeat(
                         let outcome = execution.await;
                         return (
                             outcome,
-                            Some(format!("the drive-lease heartbeat failed during btape: {error}")),
+                            Some(format!("the drive-lease heartbeat failed during native tape qualification: {error}")),
                         );
                     }
                 }
@@ -951,7 +929,8 @@ fn verified_qualification_postcondition(
     }
     if observation.at_bot != Some(true) {
         return Err(
-            "btape passed, but the required cleanup rewind did not establish BOT".to_owned(),
+            "native qualification passed, but the required cleanup rewind did not establish BOT"
+                .to_owned(),
         );
     }
     Ok(observation.health())
@@ -976,7 +955,7 @@ async fn finish_qualification(
             cartridge_id = %claim.run.cartridge_id,
             terminal_state = qualification_terminal_label(state),
             %detail,
-            "destructive Bacula tape qualification reached a durable terminal state"
+            "destructive TapeScale native qualification reached a durable terminal state"
         );
     }
     Ok(())
@@ -1432,9 +1411,9 @@ mod tests {
             expected_cartridge_label: "TS-SCRATCH-001".to_owned(),
             expected_media_generation: Some(9),
             expected_media_format: Some("LTO-9".to_owned()),
-            engine_name: "Bacula Community".to_owned(),
-            engine_version: "15.0.3".to_owned(),
-            test_kind: "btape_test".to_owned(),
+            engine_name: "TapeScale Native".to_owned(),
+            engine_version: "1".to_owned(),
+            test_kind: "native_tape_test".to_owned(),
             scratch_media_confirmed: true,
             destructive_overwrite_confirmed: true,
             state: "running".to_owned(),

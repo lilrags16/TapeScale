@@ -4,9 +4,9 @@ x-tapescale-common: &tapescale-common
   build:
     context: .
     args:
-      TAPESCALE_VERSION: ${TAPESCALE_VERSION:-0.1.0-alpha.15}
+      TAPESCALE_VERSION: ${TAPESCALE_VERSION:-0.2.0-alpha.1}
       TAPESCALE_REVISION: ${TAPESCALE_REVISION:-development}
-  image: tapescale:${TAPESCALE_VERSION:-0.1.0-alpha.15}
+  image: tapescale:${TAPESCALE_VERSION:-0.2.0-alpha.1}
   restart: unless-stopped
   read_only: true
   cap_drop: [ALL]
@@ -14,15 +14,13 @@ x-tapescale-common: &tapescale-common
     - no-new-privileges:true
   tmpfs:
     - /tmp:size=128m,mode=1777
-    - /etc/tapescale:size=1m,mode=0700
-    - /run/bacula:size=4m,mode=0750
   secrets:
     - postgres_password
   environment: &tapescale-environment
     TAPESCALE_DEMO_MODE: ${TAPESCALE_DEMO_MODE:-false}
-    TAPESCALE_LAB_TAPE_MOTION_ENABLED: ${TAPESCALE_LAB_TAPE_MOTION_ENABLED:-false}
-    TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED: ${TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED:-false}
-    TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED: ${TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED:-false}
+    TAPESCALE_TAPE_MOTION_ENABLED: ${TAPESCALE_TAPE_MOTION_ENABLED:-false}
+    TAPESCALE_TAPE_PREPARATION_ENABLED: ${TAPESCALE_TAPE_PREPARATION_ENABLED:-false}
+    TAPESCALE_NATIVE_BACKUP_ENABLED: ${TAPESCALE_NATIVE_BACKUP_ENABLED:-false}
     TAPESCALE_SOURCE_ROOT: /source
     TAPESCALE_RESTORE_ROOT: /restore
     TAPESCALE_DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
@@ -81,12 +79,11 @@ services:
       TAPESCALE_TAPE_DEVICES: ${TAPESCALE_TAPE_DEVICES:-}
       TAPESCALE_SYSFS_ROOT: ${TAPESCALE_SYSFS_ROOT:-/sys}
       TAPESCALE_MT_PATH: ${TAPESCALE_MT_PATH:-/usr/bin/mt-st}
-      TAPESCALE_BTAPE_PATH: ${TAPESCALE_BTAPE_PATH:-/usr/sbin/btape}
-      TAPESCALE_BCONSOLE_PATH: ${TAPESCALE_BCONSOLE_PATH:-/usr/sbin/bconsole}
-      TAPESCALE_BACULA_STATE_DIR: /var/lib/tapescale/bacula
-      TAPESCALE_BACULA_SPOOL_MAX_BYTES: ${TAPESCALE_BACULA_SPOOL_MAX_BYTES:-0}
-      TAPESCALE_BACULA_SPOOL_RESERVE_BYTES: ${TAPESCALE_BACULA_SPOOL_RESERVE_BYTES:-8589934592}
-      TAPESCALE_BACULA_SPOOL_MIN_BYTES: ${TAPESCALE_BACULA_SPOOL_MIN_BYTES:-8589934592}
+      TAPESCALE_DAR_PATH: ${TAPESCALE_DAR_PATH:-/usr/local/bin/dar}
+      TAPESCALE_NATIVE_SPOOL_DIR: /var/lib/tapescale/spool
+      TAPESCALE_NATIVE_SPOOL_RESERVE_BYTES: ${TAPESCALE_NATIVE_SPOOL_RESERVE_BYTES:-8589934592}
+      TAPESCALE_NATIVE_SLICE_BYTES: ${TAPESCALE_NATIVE_SLICE_BYTES:-68719476736}
+      TAPESCALE_NATIVE_COMPRESSION_THREADS: ${TAPESCALE_NATIVE_COMPRESSION_THREADS:-4}
       TAPESCALE_QUALIFICATION_TIMEOUT_SECS: ${TAPESCALE_QUALIFICATION_TIMEOUT_SECS:-1800}
       TAPESCALE_DATA_RUN_TIMEOUT_SECS: ${TAPESCALE_DATA_RUN_TIMEOUT_SECS:-43200}
       TAPESCALE_TRANSFER_STALL_TIMEOUT_SECS: ${TAPESCALE_TRANSFER_STALL_TIMEOUT_SECS:-1800}
@@ -95,8 +92,6 @@ services:
     volumes:
       - recovery_exports:/var/lib/tapescale/recovery
       - spool:/var/lib/tapescale/spool
-      - engine_state:/var/lib/tapescale/bacula
-      - bacula_runtime:/var/lib/bacula
       - ${TAPESCALE_SOURCE_HOST_PATH:-./fixtures}:/source:ro
       - type: bind
         source: ${TAPESCALE_RESTORE_HOST_PATH:-./restore}
@@ -168,8 +163,6 @@ volumes:
   postgres_data:
   recovery_exports:
   spool:
-  engine_state:
-  bacula_runtime:
 
 networks:
   edge:

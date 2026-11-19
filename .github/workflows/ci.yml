@@ -63,95 +63,59 @@ jobs:
           docker compose --file compose.truenas.yaml config --quiet
       - name: Build runtime image
         run: docker build --tag tapescale:ci .
-      - name: Validate packaged Bacula schema
-        run: >-
-          docker run --rm
-          --entrypoint /usr/local/bin/tapescale-worker
-          tapescale:ci
-          --validate-bacula-schema
-      - name: Exercise single- and multi-volume recovery roundtrips
+      - name: Validate native runtime contents
         run: |
           set -euo pipefail
-          catalog_network="tapescale-ci-catalog-${GITHUB_RUN_ID}"
-          catalog_postgres="tapescale-ci-postgres-${GITHUB_RUN_ID}"
-          cleanup() {
-            docker rm --force "$catalog_postgres" >/dev/null 2>&1 || true
-            docker network rm "$catalog_network" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          docker network create "$catalog_network"
-          docker run --detach \
-            --name "$catalog_postgres" \
-            --network "$catalog_network" \
-            --network-alias postgres \
-            --env POSTGRES_DB=tapescale \
-            --env POSTGRES_USER=tapescale \
-            --env POSTGRES_PASSWORD=tapescale_ci \
-            postgres:16.15-bookworm
-          for attempt in $(seq 1 30); do
-            if docker exec "$catalog_postgres" pg_isready --username tapescale --dbname tapescale; then
-              break
-            fi
-            if test "$attempt" = 30; then
-              docker logs "$catalog_postgres"
-              exit 1
-            fi
-            sleep 1
-          done
-          docker run --rm \
-            --network "$catalog_network" \
-            --user 0:0 \
-            --env DATABASE_URL=postgresql://tapescale:tapescale_ci@postgres:5432/tapescale \
-            --env BACULA_CATALOG_HOST=postgres \
-            --env BACULA_CATALOG_PORT=5432 \
-            --env BACULA_CATALOG_DATABASE=tapescale \
-            --env BACULA_CATALOG_USER=tapescale \
-            --env BACULA_CATALOG_PASSWORD=tapescale_ci \
-            --volume "$GITHUB_WORKSPACE/scripts/ci-bacula-file-roundtrip.sh:/usr/local/bin/ci-bacula-file-roundtrip:ro" \
-            --entrypoint /usr/local/bin/ci-bacula-file-roundtrip \
-            tapescale:ci
-          docker run --rm \
-            --network "$catalog_network" \
-            --user 0:0 \
-            --env BACULA_CI_MODE=lzo \
-            --env DATABASE_URL=postgresql://tapescale:tapescale_ci@postgres:5432/tapescale \
-            --env BACULA_CATALOG_HOST=postgres \
-            --env BACULA_CATALOG_PORT=5432 \
-            --env BACULA_CATALOG_DATABASE=tapescale \
-            --env BACULA_CATALOG_USER=tapescale \
-            --env BACULA_CATALOG_PASSWORD=tapescale_ci \
-            --volume "$GITHUB_WORKSPACE/scripts/ci-bacula-file-roundtrip.sh:/usr/local/bin/ci-bacula-file-roundtrip:ro" \
-            --entrypoint /usr/local/bin/ci-bacula-file-roundtrip \
-            tapescale:ci
-          docker run --rm \
-            --network "$catalog_network" \
-            --user 0:0 \
-            --env BACULA_CI_MODE=spanning \
-            --env DATABASE_URL=postgresql://tapescale:tapescale_ci@postgres:5432/tapescale \
-            --env BACULA_CATALOG_HOST=postgres \
-            --env BACULA_CATALOG_PORT=5432 \
-            --env BACULA_CATALOG_DATABASE=tapescale \
-            --env BACULA_CATALOG_USER=tapescale \
-            --env BACULA_CATALOG_PASSWORD=tapescale_ci \
-            --volume "$GITHUB_WORKSPACE/scripts/ci-bacula-file-roundtrip.sh:/usr/local/bin/ci-bacula-file-roundtrip:ro" \
-            --entrypoint /usr/local/bin/ci-bacula-file-roundtrip \
-            tapescale:ci
-          catalog_result="$(docker exec \
-            --env PGPASSWORD=tapescale_ci \
-            "$catalog_postgres" \
-            psql --username tapescale --dbname tapescale --tuples-only --no-align \
-            --command "SELECT versionid || '|' || (to_regclass('public.job') IS NOT NULL)::text || '|' || (to_regclass('public.media') IS NOT NULL)::text FROM public.version")"
-          test "$catalog_result" = "1026|true|true"
-      - name: Verify capability-free worker state access
-        run: |
-          docker volume create tapescale-ci-engine-state
           docker run --rm \
             --entrypoint /bin/sh \
-            --user 0:0 \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m \
+            tapescale:ci \
+            -ec '
+              command -v dar
+              command -v mt-st
+              for executable in btape bconsole bacula-dir bacula-sd bacula-fd dbcheck; do
+                ! command -v "$executable"
+              done
+              dar -V >/tmp/dar-version 2>&1
+              grep -F "dar version 2.8.6" /tmp/dar-version
+              grep -E "gzip compression \(libz\) +: YES$" /tmp/dar-version
+              grep -E "zstd compression \(libzstd\) +: YES$" /tmp/dar-version
+              grep -E "lz4 compression \(liblz4\) +: YES$" /tmp/dar-version
+              grep -F "Multiple threads (libthreads): YES (1.6.1" /tmp/dar-version
+              test ! -e /var/lib/bacula
+              test ! -e /var/lib/tapescale/bacula
+              test ! -e /etc/bacula
+              test ! -e /run/bacula
+              test -d /var/lib/tapescale/spool
+              test -d /var/lib/tapescale/recovery
+            '
+      - name: Exercise source-independent native DAR roundtrips
+        run: |
+          set -euo pipefail
+          for codec in zstd lz4; do
+            docker run --rm \
+              --cap-drop ALL \
+              --security-opt no-new-privileges:true \
+              --env "NATIVE_CI_COMPRESSION=$codec" \
+              --volume "$GITHUB_WORKSPACE/scripts/ci-native-dar-roundtrip.sh:/usr/local/bin/ci-native-dar-roundtrip:ro" \
+              --entrypoint /usr/local/bin/ci-native-dar-roundtrip \
+              tapescale:ci
+          done
+      - name: Verify capability-free native spool access
+        run: |
+          set -euo pipefail
+          native_spool="tapescale-ci-native-spool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            docker volume rm --force "$native_spool" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker volume create "$native_spool"
+          docker run --rm \
+            --entrypoint /bin/sh \
+            --user 10001:10001 \
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
             --read-only \
-            --volume tapescale-ci-engine-state:/var/lib/tapescale/bacula \
+            --volume "$native_spool:/var/lib/tapescale/spool" \
             tapescale:ci \
-            -ec 'test "$(stat -c "%u:%g:%a" /var/lib/tapescale/bacula/qualifications)" = "10001:0:770"; mkdir /var/lib/tapescale/bacula/qualifications/ci-write-test; touch /var/lib/tapescale/bacula/qualifications/ci-write-test/bacula-sd.conf'
-          docker volume rm tapescale-ci-engine-state
+            -ec 'test "$(stat -c "%u:%g:%a" /var/lib/tapescale/spool)" = "10001:0:770"; mkdir /var/lib/tapescale/spool/ci-write-test; touch /var/lib/tapescale/spool/ci-write-test/archive.000001.dar'

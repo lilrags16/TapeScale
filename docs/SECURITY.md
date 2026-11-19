@@ -1,136 +1,111 @@
-# Security and media-safety model
+# Security model
 
-TapeScale protects offline recovery data, credentials, encryption keys, and destructive hardware. Security failures can destroy the final usable copy, so the system defaults to denial when identity or state is uncertain.
+TapeScale `0.2.0-alpha.1` is an attended, non-production release. The alpha web application has no accounts, authorization, or TLS termination. Anyone who can reach its HTTP port can inspect filenames and attempt to initiate the exposed workflows. Deploy it only on an isolated trusted network behind host-level access controls, and never load retained or unknown media while destructive features are enabled.
 
-This document is the required production security contract. The alpha implements core RBAC/destructive-action policy, overwrite denial, restore-path validation, simulator claim boundaries, and a constrained external-tool runner. It does not yet constitute a production authentication, MFA, encrypted-secret, TLS, key-management, or device-security implementation. Those requirements remain production release blockers even where the UI demonstrates the intended workflow.
+## Authority boundaries
 
-## Threat model
+The deployment separates four services:
 
-The design considers:
+- the API serves the UI, performs bounded read-only browsing, and persists intent;
+- the scheduler creates durable work but has no source, restore, or tape access;
+- the worker alone receives the exact tape device, read-only source mount, and writable spool/restore roots;
+- PostgreSQL is reachable only on the private application network.
 
-- a compromised browser session or insufficiently authorized operator;
-- malicious source filenames, archive paths, link targets, metadata, and native properties;
-- lost, foreign, mislabeled, or unexpectedly loaded media;
-- stale catalogs, replayed events, worker crashes, device resets, and split ownership;
-- a compromised source NAS and loss of the original application database;
-- secrets leaking through logs, diagnostics, notifications, environment variables, or exports;
-- shell metacharacters and hostile values passed to external utilities;
-- an attacker attempting to reduce retention, relabel, erase, export keys, or overwrite live destinations.
+Neither the API nor scheduler receives `/dev/nstN`. No service receives the Docker socket or a writable host-root mount. The TrueNAS alpha worker runs as container root with a narrow capability set because it must traverse protected source metadata and preserve filesystem ownership; it is not privileged.
 
-## Trust boundaries
+## Destructive tape operations
 
-- Browser and API inputs are untrusted, even for administrators.
-- Tape labels, barcodes, engine output, manifests recovered from media, and archive paths are untrusted until authenticated and reconciled.
-- The API service cannot access devices or writable source/recovery data. The alpha stack is an explicit exception: it gives the API read-only `/source` and recovery-artifact views plus `DAC_READ_SEARCH` for contained metadata browsing and preflight. It must never return file contents, absolute paths, symlink targets, or artifact storage references.
-- The privileged worker receives only explicit intents already authorized by the API, then independently rechecks policy, object versions, lease ownership, and current physical state.
-- PostgreSQL is durable product state, not proof that a physical write completed.
-- Engine state is authoritative for its records but does not override TapeScale retention or authorization.
+Public tape motion is a closed set: rewind and rewind-and-unload. Preparation is a separate destructive workflow. The API does not expose seek, spacing, arbitrary filemarks, erase, format, raw read/write, shell, or free-form `mt-st` arguments.
 
-## Identity and authorization
+Preparation requires:
 
-Default roles are:
+- `TAPESCALE_TAPE_PREPARATION_ENABLED=true`;
+- an exact reconciled allowlisted `/dev/nstN` drive;
+- a ready loaded medium;
+- a registered, unprotected, non-WORM scratch cartridge;
+- no conflicting hold, retained content, reservation, identity mismatch, or active operation;
+- one server-bound destructive action;
+- fenced drive and media leases revalidated by the worker.
 
-- Administrator: configure hardware, policies, identities, keys, updates, retention, and destructive actions.
-- Operator: run permitted jobs, satisfy media requests, confirm assigned movements, and restore to approved destinations.
-- Viewer: inspect authorized status, inventory, verification evidence, and coverage.
+The worker dispatches fixed `mt-st` argument vectors and native record I/O only to the configured non-rewinding device. It writes deterministic qualification data, rereads and hashes it, then writes and rereads a preparation header containing the cartridge UUID. A process timeout cannot force a kernel-blocked tape operation to return; timeout, cancellation, lease loss, identity change, or an uncertain postcondition revokes trust and blocks later destructive work.
 
-The API and worker enforce the same permissions. Unique accounts and protected sessions are required. Administrators enroll MFA by default and receive one-time recovery codes. No image ships a shared default password. Session cookies must be `Secure`, `HttpOnly`, and `SameSite`; state-changing browser requests require origin/CSRF protection. Login, MFA, and reauthentication endpoints are rate-limited.
+Linux may commit a pending filemark when a tape descriptor closes or before motion. Rewind and unload therefore remain physical operations and should be used only with media whose current state is understood.
 
-Erase, relabel, retention reduction, key export, destruction of protection, and overwrite of existing data require:
+## Native backup safety gates
 
-1. an administrator role;
-2. a server-generated preview listing every affected recovery point, dependency, tape, and destination;
-3. recent MFA-backed reauthentication;
-4. an execution token bound to the preview digest and current object versions;
-5. an immutable audit result.
+New backups use TapeScale Native v1; Bacula is not installed in the runtime. Before tape motion, the worker:
 
-## Media safety
+1. reopens and verifies the selected source is a contained named snapshot on a read-only mount;
+2. inventories and hashes the source with bounded-memory external sorting;
+3. creates a private run-scoped archive stage on the dedicated spool;
+4. completes and tests the DAR archive;
+5. verifies planned slices fit conservative native cartridge capacity;
+6. rechecks leases, drive identity, cartridge eligibility, and the preparation UUID read from tape.
 
-Media is write-protected in policy unless every overwrite-gate condition in [ARCHITECTURE.md](ARCHITECTURE.md) passes. Additional rules are:
+The permanent media-write boundary is committed before overwriting the preparation record. After it, any failure or ambiguity quarantines touched media and prevents creation of a recovery point. Every volume is immediately rewound and read back before it is accepted as verified.
 
-- Unknown or foreign media begins protected.
-- A barcode or printed label is never sufficient identity.
-- Labeling, format import, erasing, and reuse are separate operations.
-- A reset or disconnect makes position and pending writes uncertain.
-- Off-site return changes custody only; it does not change retention.
-- WORM status cannot be overridden by software.
-- Exported or active-job media remains reserved against conflicting writes.
-- Destructive exceptional overrides cannot suppress the resulting protection gap or audit event.
+An operator preview is advisory. Assignment and worker execution repeat eligibility checks under database locks and fencing tokens. Printed labels, UI selection, and typed text never substitute for the native UUID read from tape.
 
-The alpha's optional rewind/unload path is an isolated-lab exception, not the production authorization model. It requires an exact reconciled drive, known zero-in-flight kernel state, a durable fenced lease, and an explicit designated-scratch-media acknowledgement. Linux permits these two endpoint operations to recover from its internal lost-position state; this does not authorize data I/O or relative positioning. Linux can finalize another controller's prior write with a filemark before motion, so the control must never be used with retained, production, unknown, or foreign media. The alpha API has no accounts yet; when the lab flag is enabled, its network must be isolated and attended.
+## DAR process boundary
 
-The optional `btape` path is a more destructive isolated-lab exception. The console presents one reviewed **Prepare tape** action; for API compatibility it derives the two acknowledgements and exact `DESTROY <registered-label> WITH BACULA BTAPE TEST` value from the selected server record instead of asking the operator to transcribe them. The selected inventory record must be non-WORM, unheld, content-free, unreserved, and neither foreign nor mismatched. The first preparation of blank media still associates the human-readable printed name with that physical cartridge. The worker rechecks the exact device identity and fenced reservation, accepts only the pinned `/usr/sbin/btape` binary/digest and fixed `test\n` transcript, requires completed-test output markers, then writes and reads back the deterministic `TS-PREP-V1-<cartridge UUID>` label with a closed command transcript before rewinding to an observed BOT. It never promotes the broader qualification state. The alpha has no authentication, so port 18080 is an unauthenticated destructive surface: deploy it only on an isolated attended lab network, disable `TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED` whenever the test is not actively required, and never load non-scratch media while it is enabled.
+DAR 2.8.6 and libthreadar are distributed under their own licenses as separate executables. TapeScale does not link their code into its Rust binaries.
 
-The **Prepare tape** wizard sequences drive reconciliation, cartridge registration or exact-record reuse, and qualification through their existing API contracts. It may auto-select only one current safe drive; it cannot mark WORM media scratch, suppress holds/content/reservations, or dispatch a tape command before the single destructive action. Each qualification submission carries a browser-generated idempotency key. PostgreSQL serializes that key, fingerprints the exact drive/media request, returns the original current or terminal run on a matching replay, and rejects changed-payload reuse. An ambiguous network retry therefore cannot silently create a second destructive run. Once preparation succeeds, idle discovery can map the internal label to exactly one inventory record. The worker nevertheless probes again at every write/read boundary; cached drive health never authorizes tape I/O.
+The worker invokes an absolute configured executable with a closed argument list and no shell. Source and stage paths are server-resolved absolute paths. Configuration files are disabled with `-N`, interactive prompts are disabled with `-Q`, compression and thread counts come from enumerated/bounded values, and stdout/stderr evidence is bounded. A run-scoped directory accepts only expected regular files and rejects symlinks, special objects, unexpected names, missing slices, non-contiguous ordinals, and overflowed byte totals.
 
-The source and recovery-manifest browsers expand filename visibility on the unauthenticated test API. Both are GET-only, non-cacheable, one-level, bounded metadata projections. A directory larger than the display bound is returned with `truncated=true` and must be presented as partial; the backup and retained manifest themselves are not truncated. Source browsing holds the read-only root/selection as descriptors, resolves beneath them without following symlinks, and obtains entry metadata relative to the held directory; special objects remain non-navigable. Recovery browsing first verifies the retained manifest artifact and then projects its recorded entries without exposing the artifact path or reading source/tape content. This disclosure is another reason to keep port 18080 on an isolated attended network. Browser output is advisory. For a selected restore, plan creation validates every requested path against the authenticated manifest, recursively expands directories, closes hard-link groups, removes redundant descendants, and snapshots a deterministic normalized scope/hash. Execution is offered only for an exactly one-volume point; a multi-volume selected scope is blocked until TapeScale can prove path-to-media coverage and truthful per-volume reads. The worker reloads the manifest and requires the same result before tape access. Parameterized Bacula catalog lookups are pinned to the original JobId, and only numeric FileIndex/PathId values—not operator paths—enter restricted BVFS commands.
+DAR input is still the contents and metadata of the selected filesystem tree. Unusual paths and metadata require physical qualification, but filenames are never interpolated into a shell command.
 
-## External command execution
+## On-tape authenticity and integrity
 
-Rust integrations invoke programs with an executable path and an argument array. They must not use `sh -c`, interpolate user data into command strings, or inherit an uncontrolled environment.
+Native metadata records use a versioned binary envelope with record kind, payload length, and SHA-256. Headers, indexes, and trailers bind cartridge, archive, archive-volume, and ordinal identities. Every DAR slice has an expected length and SHA-256. The trailer commits to the canonical index and ordered slice digest set.
 
-The tool runner:
+SHA-256 detects accidental corruption and inconsistent media; it is not a signature against a malicious party who can rewrite both data and metadata. The current unencrypted alpha has no key-backed media authentication or confidentiality. Treat physical custody and network isolation as part of the security boundary.
 
-- allowlists executable and operation combinations;
-- validates dataset, snapshot, device, and destination arguments;
-- sets an explicit working directory, environment, uid/gid, and timeout where available;
-- bounds captured output and redacts configured secrets;
-- records executable version, argv classification, exit status, timeout, and correlation ID;
-- treats a failed producer, consumer, or pipeline endpoint as failure;
-- handles cancellation at operation-specific safe boundaries;
-- turns missing tools and hung commands into actionable durable states.
+## Source and manifest browsing
 
-Acceptance AT-30 includes shell metacharacters, failed producers, timeouts, cancellation, and missing dependencies.
+The source browser is read-only, one directory level at a time, bounded, non-cacheable, descriptor-relative, and does not follow symlinks. Special objects are visible but not navigable or selectable. It never makes `/source` itself a backup root.
 
-The alpha's operational backup path is an isolated-lab exception to the production authorization and encryption contract. It accepts only a server-contained named `.zfs/snapshot/<name>` source on a kernel-reported read-only mount, one Full file job, one exact G0.1-qualified drive, and an ordered set of independently qualified and authorized scratch cartridges. The console presents one destructive action for the detected first tape and each destructive continuation; it supplies the server-issued compatibility confirmation without making the operator retype identity already read from tape. The worker independently re-probes the internal label and rechecks source access, qualification, compatibility, pool, holds, content, WORM, reservation, and readiness before each durable write boundary. A missing, foreign, ambiguous, or wrong label blocks before data I/O. The alpha still has no authentication, so anyone who can reach its API can invoke these visible destructive actions. Do not place sensitive production data in this unencrypted slice or expose it outside the isolated attended lab network.
+The retained browser verifies the manifest artifact before projecting recorded names, types, sizes, and timestamps. It does not read source or tape content and does not return internal storage paths. Because the alpha is unauthenticated, both browsers disclose filenames to any network client that can reach the API.
 
-## Restore containment
+## Spool and evidence isolation
 
-Restored names and metadata are hostile. File restoration must anchor all resolution to an already approved destination and reject absolute paths, `..`, alternate separators, NULs, device paths, and platform-specific escape forms. Directory traversal checks alone are insufficient.
+The native spool must be a real directory isolated from source, restore, and evidence trees. It should be a dedicated dataset that is writable only by the worker. The API must never mount it. Run directories are created without following symlinks; unexpected non-regular files cause failure.
 
-Creation uses descriptor-relative operations or an equivalent race-resistant mechanism that refuses unexpected symlinks. Symlink and hard-link targets are validated before creation; a hard link cannot target an inode outside the restore root. Special files require an explicit policy and isolated destination. Native receives rewrite mountpoints and dataset names into an approved restore hierarchy, do not mount over live paths, do not enable recovered shares, and restrict imported properties.
+Recovery evidence is writable by the worker and read-only to the API. Public evidence responses are bounded and omit internal artifact paths. PostgreSQL append-only events retain intent, physical boundaries, volume identities, and results.
 
-Existing destinations default to skip conflicts. Rename and replace are explicit. Dataset replacement and deletion reconciliation are destructive administrator operations with preview and reauthentication.
+## Offline recovery utility
 
-The alpha's attended verified-point rehearsal is a narrow laboratory exception, not the production authorization model. It requires an unexpired blocker-free plan and unchanged preview hash/restore scope, explicit exact-drive selection, three attended confirmations, and a typed phrase bound to the plan. The API cannot read worker evidence files or the restore destination. The worker independently revalidates the plan provenance, current drive/media reservation and fencing, original Bacula catalog/volume, retained manifest artifact, and complete-point or selected-path scope before dispatch. A complete-point run reserves the complete ordered cartridge set; a selected run is permitted only when the point has exactly one retained cartridge. API planning, queueing, claim, and worker gates independently reject a multi-volume selected run so an older persisted plan cannot bypass the boundary after upgrade. The worker creates a brand-new UUID destination and has no rehearsal code path for label, erase, BOT invalidation, backup, media reuse, existing-destination replacement, or publication. Internal artifact storage paths never enter public detail or evidence responses. A selected pass records `selective_restore_test` and cannot satisfy a complete-point `restore_test` gate. The alpha still has no authentication, so deploy this physical-read surface only on the isolated attended lab network described for G0.1, operational backup, and G0.2.
+`tapescale-recovery` runs without the original database. Its native commands:
 
-## Encryption and keys
+- accept only exact `/dev/nstN` device paths;
+- use `mt-st` only for variable-block mode and rewind with fixed arguments;
+- stream tape files into a real capture directory;
+- validate all volume and slice bindings before committing a receipt;
+- refuse duplicate/inconsistent archive members;
+- require a complete contiguous volume/slice set before extraction;
+- require an existing empty real destination;
+- test the reconstructed DAR archive before restore;
+- compare the restored tree with the authenticated source manifest.
 
-Encryption is enabled by default for new policies and covers content plus sensitive filenames, paths, metadata, and exported catalogs. Use an established authenticated-encryption format or a qualified encryption-plus-authentication construction. Compression occurs before application encryption. Hardware encryption is optional; a qualified software path is required for older drives.
+Captured archive directories contain plaintext source data and metadata. Protect them as strongly as the original source, restrict permissions, and remove them through an approved lifecycle after recovery evidence is retained.
 
-Key records refer to lineages and identifiers. Usable key material is encrypted at rest and never written to ordinary manifests, logs, or diagnostics. Historical keys remain protected while retained records depend on them.
+## Database and secrets
 
-Catalog recovery and key recovery are independent. A portable encrypted key package is stored away from the source NAS and application catalog, and its recovery is verified before media becomes ordinarily export-ready. Raw ZFS encryption can require original dataset keys and does not automatically conceal all outer metadata; the recovery plan lists these dependencies explicitly.
+The pasteable TrueNAS alpha intentionally contains a disposable inline PostgreSQL password because it targets an isolated test environment. It is not a production credential design. A qualified deployment must use secret files or an external secret facility, TLS for the web endpoint, authentication, RBAC, audited reauthentication for destructive actions, and independently stored recovery material.
 
-An administrator can opt out only with a recorded reason and visible deviation. Tape identity, record integrity, manifest authentication, truthful status, retention, and overwrite gates cannot be disabled.
+Do not log keys, passwords, usable recovery secrets, or raw configuration exports. Encryption and key recovery are not implemented by the native alpha.
 
-## Secrets and transport
+## Denial of service and resource limits
 
-- Browser/API traffic uses HTTPS.
-- TrueNAS control uses authenticated secure WebSocket JSON-RPC with certificate verification and negotiated supported version.
-- Internal service communication is authenticated and protected; database and engine control ports remain private.
-- Long-lived secrets are mounted from secret files or a platform secret provider, not committed configuration.
-- Diagnostics use an allowlist and redact credentials, recovery codes, usable keys, cookies, authorization headers, and sensitive path inventories.
-- Notifications contain the minimum operational context and link an authenticated user to details.
+The API bounds request bodies, pages, evidence values, manifest browsing, and concurrency. The worker bounds command output, metadata records, thread counts, slice sizes, timeouts, and retained JSON. Source inventory has no artificial total entry or logical-byte ceiling, so real storage, inode, CPU, staging, and time exhaustion remain possible. Use dataset quotas, container memory/CPU/PID limits, and network isolation.
 
-## Audit and event integrity
+## Known gaps
 
-Security, media, custody, retention, verification, and destructive actions append audit records containing actor, authenticated method, correlation ID, object versions, request/preview digest, decision, result, and timestamp. Corrections append a superseding event and preserve the prior record.
+- no application authentication, authorization, MFA, or native TLS;
+- no encrypted archive or authenticated metadata signature;
+- no production-qualified drive/media/metadata matrix;
+- no changer support or unattended media selection;
+- in-console native restore is pending;
+- no automatic secure deletion of captured recovery plaintext;
+- legacy Bacula source modules remain for historical audit compatibility, but the 0.2 runtime neither packages nor uses Bacula for native backup or recovery.
 
-Notifications use durable event identities. Replay may retry delivery but cannot silently duplicate movement confirmation or destructive execution.
-
-The alpha database schema and domain rules establish this contract; full authenticated end-to-end audit/outbox delivery evidence remains pending in AT-28.
-
-## Container hardening
-
-- Run as non-root whenever device access permits; use explicit uid/gid and supplementary device groups.
-- Drop all capabilities, then add only a documented minimum to the worker or constrained host helper.
-- Prefer read-only root filesystems and writable named volumes for exact state paths.
-- Mount source data read-only and approved restore destinations narrowly. If manifest browsing is enabled, expose only the exact recovery-artifact volume to the API as read-only; never mount the worker spool, Bacula runtime, or writable recovery state there.
-- Do not mount `/`, the Docker socket, arbitrary `/dev`, or broad host configuration.
-- Apply CPU, memory, process, and spool/staging limits.
-- Generate an SBOM and scan the release image; pin base images and dependencies.
-
-## Incident behavior
-
-When identity, position, catalog agreement, key availability, or integrity is uncertain, TapeScale preserves media and recoverable state, blocks destructive continuation, raises an actionable condition, and retains evidence. Operators should not bypass this state at the engine console; follow reconciliation in [OPERATIONS.md](OPERATIONS.md).
+Report vulnerabilities through the private process described in the repository `SECURITY.md`, not a public issue.

@@ -11,6 +11,7 @@ use crate::engine::bacula::DATA_SPOOL_DIRECTORY;
 const DEFAULT_DATA_SPOOL_MAX_BYTES: u64 = 0;
 const DEFAULT_DATA_SPOOL_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_DATA_SPOOL_MIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DEFAULT_NATIVE_SLICE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -36,6 +37,11 @@ pub struct Config {
     pub bacula_spool_max_bytes: u64,
     pub bacula_spool_reserve_bytes: u64,
     pub bacula_spool_min_bytes: u64,
+    pub dar_path: PathBuf,
+    pub native_spool_dir: PathBuf,
+    pub native_spool_reserve_bytes: u64,
+    pub native_slice_bytes: u64,
+    pub native_compression_threads: u16,
 }
 
 impl Config {
@@ -48,10 +54,21 @@ impl Config {
         let web_dir = PathBuf::from(value("TAPESCALE_WEB_DIR", "web"));
         let database_connect_timeout = Duration::from_secs(parse("TAPESCALE_DB_TIMEOUT_SECS", 10)?);
         let worker_poll_interval = Duration::from_secs(parse("TAPESCALE_WORKER_POLL_SECS", 5)?);
-        let lab_tape_motion_enabled = parse_bool("TAPESCALE_LAB_TAPE_MOTION_ENABLED", false)?;
-        let lab_tape_qualification_enabled =
-            parse_bool("TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED", false)?;
-        let lab_file_roundtrip_enabled = parse_bool("TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED", false)?;
+        let lab_tape_motion_enabled = parse_bool_alias(
+            "TAPESCALE_TAPE_MOTION_ENABLED",
+            "TAPESCALE_LAB_TAPE_MOTION_ENABLED",
+            false,
+        )?;
+        let lab_tape_qualification_enabled = parse_bool_alias(
+            "TAPESCALE_TAPE_PREPARATION_ENABLED",
+            "TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED",
+            false,
+        )?;
+        let lab_file_roundtrip_enabled = parse_bool_alias(
+            "TAPESCALE_NATIVE_BACKUP_ENABLED",
+            "TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED",
+            false,
+        )?;
         let btape_path = PathBuf::from(value("TAPESCALE_BTAPE_PATH", "/usr/sbin/btape"));
         let bconsole_path = PathBuf::from(value("TAPESCALE_BCONSOLE_PATH", "/usr/sbin/bconsole"));
         let bacula_state_dir = PathBuf::from(value(
@@ -83,6 +100,17 @@ impl Config {
             "TAPESCALE_BACULA_SPOOL_MIN_BYTES",
             DEFAULT_DATA_SPOOL_MIN_BYTES,
         )?;
+        let dar_path = PathBuf::from(value("TAPESCALE_DAR_PATH", "/usr/bin/dar"));
+        let native_spool_dir = PathBuf::from(value(
+            "TAPESCALE_NATIVE_SPOOL_DIR",
+            "/var/lib/tapescale/spool",
+        ));
+        let native_spool_reserve_bytes = parse(
+            "TAPESCALE_NATIVE_SPOOL_RESERVE_BYTES",
+            DEFAULT_DATA_SPOOL_RESERVE_BYTES,
+        )?;
+        let native_slice_bytes = parse("TAPESCALE_NATIVE_SLICE_BYTES", DEFAULT_NATIVE_SLICE_BYTES)?;
+        let native_compression_threads = parse("TAPESCALE_NATIVE_COMPRESSION_THREADS", 4_u16)?;
 
         anyhow::ensure!(
             qualification_timeout >= Duration::from_secs(60),
@@ -112,11 +140,7 @@ impl Config {
             anyhow::ensure!(
                 source_root == PathBuf::from("/source")
                     && restore_root == PathBuf::from("/restore"),
-                "the pinned G0.2 Bacula adapter requires TAPESCALE_SOURCE_ROOT=/source and TAPESCALE_RESTORE_ROOT=/restore"
-            );
-            anyhow::ensure!(
-                bconsole_path == PathBuf::from("/usr/sbin/bconsole"),
-                "the pinned G0.2 Bacula adapter requires TAPESCALE_BCONSOLE_PATH=/usr/sbin/bconsole"
+                "the native backup worker requires TAPESCALE_SOURCE_ROOT=/source and TAPESCALE_RESTORE_ROOT=/restore"
             );
         }
         anyhow::ensure!(
@@ -150,6 +174,27 @@ impl Config {
                     || bacula_spool_max_bytes >= bacula_spool_min_bytes),
             "TAPESCALE_BACULA_SPOOL_MIN_BYTES must be non-zero; TAPESCALE_BACULA_SPOOL_MAX_BYTES must be zero (automatic) or at least the minimum"
         );
+        anyhow::ensure!(
+            dar_path.is_absolute() && native_spool_dir.is_absolute(),
+            "TAPESCALE_DAR_PATH and TAPESCALE_NATIVE_SPOOL_DIR must be absolute paths"
+        );
+        anyhow::ensure!(
+            (64 * 1024 * 1024..=1024_u64 * 1024 * 1024 * 1024).contains(&native_slice_bytes),
+            "TAPESCALE_NATIVE_SLICE_BYTES must be between 64 MiB and 1 TiB"
+        );
+        anyhow::ensure!(
+            (1..=64).contains(&native_compression_threads),
+            "TAPESCALE_NATIVE_COMPRESSION_THREADS must be between 1 and 64"
+        );
+        anyhow::ensure!(
+            !native_spool_dir.starts_with(&source_root)
+                && !source_root.starts_with(&native_spool_dir)
+                && !native_spool_dir.starts_with(&restore_root)
+                && !restore_root.starts_with(&native_spool_dir)
+                && !native_spool_dir.starts_with(&evidence_root)
+                && !evidence_root.starts_with(&native_spool_dir),
+            "the native archive spool must be isolated from source, restore, and evidence trees"
+        );
 
         Ok(Self {
             bind,
@@ -174,6 +219,11 @@ impl Config {
             bacula_spool_max_bytes,
             bacula_spool_reserve_bytes,
             bacula_spool_min_bytes,
+            dar_path,
+            native_spool_dir,
+            native_spool_reserve_bytes,
+            native_slice_bytes,
+            native_compression_threads,
         })
     }
 }
@@ -228,6 +278,17 @@ fn parse_bool(key: &str, default: bool) -> Result<bool> {
     let Ok(raw) = env::var(key) else {
         return Ok(default);
     };
+    parse_bool_value(key, &raw)
+}
+
+fn parse_bool_alias(primary: &str, legacy: &str, default: bool) -> Result<bool> {
+    if let Ok(raw) = env::var(primary) {
+        return parse_bool_value(primary, &raw);
+    }
+    parse_bool(legacy, default)
+}
+
+fn parse_bool_value(key: &str, raw: &str) -> Result<bool> {
     match raw.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),

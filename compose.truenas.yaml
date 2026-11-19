@@ -3,18 +3,12 @@
 # The worker expects one standalone SAS tape drive at /dev/nst0. If TrueNAS
 # exposes /dev/nst1 instead, set TAPESCALE_TAPE_DEVICES and both sides of the
 # device mapping to /dev/nst1 so the container path matches Linux sysfs.
-# This alpha stack exposes status, rewind, unload, an attended Bacula btape
-# qualification run with a guided tape-initialization flow, an attended Backup
-# Center with graphical source browsing, operator-attended multi-cartridge
-# full-file writes, selectable Bacula compression and whole-archive staged or
-# advanced direct delivery, physical readback, retained
-# manifest browsing, the narrower G0.2 recovery exercise,
-# recovery evidence/planning, attended multi-volume complete-point or
-# single-volume selected-path read-only verified-point rehearsal,
-# confirmed manual media-custody operations, and a fail-closed media console.
-# Qualification, operational backup, and the initial G0.2 exercise deliberately
-# overwrite the loaded tape; the later rehearsal reads it. Use scratch media for
-# every destructive workflow. No unattended tape selection is performed.
+# This alpha stack exposes status, rewind, unload, native TapeScale tape
+# preparation, graphical source browsing, compressed DAR archive creation,
+# operator-attended multi-cartridge writes, immediate physical readback, retained
+# manifest browsing, recovery evidence, confirmed manual media-custody operations,
+# and a fail-closed media console. Preparation and operational backup deliberately
+# overwrite loaded scratch media. No unattended tape selection is performed.
 # Before installing, create /mnt/tapescale-restores as an isolated restore dataset
 # and /mnt/tapescale-spool as a large dedicated staging dataset, preferably on
 # SSD/NVMe. Give both a Generic/POSIX-compatible ACL preset and no SMB/NFS share.
@@ -28,11 +22,11 @@ name: tapescale
 
 x-tapescale-common: &tapescale-common
   build:
-    context: https://github.com/lilrags16/TapeScale.git#v0.1.0-alpha.15
+    context: https://github.com/lilrags16/TapeScale.git#v0.2.0-alpha.1
     args:
-      TAPESCALE_VERSION: 0.1.0-alpha.15
-      TAPESCALE_REVISION: v0.1.0-alpha.15
-  image: tapescale:0.1.0-alpha.15
+      TAPESCALE_VERSION: 0.2.0-alpha.1
+      TAPESCALE_REVISION: v0.2.0-alpha.1
+  image: tapescale:0.2.0-alpha.1
   pull_policy: build
   restart: unless-stopped
   read_only: true
@@ -41,13 +35,11 @@ x-tapescale-common: &tapescale-common
     - no-new-privileges:true
   tmpfs:
     - /tmp:size=128m,mode=1777
-    - /etc/tapescale:size=1m,mode=0700
-    - /run/bacula:size=4m,mode=0750
   environment: &tapescale-environment
     TAPESCALE_DEMO_MODE: "false"
-    TAPESCALE_LAB_TAPE_MOTION_ENABLED: "true"
-    TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED: "true"
-    TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED: "true"
+    TAPESCALE_TAPE_MOTION_ENABLED: "true"
+    TAPESCALE_TAPE_PREPARATION_ENABLED: "true"
+    TAPESCALE_NATIVE_BACKUP_ENABLED: "true"
     TAPESCALE_SOURCE_ROOT: /source
     TAPESCALE_RESTORE_ROOT: /restore
     DATABASE_URL: postgresql://tapescale:tapescale_test_only_password@postgres:5432/tapescale
@@ -102,16 +94,13 @@ services:
       TAPESCALE_TAPE_DEVICES: /dev/nst0
       TAPESCALE_SYSFS_ROOT: /sys
       TAPESCALE_MT_PATH: /usr/bin/mt-st
-      TAPESCALE_BTAPE_PATH: /usr/sbin/btape
-      TAPESCALE_BCONSOLE_PATH: /usr/sbin/bconsole
-      TAPESCALE_BACULA_STATE_DIR: /var/lib/tapescale/bacula
-      # Whole-archive anti-shoe-shine staging. Zero uses the dedicated spool
-      # dataset's available capacity after filesystem and attribute reserves.
-      # TapeScale blocks before dispatch unless the conservative archive estimate
-      # fits; runtime guards cancel near the limit or on an observed early drain.
-      TAPESCALE_BACULA_SPOOL_MAX_BYTES: "0"
-      TAPESCALE_BACULA_SPOOL_RESERVE_BYTES: "8589934592"
-      TAPESCALE_BACULA_SPOOL_MIN_BYTES: "8589934592"
+      TAPESCALE_DAR_PATH: /usr/local/bin/dar
+      # DAR completes and validates this staged archive before tape motion begins,
+      # so source traversal and compression cannot starve the physical drive.
+      TAPESCALE_NATIVE_SPOOL_DIR: /var/lib/tapescale/spool
+      TAPESCALE_NATIVE_SPOOL_RESERVE_BYTES: "8589934592"
+      TAPESCALE_NATIVE_SLICE_BYTES: "68719476736"
+      TAPESCALE_NATIVE_COMPRESSION_THREADS: "4"
       TAPESCALE_QUALIFICATION_TIMEOUT_SECS: "1800"
       TAPESCALE_DATA_RUN_TIMEOUT_SECS: "43200"
       TAPESCALE_TRANSFER_STALL_TIMEOUT_SECS: "1800"
@@ -126,8 +115,6 @@ services:
         target: /var/lib/tapescale/spool
         bind:
           create_host_path: false
-      - worker_engine_state:/var/lib/tapescale/bacula
-      - worker_bacula_runtime:/var/lib/bacula
       - /mnt:/source:ro
       - type: bind
         source: /mnt/tapescale-restores
@@ -193,8 +180,6 @@ volumes:
   postgres_data:
   # PostgreSQL retains plans, requests, inventory, runs, and recovery evidence.
   worker_recovery:
-  worker_engine_state:
-  worker_bacula_runtime:
 
 networks:
   edge:

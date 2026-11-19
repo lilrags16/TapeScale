@@ -1,278 +1,138 @@
-# Operator guide
+# TapeScale Native operations
 
-This guide describes the intended TapeScale operating model. The current release is an alpha with SAS discovery, guided tape preparation, bounded graphical source/retained-manifest browsing, guarded scratch-media rewind/unload, a destructive Bacula `btape test` harness, an attended operational full-backup path, the G0.2 Bacula restore-comparison exercise, and an attended ordered-volume restore for compatible verified operational or G0.2 points. It must not be represented as generally protecting production tape until G0/G1 qualification is complete.
+This guide describes TapeScale `0.2.0-alpha.1`. It is an attended alpha for one standalone SAS tape drive, not a production-qualification claim. The active writer is **TapeScale Native v1** and DAR 2.8.6 is used only as the file-archive codec. Bacula is not installed or used by the current runtime.
 
-Procedures below distinguish the implemented alpha from the broader operator acceptance target. **Backups** saves one exact existing snapshot, obtains the server's current eligible drive/tape pairs, guides tape preparation when needed, and creates a durable request only after the operator selects a pair. Final destructive authorization remains attended. The worker writes one compressed or uncompressed Full job through Bacula, pauses for ordered operator-supplied continuation media when needed, and physically reads every recorded volume before retaining a recovery point. A fixed-source Saturday scheduler exists behind the API, but the console does not offer it because it does not yet create or select a newer TrueNAS snapshot. The G0.2 path additionally restores its capture immediately. Recovery Vault can later restore and compare a compatible complete operational point across its exact ordered cartridge set (or a one-volume G0.2 point); a server-normalized selected restore is executable only when that point has exactly one retained volume. Encryption recovery, catalog-loss recovery, incrementals, native ZFS, automatic changers, multi-volume selected execution, and production authorization remain incomplete or blocked; compression, spanning, multi-volume complete restore, and single-volume selected restore have no physical qualification claim yet.
+Do not make this alpha the only copy of data. A result is evidence for the exact source snapshot, drive, firmware, cartridge set, format, and software revision recorded by the run.
 
-## Daily overview
+## Operating model
 
-Start on the operational overview and resolve items in this order:
+A native Full backup follows one closed sequence:
 
-1. unsafe or uncertain device/media state;
-2. failed or interrupted restores and writes;
-3. waiting-for-media requests and blocked verification;
-4. overdue custody movements and off-site coverage gaps;
-5. expired backup freshness, key recovery, or retained-media audit targets;
-6. forecast media, spool, staging, snapshot, and destination capacity shortages.
+1. Select one existing named ZFS snapshot with the graphical browser.
+2. Inventory and SHA-256 hash the immutable source.
+3. Build large DAR slices and an isolated catalog on the dedicated spool dataset.
+4. Test the complete staged archive while tape remains idle.
+5. Plan whole slices across the required prepared cartridges.
+6. Read the loaded cartridge UUID from tape file zero and reject a mismatch.
+7. Stream completed large files sequentially to tape.
+8. Rewind and immediately read every tape file back, checking identities, lengths, and SHA-256 digests.
+9. Retain a recovery point only after every volume passes and the source snapshot is still unchanged.
 
-The latest successful backup, latest verified recovery point, and latest complete verified off-site source-data time are different values. Do not substitute one for another.
+This design deliberately spends disk capacity to separate small-file traversal and compression from tape motion. It does not use a partial fill/drain spool or a small RAM buffer as a substitute for sustained throughput.
 
-## Choose a snapshot backup
+## Required deployment flags
 
-In **Backups**, choose **Choose snapshot** and use **Choose folder** to inspect one bounded directory level at a time beneath the configured read-only `/source` mount. The browser displays folders plus recorded file size/mtime, never file contents; symlinks and special objects are non-navigable. A directory with more than 2,000 direct children returns a clearly marked, deterministic partial view instead of failing. This display bound does not limit the backup inventory: the folder remains selectable, and manual relative-path entry remains available. Operational backups require a named `.zfs/snapshot/<name>` directory or one of its descendants as the recursive backup scope; plan creation validates either selection by the same rule.
+The TrueNAS alpha Compose enables these canonical controls:
 
-The browser is selection assistance, not safety authority. Saving independently resolves and contains the path, rejects traversal and symlink escape, and verifies the exact open directory's kernel mount flags. TapeScale repeats that verification before a manual request is queued and again in the worker. The saved item remains bound to this exact already-existing snapshot on every later **Start backup**. Prepare and retain snapshots outside TapeScale: this alpha does not create, hold, advance, or replace them. Choose and save a newer named snapshot separately when it should be protected.
+- `TAPESCALE_TAPE_MOTION_ENABLED=true` for guarded rewind and unload;
+- `TAPESCALE_TAPE_PREPARATION_ENABLED=true` for destructive native preparation;
+- `TAPESCALE_NATIVE_BACKUP_ENABLED=true` for native Full backups;
+- `TAPESCALE_DAR_PATH=/usr/local/bin/dar`;
+- `TAPESCALE_NATIVE_SPOOL_DIR=/var/lib/tapescale/spool`;
+- `TAPESCALE_NATIVE_SPOOL_RESERVE_BYTES=8589934592`;
+- `TAPESCALE_NATIVE_SLICE_BYTES=68719476736`;
+- `TAPESCALE_NATIVE_COMPRESSION_THREADS=4`.
 
-The executable alpha contract is deliberately fixed:
+Older `TAPESCALE_LAB_*` flag names remain compatibility aliases only. New deployments should use the canonical names above.
 
-- representation: file;
-- level: full;
-- volumes: one or more ordered, manually supplied standalone-drive cartridges when spanning is enabled;
-- compression: automatic LZO, explicit balanced GZIP, LZO, or none;
-- encryption: disabled;
-- verification: full physical readback;
-- retention: 1 to 36,500 days, default 28;
-- schedule: manual in the console;
-- media: optional preferred scratch pool, with exact attended assignment for every request.
+## Prepare a cartridge
 
-Native ZFS, dual representation, incrementals, encryption, and unattended changer selection fail validation. The operational source inventory uses bounded-memory external sorting and does not enforce a TapeScale total file-count or logical-byte limit; host storage, source filesystem, Bacula, device, time, and available-media constraints remain real limits. G0.2 creation retains its 100,000-entry/100 GiB fixture gate. Later attended restore inventory uses the bounded-memory operational scanner and does not reapply that entry/logical-size gate, but authenticated manifest decoding remains limited to a 256 MiB serialized artifact. The existing API-level Saturday scheduler binds the exact same source path on every occurrence; it remains an alpha mechanism rather than a rolling-backup control until TrueNAS snapshot creation/selection is implemented.
+> **Destructive operation:** preparation overwrites the loaded cartridge. Use only blank or expendable scratch media. Never prepare a retained, foreign, WORM, or irreplaceable tape.
 
-## Run and monitor a backup
+1. Load one scratch cartridge and wait for the drive to report ready.
+2. Open **Prepare tape** from the drive or tape view.
+3. Register or select the inventory record and LTO generation.
+4. Review the exact detected drive and cartridge, then invoke the single destructive action.
+5. Leave the worker and drive available until the result is terminal.
 
-Choose **Start backup** for the saved snapshot. Before it creates a request, the console asks the server for the current eligible drive/cartridge pairs and structured blockers. The preview considers the saved snapshot binding, exact trusted ready drive, accessible device, tape identity and eligibility, configured pool, generation compatibility, protection/WORM/hold/reservation state, uncertain prior writes, the passed setup test for that exact pair, and active work. The response is not cached and reports `safety_authority: false`: it guides the console but does not authorize a write or guarantee that the pair will still be accepted.
+The worker uses the exact configured `/dev/nstN` path, enables variable-block I/O, writes deterministic 256 KiB records across two tape files, rewinds, and rereads every record and file boundary. A pass then replaces the test data with a TapeScale preparation record containing the cartridge UUID and reads it back. That UUID, not a repeated typed assertion, identifies the tape at later destructive boundaries.
 
-If no pair is ready, choose **Prepare loaded tape** without leaving the flow. The destructive setup test remains a separate durable operation; after the exact pair passes and its internal identity is read back, TapeScale returns to the pending backup. For a ready drive, the console resolves the loaded internal volume label to the one eligible inventory record. Review that detected pair and choose **Erase tape & start backup**. No source read or tape write occurs before assignment succeeds.
+A pass is narrow evidence for that drive/cartridge tuple. It is not backup, spanning, restore, ACL, or general hardware qualification.
 
-The assignment transaction repeats every eligibility gate under locks, and the worker repeats the source, device, identity, qualification, and media gates before dispatch. A previewed pair can therefore disappear or be rejected after any relevant state change. The dedicated backup page then reports queued/preparing, source inventory, writing, media required, written, verifying, and verified, or blocked/interrupted/failed/cancelled with retained evidence. It shows a percentage only when the backend supplies a real measurement; request identity, ordered volume history, raw engine evidence, and complete activity remain under **Technical details**.
+## Create and run a backup
 
-When the same Bacula Full job reaches end of media, TapeScale releases the storage device and creates a durable request for the next sequence number. Load one prepared eligible scratch cartridge in the same drive and wait for TapeScale to read its internal ID, then choose the displayed continuation action. TapeScale rejects a missing, foreign, ambiguous, wrong, protected, unqualified, held, reserved, or already-used tape before clearing or labeling it. The operator wait does not consume the engine no-progress watchdog. Do not stop the application, Bacula runtime, or database while the active job is waiting.
+1. In **Backups**, browse beneath `/source` to a path such as `pool/dataset/.zfs/snapshot/snapshot-name`.
+2. Save the selection. TapeScale resolves it beneath the held source root and verifies kernel read-only mount flags.
+3. Choose retention, optional scratch pool, media spanning, and compression:
+   - **Automatic** → fast Zstandard;
+   - **Zstandard** → fast Zstd;
+   - **LZ4** → fast LZ4;
+   - **GZIP** → balanced GZIP;
+   - **None** → no archive compression.
+4. Create the request and review the server-calculated eligible drive/cartridge pair.
+5. Start the destructive run. The API and worker repeat the source, lease, reservation, media, hold, WORM, qualification, and on-tape identity checks under lock.
 
-During full readback, TapeScale requests the already-recorded cartridges in catalog order. Load the displayed tape; TapeScale reads its retained operational volume label and enables the read-only continuation only when it matches that request. A readback request is non-destructive: the worker must not clear BOT or relabel the cartridge. Wrong media remains unchanged and the request stays open.
+Only complete disk staging is supported by the native writer. Direct source-to-tape delivery is a legacy policy value and is rejected for new native runs.
 
-- `waiting for media` survives restart and requires operator action; TapeScale does not create a TrueNAS hold, so the selected snapshot must remain available.
-- `written` is not export-ready when full read-back is required.
-- `verified` records the exact full-media read-back, manifest, catalog binding, every ordered volume record, and recovery point; it is not a restore test.
-- Unexpected unreadable paths, enumeration failure, missing keys, unsupported mandatory metadata, producer failure, or integrity error prevents a clean result.
+### Spool sizing
 
-Never satisfy a request from a paper label alone. The loaded internal volume label must resolve to exactly one expected inventory record, which must also be unprotected, non-WORM, healthy, compatible with the exact reconciled drive, in the saved backup's pool when one is configured, and free of holds, conflicting identity, active reservation, or pending unsafe custody. The API binds the request ID and cartridge record, and the worker probes the tape again immediately before the physical boundary.
+The spool must fit the complete encoded archive plus the configured reserve. Preflight conservatively budgets source logical bytes, compression headroom, entry overhead, the retained manifest, and native metadata. Actual compression may use less space, but TapeScale will not begin tape motion based on an incomplete archive.
 
-After success, **Browse backed-up files** opens the integrity-checked retained manifest and **Recovery options** opens the recovery point. Manifest browsing shows recorded names and metadata without reading tape and cannot narrow restore scope. It is not restore execution or restore proof.
+Use a dedicated fast SSD/NVMe dataset when possible. The stage is deleted after successful finalization. It is retained for diagnosis after a media-write failure; a pre-write failure removes the unused stage.
 
-## Manual tape handling
+### Multi-tape handoff
 
-Before handling media, verify the intended drive under **Drives & libraries**. A newly discovered drive is untrusted. Compare its physical model, serial/WWN, firmware, and non-rewinding device path, then select **Trust identity**. TapeScale revokes that reconciliation when the path, identity, firmware, or access state changes. This setup action binds the observed identity; it does not by itself authorize motion or data writes.
+DAR slices are assigned whole to volumes. When another cartridge is required:
 
-### Lab-only rewind and unload
+1. the completed volume has already been rewound and fully verified;
+2. unload it and load the exact requested prepared cartridge;
+3. authorize the displayed continuation;
+4. TapeScale reads the new preparation UUID before accepting or overwriting it.
 
-The alpha TrueNAS Compose enables `TAPESCALE_LAB_TAPE_MOTION_ENABLED=true`. With a current reconciled drive and a reported loaded medium, **Rewind** and **Unload** create durable worker requests. Confirm that the loaded cartridge is designated scratch media, acknowledge the prior-write warning, then wait for the request to leave `queued`/`running` and verify the resulting drive status. Unload uses the device's rewind-and-offline operation; it puts the device offline and may physically eject the cartridge.
+The operator wait is durable and is not counted as an active-transfer stall. A wrong, missing, foreign, protected, held, unqualified, reserved, or already-used cartridge is rejected before data I/O.
 
-Linux may write a filemark before rewind/offline when the previous tape operation was a write. TapeScale exposes no data-write or explicit filemark command here, but it cannot promise unchanged media after another controller wrote to the drive. Never use retained, production, unknown, or foreign media with this unqualified lab control.
+## Understand the live page
 
-TapeScale leases one drive controller, rechecks its exact stable identity and safety state, executes only the fixed allowlisted command, and appends audit evidence. A missing/stale drive, identity change, conflict, TapeScale-uncertain prior motion result, absent medium, or existing active request blocks execution. The [Linux SCSI tape driver explicitly permits rewind/offline as recovery operations](https://github.com/torvalds/linux/blob/master/drivers/scsi/st.c#L3771-L3791) when its internal tape position was lost after reset; TapeScale still requires a ready scratch cartridge and verifies BOT after rewind or no-media after unload. Do not run another tape controller against the same drive during this lab workflow.
+The UI keeps incompatible counters separate:
 
-### Guided tape preparation and destructive Bacula qualification
+- **Inventory**: source entries and logical bytes discovered;
+- **Packing**: regular files and bytes created in the run-scoped disk stage;
+- **Current file**: the bounded source-relative path most recently reported by DAR;
+- **Tape write**: physical write rate for the exact SCSI tape device;
+- **Tape read**: physical rate during immediate volume readback;
+- **Waiting for tape**: the required next volume, with no invented transfer rate.
 
-The disposable TrueNAS Compose also enables `TAPESCALE_LAB_TAPE_QUALIFICATION_ENABLED=true` and packages Debian's pinned Bacula Community 15.0.3 tools. This is an attended G0.1 harness, not a backup job.
+Logical source bytes, compressed DAR bytes, and physical device bytes are not interchangeable. Compression, sparse files, hard links, metadata, record framing, and repeated per-volume metadata prevent a truthful single synthetic byte counter.
 
-Choose **Prepare tape** from **Drives & libraries** or **Tapes & pools**. The wizard composes the existing durable operations instead of inventing a weaker shortcut:
+If packing is slow, inspect source metadata latency, CPU/compression, and spool I/O. Tape should be idle during this phase. If the drive shoe-shines during the native tape pass, the completed spool filesystem, host contention, HBA/device path, media condition, or physical block behavior is the likely bottleneck; the source filesystem is no longer in the active data path.
 
-1. Physically load a blank or expendable cartridge and wait for the drive to report ready. When exactly one current safe drive exists it can be preselected; otherwise select the exact drive explicitly.
-2. Review its stable identity, non-rewinding path, serial/WWN, and firmware. If it is not yet reconciled, explicitly allow the wizard to perform the same **Trust identity** API check. Stale, inaccessible, conflicting, uncertain-position, immediate-mode, or busy drives remain blocked.
-3. Register the cartridge's printed label and generation inline, or select its existing inventory record. Barcode is optional and WORM is never offered as a preparation candidate. WORM media, cartridges with content/holds, foreign or mismatched identities, and reserved media are ineligible.
-4. Review the selected drive and scratch record, then choose **Prepare tape**. This one button is the destructive authorization; no tape command is issued before it.
-5. Keep the host, container, drive, and cartridge available while the durable run is queued/running. The wizard can be closed; progress and evidence remain under **System & qualification → Qualification**. A pass requires Bacula test success, an exact write/readback of `TS-PREP-V1-<cartridge UUID>`, cleanup rewind, and an affirmative same-drive ready-at-BOT observation.
+## Cancellation and failure
 
-Registration, drive reconciliation, and qualification remain separate audited operations. The browser retains a random request key before qualification submission, and PostgreSQL atomically binds that key to the exact semantic request. Replaying the same key returns the original run—even after it becomes terminal—while reuse with a different drive or cartridge is rejected. A response-loss retry therefore reloads the exact existing media record and durable qualification instead of dispatching another destructive test. When preparation was opened from a blocked backup, only a passed exact-pair result returns to that pending flow, where final destructive backup authorization is still required. Failure never advances into a backup; inspect the retained result and reconcile uncertain hardware before deliberately starting a new attempt.
+- Before the media-write boundary, cancellation leaves tape unchanged.
+- Physical record I/O cannot always be interrupted safely. After cancellation, the worker finishes the current tape file before stopping when possible.
+- A failed or interrupted write creates no recovery point and leaves touched media uncertain/write-unverified.
+- A device reset, disconnect, lease loss, identity change, or unproven cleanup position requires reconciliation before further destructive work.
+- An unexpected end-of-media is a failed volume in this first native release; capacity planning intentionally leaves a reserve rather than relying on EOM continuation.
 
-The API reserves the selected cartridge and creates append-only events before the worker can claim the run. The worker rechecks path, stable identity, model, serial/WWN, firmware, device access, kernel immediate mode, outstanding I/O, loaded/ready state, reservation, and the server-bound destructive request. It invokes only `btape -c <per-run-config> /dev/nstN` with fixed test and label/readback transcripts. A timeout, cancellation, worker loss, lease expiry, Bacula failure, label mismatch, identity change, or missing postcondition records a failed/interrupted result and revokes drive reconciliation. The captured output is deliberately bounded and reports truncation.
+## Recovery
 
-`btape` overwrites media. A successful result demonstrates basic Bacula record/filemark/position/append/re-read behavior for the recorded tuple and leaves the deterministic preparation identity at BOT; it does not prove file backup, full readback, restore, metadata fidelity, spanning, encryption, catalog recovery, or G0 completion. The harness does not expose Bacula `fill`, erase, a console, or arbitrary operator commands.
+The web Recovery Vault can browse retained manifests and evidence. In-console restore dispatch remains pending for native points. The independent `tapescale-recovery` executable can operate without PostgreSQL:
 
-Cartridges prepared before alpha.14 do not contain the preparation identity. Before their next destructive operational write, prepare them once only when they are blank or expendable scratch media. Do not re-prepare a retained archive: preparation overwrites it. An archive already written by TapeScale may instead be recognized from its retained operational Bacula volume label when the corresponding ledger record exists.
+```sh
+tapescale-recovery capture-native-volume \
+  --device /dev/nst0 \
+  --archive-dir /recovery/archive
 
-### Operational attended full backup
+tapescale-recovery restore-native-archive \
+  --archive-dir /recovery/archive \
+  --destination /recovery/restored
+```
 
-Use **Backups** for the guided operational path. The exact loaded drive/cartridge combination must have a passed G0.1 `btape` result before it can be assigned, but a blocked flow can open **Prepare loaded tape** directly. Every assignment is destructive to the selected scratch cartridge.
+Run the capture command once for every cartridge in the archive. It reads and verifies the header, repeated catalog and source manifest, slices, volume index, and trailer. Restore is accepted only when every declared volume and every contiguous slice is present and all captured files still match their digests. The destination must be an existing empty real directory. DAR tests the reconstructed archive before extraction, then TapeScale inventories the result and compares it with the retained source manifest.
 
-1. Choose **Choose snapshot**, name the saved backup, select one existing immutable named snapshot below the read-only source mount, and choose retention, compression, delivery, spanning, plus an optional scratch pool. Keep the default **Whole-archive staging** unless the exact source has been measured fast enough to sustain the tape continuously. **Direct streaming** is advanced and can backhitch badly on metadata-heavy or slow sources. Saving does not create or hold that snapshot.
-2. Choose **Continue to tape** for a new saved item, or **Start backup** later. Review the server-returned eligible pairs and blockers. If preparation is required, complete **Prepare loaded tape** and wait for that exact setup test to pass.
-3. Physically load one prepared eligible scratch cartridge into the exact trusted drive and ensure no other controller uses it. TapeScale reads the internal label and narrows the server-returned candidates to that cartridge.
-4. Review the detected drive/tape pair and choose **Erase tape & start backup**. The server rechecks the pair before assignment, and the worker re-reads the label before invalidation or write; a readiness preview is never destructive authority.
-5. Follow the dedicated backup page. Before the destructive boundary, the worker proves the run-scoped Storage Daemon working directory is writable and reserves the manifest-derived attribute allowance plus the configured filesystem reserve (8 GiB by default). For whole-archive staging it also requires usable capacity for 125% of the logical payload, 64 KiB per manifest entry, and 4 GiB of framing. `TAPESCALE_BACULA_SPOOL_MAX_BYTES=0` uses all capacity remaining after those reserves. If that conservative estimate does not fit, the job blocks before tape is touched. Encoded metadata and concurrent filesystem use can exceed this point-in-time estimate, so the worker cancels if observed staging approaches its hard limit or starts draining before source production finishes rather than knowingly continuing repeated partial batches. A cancelled attempt can leave the selected tape uncertain and quarantined. Direct jobs do not stage payload bytes but must sustain the drive from source traversal and compression alone. **Automatic** compression resolves to LZO; choose GZIP explicitly only when its space saving is worth lower producer throughput on the installed CPU. The live panel distinguishes exact JobId-scoped Bacula flow, the estimated stage target, staging occupancy, and physical tape movement and shows the age of the last measured progress. The generated device configuration uses a 32 GiB logical tape-file boundary and a 256 KiB maximum physical tape block to reduce filemark and block overhead; neither limits archive or cartridge capacity. Rerun **Prepare tape** after upgrading so `btape` exercises that block size on the exact hardware.
-6. Each time the run reports **Next tape needed**, unload the previous tape, load one prepared eligible scratch cartridge, wait for its internal ID to appear, and choose the order-specific continuation action. Keep every written tape available and in its displayed sequence.
-7. During `Level=Data` verification, reload the recorded tapes as requested in order. TapeScale matches each operational volume label before continuing. This rereads the physical volumes and exercises decompression rather than rereading the mounted source. TapeScale rescans the source afterward and refuses success if the supposedly immutable input changed.
-8. Treat the run as protected only after **Verified**. Use **Browse backed-up files** to inspect the retained manifest and **Recovery options** to open the recovery point; raw manifest digest, Bacula JobId, ordered volumes, compression, full-readback verification, recovery-point UUID, and complete history remain under **Technical details**. Recovery Vault can independently restore a compatible operational point, pausing for each exact cartridge in the retained order.
+This implemented utility still requires physical qualification across drive generations, failure modes, and metadata combinations. Follow [RECOVERY.md](RECOVERY.md) and do not publish restored data without review.
 
-A waiting initial request can be cancelled immediately with a retained reason. Once assigned, cancellation is cooperative: the worker observes the durable request at safe scan/engine boundaries, asks Bacula to cancel when applicable, performs required cleanup, and records the honest terminal result. TapeScale cannot guarantee immediate interruption of a command blocked in kernel tape I/O. A cancelled, failed, interrupted, source-changed, or cleanup-uncertain run creates no recovery point and may leave every touched cartridge quarantined or write-unverified.
+## Media management
 
-The operational path does not perform the immediate isolated restore and manifest comparison used by G0.2. Its two separate verification records mean only that the write completed and the full physical readback completed. Do not describe that result as a restore test.
+Retention, holds, custody, pools, and overwrite evaluation are separate from physical tape identity. A server result that media appears reusable does not itself erase or prepare it. Archive and legal holds never silently expire. Unknown identity, incomplete dependency evidence, unverified writes, WORM state, active reservations, and retained recovery points block destructive reuse.
 
-Staging capacity must include runtime headroom: the conservative target must fit below the Bacula hard limit minus the greater of 10% of that limit or 1 GiB. This headroom is separate from the 8 GiB filesystem reserve and the attribute-spool allowance.
+## Current limits
 
-**Upgrade warning:** alpha.14 introduces the durable preparation ID. Rerun **Prepare tape** once only with blank/expendable scratch media before its next write. The setup test is destructive; never run it on retained archive media. Existing archives remain readable.
+- attended manually started Full file archives only;
+- one standalone drive, with manual cartridge changes;
+- existing named snapshots only; no automatic snapshot creation or rolling selection;
+- no incrementals, encryption, tape library/changer automation, native ZFS send, or append-after-interruption;
+- in-console native restore and selected-file extraction are pending;
+- no production claim for ACL/xattr fidelity, hard links, sparse files, unusual names, compression, spanning, interruption, or clean-host recovery until the qualification ledger records physical evidence.
 
-### First recoverable tape (G0.2)
-
-Use **Recovery exercise** only after the exact loaded drive/cartridge combination has a passed G0.1 `btape` run. This attended exercise deliberately overwrites that cartridge again.
-
-1. Create an immutable TrueNAS snapshot below the read-only host source mount. In the alpha Compose, enter its path relative to `/mnt`, such as `pool/dataset/.zfs/snapshot/tapescale-g02`.
-2. Ensure `/mnt/tapescale-restores` is a dedicated isolated dataset with a Generic/POSIX-compatible ACL preset and no shares. An SMB/NFSv4 `aclmode=restricted` destination can reject required metadata restoration. Choose a relative restore subpath that is not used by another run.
-3. Create a recovery profile. TapeScale resolves the selected source beneath `/source`, confirms its container mount is read-only, and records an operator assertion that it is an immutable snapshot.
-4. Select the same trusted drive and registered scratch cartridge. Confirm scratch designation, destructive overwrite, and the G0.2 encryption-disabled deviation.
-5. Type `WRITE <profile name> TO <cartridge label> AND RESTORE VERIFY` exactly. Keep the host, database, mounts, worker, drive, and tape available until the run reaches a terminal state.
-6. Follow the phase timeline: queued, preparing, writing, written, tape verification, restore, manifest comparison, and terminal result. Do not infer progress from drive motion alone.
-7. Review the retained source manifest, Bacula job evidence, restored manifest, comparison, and evidence report. A recovery point is created only after strict Bacula job success and an exact independent comparison.
-
-Qualification, an interrupted earlier attempt, or another scratch workflow can leave records or a valid label at BOT. G0.2 therefore cannot assume that the Director's normal `label` command is starting from blank media; Bacula correctly refuses to overwrite a valid existing label. After the durable write boundary and all three destructive confirmations are committed, the worker rewinds the exact fenced scratch drive, issues one fixed internal `mt-st -f /dev/nstN weof 1` command to invalidate prior BOT contents, records that action, and rewinds again before starting Bacula. This is not exposed as a general motion control. Failure or interruption quarantines the cartridge as write-unverified and prevents a recovery point.
-
-The source manifest records per-file SHA-256 and the explicitly covered namespace/metadata fields. This G0.2 harness accepts at most 100,000 manifest entries and 100 GiB logical data so the in-memory comparison remains bounded; larger fixtures are blocked before a tape write. Bacula Data verification rereads the physical volume; it is not satisfied by rereading the mounted source. The subsequent normal Bacula restore is written beneath `/restore/<profile restore subpath>/<run id>` and remains isolated for inspection. TapeScale then scans that restored tree independently. Any missing/extra path, content or covered-metadata difference, warning/error terminal state, lease loss, identity change, source mutability, or uncertain cleanup prevents a pass.
-
-This pass is deliberately narrow. It establishes recoverability only for the exact recorded run and does not qualify NFSv4 ACLs, encryption, incrementals, multiple volumes, EOM/wrong-media behavior, changers, native ZFS streams, interruption recovery, or clean-host catalog reconstruction. Do not move the cartridge off site or reuse it under a general policy on the strength of this exercise.
-
-The rewind/unload motion gate does not expose load, seek, spacing, retension, an explicit filemark, read, write, label, format, or erase command. A successful rewind/unload does not identify the cartridge or prove restoration. The separate `btape` harness performs only its fixed destructive test and creates no recovery point; only the fenced operational-backup and G0.2 workflows may invoke the fixed Bacula data path described above.
-
-For a standalone drive:
-
-1. Read the requested tape IDs, generation/format, pool, and reason.
-2. Inspect the physical label and load one candidate.
-3. Allow TapeScale/engine to read identity before any write.
-4. If the identity is wrong or unknown, unload it unchanged and keep the request open.
-5. Confirm removal only after the drive reports unloaded.
-
-For a library, use the inventory and slot view. Changer motion, drive ownership, and import/export operations remain serialized. An export-slot move is not off-site delivery.
-
-After a device reset, disconnect, manual removal, or unexpected slot change, never continue an active write from an assumed position. Rewind/unload may recover an endpoint only in this scratch-media lab path; all future data I/O must still reconcile the engine position and media state first.
-
-## Verification
-
-Verification types are distinct:
-
-- Full read-back: reads recorded data from actual tapes through decoding and validates identities, order, lengths, authentication, decompression, and expected file/native bytes.
-- Sample verification: reads only the recorded sample and is labeled accordingly.
-- Restore exercise: restores declared content and metadata to an isolated destination.
-- Drive read-after-write: device protection only, not application recovery evidence.
-
-Interrupted verification cannot pass. New data defaults to full read-back before ordinary off-site eligibility. Schedule monthly representative file restores, quarterly native-chain exercises, quarterly clean-install catalog-loss exercises, and full qualifying retained-media read-back at least every 12 months, subject to policy and coverage checks.
-
-## Plan and execute a restore
-
-Open **Restore → Recovery vault**, search by source, tape, representation, status, or date, and select a point. The dossier joins the durable recovery contract to ordered volume records, confirmed locations, physical readback, isolated restore-test evidence, origin events, retained artifact digests, and later rehearsal runs. Evidence downloads are bounded and omit internal artifact storage paths.
-
-For file-mode points with an integrity-checked source manifest, choose **Browse files** to navigate the recorded directory tree. The API reads the retained manifest through a read-only artifact mount and returns only bounded names and recorded type/size/mtime metadata—never file contents or the worker artifact path. This is catalog inspection, not tape I/O. Select one or more files, symlinks, or directories and choose **Plan selected restore**; a directory includes every retained descendant. The browser removes descendants already covered by a parent and permits at most 256 explicit paths. Clearing the selection and choosing **Plan restore** retains the complete-point workflow. Browsing and scope resolution remain useful for a multi-volume point, but the resulting selected plan is blocked from execution in this alpha.
-
-Select **Plan restore** or **Plan selected restore**, choose a contained relative destination and conflict policy, and declare the destination/key/capacity facts that are actually known. For a selection, the server authenticates the retained manifest, recursively resolves directories, closes selected hard-link groups, and snapshots the normalized roots, selected-manifest digest, logical size, and deterministic selection hash into the plan. TapeScale persists the preview for 30 minutes and reports required tapes, dependency order, exact compatible qualified drives, locations, keys, warnings, and blockers. A selected scope whose recovery point has more than one retained volume receives the explicit `selected_restore_multivolume_unavailable` blocker: the browser cannot prove which tapes contain that scope or which tapes Bacula actually read. An unverified point, unknown tape location, missing exact hardware qualification, unsafe destination, insufficient declared capacity, unavailable key, changed manifest/scope, or unsupported selection prevents a ready result. Planning alone never moves media, invokes Bacula, or creates a destination.
-
-A ready plan exposes **Start Restore run** only when it resolves to a verified operational-backup or passed G0.2 `file/full` point with one contiguous finalized unencrypted volume set, no recovery dependencies or key lineage, the pinned Bacula 15.0.3 adapter/format, an authenticated retained source manifest, an intact original backup JobId/catalog, and a current exact qualified drive plus qualified/readable cartridge set. Legacy G0.2 points remain one volume; compatible operational Full points may span tapes. Every broader plan remains planning-only.
-
-Before queueing a complete-point rehearsal, retrieve the complete displayed tape set, load tape 1 in the selected exact drive, confirm its printed/internal identity against the plan, and keep the worker and database available. Queueing submits only the plan UUID, unchanged preview hash, selected drive UUID, and attended confirmation; the immutable scope remains server-owned, and queueing atomically reserves the complete ordered cartridge set. The worker rechecks every durable prerequisite, reloads and authenticates the manifest, fences the drive and first cartridge, and re-probes the SAS identity. A complete-point run asks Bacula for the retained backup JobId. When Bacula requests another volume, the run releases the prior media lease, pauses in `waiting_for_media`, and displays the exact next label and confirmation phrase. Load only that cartridge and complete the read-only handoff. Each continuation obtains a new media fence, re-probes the same drive, rewinds, and mounts without any label, clear, erase, backup, or other tape-write command.
-
-Before queueing a selected rehearsal, confirm that its plan is ready and names exactly one retained cartridge; a multi-volume selected plan is deliberately blocked. The worker requires the same normalized selection and hash, resolves the paths to parameterized catalog rows pinned to the retained JobId, and passes only server-generated table names plus numeric FileIndex/PathId identities to the restricted BVFS commands. Operator-selected source paths never enter `bconsole`. This single-volume boundary prevents TapeScale from claiming untouched cartridges were physically read while it does not yet retain authenticated path-to-volume coverage.
-
-The destination is always a newly created `/restore/<planned relative path>/<rehearsal UUID>` directory. Replace, rename, merge, live cutover, and automatic share publication are unavailable. TapeScale scans the recovered tree independently with bounded-memory external sorting and requires an exact comparison of every promised path, SHA-256 content value, and covered metadata field. A selected comparison permits only the ancestor directories required to place requested content and rejects unrelated extras. A complete pass appends `restore_test`; a selected pass appends `selective_restore_test`, which cannot satisfy the complete-point recovery gate. Neither creates a recovery point nor expands hardware qualification.
-
-Queued and running rehearsals, ordered volume state, and media requests are durable. The Recovery Vault reports exact media/drive/destination, current/next tape, phase events, engine correlation, comparison, result, cancellation, and bounded evidence. A running cancellation asks Bacula to cancel and waits for a terminal observation. A pending operator handoff does not consume the no-progress watchdog, but the overall deadline and drive lease remain active. The Bacula process itself is not restart-resumable: lease loss or worker restart fails closed, and a restart after a tape was durably loaded is treated as position-uncertain. Timeout, identity change, catalog disagreement, wrong/missing media, manifest mismatch, or uncertain cleanup cannot pass and may require drive reconciliation.
-
-Use the restore planner before loading media. It must show:
-
-- selected recovery point and scope;
-- all required tapes, order, and confirmed locations;
-- full/incremental dependencies and compatible drives;
-- key and original-dataset-key requirements;
-- verification/restore-test evidence;
-- estimated read and staging work;
-- destination mapping, ACL/identity limitations, and conflicts.
-
-Default to a new directory or dataset. For an existing directory, skip conflicts by default; rename or replace must be explicit. Native receives go beneath an isolated approved dataset, with mountpoints rewritten and recovered shares disabled.
-
-File restore validation compares SHA-256 content and promised metadata. Native validation covers the full send/receive and declared dataset state. Per-file claims for native recovery require an independently recorded file scan. A zvol is a block volume.
-
-Inspect the result before publishing or cutting over. Replacement of live data is an administrator destructive workflow.
-
-## Off-site rotation
-
-The current manual-custody workflow supports named physical locations and exact take-off-site, return, swap, and recall tasks. A newly registered cartridge with no location can be established at its first endpoint only through a direct physical confirmation. A two-step move requires a confirmed source plus an explicit in-transit location.
-
-Each task reserves its exact cartridge set. Operators may confirm a subset, so a multi-tape delivery remains incomplete until every tape reaches the destination. Departure, arrival, direct confirmation, cancellation, and custody correction use optimistic versions and idempotency keys; retrying the same request cannot silently complete it twice. Cartridge location and reservation updates, append-only custody history, audit events, and in-app outbox records commit together. Missed work is durably marked overdue and remains overdue through partial progress.
-
-Movement tasks describe tape IDs, reason, source, destination, readiness, due time, dependencies, and assigned operator. A weekly group becomes export-ready only after finalized writes, committed recovery metadata, required verification, independent key-package recovery readiness, and absence of active writes.
-
-Use the packing checklist, then record physical departure and arrival or a single confirmed move according to site policy. Scheduled dates, notifications, ejection, and export-slot placement do not change custody.
-
-Partial delivery remains incomplete. Minimum coverage is evaluated using every tape and dependency of a complete verified recovery point at the required location. Routine recall waits for verified replacement coverage. Emergency recall requires an explicit recorded exception showing the temporary gap.
-
-Corrections append custody history. Do not edit a prior location into a value that was never confirmed.
-
-## Retention, holds, and reuse
-
-Open **Tapes & pools** to work from the durable cartridge inventory rather than a handwritten label. Search and filter inventory by pool, confirmed location, identity, health, protection, and attention state. The cartridge dossier joins the registered identity to on-tape identity, pool, location, reservation, volume coordinates, recovery points, dependencies, expiry, verification, holds, custody, and audit history. It does not disclose worker artifact paths.
-
-View retention on recovery points and dependency chains, not only tape dates. A cartridge is protected if any contained recovery point, base, increment, manifest, explicit hold, archive, incomplete recoverable record, export reservation, pending custody task, or active job needs it. A cartridge may appear in more than one recovery dependency chain; every affected point must be cleared before reuse can be considered.
-
-Archives are self-contained full captures, retained indefinitely, with two independently verified copies by default and at least one off site. Archives do not delete source data and use separate media by default.
-
-Create routine, archive, scratch, or cleaning pools deliberately. Pool assignment is an audited cartridge mutation. The browser submits the dossier's current `state_version`; if the cartridge changes first, refresh and review the new facts instead of forcing the assignment. Repeating the same idempotent request returns its original receipt. Never move protected archive content into a reusable pool or treat a pool name as proof that physical media is blank.
-
-Manual, legal, and archive holds can be added from the dossier. Releasing one of these operator-created holds requires a reason and appends actor, correlation, and release evidence; it does not delete the hold record. Dependency, active-job, and unknown-identity protection is derived from system state and is not released through this control. A stale cartridge version blocks either mutation.
-
-Select a currently observed drive to evaluate reuse. The evaluation is read-only and denies on uncertainty. It reports identity/catalog reconciliation, retained and dependent recovery points, holds and archives, reservations and custody, WORM state, health and location certainty, actual format/generation compatibility, and affected recovery points. Correct the listed state and evaluate again; do not substitute a different drive merely to hide a protection blocker.
-
-Returning a tape from off site does not make it reusable. This release has no general erase, relabel, recycle, overwrite-execution, or policy-override control. Even when the read-only evaluation says `allowed`, an operator has not authorized destruction and TapeScale dispatches no tape command. The production target's exceptional-destruction workflow still requires administrator reauthentication and an unchanged affected-object preview, but that workflow is not implemented in this alpha.
-
-## Scheduling behavior
-
-The standalone `tapescale-scheduler` evaluates these rules and persists occurrences/work in PostgreSQL. It has no tape devices, source paths, restore destinations, or engine control. The worker claims eligible work and performs privileged orchestration.
-
-- Overlapping runs of the same job queue by default with at most one catch-up run.
-- After downtime, TapeScale records missed occurrences and captures the current source once; it does not fabricate historical snapshots.
-- A due/missed full outranks coalesced incrementals. A failed full does not become a base.
-- Requested restores outrank queued backups at safe boundaries but never interrupt an active write solely for priority.
-- Timezone schedules run a repeated local occurrence once and move nonexistent local time to the next valid instant.
-- Manual media waits persist and remind after 24 hours; they do not release required state or select alternate media destructively.
-
-## Alerts and corrective action
-
-### Unknown or foreign tape
-
-Leave it protected. Inspect read-only identity and catalog evidence. Importing a known foreign format, labeling, erasing, and reuse are separate administrator decisions.
-
-### Waiting for media
-
-Open the retained backup and inspect the displayed phase, sequence number, and exact confirmation. For an initial or continuation **write**, choose an eligible scratch cartridge, use **Prepare loaded tape** if that exact pair needs its setup test, and complete the destructive order-specific confirmation. For **full readback**, load only the exact previously written label requested for that sequence and use the non-destructive readback confirmation. Never substitute retained/archive media because it is physically nearby, never overwrite a tape requested for readback, and never treat an earlier readiness preview as authority for the current request.
-
-### Source read or metadata failure
-
-Fix access/source health and start a recorded retry from an immutable valid snapshot where possible. Do not mark an incomplete manifest successful.
-
-### Verification failure
-
-Quarantine the affected media for investigation, map impacted recovery points, preserve valid copies, and create replacement work from a valid source or independent copy. Checksums detect damage; they do not repair missing bytes.
-
-### Device loss or uncertain position
-
-Stop the controller, preserve logs, check cabling/driver/firmware, then perform inventory and identity reconciliation. Do not manually advance the engine catalog.
-
-### Full spool, staging, or destination
-
-TapeScale blocks before the media-write boundary when the Storage Daemon working filesystem cannot preserve its archive-specific attribute allowance and configured reserve. Whole-archive staging additionally requires the complete conservative stream estimate and runtime headroom to fit. Free or expand `/mnt/tapescale-spool`. If an explicit nonzero `TAPESCALE_BACULA_SPOOL_MAX_BYTES` cap was configured, raise it without consuming the real reserve or restore the default `0` so current usable capacity is selected automatically; a smaller value does not create a supported partial-buffer mode. Direct delivery writes no backup payload spool but is safe for tape motion only when measured sustained production exceeds the drive's minimum streaming rate. Never delete an active Bacula spool file, the only retry state, or verification evidence to finish within a window.
-
-In direct mode, low Bacula flow plus repeated tape stops points to source traversal, compression, CPU, or input-file shape; no spool metric is expected. It does not prove a low raw ZFS pool-read rate. In whole-archive mode, a growing spool with no tape movement is intentional staging. Tape movement should begin only after source production completes; during that single drain, repeated stop/start points to the staging device, host I/O contention, block/device compatibility, or the tape path. If no engine, optional spool, or tape movement occurs, TapeScale shows the measured idle age and cancels after `TAPESCALE_TRANSFER_STALL_TIMEOUT_SECS` (1,800 seconds by default; allowed range 300–7,200). A worker heartbeat does not reset that timer. Whole-archive staging protects tape motion but does not make the source scan itself faster, and the current file format still lacks small-file object packing.
-
-### Missing key
-
-Identify the required lineage and recover it through the independent key process. Do not expose or export ciphertext as a successful restore.
-
-## Catalog and configuration protection
-
-Create consistent PostgreSQL/configuration exports at least daily and after protected-job finalization, key changes, and relevant configuration changes. Keep the recovery bundle and key package separately. Test the clean-host path in [RECOVERY.md](RECOVERY.md) quarterly.
-
-## Upgrades
-
-Drain new work and stop active operations only at safe engine boundaries. Take and verify pre-migration catalog/configuration backups and a recovery bundle. Record versions, apply migrations, reconcile all hardware/media state, and run preflight plus a historical-format restore fixture before resuming.
-
-## Diagnostic exports
-
-Diagnostic bundles include component versions, sanitized health, correlation IDs, state transitions, and configured evidence. Review the redaction preview. Never include credentials, cookies, recovery codes, usable encryption keys, authorization headers, or an unrestricted sensitive path inventory.
-
-## Escalation rule
-
-When the UI and physical reality disagree, preserve the media and recoverable state, stop destructive work, and escalate with the correlation ID and evidence. Direct engine-console changes can invalidate reconciliation and are not a supported shortcut.
+See [NATIVE_FORMAT.md](NATIVE_FORMAT.md), [SECURITY.md](SECURITY.md), and [QUALIFICATION.md](QUALIFICATION.md).

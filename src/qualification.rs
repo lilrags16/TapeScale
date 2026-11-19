@@ -893,12 +893,12 @@ fn hex_digest(bytes: &[u8]) -> String {
 pub fn report() -> Value {
     json!({
         "release": crate::VERSION,
-        "gate": "G0 not passed",
+        "gate": "hardware qualification is installation-specific",
         "engine": {
-            "candidate": format!("{BACULA_CANDIDATE} {BACULA_CANDIDATE_VERSION}"),
-            "selection": "G0 laboratory candidate; not selected for production",
-            "adapter": "Simulator for the legacy generic job engine; pinned Bacula 15.0.3 is available through attended btape qualification, compressed multi-volume operational Full backups, and single-volume G0.2 recovery exercises",
-            "format": "Bacula format is exercised by attended Full backups and G0.2 recovery runs; production format selection remains open"
+            "candidate": "TapeScale Native 1",
+            "selection": "native archive and cartridge format selected for alpha testing",
+            "adapter": "TapeScale directly exercises the configured non-rewinding SCSI tape device with closed record, filemark, rewind, and readback operations",
+            "format": "TapeScale Native Volume v1 writes a machine-readable cartridge UUID at tape file zero"
         },
         "claims": {
             "software_tests": "Automated domain and service tests",
@@ -959,7 +959,10 @@ mod tests {
     #[test]
     fn report_never_claims_physical_qualification() {
         let value = report();
-        assert_eq!(value["gate"], "G0 not passed");
+        assert_eq!(
+            value["gate"],
+            "hardware qualification is installation-specific"
+        );
         assert_eq!(value["generations"].as_array().map(Vec::len), Some(10));
         assert!(value["generations"]
             .as_array()

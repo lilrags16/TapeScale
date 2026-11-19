@@ -1,119 +1,65 @@
-# Tape engine evaluation gate
+# Tape engine decision record
 
-Decision status: **open; no production engine or on-tape format is qualified**.
+Decision status: **TapeScale Native v1 selected for the `0.2.0-alpha.1` architecture; physical production qualification remains open**.
 
-The requirements identify Bacula Community as the initial feasibility candidate, not a pre-certified dependency. TapeScale must reuse a mature engine's records, spanning, checksums, spooling, and restart boundaries unless test evidence demonstrates that no qualified format can satisfy the contract. This repository's simulator is not an on-tape format and is not a production engine.
+## Decision
 
-## Gate question
+The Bacula-backed alpha path failed to provide the performance, operational simplicity, identity model, and dependable recovery contract required for TapeScale. The deployment has no valid Bacula recovery media, so `0.2.0-alpha.1` makes a clean, intentionally incompatible transition:
 
-Select and pin an engine release and durable format only after a named TrueNAS host, real drives/changer, and designated scratch tapes demonstrate the contract below. The result is an architecture decision record containing versions, licenses, packaging, privileges, structured interfaces, failure evidence, and the final go/no-go decision.
+- TapeScale owns the on-tape format, cartridge/archive identities, volume ordering, motion, direct device I/O, physical byte readback, evidence, and recovery contract.
+- DAR 2.8.6 is a pinned, separately executed archive codec used to package and restore file trees.
+- Every archive is completely staged and tested on disk before the first data tape is written.
+- Every native volume carries an authenticated header, repeated isolated DAR catalog and source manifest, complete DAR slices, index, and trailer.
+- A clean-host `tapescale-recovery` utility captures and authenticates tapes, reconstructs the archive, extracts it, and compares the restored tree without PostgreSQL.
+- The runtime image contains no Bacula package, daemon, console, or catalog utility.
 
-## Candidate set
+The exact media contract is documented in [NATIVE_FORMAT.md](NATIVE_FORMAT.md). Implementation and service boundaries are documented in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-### Bacula Community 15 feasibility candidate
+## Why this direction
 
-The Bacula 15 documentation referenced by the specification is the initial study baseline. The eventual package release and digest must be pinned only after qualification. Advantages to investigate:
+The new architecture directly addresses the observed failure modes:
 
-- established file backup, media pools, multi-volume operation, catalog, Accurate-mode namespace tracking, checksums, spooling, and recovery tools;
-- documented tape and changer support;
-- an independently installable recovery path.
+- Complete staging removes source traversal, tiny-file packaging, metadata walking, and compression from the active tape pass.
+- Whole DAR slices give the tape writer long sequential files and make volume placement deterministic.
+- TapeScale reads identity from media at destructive boundaries instead of asking the operator to attest repeatedly to the only loaded cartridge.
+- Native headers and trailers make a cartridge self-describing and bind it to one archive and volume ordinal.
+- Immediate readback verifies the bytes actually readable from every written tape.
+- Database-independent recovery avoids making the original service catalog a prerequisite for disaster recovery.
 
-Research checkpoint (12 November 2026): **Bacula Community 15.0.3 is the first G0 laboratory candidate, not a production selection or qualification result.** The lab adapter should evaluate the supported Baculum API v2 and allowlisted JSON console surfaces, use `btape` for designated-scratch-media drive/EOM exercises, and retain `bscan` clean-catalog recovery evidence. TapeScale must keep Bacula Director, Storage Daemon, and the engine catalog isolated; only the Storage Daemon receives the qualified tape/changer devices. Bareos remains the comparison fallback if any mandatory Bacula result fails.
+## Rejected active alternatives
 
-Implementation checkpoint (12 November 2026): the G0.1 quick test is wired to Debian's exact `bacula-sd=15.0.3-3~bpo12+1` package from snapshot `20250730T000000Z`. The worker accepts only the packaged `/usr/sbin/btape` amd64 digest, a generated exact-device configuration, and the fixed `test\n` transcript. Durable drive/media fencing, typed destructive confirmation, completed-test output markers, bounded evidence, and cleanup rewind-to-BOT are implemented. No physical run is recorded in this repository, and this harness does not start the Storage Daemon or select Bacula's production format. The later backup data plane must give the isolated Storage Daemon exclusive device ownership rather than sharing the preview worker path.
+### Bacula Community
 
-The candidate has a release-blocking encryption question: the documented Storage Daemon volume-encryption construction and its metadata coverage must be tested against the authenticated-encryption and independent-recovery requirements. A successful `btape` result alone selects neither the security pipeline nor the product format.
+Bacula was the earlier feasibility engine. It is no longer an active runtime or recovery dependency. Its prior jobs and catalog fields can remain in the database as historical audit records, but they are not native recovery points and the native image cannot read Bacula media.
 
-Primary candidate references:
+### Amanda/Zmanda and Bareos
 
-- [Bacula Community 15.0.3 release](https://www.bacula.org/bacula-community-15-0-3-released/)
-- [Bacula 15 new features and JSON interfaces](https://www.bacula.org/15.0.x-manuals/en/main/New_Features_in_15_0_0.html)
-- [`btape` drive qualification](https://www.bacula.org/15.0.x-manuals/en/problems/Testing_Your_Tape_Drive_Wit.html)
-- [Baculum API](https://www.bacula.org/15.0.x-manuals/en/console/Baculum_API_Web_GUI_Tools.html)
-- [Bacula security behavior](https://www.bacula.org/15.0.x-manuals/en/main/Bacula_Security_Issues.html)
+These remain possible external tools for separate deployments, but adopting either would reintroduce an engine catalog, adapter lifecycle, media conventions, and operator surface that TapeScale would still need to reconcile. Neither is part of Native v1 and neither can read its media without a TapeScale-aware reader.
 
-Questions that must be answered with pinned-version evidence:
+### LTFS
 
-- Is there a supported structured control surface for every required operation, or would critical state require parsing presentation-oriented `bconsole` output?
-- Does Accurate mode reproduce deletions, renames, directory changes, and metadata-only changes on the TrueNAS fixture?
-- Are TrueNAS NFSv4 ACL inheritance and allow/deny semantics preserved, not merely generic ACL flags?
-- How are arbitrary native ZFS send streams represented without replacing Bacula's proven tape-record layer?
-- What are the documented durable restart units for files, native streams, volume changes, verification, and catalog finalization?
-- Can a clean host rebuild or import the necessary catalog from tape-resident and separately exported metadata?
-- Which encryption modes cover filenames, paths, and catalog exports, and how are keys recovered independently?
+LTFS does not cover the intended LTO-1-through-current generation model and does not by itself solve multi-volume archive identity, complete-set validation, clean-host catalog reconstruction, or the required recovery evidence. It is not the Native v1 format.
 
-### Bareos
+## Mandatory qualification before production claims
 
-Evaluate under exactly the same fixture and evidence rubric. Do not infer compatibility from shared ancestry or documentation. Record the supported API/control surface, licensing, packaged versions, recovery tooling, Accurate-equivalent semantics, ACL behavior, and format support.
+The architecture decision does not constitute physical qualification. The named TrueNAS host and supported hardware must demonstrate:
 
-### Other established engines
+1. representative file and metadata round trips, including POSIX/NFSv4 ACLs, xattrs, hard links, symlinks, sparse files, and unusual names;
+2. sustained native write/read throughput without pathological backhitching;
+3. real multi-volume backup and clean-host restore across physical capacity boundaries;
+4. rejection of wrong, foreign, protected, reordered, corrupt, truncated, missing, and duplicate media;
+5. safe behavior across cancellation, process/container restart, device reset/disconnect, and power interruption;
+6. a complete replacement-host recovery with no original database;
+7. operational retention, custody, reuse, and diagnostics evidence.
 
-Additional engines may enter the gate if they support Linux tape libraries, multi-volume recovery, catalog reconstruction, exact incrementals, and maintained independent restore tooling. Cloud-only, LTFS-only, or LTO-5-and-later-only paths cannot satisfy the all-generation baseline.
+The current status for each acceptance case is maintained in [QUALIFICATION.md](QUALIFICATION.md).
 
-## Mandatory laboratory fixture
+## Alpha limits
 
-Use TrueNAS 25.10.8 on x86-64 initially and record exact OpenZFS, kernel, tape driver, engine, image, drive, changer, firmware, HBA, and media versions. The source fixture includes:
+Native v1 currently targets attended Full backups to one standalone SAS tape drive. It is unencrypted. It does not yet provide incrementals, changers, automatic snapshot lifecycle, native ZFS streams/zvols, selected-file restore, or web-operated restore. Physical EOM is treated as a failed uncertain volume rather than a normal spanning signal; planned volume placement uses conservative generation capacity and keeps slices whole.
 
-- POSIX ACL and native TrueNAS NFSv4 ACL datasets with inheritance and allow/deny cases;
-- empty, small, large, sparse, hard-linked, symlinked, extended-attribute, unusual-name, and unreadable files;
-- additions, content changes, moves, deletions, directory changes, and metadata-only changes across snapshots;
-- a native filesystem dataset and a zvol, both full and incremental;
-- a file and a native stream larger than one cartridge;
-- compressible, incompressible, already compressed, and raw-encrypted data;
-- wrong, unknown, protected, WORM where available, and physically full media;
-- a library path with slots/import-export where available and a standalone manual-drive path.
+Do not rely on this alpha as the only copy of data. Do not destructively prepare a cartridge that may contain data worth preserving in another format.
 
-## Required demonstrations
+## Superseded research record
 
-The gate cannot pass on documentation or simulation alone. Retain logs, manifests, hashes, screenshots, media inventory, and restore comparisons for:
-
-1. File full/incremental backup and exact dated reconstruction.
-2. POSIX and NFSv4 ACL/metadata round trips on the actual TrueNAS dataset.
-3. Native ZFS full/incremental send and receive, including zvol.
-4. Multi-volume write and restore with physical end-of-media.
-5. Wrong continuation tape rejection without modifying it.
-6. Failed source/producer propagation through the engine.
-7. Cancellation and power/process interruption at documented boundaries.
-8. Actual read-back verification through the recovery decoding path.
-9. Software encryption and independent historical-key recovery.
-10. Clean replacement host catalog-loss recovery without the original database.
-11. Stable logical source identity across changing snapshot mount paths.
-12. Safe device ownership and changer coordination across restart.
-
-## Scoring rubric
-
-Each candidate is scored pass/fail for mandatory items and comparatively for operational quality:
-
-| Area | Mandatory evidence |
-|---|---|
-| Format durability | Versioned maintained format; independent reader/tools; prior-format policy |
-| Exact recovery | Complete namespace and metadata fixture reconstructed |
-| TrueNAS fidelity | Real POSIX/NFSv4 ACL, xattr, links, sparse behavior |
-| Native ZFS | Full/incremental dataset and zvol round trips |
-| Media behavior | Physical spanning, EOM, wrong media, unknown media, WORM handling |
-| Failure truth | Producer errors, resets, timeouts, cancellation, restart states |
-| Control interface | Supported structured interface with stable identifiers |
-| Catalog loss | Clean-host identification, import/rebuild, restore |
-| Encryption | Authenticated format, metadata coverage, portable key recovery |
-| Operations | Packaging, diagnostics, performance, licensing, security updates |
-
-Any mandatory failure is a no-go or a documented release-blocking gap. A workaround that replaces the engine's record layer creates a new format qualification burden and is not accepted by convenience.
-
-## Adapter acceptance
-
-After engine selection, pin:
-
-- engine version and package/image digest;
-- engine catalog schema ownership and supported interface;
-- adapter protocol version;
-- on-tape and manifest format identifiers;
-- required external tools and versions;
-- privileges, devices, mounts, and network flows;
-- timeout, cancellation, restart, and reconciliation semantics;
-- clean-host installation and recovery artifacts.
-
-The adapter must prove hostile argument handling, missing tools, hung commands, cancellation, and failed producer/consumer propagation as required by AT-30.
-
-## Current conclusion
-
-No production engine is selected and no physical evidence is present. The only enabled write is the attended destructive `btape test` against explicitly designated scratch media; it cannot create recovery data. Production writes must remain disabled until this document is replaced by a signed G0 decision record backed by the named laboratory evidence.
+The pre-`0.2.0` repository evaluated Bacula, Bareos, and other established engines under a G0 laboratory gate. That research is superseded as an implementation decision by TapeScale Native v1. Historical commits and the changelog preserve why the earlier adapter existed; current operator documentation must not present it as enabled.

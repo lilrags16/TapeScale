@@ -625,7 +625,7 @@ impl TryFrom<InventoryRow> for MediaInventorySummary {
             });
         let healthy = matches!(
             row.health_status.as_str(),
-            "healthy" | "verified" | "written_verified"
+            "healthy" | "verified" | "written_verified" | "qualified_scratch"
         );
         let reuse_state = if row.worm {
             InventoryReuseState::PhysicallyBlocked
@@ -1939,9 +1939,9 @@ pub async fn evaluate_media_reuse(
                           IS NOT DISTINCT FROM qualified_cartridge.media_generation
                       AND qualification.expected_media_format
                           IS NOT DISTINCT FROM qualified_cartridge.media_format
-                      AND qualification.engine_name = 'Bacula Community'
-                      AND qualification.engine_version = '15.0.3'
-                      AND qualification.test_kind = 'btape_test'
+                      AND qualification.engine_name = 'TapeScale Native'
+                      AND qualification.engine_version = '1'
+                      AND qualification.test_kind = 'native_tape_test'
                       AND qualification.attempt > 0
                     ORDER BY qualification.created_at DESC, qualification.id DESC
                     LIMIT 1
@@ -2578,7 +2578,7 @@ const fn media_format_generation(format: MediaFormat) -> i16 {
 
 fn media_health(status: &str) -> MediaHealth {
     match status {
-        "healthy" | "verified" | "written_verified" => MediaHealth::Healthy,
+        "healthy" | "verified" | "written_verified" | "qualified_scratch" => MediaHealth::Healthy,
         "quarantined" | "write_unverified" => MediaHealth::Quarantined,
         "failed" => MediaHealth::Failed,
         _ => MediaHealth::Degraded,
@@ -2939,6 +2939,19 @@ mod tests {
             inventory.reuse_state,
             InventoryReuseState::DriveEvaluationRequired
         );
+    }
+
+    #[test]
+    fn qualified_scratch_is_healthy_and_does_not_require_reconciliation() {
+        let mut row = inventory_row();
+        row.health_status = "qualified_scratch".to_owned();
+        let inventory = MediaInventorySummary::try_from(row).unwrap();
+
+        assert_eq!(
+            inventory.reuse_state,
+            InventoryReuseState::DriveEvaluationRequired
+        );
+        assert_eq!(media_health("qualified_scratch"), MediaHealth::Healthy);
     }
 
     #[test]

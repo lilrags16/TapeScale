@@ -255,6 +255,7 @@ impl RestoreLiveIoSampler {
                 .expect("restore progress totals always carry an authoritative basis"),
             archive_entries_per_second,
             pipeline_bytes_processed: self.maximum_pipeline_bytes,
+            pipeline_bytes_total: None,
             pipeline_bytes_per_second,
             file_daemon_read_bytes_processed: file_daemon_read_bytes,
             file_daemon_read_bytes_per_second,

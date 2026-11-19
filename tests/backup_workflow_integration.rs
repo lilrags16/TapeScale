@@ -743,6 +743,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         progress_basis: "bacula_job_files_over_manifest_entries",
         archive_entries_per_second: Some(1.0),
         pipeline_bytes_processed: 2_048,
+        pipeline_bytes_total: None,
         pipeline_bytes_per_second: Some(400),
         file_daemon_read_bytes_processed: None,
         file_daemon_read_bytes_per_second: None,
@@ -1583,7 +1584,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(assignment.requested_level, "full");
     assert_eq!(assignment.retention_days, assignment_profile.retention_days);
     assert_eq!(assignment.compression_mode, "auto");
-    assert_eq!(assignment.resolved_compression, "lzo");
+    assert_eq!(assignment.resolved_compression, "zstd");
     assert!(assignment.spanning_enabled);
     assert_eq!(assignment.data_delivery, "disk_spool");
     let assignment_volumes = store::data_run_volumes(&pool, assignment.id)
@@ -1919,6 +1920,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         progress_basis: "bacula_job_files_over_manifest_entries",
         archive_entries_per_second: Some(1.0),
         pipeline_bytes_processed: 1_024,
+        pipeline_bytes_total: None,
         pipeline_bytes_per_second: Some(200),
         file_daemon_read_bytes_processed: Some(1_024),
         file_daemon_read_bytes_per_second: Some(200),
@@ -2521,6 +2523,7 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         progress_basis: "bacula_job_files_over_backup_job_files",
         archive_entries_per_second: Some(1.0),
         pipeline_bytes_processed: 1_024,
+        pipeline_bytes_total: None,
         pipeline_bytes_per_second: Some(200),
         file_daemon_read_bytes_processed: Some(1_024),
         file_daemon_read_bytes_per_second: Some(200),

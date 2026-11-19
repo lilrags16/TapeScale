@@ -136,28 +136,25 @@ test("creating a request continues directly into final tape authorization", () =
   assert.doesNotMatch(submit, /toast\("Full backup queued"/);
 });
 
-test("backup policy defaults to whole-archive anti-shoe-shine staging and retains advanced direct delivery", () => {
+test("new backup policy always stages a native DAR archive before sequential tape streaming", () => {
   const open = section("  function openBackupProfile(", "  async function submitBackupProfile(");
   const submit = section("  async function submitBackupProfile(", "  function backupCapacityPlan(");
 
   assert.match(open, /name="compression_mode"/);
   assert.match(open, /value="auto" selected/);
+  assert.match(open, /value="zstd"/);
+  assert.match(open, /value="lz4"/);
   assert.match(open, /value="gzip"/);
-  assert.match(open, /value="lzo"/);
   assert.match(open, /value="none"/);
-  assert.match(open, /Automatic · LZO \(recommended\)/);
-  assert.match(open, /prioritize source throughput and reduce tape starvation/);
-  assert.doesNotMatch(open, /Automatic · fast GZIP/);
+  assert.match(open, /Automatic · Zstandard fast \(recommended\)/);
+  assert.match(open, /Automatic uses Zstandard level 1/);
   assert.match(open, /name="spanning_enabled" checked/);
   assert.match(open, /spans tapes as needed/);
-  assert.match(open, /name="data_delivery" value="disk_spool" checked/);
-  assert.match(open, /name="data_delivery" value="direct"/);
-  assert.match(open, /Whole-archive staging <em>Recommended<\/em>/);
-  assert.match(open, /stage toward a conservative whole-archive target before the tape data pass/i);
-  assert.match(open, /target is an estimate, not a guarantee/i);
-  assert.match(open, /cancels near the hard spool limit or if early draining is detected/i);
-  assert.match(open, /Direct streaming <em>Advanced<\/em>/);
-  assert.match(open, /Small-file or slow sources can starve the drive and cause shoe-shining/);
+  assert.match(open, /type="hidden" name="data_delivery" value="disk_spool"/);
+  assert.doesNotMatch(open, /name="data_delivery" value="direct"/);
+  assert.match(open, /Pack once, then stream sequentially/);
+  assert.match(open, /DAR packages small files into large archive slices on disk/);
+  assert.match(open, /validates the complete staged archive before the tape moves/);
   assert.match(submit, /compression_mode: String\(values\.get\("compression_mode"\) \|\| "auto"\)/);
   assert.match(submit, /data_delivery: String\(values\.get\("data_delivery"\) \|\| "disk_spool"\)/);
   assert.match(submit, /spanning_enabled: values\.get\("spanning_enabled"\) === "on"/);
@@ -182,7 +179,7 @@ test("delivery labels distinguish advanced direct, whole-archive staged, legacy,
   assert.equal(values[2]({ data_delivery: "ram_ring" }), "Unsupported (ram_ring)");
 });
 
-test("unsupported legacy compression is shown and blocked instead of becoming auto", () => {
+test("native compression choices and legacy aliases retain explicit labels", () => {
   const helpers = section("  function backupCompressionMode(", "  function backupSpanningEnabled(");
   const testPick = (object, ...keys) => {
     if (!object || typeof object !== "object") return null;
@@ -195,8 +192,8 @@ test("unsupported legacy compression is shown and blocked instead of becoming au
     "backupEvidenceValue",
     '"use strict";\n' + helpers + "\nreturn [backupCompressionMode, backupCompressionSupported, backupCompressionLabel];"
   )(testPick, () => null, () => null);
-  const legacy = { compression_mode: "zstd" };
-  assert.equal(evaluate[2]({ compression_mode: "auto" }), "Automatic → LZO (fastest)");
+  const unsupported = { compression_mode: "bzip2" };
+  assert.equal(evaluate[2]({ compression_mode: "auto" }), "Automatic → Zstandard level 1 (fast)");
   const legacyAutomatic = Function(
     "pick",
     "backupProfileForRun",
@@ -204,9 +201,12 @@ test("unsupported legacy compression is shown and blocked instead of becoming au
     '"use strict";\n' + helpers + "\nreturn backupCompressionLabel;"
   )(testPick, () => null, () => "gzip");
   assert.equal(legacyAutomatic({ compression_mode: "auto" }), "Automatic → GZIP1 (legacy)");
-  assert.equal(evaluate[0](legacy), "zstd");
-  assert.equal(evaluate[1](legacy), false);
-  assert.equal(evaluate[2](legacy), "Unsupported (zstd)");
+  assert.equal(evaluate[2]({ compression_mode: "zstd" }), "Zstandard level 1 (fast)");
+  assert.equal(evaluate[2]({ compression_mode: "lz4" }), "LZ4 (fastest)");
+  assert.equal(evaluate[2]({ compression_mode: "lzo" }), "LZO (legacy)");
+  assert.equal(evaluate[0](unsupported), "bzip2");
+  assert.equal(evaluate[1](unsupported), false);
+  assert.equal(evaluate[2](unsupported), "Unsupported (bzip2)");
 
   const profiles = section("  function renderBackupProfiles(", "  function renderBackupRunTable(");
   assert.match(profiles, /!compressionSupported/);
@@ -504,7 +504,10 @@ test("the Recovery Vault keeps multi-tape full restore and single-tape selected 
   assert.match(detailContract, /Required next/);
 
   assert.match(history, /<h3>Restore runs<\/h3>/);
-  assert.match(history, /supported verified Full recovery point can run an attended one- or multi-tape restore/);
+  assert.match(history, /Offline recovery is available with the independent tapescale-recovery utility/);
+  assert.match(history, /compatible legacy recovery point can run an attended restore only when the server offers that exact execution contract/);
+  assert.match(history, /unsuccessful or retired outcome is audit history, not a recovery source/);
+  assert.match(history, /Recovery planning is unavailable because this point is not verified/);
   assert.match(history, /<h4>Restore run<\/h4>/);
   assert.match(history, /Attended .*multi-tape.*single-tape/);
   assert.match(history, /Load tape .* of/);
@@ -514,9 +517,15 @@ test("the Recovery Vault keeps multi-tape full restore and single-tape selected 
   assert.match(history, /Download restore evidence/);
   assert.doesNotMatch(history, /Ready G0\.2 restore plans|Recovery rehearsals/);
 
-  assert.match(app, /Server-normalized file or directory selection is executable only for a single-tape recovery point/);
-  assert.match(app, /multi-tape selected execution stays blocked until per-path media evidence is retained/);
-  assert.match(app, /Plan complete restore/);
+  assert.match(app, /Offline recovery available · in-console restore pending/);
+  assert.match(app, /This DAR recovery point is cataloged, browseable, and physically read back/);
+  assert.match(dossier, /pointVerified = pointState === "verified"/);
+  assert.match(dossier, /legacy_format_retired/);
+  assert.match(dossier, /Not a valid recovery point/);
+  assert.match(dossier, /records are audit history only/);
+  assert.match(dossier, /const planAction = pointVerified/);
+  assert.match(app, /this Alpha restores the server-normalized selected paths only when this is a single-tape recovery point/);
+  assert.match(app, /Plan a complete restore/);
   assert.match(planDialog, /server-returned ordered tape set/);
 
   assert.match(mediaContract, /planArray\(restorePlanExecution\(plan\), "required_tape_ids", "required_tapes", "tapes"\)/);
@@ -794,7 +803,7 @@ test("the operation hero renders phase-specific progress, rates, and tape action
   };
   const objectValue = (object, key) => object && object[key] && typeof object[key] === "object" && !Array.isArray(object[key]) ? object[key] : {};
   const [operation, render] = Function(
-    "pick", "objectValue", "backupRunState", "backupTransferProgress", "BACKUP_TERMINAL_STATES", "backupMediaRequestState", "backupDataDelivery", "backupTransferPhase", "backupLiveActivity", "backupPhaseIndex", "backupRunStateLabel", "backupNeedsNextMedia", "backupMediaIsReadback", "backupNextVolumeSequence", "recordId", "esc", "backupRunVolumes", "bytes", "backupDurationLabel", "date", "BACKUP_PHASES",
+    "pick", "objectValue", "backupRunState", "backupTransferProgress", "BACKUP_TERMINAL_STATES", "backupMediaRequestState", "backupDataDelivery", "backupTransferPhase", "backupLiveActivity", "backupNativeEngineState", "backupPhaseIndex", "backupRunStateLabel", "backupNeedsNextMedia", "backupMediaIsReadback", "backupNextVolumeSequence", "recordId", "esc", "backupRunVolumes", "bytes", "backupDurationLabel", "date", "BACKUP_PHASES",
     '"use strict";\n' + helpers + "\nreturn [backupCurrentOperation, renderBackupCurrentOperation];"
   )(
     testPick,
@@ -806,6 +815,7 @@ test("the operation hero renders phase-specific progress, rates, and tape action
     (run) => run.data_delivery || "disk_spool",
     (value) => ({ tape_write: "backup_write", writing: "backup_write", tape_read: "full_readback", verifying: "full_readback" })[String(value || "")] || String(value || ""),
     (liveIo) => liveIo.activity || "starting",
+    (liveIo) => String(liveIo && liveIo.engine_state || "").toLowerCase(),
     (run) => Number.isInteger(run.step) ? run.step : 3,
     (run) => ({ writing: "Writing tape", verifying: "Reading tape back", failed: "Failed", queued: "Waiting to start" })[run.state] || run.state,
     (run) => Boolean(run.needsNextMedia),
@@ -868,12 +878,12 @@ test("the operation hero renders phase-specific progress, rates, and tape action
   };
   const direct = render(directRun);
   assert.match(direct, /Step 4 of 8/);
-  assert.match(direct, /Streaming directly to tape/);
+  assert.match(direct, /Streaming a native volume to tape/);
   assert.match(direct, /Archive entries reached/);
   assert.match(direct, /4 of 10 entries/);
-  assert.match(direct, /400 B in the Bacula phase stream/);
+  assert.match(direct, /400 B in the current archive stage/);
   assert.match(direct, /40%/);
-  assert.match(direct, /Bacula write stream/);
+  assert.match(direct, /Archive write stream/);
   assert.match(direct, /100 B\/s/);
   assert.match(direct, /Source read/);
   assert.match(direct, /80 B\/s/);
@@ -887,8 +897,8 @@ test("the operation hero renders phase-specific progress, rates, and tape action
   assert.match(direct, /Radio Stuff\/session &lt;final&gt;&amp;&quot;\.wav/);
   assert.doesNotMatch(direct, /<final>/, "the source-relative filename must be HTML escaped");
   assert.match(direct, /not retained after this phase/);
-  assert.match(direct, /Direct streaming · source speed must continuously sustain tape/);
-  assert.match(direct, /tape can still backhitch/);
+  assert.match(direct, /Legacy direct streaming record/);
+  assert.match(direct, /New TapeScale Native backups always build and validate a complete disk archive first/);
 
   const readbackRun = {
     ...directRun,
@@ -920,6 +930,7 @@ test("the operation hero renders phase-specific progress, rates, and tape action
       liveIo: {
         phase: "backup_write",
         activity: "buffering",
+        engine_state: "packing",
         tape_write_counter_available: true,
         tape_write_bytes_per_second: 0,
         spool_bytes: 250,
@@ -929,11 +940,11 @@ test("the operation hero renders phase-specific progress, rates, and tape action
     })
   };
   const staged = render(stagedRun);
-  assert.match(staged, /Staging archive on disk/);
+  assert.match(staged, /Packing the complete archive on disk/);
   assert.match(staged, /Archive staging/);
   assert.match(staged, /250 B \/ 1,000 B/);
   assert.match(staged, /25% of estimated stage target · hard limit 1,200 B/);
-  assert.match(staged, /Capacity-gated staging · fails closed near the spool limit or on early drain/);
+  assert.match(staged, /Complete archive on disk · tape idle/);
   assert.doesNotMatch(staged, /Tape read/);
 
   const legacyStaged = render({
@@ -953,7 +964,7 @@ test("the operation hero renders phase-specific progress, rates, and tape action
   const paused = render(pausedRun);
   assert.match(paused, /Load tape 2 to continue/);
   assert.match(paused, /6 of 10 entries/);
-  assert.match(paused, /600 B in the Bacula phase stream/);
+  assert.match(paused, /600 B in the current archive stage/);
   assert.match(paused, /60%/);
   assert.match(paused, /Paused at the last confirmed position/);
   assert.match(paused, /Load next tape/);
@@ -1091,7 +1102,7 @@ test("shared preparation and engine telemetry remain honest about stale or missi
     sample_window_ms: 5000,
     phase: "tape_write",
     activity: "buffering",
-    engine_state: "running",
+    engine_state: "",
     progress_idle_ms: 0,
     no_progress_timeout_ms: 1800000,
     pipeline_bytes_per_second: 1048576,
@@ -1101,7 +1112,7 @@ test("shared preparation and engine telemetry remain honest about stale or missi
     tape_write_counter_available: true,
     tape_counters_available: true,
     stale_after_seconds: 20,
-    pipeline_basis: "bacula_storage_running_job_bytes_delta",
+    pipeline_basis: "native_dar_archive_bytes_delta",
     tape_basis: "linux_scsi_tape_sysfs_counter_delta",
     spool_bytes: 16777216,
     spool_target_bytes: 67108864,
@@ -1109,7 +1120,7 @@ test("shared preparation and engine telemetry remain honest about stale or missi
     spool_file_count: 2,
     spool_fill_bytes_per_second: 2097152,
     spool_drain_bytes_per_second: 0,
-    spool_basis: "run_scoped_bacula_spool_regular_file_bytes"
+    spool_basis: "native_run_scoped_archive_slice_bytes"
   };
 
   assert.equal(stale(freshSample, now), false);
@@ -1121,20 +1132,24 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   assert.match(live, /25\.0% of estimated stage target/);
   assert.match(live, /hard limit 80\.0 MiB/);
   assert.match(live, /Filling<\/span><strong>2\.0 MiB\/s/);
-  assert.match(live, /Source data is being staged toward a conservative whole-archive target/);
-  assert.match(live, /cancels instead of knowingly cycling partial batches/);
-  assert.match(live, /Bacula write stream/);
-  assert.match(live, /After Bacula hashing\/compression · not raw ZFS throughput/);
-  assert.doesNotMatch(live, /Logical backup pipeline/);
+  assert.match(live, /DAR is packaging source data into the complete staged archive before tape movement starts/);
+  assert.match(live, /Archive write stream/);
+  assert.match(live, /Engine stream bytes · not source logical bytes/);
   assert.match(live, /1\.0 MiB\/s/);
   assert.match(live, /Tape write/);
   assert.match(live, /0 B\/s/);
   assert.doesNotMatch(live, /Tape read/);
   assert.match(live, /Rolling 5 second sample/);
-  assert.match(live, /Engine progress: Bacula Storage Running Job Bytes Delta/);
-  assert.match(live, /Archive staging: Run Scoped Bacula Spool Regular File Bytes/);
+  assert.match(live, /Engine progress: Native Dar Archive Bytes Delta/);
+  assert.match(live, /Archive staging: Native Run Scoped Archive Slice Bytes/);
   assert.match(live, /Linux Scsi Tape Sysfs Counter Delta/);
-  assert.match(live, /Bacula: Running/);
+  assert.doesNotMatch(live, /Bacula/);
+
+  const packing = render({ state: "writing", result: { live_io: { ...freshSample, engine_state: "packing", activity: "buffering" } } });
+  assert.match(packing, /Packing the complete archive on disk/);
+  assert.match(packing, /DAR archive packing/);
+  assert.match(packing, /Tape<\/span><strong>Idle/);
+  assert.match(packing, /tape is intentionally idle during this stage/i);
 
   const firstSpoolSample = { ...freshSample, activity: "starting", sample_window_ms: null };
   delete firstSpoolSample.spool_fill_bytes_per_second;
@@ -1143,16 +1158,16 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   assert.match(firstSpool, /Net movement<\/span><strong>Measuring…/);
   assert.doesNotMatch(firstSpool, /Net movement<\/span><strong>0 B\/s/);
 
-  const streaming = render({ state: "writing", result: { live_io: { ...freshSample, activity: "streaming", spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 4194304, tape_write_bytes_per_second: 4194304 } } });
-  assert.match(streaming, /Writing the staged archive to tape/);
+  const streaming = render({ state: "writing", result: { live_io: { ...freshSample, engine_state: "writing_native_volume", activity: "streaming", spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 4194304, tape_write_bytes_per_second: 4194304 } } });
+  assert.match(streaming, /Streaming a native volume to tape/);
   assert.match(streaming, /Tape active/);
   assert.match(streaming, /Draining<\/span><strong>4\.0 MiB\/s/);
-  assert.match(streaming, /physical tape-write counter is advancing/);
+  assert.match(streaming, /staged TapeScale Native volume is streaming sequentially/);
 
-  const despooling = render({ state: "writing", result: { live_io: { ...freshSample, activity: "despooling", spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 3145728, tape_write_counter_available: false, tape_write_bytes_per_second: null } } });
-  assert.match(despooling, /Writing the staged archive to tape/);
-  assert.match(despooling, /staged data is shrinking/);
-  assert.match(despooling, /Physical tape rate and archive-entry progress remain visible separately/);
+  const despooling = render({ state: "writing", result: { live_io: { ...freshSample, engine_state: "writing_native_volume", activity: "despooling", spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 3145728, tape_write_counter_available: false, tape_write_bytes_per_second: null } } });
+  assert.match(despooling, /Streaming a native volume to tape/);
+  assert.match(despooling, /Native volume stream/);
+  assert.match(despooling, /Tape write<\/span><strong>Unavailable/);
 
   const idle = render({ state: "writing", result: { live_io: { ...freshSample, activity: "idle", progress_idle_ms: 300000, pipeline_bytes_per_second: 0, spool_fill_bytes_per_second: 0, spool_drain_bytes_per_second: 0 } } });
   assert.match(idle, /No data movement/);
@@ -1178,15 +1193,14 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   assert.match(partial, /Tape write<\/span><strong>0 B\/s/);
   assert.doesNotMatch(partial, /Tape read/);
 
-  const verifying = render({ state: "verifying", result: { live_io: { ...freshSample, phase: "full_readback", activity: "reading", tape_read_bytes_per_second: 1048576 } } });
-  assert.match(verifying, /Bacula verify stream/);
-  assert.match(verifying, /Bacula JobBytes · not source logical bytes/);
-  assert.doesNotMatch(verifying, /Logical verify pipeline|logical readback pipeline/);
+  const verifying = render({ state: "verifying", result: { live_io: { ...freshSample, engine_state: "reading_native_volume", phase: "full_readback", activity: "reading", tape_read_bytes_per_second: 1048576 } } });
+  assert.match(verifying, /Reading the volume back now/);
+  assert.match(verifying, /Physical readback/);
+  assert.match(verifying, /Immediate readback of the just-written physical volume/);
 
   const restoring = render({ state: "restoring", result: { live_io: { ...freshSample, phase: "restore", activity: "restoring", tape_read_bytes_per_second: 1048576 } } });
-  assert.match(restoring, /Bacula restore stream/);
-  assert.match(restoring, /Recovered data is moving through the Bacula restore stream/);
-  assert.doesNotMatch(restoring, /Logical restore pipeline/);
+  assert.match(restoring, /Archive read stream/);
+  assert.match(restoring, /Legacy recovered data is moving through the restore stream/);
 
   const oldSample = { ...freshSample, sampled_at: "2000-01-01T00:00:00Z", pipeline_bytes_per_second: 999999999 };
   assert.equal(stale(oldSample, now), true);
@@ -1238,7 +1252,7 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   assert.match(stalePreparation, /Rate hidden until next update/);
   assert.doesNotMatch(stalePreparation, /953\.7 MiB\/s/);
 
-  assert.match(renderPreparation({ state: "preparing", result: {} }), /Checking the immutable snapshot, Bacula catalog, drive, tape, and selected delivery path/);
+  assert.match(renderPreparation({ state: "preparing", result: {} }), /Checking the immutable snapshot, native catalog, drive, tape, and staging path/);
   assert.match(renderPreparation({ state: "inventorying", result: {} }), /Waiting for the worker's first source-scan sample/);
   const stability = renderPreparation({ state: "verifying", result: { preparation_progress: { ...preparationSample, stage: "source_stability_check", step: "sorting" } } });
   assert.match(stability, /Sorting manifest entries/);
@@ -1250,7 +1264,7 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   assert.doesNotMatch(direct, /Archive staging|Staging archive on disk|staged archive/);
   const directStarting = render({ state: "writing", data_delivery: "direct", result: { live_io: { ...freshSample, activity: "buffering" } } });
   assert.match(directStarting, /Starting the tape stream/);
-  assert.match(directStarting, /no disk data spool is in this path/);
+  assert.match(directStarting, /legacy direct source-to-tape stream is starting/);
   assert.doesNotMatch(directStarting, /staged archive/);
 
   const evidence = section("  function renderBackupEvidence(", "  function renderBackupOutcome(");
@@ -1332,7 +1346,7 @@ test("tape preparation uses one destructive action and automatically reconciles 
   assert.doesNotMatch(open, /name="scratch_media_confirmed"/);
   assert.doesNotMatch(open, /name="destructive_overwrite_confirmed"/);
   assert.doesNotMatch(open, /name="confirmation"/);
-  assert.match(submit, /"DESTROY " \+ labelText \+ " WITH BACULA BTAPE TEST"/);
+  assert.match(submit, /"DESTROY " \+ labelText \+ " WITH TAPESCALE NATIVE TEST"/);
   assert.match(submit, /Reconciling the only loaded drive/);
   assert.match(submit, /scratch_media_confirmed: true/);
   assert.match(submit, /destructive_overwrite_confirmed: true/);
@@ -1547,13 +1561,15 @@ test("backup detail distinguishes the requested time from the actual start time"
 test("backup history labels percentages with their phase", () => {
   const helper = section("  function backupTableProgressLabel(", "  function backupReadbackSummary(");
   const label = Function(
-    "BACKUP_TERMINAL_STATES", "backupRunState", "backupTransferProgress", "backupPercentLabel",
+    "BACKUP_TERMINAL_STATES", "backupRunState", "backupTransferProgress", "backupPercentLabel", "backupNativeEngineState", "backupLiveIo",
     '"use strict";\n' + helper + "\nreturn backupTableProgressLabel;"
   )(
     new Set(["verified", "failed", "cancelled"]),
     (run) => run.state,
     (run) => run.progress,
-    (value) => Math.round(value) + "%"
+    (value) => Math.round(value) + "%",
+    (liveIo) => String(liveIo && liveIo.engine_state || "").toLowerCase(),
+    (run) => run.result && run.result.live_io || {}
   );
 
   assert.equal(label({ state: "writing", progress: { phase: "backup_write", percent: 42.4 } }), "Write 42%");
@@ -1565,12 +1581,14 @@ test("backup history labels percentages with their phase", () => {
 
 test("run summaries distinguish planned, active, complete, and failed readback", () => {
   const helperSource = section("  function backupReadbackSummary(", "  function backupFailureDetail(");
-  const summary = Function("backupRunState", "BACKUP_TERMINAL_STATES", "pick", "backupPreparationProgress", "backupMediaIsReadback", '"use strict";\n' + helperSource + "\nreturn backupReadbackSummary;")(
+  const summary = Function("backupRunState", "BACKUP_TERMINAL_STATES", "pick", "backupPreparationProgress", "backupMediaIsReadback", "backupNativeEngineState", "backupLiveIo", '"use strict";\n' + helperSource + "\nreturn backupReadbackSummary;")(
     (run) => run.state,
     new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]),
     (object, key) => object && object[key] !== undefined ? object[key] : null,
     (run) => run.result && run.result.preparation_progress || {},
-    (run) => run.media_request && run.media_request.phase === "full_readback"
+    (run) => run.media_request && run.media_request.phase === "full_readback",
+    (liveIo) => String(liveIo && liveIo.engine_state || "").toLowerCase(),
+    (run) => run.result && run.result.live_io || {}
   );
 
   assert.equal(summary({ state: "waiting_for_media" }), "Complete readback planned");
@@ -1584,11 +1602,12 @@ test("run summaries distinguish planned, active, complete, and failed readback",
   assert.doesNotMatch(detail, /Full backup · complete readback/);
   assert.match(detail, /backupReadbackSummary\(run\)/);
   assert.match(app, /\{ name: "Confirm first tape", detail: "Choose the first archive volume"/);
-  assert.match(app, /\{ name: "Preflight", detail: "Validate source, catalog, drive, tape, and delivery path", aliases: \["queued", "media_assigned", "preparing"\] \}/);
+  assert.match(app, /\{ name: "Preflight", detail: "Validate source, catalog, drive, tape, and staging path", aliases: \["queued", "media_assigned", "preparing"\] \}/);
   assert.match(app, /\{ name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: \["inventorying", "manifesting", "source_manifest", "source_inventory"\] \}/);
-  assert.match(app, /\{ name: "Write archive", detail: "Copy across tapes as needed", aliases: \[[^\]]*"backup_write"/);
-  assert.match(app, /\{ name: "Read back", detail: "Verify every physical tape", aliases: \[[^\]]*"full_readback"/);
-  assert.match(app, /\{ name: "Finalize", detail: "Confirm the source snapshot and seal evidence", aliases: \["source_stability_check", "final_source_check"\] \}/);
+  assert.match(app, /\{ name: "Pack archive", detail: "Build the complete DAR archive on disk; tape idle", aliases: \["native_packing"\] \}/);
+  assert.match(app, /\{ name: "Validate archive", detail: "Check staged slices before tape moves", aliases: \["native_validating"\] \}/);
+  assert.match(app, /\{ name: "Write & read back", detail: "Stream and immediately verify each native volume", aliases: \[[^\]]*"native_volume_write"[^\]]*"native_volume_readback"/);
+  assert.match(app, /\{ name: "Finalize", detail: "Confirm the source snapshot and seal evidence", aliases: \["written", "finalizing", "source_stability_check", "final_source_check"\] \}/);
 });
 
 test("the eight-stage journey is complete on desktop and compact on mobile", () => {
@@ -1596,7 +1615,7 @@ test("the eight-stage journey is complete on desktop and compact on mobile", () 
   const phaseList = Function('"use strict";\n' + phases + "\nreturn BACKUP_PHASES;")();
   const phaseIndexSource = section("  function backupPhaseIndex(", "  function renderBackupPhaseTrack(");
   const phaseIndex = Function(
-    "BACKUP_PHASES", "backupRunState", "backupPreparationProgress", "pick", "backupMediaIsReadback", "backupNeedsNextMedia", "backupEvidenceValue", "backupRunEvents", "backupTransferPhase", "backupExpectedTransferPhase", "objectValue",
+    "BACKUP_PHASES", "backupRunState", "backupPreparationProgress", "pick", "backupMediaIsReadback", "backupNeedsNextMedia", "backupEvidenceValue", "backupRunEvents", "backupTransferPhase", "backupExpectedTransferPhase", "objectValue", "backupNativeEngineState", "backupLiveIo",
     '"use strict";\n' + phaseIndexSource + "\nreturn backupPhaseIndex;"
   )(
     phaseList,
@@ -1623,14 +1642,18 @@ test("the eight-stage journey is complete on desktop and compact on mobile", () 
       return phase;
     },
     (run) => run.expected_phase || run.result && run.result.transfer_progress && run.result.transfer_progress.phase || "",
-    (object, key) => object && object[key] && typeof object[key] === "object" && !Array.isArray(object[key]) ? object[key] : {}
+    (object, key) => object && object[key] && typeof object[key] === "object" && !Array.isArray(object[key]) ? object[key] : {},
+    (liveIo) => String(liveIo && liveIo.engine_state || "").toLowerCase(),
+    (run) => run.result && run.result.live_io || {}
   );
   const renderer = section("  function renderBackupPhaseTrack(", "  function backupTableProgressLabel(");
   assert.equal((phases.match(/\{ name:/g) || []).length, 8);
   assert.equal(phaseIndex({ state: "preparing" }), 1);
   assert.equal(phaseIndex({ state: "inventorying" }), 2);
-  assert.equal(phaseIndex({ state: "writing" }), 3);
-  assert.equal(phaseIndex({ state: "written" }), 4);
+  assert.equal(phaseIndex({ state: "writing" }), 5);
+  assert.equal(phaseIndex({ state: "writing", result: { live_io: { engine_state: "packing" } } }), 3);
+  assert.equal(phaseIndex({ state: "writing", result: { live_io: { engine_state: "validating" } } }), 4);
+  assert.equal(phaseIndex({ state: "written" }), 6);
   assert.equal(phaseIndex({ state: "verifying" }), 5);
   assert.equal(phaseIndex({ state: "verifying", readback_media: true, preparation: { stage: "final_source_check" } }), 6, "the final-check alias supersedes retained readback media state");
   assert.equal(phaseIndex({ state: "failed", result: { transfer_progress: { phase: "full_readback" } } }), 5, "a terminal detail stays on its retained canonical transfer phase");

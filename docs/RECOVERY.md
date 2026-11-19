@@ -1,163 +1,159 @@
-# Independent recovery runbook
+# Independent TapeScale Native recovery
 
-Status: recovery contract for the alpha release. A clean-host physical recovery has not been run. Do not treat this document as G2 evidence.
+Status: the database-independent native volume capture and full DAR restore path is implemented in `0.2.0-alpha.1`. It has not completed the physical G2 qualification matrix. A successful run is evidence for its exact host, drive, media, archive, metadata, and software revision; it is not a general production claim.
 
-The alpha CLI validates the documented recovery-bundle envelope and points operators to this runbook. While the original PostgreSQL/engine catalog is available, the attended online path can restore one exact Bacula Full job from a verified operational backup across its complete ordered cartridge set, or from a legacy single-volume G0.2 point. Media identification after catalog loss, catalog reconstruction, key-package decryption, and general recovery remain target behavior; the imperative steps below must not be read as claims that those paths are complete.
+The current web console does not dispatch native restores. Use the separately installed `tapescale-recovery` executable on an isolated recovery host.
 
-TapeScale recovery must remain possible after loss of the original TrueNAS host, TapeScale PostgreSQL database, and application catalog. Successful disaster recovery depends on three separately protected sets:
+## What must survive a disaster
 
-1. the required tapes and their complete dependency chain;
-2. a recent authenticated recovery bundle with catalog/configuration metadata and compatible software information;
-3. the independently protected key package and any original ZFS dataset keys required for raw encrypted streams.
+Every TapeScale Native cartridge contains its own archive/volume identity, the complete isolated DAR catalog, the authenticated source manifest, whole DAR slices, a volume index, and a trailer. PostgreSQL is useful but is not required by the recovery utility.
 
-Keeping all three on the source NAS defeats this design.
+Protect these separately:
 
-## G0.2 recovery evidence
+1. every required cartridge in the archive set;
+2. the compatible TapeScale release or recovery binary and DAR 2.8.6 runtime;
+3. this format/runbook documentation and verified software/image digests;
+4. custody records that let an operator find the cartridges;
+5. enough isolated disk capacity for the complete encoded archive and restored tree.
 
-The first-recoverable-tape exercise is an online recovery test, not this independent disaster-recovery procedure. It writes one immutable mounted snapshot to one cartridge, performs Bacula Data verification from the physical volume, restores through the normal Bacula restore path into `/restore/<profile subpath>/<run id>`, and compares a separately generated restored manifest with the retained source manifest. Only a complete match creates a verified recovery point.
+Native v1 is unencrypted, so there is no key package for this format. Captured slices and restored files are plaintext and must receive source-equivalent protection.
 
-Retain the source manifest, restored manifest, comparison, engine JobIds/status, volume binding, drive/firmware identity, cartridge identity, pinned software/configuration digests, and append-only event trail. Keep the restored directory isolated until reviewed, then remove it only through the documented test-data lifecycle.
+## Recovery commands
 
-A G0.2 pass does not prove that the tape can be found or restored after loss of PostgreSQL, the Bacula catalog, the original host, or keys. Encryption is explicitly disabled for this laboratory deviation. No recovery bundle, clean-host import, multi-volume scan, NFSv4 ACL proof, native ZFS recovery, or independent key recovery is created by this gate.
+Inspect the locally installed interface before use:
 
-### Recovery Vault and readiness plans
+```sh
+tapescale-recovery --help
+tapescale-recovery runbook
+```
 
-The online Recovery Vault exposes a bounded operator dossier for each retained recovery point: source identity, format and scope, ordered cartridge/record map, current confirmed custody, dependencies, holds, verification records, originating job/exercise, append-only activity, and artifact digests. Its JSON evidence download deliberately omits internal artifact storage paths, carries a SHA-256 ETag, and advertises any row or embedded-value truncation.
+The implemented native commands are:
 
-For file-mode points, **Browse files** projects one directory level at a time from the integrity-checked retained source manifest. It shows recorded names, object types, sizes, and modification times without reading tape, returning source content, or disclosing the worker's artifact path. The API's artifact mount is read-only. A compatible point can use this view to select up to 256 retained paths for a restore plan; a selected directory recursively includes its retained descendants, redundant descendants are removed, and every member of a selected hard-link group is included. The browser remains advisory: the API authenticates the manifest and resolves the immutable scope, selected-manifest digest, and selection hash during planning, and the worker repeats that resolution before reading media.
+```sh
+tapescale-recovery capture-native-volume \
+  --device /dev/nst0 \
+  --archive-dir /recovery/archive
 
-The restore planner consumes that durable dossier and retains a 30-minute preview hash in PostgreSQL. A plan can become ready only when the complete chain is verified, required media is finalized/reconciled and has confirmed custody, the current drive matches the newest passed exact G0.1 drive/cartridge tuple, required keys are declared available, and the destination assessment has no blockers. A ready plan is still only prerequisite evidence until an execution run exists.
+tapescale-recovery restore-native-archive \
+  --archive-dir /recovery/archive \
+  --destination /recovery/restored \
+  --dar /usr/local/bin/dar \
+  --threads 4
+```
 
-The alpha can execute one deliberately narrow online rehearsal: a verified operational-backup full-file point across its complete ordered unencrypted cartridge set, or a passed legacy G0.2 point on one cartridge, with no dependencies or keys, using its original Bacula catalog and exact qualified drive/media tuple. Execution requires the unexpired plan UUID, unchanged preview hash and restore scope, explicit selected drive, and attended confirmation for every requested cartridge. A complete-point run restores the retained JobId and may use the complete ordered set. A selected-path run requires exactly one retained volume, maps only the server-normalized paths to parameterized Bacula catalog identities pinned to that JobId, then passes only numeric FileIndex and PathId values through the restricted BVFS command path. Operator-selected source paths never enter `bconsole`. Both modes write into a new server-generated directory, inventory the restored tree with bounded-memory external sorting, and compare the declared scope with the authenticated retained source manifest. Plans whose serialized manifest exceeds the 256 MiB worker read bound are blocked before queueing. A complete pass appends `restore_test`; a selected pass appends `selective_restore_test`, which cannot satisfy the complete-point gate. Neither mode creates a new recovery point, rebuilds a lost catalog, recovers a key, or establishes general restore support.
+`--archive-dir` must already exist and be a real directory. Reuse that same directory while capturing every volume from one archive. `--destination` must already exist, be real, and be empty.
 
-Multi-volume selected execution is blocked. This alpha retains no authenticated path-to-volume proof and cannot truthfully distinguish required, skipped, and actually read cartridges when Bacula completes a selected extraction early. Native streams, incrementals, encrypted points, and points without the original Bacula catalog also cannot execute a selected restore.
+## Clean-host procedure
 
-This rehearsal remains dependent on the original PostgreSQL/Bacula catalog and worker evidence volume. It therefore does not satisfy this runbook's independent-recovery objective. The restarted-runtime file-backed CI proof demonstrates software reconstruction with the source unavailable, but it retains the catalog and is not physical or clean-host G2 evidence.
+### 1. Establish an isolated environment
 
-## Recovery bundle contract
+Use a supported Linux/TrueNAS host with no production shares or automatic publication. Record the kernel, HBA, tape driver, drive model/serial/WWN, firmware, media generation, TapeScale version, DAR version, and recovery-host identity.
 
-A versioned bundle contains no plaintext usable keys. It is expected to include:
+Attach only the required tape device and destination storage. Do not initialize PostgreSQL, prepare media, relabel tapes, or enable any write workflow.
 
-- bundle, manifest, engine-adapter, and on-tape format versions;
-- TapeScale release/image digests and a dependency inventory;
-- engine installation and compatible recovery-tool information;
-- protected product configuration and catalog export references;
-- source, snapshot, recovery-point, dependency, volume, and record maps;
-- cartridge internal IDs, labels, barcodes where present, format/generation, sequence, and last confirmed location;
-- manifest authentication information and encrypted metadata;
-- required key identifiers and key-lineage references;
-- required native dataset keys/features and destination constraints;
-- checksums for every bundle artifact and creation/freshness evidence.
+### 2. Verify the software
 
-Bundles are created at least daily and after protected-job finalization, key changes, and relevant configuration changes. A closed export set should carry an updated recovery export where the selected format permits. A separately stored copy is mandatory.
+Obtain `tapescale-recovery`, DAR 2.8.6, libthreadar, `mt-st`, and their dependencies from independently retained artifacts. Verify image/package/source digests before loading media.
 
-## Before a disaster
+The release container includes the recovery binary and DAR runtime. If using another host installation, preserve the same executable versions and library feature set.
 
-- Export the bundle and key package to independent storage.
-- Verify that the key package can be decrypted with the documented recovery method.
-- Retain compatible `tapescale-recovery`, engine tools, database schema/migrations, codecs, dictionaries, and format documentation outside the original host.
-- Print or independently retain the tape/dependency and bootstrap-location summary.
-- Perform a quarterly clean-install exercise into isolated test destinations.
-- Record exact TrueNAS, OpenZFS, engine, adapter, image, device, and format versions.
+### 3. Provision capture and restore capacity
 
-A green backup status does not prove these materials are usable. Only the clean-host exercise does.
+Create two isolated real directories:
 
-## Clean replacement procedure
+```sh
+mkdir -p /recovery/archive /recovery/restored
+chmod 0700 /recovery/archive /recovery/restored
+```
 
-### 1. Establish an isolated recovery environment
+The capture filesystem must hold the complete encoded archive plus repeated metadata and receipts. The destination must hold the restored logical tree. Account for sparse-file expansion and filesystem metadata.
 
-Use a supported x86-64 Linux/TrueNAS environment with no production shares or automatic mountpoints. Record its host, kernel, OpenZFS, driver, HBA, drive, changer, firmware, and media details. Connect only the devices and destination pools needed for the exercise.
+### 4. Capture every volume
 
-Do not load or write unknown media. Do not initialize an empty catalog over recovered evidence.
+For each cartridge in the archive:
 
-### 2. Install compatible software
+1. load it in the recorded compatible drive;
+2. wait for the kernel to report ready;
+3. run `capture-native-volume` against the exact non-rewinding device;
+4. retain the JSON result and command log;
+5. unload only after the command completes and its final rewind succeeds.
 
-Install the pinned TapeScale release, PostgreSQL 16, selected engine recovery tools, OpenZFS tools, and the exact codecs/dictionaries named by the bundle. Verify image and package digests against independently stored values.
+The capture command:
 
-The alpha CLI is `tapescale-recovery`. Inspect its local `--help` for the implemented commands; absent commands are a release-blocking gap, not permission to improvise destructive engine operations.
+- rejects device paths outside exact `/dev/nstN` syntax;
+- enables variable-block mode and rewinds through fixed `mt-st` arguments;
+- decodes the TapeScale header to learn archive, cartridge, volume, and slice identities;
+- streams catalog, manifest, and slices to disk rather than buffering them in memory;
+- reads and decodes the index and trailer;
+- checks every identity, ordinal, offset, length, and SHA-256 binding;
+- rejects a duplicate or inconsistent member already present in the directory;
+- commits canonical files and a volume receipt only after validation;
+- rewinds before returning.
 
-### 3. Inspect the bundle without importing
+Volume loading order is not security authority; receipts are sorted and checked by their on-tape ordinals. Printed labels alone are not trusted.
 
-Validate the outer bundle version, artifact checksums, authentication, and compatibility. Produce a report of:
+### 5. Restore the complete archive
 
-- available recovery points and representations;
-- full/incremental dependency chains;
-- required tapes in order and last confirmed locations;
-- drive read compatibility;
-- required key identifiers;
-- estimated read/staging capacity and destination constraints;
-- missing, stale, or unsupported prerequisites.
+After every required volume has been captured, run `restore-native-archive`. It refuses to proceed unless:
 
-Never display usable keys in the report or logs.
+- the number of receipts equals the header-declared volume count;
+- volume ordinals are complete and contiguous;
+- cartridge and archive-volume UUIDs are unique;
+- every member has the same archive UUID, representation, compression, catalog digest, and manifest digest;
+- global slice ordinals and encoded offsets are complete and contiguous;
+- every captured artifact still matches its retained length and SHA-256;
+- native header/index/trailer records still decode and bind consistently;
+- the destination is an existing empty real directory;
+- the DAR executable is the exact expected basename and an absolute executable path.
 
-### 4. Recover keys separately
+DAR tests the reconstructed archive before extraction. After extraction, TapeScale independently inventories the destination and compares it to the retained source manifest. A mismatch returns failure even when DAR itself exited successfully.
 
-Obtain the key package through the independently controlled process. Decrypt it into the approved ephemeral secret facility, not the working directory or shell history. Match key identifiers and historical lineage to retained recovery points. Obtain any original raw-ZFS dataset keys separately.
+### 6. Review before publication
 
-A missing or wrong key is a clear blocked condition. It never downgrades encryption or verification.
+Keep the destination isolated. Review:
 
-### 5. Inventory and identify media read-only
+- the final JSON `valid` value and manifest comparison;
+- missing, changed, or extra paths;
+- covered ownership, mode, timestamps, links, and content hashes;
+- ACL/xattr behavior on the specific source/destination filesystem pair;
+- application consistency and any metadata outside the manifest's declared coverage.
 
-Reconcile drive identity and generation before loading. Read media identity through the qualified engine path. Compare internal identity, format, sequence, and authenticated manifest information with the bundle. A printed label or barcode is not sufficient.
+Publication, share creation, or replacement of live data is a separate authorized operation. The recovery utility never performs cutover.
 
-Unknown, foreign, mismatched, or unexpectedly writable media remains protected. Do not relabel or erase it during recovery.
+### 7. Retain evidence
 
-### 6. Rebuild or import catalogs
-
-Use only the selected engine's supported import/rebuild interface. Bootstrap from local volume/record metadata and the authenticated bundle; do not rely on a single trailing tape index. Populate TapeScale state through the documented recovery import, preserving stable identifiers and evidence.
-
-Reconciliation differences remain visible and block destructive work. A reconstructed database is an aid to recovery, not retroactive proof that all tape writes completed.
-
-### 7. Plan the restore
-
-Select the recovery point and representation. Preview the complete chain, tapes, locations, drive compatibility, key requirements, verification history, read/staging estimate, destination mapping, and conflicts.
-
-- File restore defaults to a new empty directory.
-- Native restore maps dataset names and mountpoints below an isolated approved dataset and does not publish shares.
-- File extraction from native streams first receives the complete required chain into approved temporary ZFS capacity.
-- Zvols restore as block volumes; do not advertise file browsing.
-
-### 8. Execute and validate
-
-Load tapes only when requested and confirm exact IDs. File restores compare content with recorded SHA-256 digests and validate promised metadata. Native restores validate the entire stream/receive and declared dataset state. If a separate source-file index exists, record that additional comparison without confusing it with stream validation.
-
-Unsupported ACL semantics, missing identities, corrupt records, authentication failures, and missing volumes are explicit failures or limitations. Preserve partial recoverable output and evidence; do not publish it as complete.
-
-### 9. Review before publication
-
-Keep recovered datasets isolated and shares disabled. Review content, properties, mountpoints, ACLs, identities, keys, and application consistency. Publication or cutover is a separate authorized operation. Destructive replacement of live data requires administrator reauthentication and a new affected-object preview.
-
-### 10. Retain exercise evidence
-
-Record the acceptance report fields in [QUALIFICATION.md](QUALIFICATION.md), restored manifest checksums, comparison results, elapsed active/operator time, problems, and reviewer. Return recalled archive media to its retained location through a custody task.
-
-## Recovery modes
-
-### Original database available
-
-Restore PostgreSQL using the documented consistent backup, run versioned migrations, reconcile engine/device state, and inspect active operations before resuming. Restoring an older container image is not a database rollback.
-
-### TapeScale database lost, engine catalog available
-
-Import the authenticated recovery bundle, join engine records through stable IDs, reconcile all media and dependencies, and restore only after conflicts are resolved.
-
-### Both catalogs lost
-
-Use the recovery bundle, selected engine's supported tape scan/import path, independent key package, and required tapes. This is the decisive G2 path.
-
-### Recovery bundle unavailable
-
-Follow the selected engine's documented catalog reconstruction path and scan media read-only. Expect slower identification and potentially missing product policy/custody history. This path must be demonstrated before any release claims catalog-independent recovery; the alpha has not demonstrated it.
+Record the fields required by [QUALIFICATION.md](QUALIFICATION.md), including archive UUID, volume/archive-volume/cartridge UUIDs, capture receipts, software digests, restored-manifest comparison, duration, errors, and reviewer. Protect logs against unintended filename disclosure.
 
 ## Failure handling
 
-- Wrong tape: leave unchanged, retain the request, and explain the expected identities.
-- Read/authentication/checksum failure: fail the affected scope, preserve evidence, and try an independently valid copy only through a new recorded attempt.
-- Device reset/disconnect: mark position uncertain and reconcile before further I/O.
-- Insufficient staging/destination capacity: stop before receive/extraction where it can be predicted.
-- Unsupported format/version: use the maintained compatible reader; do not migrate the only copy in place.
-- Missing key: block and identify the exact lineage; never expose ciphertext as a successful restore.
+- **Wrong or foreign archive member:** leave unchanged and load the expected set member. Do not rename receipts or edit metadata to force acceptance.
+- **Read, length, checksum, index, or trailer failure:** stop, preserve the failed evidence, clean the uncommitted temporary capture, and try an independently valid copy only as a new recorded attempt.
+- **Device reset/disconnect or failed final rewind:** treat tape position as uncertain and reconcile before another read.
+- **Duplicate ordinal/UUID:** investigate inventory and media substitution; do not choose one arbitrarily.
+- **Missing volume or slice:** restore remains blocked. Partial extraction is not a complete recovery claim.
+- **Insufficient capture/destination capacity:** add approved storage; do not redirect output into the source or a live share.
+- **DAR test/extract failure:** retain the capture set read-only for diagnosis. Never present partial output as recovered.
+- **Manifest mismatch:** fail the recovery scope, even when every native tape hash and DAR test passed.
+- **Unsupported format/version/representation:** use a maintained compatible reader; never migrate the only copy in place.
+
+## Recovery bundle compatibility
+
+`inspect-bundle` remains available for the broader portable recovery-bundle envelope:
+
+```sh
+tapescale-recovery inspect-bundle /path/to/bundle-manifest.json
+```
+
+Bundle inspection validates its outer manifest and references; it does not read tape or constitute a restore test. TapeScale Native full recovery depends primarily on the self-describing cartridges and compatible software. Custody and policy history may be unavailable when PostgreSQL and external bundle records are lost.
 
 ## Current limitations
 
-The repository pins Bacula Community 15.0.3 for G0.1, attended operational full-backup, the G0.2 laboratory exercise, attended ordered-volume complete-point online restore, and selected-path online restore for a one-volume point; broader unsupported workflows retain simulator coverage only. Bacula is not yet selected or qualified as the production engine/format. No clean-host tape restoration, catalog reconstruction, physical multi-volume or selected-path restore qualification, NFSv4 ACL roundtrip, native ZFS restore, or independent-key recovery has been evidenced. These remain explicit G0/G1/G2 blockers regardless of a successful online backup or attended restore.
+- full native DAR archive restoration only; no selected-path recovery command;
+- manual standalone-drive cartridge changes only;
+- no encrypted archive or key recovery;
+- no native ZFS-send recovery;
+- no web-console native restore execution;
+- no automatic catalog import back into a new TapeScale database;
+- no general qualification yet for ACLs, xattrs, sparse files, hard links, unusual names, all compression modes, all LTO generations, multi-volume boundaries, wrong-media handling, or controlled interruption.
+
+Older Bacula-formatted experimental media is incompatible and cannot be recovered by the native utility. This deployment declared zero valid Bacula tapes; Bacula is therefore not packaged in the 0.2 runtime.

@@ -28,7 +28,7 @@
     { name: "Preflight", detail: "Bind source, drive, and tape", aliases: ["queued", "started", "preparing", "preflight"] },
     { name: "Inventory", detail: "Hash the immutable fixture", aliases: ["inventorying", "manifesting", "manifest", "source_manifest"] },
     { name: "Write tape", detail: "Full single-tape backup", aliases: ["writing", "backup", "engine_write"] },
-    { name: "Write complete", detail: "Close the Bacula backup job", aliases: ["written", "finalizing"] },
+    { name: "Write complete", detail: "Close the native archive volume", aliases: ["written", "finalizing"] },
     { name: "Read tape", detail: "Decode from physical media", aliases: ["verifying", "reading", "readback"] },
     { name: "Restore", detail: "Extract to isolated destination", aliases: ["restoring", "restored", "restored_manifest"] },
     { name: "Compare", detail: "Match source and restore", aliases: ["validating", "comparing", "comparison"] },
@@ -37,19 +37,20 @@
   const RECOVERY_TERMINAL_STATES = new Set(["passed", "verified", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
   const BACKUP_PHASES = [
     { name: "Confirm first tape", detail: "Choose the first archive volume", aliases: ["waiting_for_media"] },
-    { name: "Preflight", detail: "Validate source, catalog, drive, tape, and delivery path", aliases: ["queued", "media_assigned", "preparing"] },
+    { name: "Preflight", detail: "Validate source, catalog, drive, tape, and staging path", aliases: ["queued", "media_assigned", "preparing"] },
     { name: "Inventory", detail: "Hash files and build the recovery manifest", aliases: ["inventorying", "manifesting", "source_manifest", "source_inventory"] },
-    { name: "Write archive", detail: "Copy across tapes as needed", aliases: ["writing", "backup_write", "media_write_started", "engine_dispatched", "waiting_for_next_media", "next_media", "media_required"] },
-    { name: "Close archive", detail: "Finish the complete backup set", aliases: ["written", "finalizing"] },
-    { name: "Read back", detail: "Verify every physical tape", aliases: ["verifying", "reading", "readback", "full_readback"] },
-    { name: "Finalize", detail: "Confirm the source snapshot and seal evidence", aliases: ["source_stability_check", "final_source_check"] },
+    { name: "Pack archive", detail: "Build the complete DAR archive on disk; tape idle", aliases: ["native_packing"] },
+    { name: "Validate archive", detail: "Check staged slices before tape moves", aliases: ["native_validating"] },
+    { name: "Write & read back", detail: "Stream and immediately verify each native volume", aliases: ["writing", "backup_write", "media_write_started", "engine_dispatched", "native_volume_write", "native_volume_readback", "waiting_for_next_media", "next_media", "media_required", "verifying", "reading", "readback", "full_readback"] },
+    { name: "Finalize", detail: "Confirm the source snapshot and seal evidence", aliases: ["written", "finalizing", "source_stability_check", "final_source_check"] },
     { name: "Protected", detail: "Retain recovery evidence", aliases: ["verified", "passed", "completed", "complete"] }
   ];
   const BACKUP_TERMINAL_STATES = new Set(["verified", "passed", "completed", "complete", "failed", "blocked", "interrupted", "cancelled", "canceled"]);
   const BACKUP_RECORD_PROGRESS_BASES = new Set([
     "bacula_job_files_over_manifest_entries",
     "bacula_job_files_over_backup_job_files",
-    "bacula_job_files_over_selected_manifest_entries"
+    "bacula_job_files_over_selected_manifest_entries",
+    "native_archive_slices_or_entries"
   ]);
   const state = {
     route: "overview",
@@ -660,7 +661,7 @@
   }
 
   function backupCompressionSupported(source) {
-    return ["auto", "none", "gzip", "lzo"].includes(backupCompressionMode(source));
+    return ["auto", "none", "gzip", "zstd", "lz4", "lzo"].includes(backupCompressionMode(source));
   }
 
   function backupCompressionLabel(source) {
@@ -669,11 +670,15 @@
     if (!backupCompressionSupported(source)) return "Unsupported (" + mode + ")";
     if (mode === "auto") {
       if (resolved === "gzip") return "Automatic → GZIP1 (legacy)";
-      if (resolved && resolved !== "lzo") return "Automatic → " + resolved.toUpperCase();
-      return "Automatic → LZO (fastest)";
+      if (resolved === "lz4") return "Automatic → LZ4 (fastest)";
+      if (resolved === "lzo") return "Automatic → LZO (legacy)";
+      return "Automatic → Zstandard level 1 (fast)";
     }
     if (mode === "gzip") return "GZIP6 (balanced)";
-    return mode === "none" ? "No compression" : "LZO (fastest)";
+    if (mode === "zstd") return "Zstandard level 1 (fast)";
+    if (mode === "lz4") return "LZ4 (fastest)";
+    if (mode === "lzo") return "LZO (legacy)";
+    return "No compression";
   }
 
   function backupDataDeliveryExplicit(source) {
@@ -937,16 +942,22 @@
     const processedFiles = phase === "source_inventory" || phase === "source_stability_check"
       ? numeric(sample, "files_hashed")
       : numeric(sample, "files_processed");
-    const totalBytes = phase === "source_stability_check" ? manifestBytes : null;
+    const progressBasis = phase === "source_stability_check" ? "sha256_source_bytes_over_manifest_logical_bytes" : String(pick(sample, "progress_basis") || "");
+    const totalBytes = phase === "source_stability_check" ? manifestBytes
+      : progressBasis === "native_archive_bytes_over_staged_bytes" ? firstNumber(
+        numeric(sample, "pipeline_bytes_total"),
+        numeric(retained, "pipeline_bytes_total"),
+        numeric(liveIo, "pipeline_bytes_total")
+      ) : null;
     const totalFiles = phase === "source_inventory" ? null : firstNumber(
       numeric(sample, "files_total"),
       numeric(retained, "files_total"),
       numeric(liveIo, "files_total"),
       phase === "source_stability_check" ? manifestFiles : null
     );
-    const progressBasis = phase === "source_stability_check" ? "sha256_source_bytes_over_manifest_logical_bytes" : String(pick(sample, "progress_basis") || "");
     const percentBasis = phase === "source_stability_check"
       ? "bytes"
+      : progressBasis === "native_archive_bytes_over_staged_bytes" ? "bytes"
       : BACKUP_RECORD_PROGRESS_BASES.has(progressBasis) ? "records" : null;
     const rawPercent = percentBasis === "records" && processedFiles !== null && totalFiles !== null
       ? totalFiles === 0 && processedFiles === 0 ? 100 : totalFiles > 0 ? Math.min(100, Math.max(0, processedFiles / totalFiles * 100)) : null
@@ -1046,7 +1057,18 @@
     return "starting";
   }
 
-  function backupLiveActivityLabel(activity, livePhase, directDelivery) {
+  function backupNativeEngineState(liveIo) {
+    return String(pick(liveIo, "engine_state") || "").toLowerCase();
+  }
+
+  function backupLiveActivityLabel(activity, livePhase, directDelivery, engineState) {
+    const nativeLabels = {
+      packing: "Packing the complete archive on disk",
+      validating: "Validating the staged archive",
+      writing_native_volume: "Streaming a native volume to tape",
+      reading_native_volume: "Reading the volume back now"
+    };
+    if (nativeLabels[engineState]) return nativeLabels[engineState];
     const labels = {
       starting: "Starting the data pipeline",
       buffering: directDelivery ? "Starting the tape stream" : "Staging archive on disk",
@@ -1054,7 +1076,7 @@
       despooling: directDelivery ? "Streaming directly to tape" : "Writing the staged archive to tape",
       idle: "No data movement",
       stalled: "Transfer stalled",
-      waiting: "Waiting for the backup engine",
+      waiting: "Waiting for the archive engine",
       reading: "Reading tape",
       restoring: "Writing restored data to disk"
     };
@@ -1094,7 +1116,7 @@
       const preflight = runState === "preparing";
       const heading = preflight ? "Validating backup inputs" : "Starting source inventory";
       const detail = preflight
-        ? "Checking the immutable snapshot, Bacula catalog, drive, tape, and selected delivery path before the source scan begins. Tape writing has not started."
+        ? "Checking the immutable snapshot, native catalog, drive, tape, and staging path before the source scan begins. Tape writing has not started."
         : "Waiting for the worker's first source-scan sample. Tape writing has not started.";
       return '<section class="backup-live-io backup-preparation measuring" role="status"><div class="backup-live-io-head"><div><span>Backup preparation</span><h3>' + esc(heading) + '</h3></div><strong>' + (preflight ? "Preflight" : "Starting…") + '</strong></div><p>' + esc(detail) + "</p></section>";
     }
@@ -1177,18 +1199,34 @@
     const tapeBasis = pick(liveIo, "tape_basis", "tape_counters_basis", "basis");
     const spoolBasis = pick(liveIo, "spool_basis");
     const livePhase = String(pick(liveIo, "phase") || runState).toLowerCase();
+    const engineState = backupNativeEngineState(liveIo);
     const directDelivery = backupDataDelivery(run) === "direct";
-    const activity = backupLiveActivity(liveIo, livePhase);
-    const backupPipeline = ["backup_write", "tape_write", "writing", "spooling"].includes(livePhase);
-    const readPipeline = ["full_readback", "tape_read", "tape_readback", "verifying", "restore"].includes(livePhase);
-    const pipelineLabel = backupPipeline
-      ? "Bacula write stream"
-      : ["full_readback", "tape_read", "tape_readback", "verifying"].includes(livePhase)
-        ? "Bacula verify stream"
-        : livePhase === "restore" ? "Bacula restore stream" : "Bacula engine stream";
-    const pipelineDetail = backupPipeline
-      ? "After Bacula hashing/compression · not raw ZFS throughput"
-      : "Bacula JobBytes · not source logical bytes";
+    let activity = backupLiveActivity(liveIo, livePhase);
+    const nativePacking = engineState === "packing";
+    const nativeValidating = engineState === "validating";
+    const nativeWriting = engineState === "writing_native_volume";
+    const nativeReadback = engineState === "reading_native_volume";
+    if ((nativePacking || nativeValidating) && activity === "idle") activity = "buffering";
+    const backupPipeline = !nativeReadback && ["backup_write", "tape_write", "writing", "spooling"].includes(livePhase);
+    const readPipeline = nativeReadback || ["full_readback", "tape_read", "tape_readback", "verifying", "restore"].includes(livePhase);
+    const pipelineLabel = nativePacking
+      ? "DAR archive packing"
+      : nativeValidating
+        ? "Staged archive validation"
+        : nativeWriting
+          ? "Native volume stream"
+          : nativeReadback
+            ? "Physical readback"
+            : backupPipeline ? "Archive write stream" : readPipeline ? "Archive read stream" : "Archive engine stream";
+    const pipelineDetail = nativePacking
+      ? "Source files packaged into large DAR slices on disk · tape idle"
+      : nativeValidating
+        ? "Complete staged archive checked before tape movement · tape idle"
+        : nativeWriting
+          ? "TapeScale Native v1 volume bytes"
+          : nativeReadback
+            ? "Immediate readback of the just-written physical volume"
+            : "Engine stream bytes · not source logical bytes";
     const rate = (value, available) => {
       if (available === false) return "Unavailable";
       if (value === null || value === undefined || value === "") return "Measuring…";
@@ -1242,18 +1280,29 @@
         ? " Automatic cancellation in " + backupDurationLabel(remainingMilliseconds) + " if every measured signal remains flat."
         : " The no-progress safety threshold has been reached."
       : "";
-    const activityDetail = {
+    const nativeActivityDetail = {
+      packing: "DAR is packaging the complete source into large archive slices on disk. The tape is intentionally idle during this stage.",
+      validating: "TapeScale is validating the completed staged archive before allowing the tape to move. The tape is intentionally idle.",
+      writing_native_volume: "The staged TapeScale Native volume is streaming sequentially to the physical tape.",
+      reading_native_volume: "TapeScale is immediately reading the just-written volume from physical media before it requests another tape or finalizes the backup."
+    }[engineState];
+    const activityDetail = nativeActivityDetail || {
       starting: "The worker is connected and waiting for the first measured byte movement.",
-      buffering: directDelivery ? "Bacula is starting the direct source-to-tape stream; no disk data spool is in this path." : "Source data is being staged toward a conservative whole-archive target before the archive data pass starts. If staging nears its hard limit or begins draining early, TapeScale cancels instead of knowingly cycling partial batches.",
+      buffering: directDelivery ? "The legacy direct source-to-tape stream is starting." : "DAR is packaging source data into the complete staged archive before tape movement starts.",
       streaming: "The physical tape-write counter is advancing.",
-      despooling: directDelivery ? "The physical tape-write path is active without disk staging." : "The staged data is shrinking as Bacula sends it to tape. Physical tape rate and archive-entry progress remain visible separately.",
+      despooling: directDelivery ? "The legacy physical tape-write path is active without disk staging." : "TapeScale Native is sending the completed staged volume to tape. Physical tape rate and archive progress remain visible separately.",
       idle: "The worker is responding, but no measured " + (directDelivery ? "engine or tape" : "disk-buffer, engine, or tape") + " bytes have moved for " + idleLabel + ". This heartbeat is not counted as progress." + safety,
       stalled: "No measured " + (directDelivery ? "engine or tape" : "disk-buffer, engine, or tape") + " bytes have moved for " + idleLabel + "." + safety,
-      waiting: "Bacula is waiting for an engine resource; no transfer is being claimed as active." + safety,
-      reading: Number(tapeReadRate) > 0 && tapeReadAvailable !== false ? "The physical tape-read counter is advancing." : "Bacula is advancing the verify stream; a physical tape-read rate is not currently available.",
-      restoring: "Recovered data is moving through the Bacula restore stream."
+      waiting: "The archive engine is waiting for a resource; no transfer is being claimed as active." + safety,
+      reading: Number(tapeReadRate) > 0 && tapeReadAvailable !== false ? "The physical tape-read counter is advancing." : "The native readback is advancing; a physical tape-read rate is not currently available.",
+      restoring: "Legacy recovered data is moving through the restore stream."
     }[activity];
-    const activityBadge = {
+    const activityBadge = ({
+      packing: "Packing",
+      validating: "Validating",
+      writing_native_volume: "Tape active",
+      reading_native_volume: "Readback"
+    }[engineState]) || ({
       starting: "Starting…",
       buffering: "Buffering",
       streaming: "Tape active",
@@ -1263,19 +1312,21 @@
       waiting: "Engine wait",
       reading: "Tape active",
       restoring: "Restoring"
-    }[activity] || "Updated";
+    }[activity] || "Updated");
     const basis = [
       pipelineBasis ? "Engine progress: " + human(pipelineBasis) : null,
       !directDelivery && spoolBasis ? "Archive staging: " + human(spoolBasis) : null,
       tapeBasis ? "Physical tape I/O: " + human(tapeBasis) : tapeCountersAvailable === false ? "Physical tape counters unavailable on this host or drive" : "Physical tape counters measuring",
-      pick(liveIo, "engine_state") ? "Bacula: " + human(pick(liveIo, "engine_state")) : null
+      engineState ? "Native engine: " + human(engineState) : null
     ].filter(Boolean).join(" · ");
-    const tapeRateCard = readPipeline
+    const tapeRateCard = nativePacking || nativeValidating
+      ? '<div><span>Tape</span><strong>Idle</strong><small>Archive is still on disk</small></div>'
+      : readPipeline
       ? '<div><span>Tape read</span><strong>' + esc(rate(tapeReadRate, tapeReadAvailable)) + "</strong></div>"
       : backupPipeline
         ? '<div><span>Tape write</span><strong>' + esc(rate(tapeWriteRate, tapeWriteAvailable)) + "</strong></div>"
         : "";
-    return '<section class="backup-live-io activity-' + esc(activity) + '" role="status"><div class="backup-live-io-head"><div><span>Live transfer</span><h3>' + esc(backupLiveActivityLabel(activity, livePhase, directDelivery)) + '</h3></div><strong>' + esc(activityBadge) + ' · ' + esc(date(sampledAt)) + '</strong></div><div class="backup-live-rate-grid backup-transfer-grid">' + spoolCards + '<div><span>' + esc(pipelineLabel) + '</span><strong>' + esc(rate(pipelineRate, true)) + '</strong><small>' + esc(pipelineDetail) + "</small></div>" + tapeRateCard + '</div><p class="backup-live-activity-detail">' + esc(activityDetail || "The worker is reporting a current transfer sample.") + '</p><p>' + esc(windowLabel + (basis ? " · " + basis : "")) + "</p></section>";
+    return '<section class="backup-live-io activity-' + esc(activity) + '" role="status"><div class="backup-live-io-head"><div><span>Live transfer</span><h3>' + esc(backupLiveActivityLabel(activity, livePhase, directDelivery, engineState)) + '</h3></div><strong>' + esc(activityBadge) + ' · ' + esc(date(sampledAt)) + '</strong></div><div class="backup-live-rate-grid backup-transfer-grid">' + spoolCards + '<div><span>' + esc(pipelineLabel) + '</span><strong>' + esc(rate(pipelineRate, true)) + '</strong><small>' + esc(pipelineDetail) + "</small></div>" + tapeRateCard + '</div><p class="backup-live-activity-detail">' + esc(activityDetail || "The worker is reporting a current transfer sample.") + '</p><p>' + esc(windowLabel + (basis ? " · " + basis : "")) + "</p></section>";
   }
 
   function backupApproximateDuration(seconds) {
@@ -1356,7 +1407,9 @@
       return Number.isFinite(numeric) && numeric >= 0 ? numeric : Number.NaN;
     };
     const livePhase = backupTransferPhase(pick(liveIo, "phase"));
-    const activity = progress.sampleFresh && livePhase ? backupLiveActivity(liveIo, livePhase) : null;
+    const engineState = backupNativeEngineState(liveIo);
+    let activity = progress.sampleFresh && livePhase ? backupLiveActivity(liveIo, livePhase) : null;
+    if (["packing", "validating"].includes(engineState) && activity === "idle") activity = "buffering";
     const preparationStep = String(pick(preparation, "step") || "");
     const step = Math.max(0, backupPhaseIndex(run));
     let heading = backupRunStateLabel(run);
@@ -1391,7 +1444,7 @@
     } else if (runState === "preparing") {
       heading = "Validating backup inputs";
       badge = "Preflight";
-      detail = "Checking the snapshot, Bacula catalog, drive, tape, and selected delivery path before source inventory begins.";
+      detail = "Checking the snapshot, native catalog, drive, tape, and complete-archive staging path before source inventory begins.";
     } else if (runState === "inventorying" || progress.phase === "source_inventory") {
       const postScan = {
         sorting: ["Sorting manifest entries", "Organizing", "The source scan and hash pass are complete. TapeScale is ordering the fixed entry set without rereading file data."],
@@ -1402,14 +1455,21 @@
       badge = progress.stale ? "Update delayed" : postScan ? postScan[1] : progress.sampledAt ? "Scanning" : "Starting";
       detail = postScan ? postScan[2] : "The source total grows while the tree is walked, so TapeScale does not guess a completion percentage.";
     } else if (runState === "writing") {
-      const headings = direct
-        ? { starting: "Starting the tape stream", buffering: "Starting the tape stream", streaming: "Streaming directly to tape", despooling: "Streaming directly to tape", idle: "No data movement", stalled: "Transfer stalled", waiting: "Waiting for the backup engine" }
-        : { starting: "Preparing whole-archive staging", buffering: "Staging archive on disk", streaming: "Writing the staged archive to tape", despooling: "Writing the staged archive to tape", idle: "No data movement", stalled: "Transfer stalled", waiting: "Waiting for the backup engine" };
-      heading = headings[activity] || (progress.sampleFresh ? direct ? "Streaming directly to tape" : "Staging archive on disk" : direct ? "Starting the tape stream" : "Preparing whole-archive staging");
+      const nativeStages = {
+        packing: ["Packing the complete archive on disk", "Packing", "DAR is packaging source files into large sequential slices. The tape is intentionally idle until the complete archive exists on disk."],
+        validating: ["Validating the staged archive", "Validating", "TapeScale is checking the completed DAR archive before any tape movement. The tape is intentionally idle."],
+        writing_native_volume: ["Streaming a native volume to tape", "Tape active", "TapeScale Native v1 is writing the staged volume sequentially to the loaded cartridge."],
+        reading_native_volume: ["Reading the volume back now", "Verifying", "TapeScale is immediately reading the just-written physical volume before it requests another tape or finalizes the archive."]
+      }[engineState];
+      const headings = { starting: "Starting the native archive pipeline", buffering: "Packing the complete archive on disk", streaming: "Streaming a native volume to tape", despooling: "Streaming a native volume to tape", idle: "No data movement", stalled: "Transfer stalled", waiting: "Waiting for the archive engine", reading: "Reading the volume back now" };
+      heading = nativeStages ? nativeStages[0] : headings[activity] || (progress.sampleFresh ? "Advancing the native archive" : "Starting complete-archive staging");
       badge = activity === "stalled" ? "Action required" : activity === "idle" ? "No movement" : activity === "waiting" ? "Waiting" : progress.stale ? "Update delayed" : progress.sampleFresh ? "Active" : "Measuring";
-      if (progress.stale) detail = "The last cumulative position is retained. Live rates and ETA are hidden until a fresh sample arrives.";
-      else if (!progress.sampleFresh) detail = "Waiting for the first live Bacula sample. No transfer rate or movement is being claimed yet.";
-      else if (activity === "waiting") detail = "Bacula is running but is waiting on an engine resource; no source, buffer, or tape movement is being claimed.";
+      if (nativeStages && activity !== "stalled" && activity !== "waiting" && !progress.stale) {
+        badge = nativeStages[1];
+        detail = nativeStages[2];
+      } else if (progress.stale) detail = "The last cumulative position is retained. Live rates and ETA are hidden until a fresh sample arrives.";
+      else if (!progress.sampleFresh) detail = "Waiting for the first live TapeScale Native sample. No transfer rate or tape movement is being claimed yet.";
+      else if (activity === "waiting") detail = "The native archive engine is waiting on a resource; no source, staging, or tape movement is being claimed.";
       else if (activity === "stalled" || activity === "idle") {
         const idle = durationCounter("progress_idle_ms");
         const timeout = durationCounter("no_progress_timeout_ms");
@@ -1418,19 +1478,19 @@
           : "";
         detail = "The worker is responding, but no measured source, engine, buffer, or tape bytes have moved" + (Number.isFinite(idle) ? " for " + backupDurationLabel(idle) : "") + ". The retained position will not advance until data movement resumes." + safety;
       }
-      else if (direct) detail = "Bacula is processing source data directly to tape. If source and compression throughput fall below the drive minimum, the tape can still backhitch.";
-      else if (activity === "buffering") detail = "Bacula is staging toward a conservative whole-archive target before the tape data pass. The target is an estimate, not a guarantee; runtime guards cancel near the hard limit or on early drain rather than knowingly repeating partial batches.";
-      else detail = "Bacula is writing staged data to tape while retaining archive-entry progress separately from engine and physical tape rates.";
+      else if (direct) detail = "This legacy record used direct streaming. New TapeScale Native backups always build and validate a complete disk archive first.";
+      else if (activity === "buffering") detail = "DAR is packaging small files into large sequential archive slices on disk before the tape moves.";
+      else detail = "TapeScale Native is advancing the staged archive while retaining archive progress separately from physical tape rates.";
     } else if (["written", "finalizing"].includes(runState)) {
       heading = "Closing archive";
       badge = "Write complete";
-      detail = "All source data was processed. Bacula is closing the complete ordered tape set before readback begins.";
+      detail = "All source data was processed. TapeScale Native is closing the ordered volume set and sealing its evidence.";
     } else if (runState === "verifying") {
       heading = activity === "idle" ? "No data movement" : activity === "stalled" ? "Readback stalled" : activity === "waiting" ? "Waiting for the readback engine" : progress.sampleFresh ? "Reading archive back" : "Starting physical readback";
       badge = activity === "stalled" ? "Action required" : activity === "idle" ? "No movement" : activity === "waiting" ? "Waiting" : progress.stale ? "Update delayed" : progress.sampleFresh ? "Verifying" : "Measuring";
       if (progress.stale) detail = "The last readback position is retained. Live rates and ETA are hidden until a fresh sample arrives.";
-      else if (!progress.sampleFresh) detail = "Waiting for the first live Bacula readback sample. No tape-read movement is being claimed yet.";
-      else if (activity === "waiting") detail = "Bacula is running but is waiting on a readback resource; no archive or tape-read movement is being claimed.";
+      else if (!progress.sampleFresh) detail = "Waiting for the first live native readback sample. No tape-read movement is being claimed yet.";
+      else if (activity === "waiting") detail = "TapeScale Native is waiting on a readback resource; no archive or tape-read movement is being claimed.";
       else if (activity === "idle" || activity === "stalled") {
         const idle = durationCounter("progress_idle_ms");
         const timeout = durationCounter("no_progress_timeout_ms");
@@ -1439,7 +1499,7 @@
           : "";
         detail = "The worker is responding, but no measured engine or tape-read bytes have moved" + (Number.isFinite(idle) ? " for " + backupDurationLabel(idle) : "") + "." + safety;
       }
-      else detail = "Bacula is reading the physical archive and advancing a separate archive-entry counter.";
+      else detail = "TapeScale Native is reading the physical archive and advancing a separate archive counter.";
     } else if (runState === "queued") {
       heading = "Waiting for a worker";
       badge = "Queued";
@@ -1449,7 +1509,7 @@
     if (cancellationRequested && !terminal) {
       heading = "Cancellation requested";
       badge = "Stopping safely";
-      detail = "TapeScale has retained the request and will stop at the next safe Bacula and tape boundary. Current progress remains visible while cleanup completes.";
+      detail = "TapeScale has retained the request and will stop at the next safe native archive and tape boundary. Current progress remains visible while cleanup completes.";
     }
 
     const metrics = [];
@@ -1467,14 +1527,19 @@
       metrics.push({ label: "Source bytes found", value: discoveredBytes === null ? "Measuring…" : bytes(discoveredBytes), detail: ["sorting", "writing_manifest", "digesting_manifest"].includes(preparationStep) ? "Final source total" : "Growing total" });
       metrics.push({ label: "Elapsed", value: elapsed === null ? "Measuring…" : backupDurationLabel(elapsed), detail: "Source inventory" });
     } else if (((progress.phase === "backup_write" && runState === "writing") || (progress.phase === "full_readback" && runState === "verifying") || progress.phase === "source_stability_check") && !terminal && !waiting) {
-      const pipelineLabel = progress.phase === "backup_write" ? "Bacula write stream" : progress.phase === "full_readback" ? "Bacula verify stream" : "Source check";
+      const pipelineLabel = engineState === "packing" ? "DAR archive pack" : engineState === "validating" ? "Archive validation" : engineState === "writing_native_volume" ? "Native volume stream" : engineState === "reading_native_volume" ? "Physical readback" : progress.phase === "backup_write" ? "Archive write stream" : progress.phase === "full_readback" ? "Archive read stream" : "Source check";
       metrics.push({ label: pipelineLabel, value: progress.sampleFresh && progress.rate !== null ? bytes(progress.rate) + "/s" : progress.stale ? "Unavailable" : "Measuring…", detail: progress.phase === "source_stability_check" ? "SHA-256 source bytes" : "Engine stream bytes · not source logical bytes" });
       if (progress.phase === "backup_write") {
-        const sourceReadRate = number(liveIo, "file_daemon_read_bytes_per_second");
-        if (sourceReadRate !== null) metrics.push({ label: "Source read", value: bytes(sourceReadRate) + "/s", detail: "Live Bacula File Daemon read counter" });
+        const sourceReadRate = number(liveIo, "source_read_bytes_per_second") ?? number(liveIo, "file_daemon_read_bytes_per_second");
+        if (sourceReadRate !== null) metrics.push({ label: "Source read", value: bytes(sourceReadRate) + "/s", detail: engineState ? "Live DAR source-read counter" : "Legacy engine source-read counter" });
         const available = pick(liveIo, "tape_write_counter_available", "tape_counters_available");
         const tapeRate = number(liveIo, "tape_write_bytes_per_second");
-        metrics.push({ label: "Tape write", value: progress.stale || available === false ? "Unavailable" : progress.sampleFresh && tapeRate !== null ? bytes(tapeRate) + "/s" : "Measuring…", detail: "Physical drive counter" });
+        if (engineState === "packing" || engineState === "validating") metrics.push({ label: "Tape", value: "Idle", detail: "Archive is still on disk" });
+        else if (engineState === "reading_native_volume") {
+          const readAvailable = pick(liveIo, "tape_read_counter_available", "tape_counters_available");
+          const readRate = number(liveIo, "tape_read_bytes_per_second");
+          metrics.push({ label: "Tape read", value: progress.stale || readAvailable === false ? "Unavailable" : progress.sampleFresh && readRate !== null ? bytes(readRate) + "/s" : "Measuring…", detail: "Immediate physical readback" });
+        } else metrics.push({ label: "Tape write", value: progress.stale || available === false ? "Unavailable" : progress.sampleFresh && tapeRate !== null ? bytes(tapeRate) + "/s" : "Measuring…", detail: "Physical drive counter" });
       } else if (progress.phase === "full_readback") {
         const available = pick(liveIo, "tape_read_counter_available", "tape_counters_available");
         const tapeRate = number(liveIo, "tape_read_bytes_per_second");
@@ -1486,7 +1551,7 @@
           : progress.entryRate < 10 && progress.entryRate % 1
             ? progress.entryRate.toFixed(1)
             : Math.round(progress.entryRate).toLocaleString();
-        metrics.push({ label: "Archive entry rate", value: entryRateLabel + " entries/s", detail: "Bacula JobFiles delta" });
+        metrics.push({ label: "Archive entry rate", value: entryRateLabel + " entries/s", detail: engineState ? "Native DAR entry delta" : "Legacy engine entry delta" });
       }
       if (progress.etaSeconds !== null) {
         const eta = backupApproximateDuration(progress.etaSeconds);
@@ -1516,11 +1581,11 @@
       progress,
       metrics,
       action: cancellationRequested ? null : backupOperatorAction(run),
-      modeNote: runState === "writing" ? direct ? "Direct streaming · source speed must continuously sustain tape" : "Capacity-gated staging · fails closed near the spool limit or on early drain" : null,
+      modeNote: runState === "writing" ? direct ? "Legacy direct streaming record" : engineState === "packing" || engineState === "validating" ? "Complete archive on disk · tape idle" : engineState === "reading_native_volume" ? "Immediate physical readback before the next volume" : "TapeScale Native v1 · staged sequential tape stream" : null,
       activity,
       preparationStep,
       cancellationRequested,
-      currentFile: progress.sampleFresh ? pick(liveIo, "current_file") : null,
+      currentFile: progress.sampleFresh ? pick(liveIo, "current_file", "current_archive_member", "current_path") : null,
       successful,
       terminal
     };
@@ -1531,10 +1596,10 @@
     if (operation.successful) return "";
     const progress = operation.progress;
     const progressLabel = progress.phase === "full_readback"
-      ? progress.percentBasis === "records" ? "Archive entries read back" : "Bacula verify stream position"
+      ? progress.percentBasis === "records" ? "Archive entries read back" : "Archive read stream position"
       : progress.phase === "source_stability_check" ? "Source snapshot checked"
         : progress.phase === "source_inventory" ? "Source inventory"
-          : progress.percentBasis === "records" ? "Archive entries reached" : "Bacula write stream position";
+          : progress.percentBasis === "records" ? "Archive entries reached" : "Native archive stream position";
     let progressMarkup = "";
     if (progress.phase === "source_inventory") {
       const postScan = ["sorting", "writing_manifest", "digesting_manifest"].includes(operation.preparationStep);
@@ -1546,7 +1611,7 @@
       const displayedEntries = Math.min(progress.processedFiles, progress.totalFiles);
       const stream = progress.phaseComplete && !operation.terminal
         ? "All entries reached · phase finalization pending"
-        : progress.processedBytes === null ? "Bacula stream position unavailable" : bytes(progress.processedBytes) + " in the Bacula phase stream";
+        : progress.processedBytes === null ? "Archive stream position unavailable" : bytes(progress.processedBytes) + " in the current archive stage";
       progressMarkup = '<div class="backup-operation-progress"><div class="progress-track" role="progressbar" aria-label="' + esc(progressLabel) + '" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + esc(progress.percent.toFixed(1)) + '"><div class="progress-value" style="width:' + esc(progress.percent.toFixed(3)) + '%"></div></div><div class="progress-meta"><strong>' + esc(progressLabel) + '</strong><strong>' + esc(percent) + '</strong><span>' + esc(Math.trunc(displayedEntries).toLocaleString()) + ' of ' + esc(Math.trunc(progress.totalFiles).toLocaleString()) + ' entries</span><span>' + esc(stream) + "</span></div></div>";
     } else if (progress.percentBasis === "records" && progress.processedFiles === 0 && progress.totalFiles === 0) {
       progressMarkup = '<div class="backup-operation-position"><span>Archive entry set</span><strong>Empty source confirmed</strong><small>' + (!operation.terminal ? "Phase finalization is still in progress" : "No archive entries were required") + "</small></div>";
@@ -1566,7 +1631,7 @@
       ? '<div class="backup-operation-action"><div><strong>' + esc(operation.action.heading) + '</strong><span>' + esc(operation.action.detail) + "</span></div>" + operation.action.button + "</div>"
       : "";
     const currentFile = operation.currentFile
-      ? '<div class="backup-current-file"><span>Current file</span><code title="' + esc(operation.currentFile) + '">' + esc(operation.currentFile) + '</code><small>Live Bacula status · not retained after this phase</small></div>'
+      ? '<div class="backup-current-file"><span>Current file</span><code title="' + esc(operation.currentFile) + '">' + esc(operation.currentFile) + '</code><small>Live DAR archive status · not retained after this phase</small></div>'
       : "";
     const sample = progress.sampledAt
       ? '<footer class="backup-operation-sample">' + (progress.paused ? "Paused at the last confirmed position" : progress.stale ? "Last sample " + esc(date(progress.sampledAt)) : "Updated " + esc(date(progress.sampledAt))) + "</footer>"
@@ -1579,6 +1644,11 @@
     const runState = backupRunState(run);
     if (["verified", "passed", "completed", "complete"].includes(runState)) return BACKUP_PHASES.length - 1;
     if (backupTransferPhase(pick(backupPreparationProgress(run), "stage")) === "source_stability_check") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("source_stability_check"));
+    const nativeState = backupNativeEngineState(backupLiveIo(run));
+    if (nativeState === "packing") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_packing"));
+    if (nativeState === "validating") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_validating"));
+    if (nativeState === "writing_native_volume") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_volume_write"));
+    if (nativeState === "reading_native_volume") return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("native_volume_readback"));
     if (backupMediaIsReadback(run)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("readback"));
     if (backupNeedsNextMedia(run)) return BACKUP_PHASES.findIndex((phase) => phase.aliases.includes("next_media"));
     const rawExplicit = backupEvidenceValue(run, "phase_index");
@@ -1619,12 +1689,14 @@
     if (BACKUP_TERMINAL_STATES.has(backupRunState(run))) return null;
     const progress = backupTransferProgress(run);
     if (progress.percent === null) return null;
-    const phase = progress.phase === "full_readback" ? "Readback" : progress.phase === "source_stability_check" ? "Final check" : progress.phase === "backup_write" ? "Write" : null;
+    const nativeState = backupNativeEngineState(backupLiveIo(run));
+    const phase = nativeState === "packing" ? "Packing" : nativeState === "validating" ? "Validating" : nativeState === "writing_native_volume" ? "Tape write" : nativeState === "reading_native_volume" ? "Readback" : progress.phase === "full_readback" ? "Readback" : progress.phase === "source_stability_check" ? "Final check" : progress.phase === "backup_write" ? "Write" : null;
     return phase ? phase + " " + backupPercentLabel(progress.percent) : null;
   }
 
   function backupReadbackSummary(run) {
     const runState = backupRunState(run);
+    if (backupNativeEngineState(backupLiveIo(run)) === "reading_native_volume") return "Current volume readback in progress";
     if (["verified", "passed", "completed", "complete"].includes(runState)) return "Readback complete";
     if (pick(backupPreparationProgress(run), "stage") === "source_stability_check") return "Readback complete; final source check";
     if (runState === "waiting_for_media" && backupMediaIsReadback(run)) return "Readback tape needed";
@@ -1717,7 +1789,7 @@
     const id = recordId(run);
     const profile = backupProfileForRun(run);
     const profileId = String(pick(run, "profile_id", "backup_profile_id") || recordId(profile));
-    const repeatAllowed = Boolean(profileId && profile && pick(profile, "enabled") !== false && backupCompressionSupported(profile) && backupDataDeliverySupported(profile));
+    const repeatAllowed = Boolean(profileId && profile && pick(profile, "enabled") !== false && backupCompressionSupported(profile) && backupDataDeliverySupported(profile) && backupDataDelivery(profile) === "disk_spool");
     const source = pick(run, "source_subpath", "source_path", "logical_root") || pick(profile, "source_subpath", "source_path", "logical_root") || "Source not reported";
     const progress = backupTableProgressLabel(run);
     const primary = item.kind === "waiting" ? "Continue backup" : item.kind === "active" ? "View live progress" : "Review attempt";
@@ -1824,7 +1896,7 @@
       ["Encoded bytes", encoded == null ? null : bytes(encoded)],
       ["Recorded average", throughput == null ? null : bytes(throughput) + "/s"],
       ["Source manifest", backupEvidenceValue(run, "source_manifest_sha256", "source_manifest_digest", "manifest_sha256")],
-      ["Bacula JobId", backupEvidenceValue(run, "backup_job_id", "engine_job_id", "bacula_job_id", "engine_operation_id")],
+      ["Engine job", backupEvidenceValue(run, "backup_job_id", "engine_job_id", "bacula_job_id", "engine_operation_id")],
       ["Compression", backupCompressionLabel(run)],
       ["Delivery", backupDataDeliveryLabel(run)],
       ["Tapes used", volumes.length || null],
@@ -1931,7 +2003,7 @@
     const outcome = terminal ? '<section class="backup-detail-section backup-result-section"><div class="backup-section-head"><div><span>At a glance</span><h3>' + (successful ? "Verified backup" : "Attempt summary") + '</h3></div></div>' + renderBackupOutcome(run) + "</section>" : "";
     const profile = backupProfileForRun(run);
     const profileId = String(pick(run, "profile_id", "backup_profile_id") || recordId(profile));
-    const repeatAllowed = Boolean(profileId && profile && pick(profile, "enabled") !== false && backupCompressionSupported(profile) && backupDataDeliverySupported(profile));
+    const repeatAllowed = Boolean(profileId && profile && pick(profile, "enabled") !== false && backupCompressionSupported(profile) && backupDataDeliverySupported(profile) && backupDataDelivery(profile) === "disk_spool");
     const repeat = terminal && repeatAllowed ? '<button class="button button-primary button-small" type="button" data-action="start-backup" data-profile-id="' + esc(profileId) + '">' + (successful ? "Back up same snapshot" : "Retry same snapshot") + "</button>" : "";
     const newer = terminal ? '<button class="button button-small" type="button" data-action="create-backup-profile">Choose newer snapshot</button>' : "";
     const actions = cancel || repeat || newer ? '<div class="backup-run-actions">' + cancel + repeat + newer + "</div>" : "";
@@ -3152,9 +3224,9 @@
       ["Finished", pick(record, "finished_at") ? date(pick(record, "finished_at")) : null]
     ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "");
     let outcome = '<div class="notice info"><span class="notice-icon" aria-hidden="true">▶</span><div class="notice-copy"><strong>' + esc(human(restoreRehearsalPhase(rehearsal))) + '</strong><span>Keep ' + esc(currentVolume ? currentVolume.label : "the requested tape") + ' loaded and the isolated destination online. Cancellation is honored only at a safe boundary.</span></div></div>';
-    if (mediaAccepted) outcome = '<div class="notice info restore-media-handoff"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Tape accepted; Restore run is resuming</strong><span>Keep the selected drive and exact loaded tape available while Bacula validates its on-tape label and continues the same restore job.</span></div></div>';
+    if (mediaAccepted) outcome = '<div class="notice info restore-media-handoff"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Tape accepted; legacy Restore run is resuming</strong><span>Keep the selected drive and exact loaded tape available while the compatible legacy reader validates its on-tape label and continues the same restore job.</span></div></div>';
     if (waiting) outcome = '<div class="notice warning restore-media-handoff"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Load tape ' + esc(nextOrder || "?") + ' of ' + esc(totalVolumes || "?") + ': ' + esc(nextLabel || "exact recorded cartridge") + '</strong><span>The Restore run is durably paused at a read-only media boundary. Unload the previous tape, insert this exact next cartridge, and confirm it below. TapeScale will not erase, relabel, or append to it.</span></div><button class="button button-primary" type="button" data-action="open-restore-media-handoff" data-id="' + esc(id) + '">Load exact next tape</button></div>';
-    if (["passed", "verified", "completed", "complete"].includes(runState)) outcome = '<div class="notice success"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Restore run passed</strong><span>Bacula restored ' + (selectedScope ? "the planned selected content" : "the complete retained recovery point") + ' from physical tape and TapeScale independently matched the restored manifest evidence.</span></div></div>';
+    if (["passed", "verified", "completed", "complete"].includes(runState)) outcome = '<div class="notice success"><span class="notice-icon" aria-hidden="true">✓</span><div class="notice-copy"><strong>Legacy Restore run passed</strong><span>The compatible legacy reader restored ' + (selectedScope ? "the planned selected content" : "the complete retained recovery point") + ' from physical tape and TapeScale independently matched the restored manifest evidence.</span></div></div>';
     if (["failed", "blocked", "interrupted", "cancelled", "canceled"].includes(runState)) outcome = '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Restore run ' + esc(runState) + '</strong><span>' + esc(resultDetail || "Inspect the durable activity below for the terminal evidence.") + "</span></div></div>";
     const cancel = active ? '<button class="button button-danger button-small" type="button" data-action="open-cancel-restore-rehearsal" data-id="' + esc(id) + '">Request safe cancel</button>' : "";
     const liveTransfer = renderBackupLiveThroughput({ state: waiting ? "waiting_for_media" : runState, result });
@@ -3162,8 +3234,14 @@
   }
 
   function renderRestoreRehearsals(pointId) {
+    const pointSummary = state.data.recoveryPoints.find((point) => recordId(point) === String(pointId));
+    const pointDetail = recoveryPointDetail(pointId);
+    const pointRecord = pointDetail && pointDetail.recovery_point && typeof pointDetail.recovery_point === "object" ? pointDetail.recovery_point : pointSummary;
+    const pointOrigin = pointDetail && pointDetail.origin && typeof pointDetail.origin === "object" ? pointDetail.origin : {};
+    const nativeRestorePending = String(pick(pointRecord, "format_version") || "") === "tapescale-native-v1" || String(pick(pointOrigin, "engine_name") || "") === "TapeScale Native";
+    const pointVerified = recoveryPointState(pointRecord) === "verified";
     const runs = restoreRehearsalsForPoint(pointId);
-    if (!runs.length) return '<section class="vault-dossier-section restore-rehearsals"><div class="vault-section-head"><div><h3>Restore runs</h3><p>A supported verified Full recovery point can run an attended one- or multi-tape restore into isolation when the server offers that exact execution contract.</p></div><span>0 runs</span></div><div class="vault-section-empty">No Restore run has been started for this recovery point.</div></section>';
+    if (!runs.length) return '<section class="vault-dossier-section restore-rehearsals"><div class="vault-section-head"><div><h3>Restore runs</h3><p>' + (!pointVerified ? "This unsuccessful or retired outcome is audit history, not a recovery source." : nativeRestorePending ? "Offline recovery is available with the independent tapescale-recovery utility. In-console native restore execution is still pending." : "A compatible legacy recovery point can run an attended restore only when the server offers that exact execution contract.") + '</p></div><span>0 runs</span></div><div class="vault-section-empty">' + (!pointVerified ? "Recovery planning is unavailable because this point is not verified." : nativeRestorePending ? "Use tapescale-recovery offline; console restore pending." : "No Restore run has been started for this recovery point.") + '</div></section>';
     const selected = selectedRestoreRehearsal();
     const choices = runs.length > 1 ? '<div class="restore-rehearsal-picker" role="list" aria-label="Restore run history">' + runs.map((run) => {
       const volumes = restoreRehearsalVolumes(run);
@@ -3189,6 +3267,9 @@
     const artifacts = detail ? list(detail, "artifacts") : [];
     const events = detail ? list(detail, "events") : [];
     const origin = detail && detail.origin && typeof detail.origin === "object" ? detail.origin : {};
+    const nativeRestorePending = String(pick(point, "format_version") || "") === "tapescale-native-v1" || String(pick(origin, "engine_name") || "") === "TapeScale Native";
+    const pointState = recoveryPointState(point);
+    const pointVerified = pointState === "verified";
     const detailError = state.errors["recoveryPoint:" + id];
     const loadingDetail = state.recoveryPointDetailLoading.has(id) || (!detail && !detailError);
     const dataset = pick(point, "dataset_name", "source", "dataset", "logical_root");
@@ -3210,12 +3291,19 @@
     let feedback = "";
     if (loadingDetail) feedback = '<div class="notice info vault-detail-notice"><span class="notice-icon" aria-hidden="true">↻</span><div class="notice-copy"><strong>Loading durable recovery evidence</strong><span>The summary is visible while TapeScale assembles the ordered media and verification record.</span></div></div>';
     if (detailError) feedback = '<div class="notice danger vault-detail-notice"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Could not load the recovery dossier</strong><span>' + esc(errorMessage(detailError)) + '</span></div><button class="button button-small" type="button" data-action="retry-recovery-point" data-id="' + esc(id) + '">Retry</button></div>';
-    return '<article class="panel vault-dossier"><header class="vault-dossier-hero"><div><span class="vault-kicker">Recovery point · ' + esc(human(representation)) + '</span><div class="vault-dossier-title"><h2>' + esc(label(dataset)) + '</h2>' + status(recoveryPointState(point)) + '</div><p class="mono">' + esc(id) + '</p><span>' + esc(date(pick(point, "recovery_time", "created_at"))) + " · " + esc(human(pick(point, "level") || "unknown")) + ' backup</span></div><div class="vault-dossier-actions"><button class="button button-quiet" type="button" data-action="download-recovery-evidence" data-id="' + esc(id) + '">Download evidence</button><button class="button button-primary" type="button" data-action="open-restore-plan" data-id="' + esc(id) + '">Plan a restore</button></div></header><div class="vault-plan-boundary"><strong>Plan first; run only when explicitly offered</strong><span>Current Alpha execution is limited to supported verified Full recovery points from operational backups or the recovery exercise. A Restore run recovers the complete point across its exact ordered tape set into a new isolated destination after attended drive and media confirmation. File or directory selection, encrypted recovery points, and clean-catalog recovery are not available yet.</span></div>' + feedback + renderRecoveryPointFiles(id) + renderRestoreRehearsals(id) + '<section class="vault-proof-grid">' + renderVaultProof("Full media readback", fullReadback, verifications.length ? "Recorded independently of write completion" : "Loading verification evidence") + renderVaultProof("Isolated restore test", restoreTest, verifications.length ? "Application recovery evidence" : "Loading verification evidence") + renderVaultProof("Required media", volumes.length ? "recorded" : "missing", volumes.length + " cartridge" + (volumes.length === 1 ? "" : "s") + " in read order") + renderVaultProof("Dependencies", dependencies.length ? "required" : "ready", dependencies.length ? dependencies.length + " prerequisite recovery point(s)" : "No earlier recovery point required") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Required media in read order</h3><p>Load cartridges in this exact volume sequence. Engine record boundaries are retained for reconstruction.</p></div><span>' + volumes.length + " volume" + (volumes.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVolumes(volumes) + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Verification evidence</h3><p>Write completion, full readback, and restore testing remain separate claims.</p></div><span>' + verifications.length + " record" + (verifications.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVerifications(verifications) + '</section><div class="vault-two-column"><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Recovery contract</h3><p>The durable identity and retention boundary.</p></div></div><dl class="vault-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="' + (/hash|manifest|lineage|format/i.test(name) ? "mono" : "") + '">' + esc(value) + "</dd>").join("") + '</dl>' + (Object.keys(coverage).length ? '<details class="vault-json"><summary>Recorded coverage</summary><pre>' + esc(JSON.stringify(coverage, null, 2)) + "</pre></details>" : "") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Dependencies & holds</h3><p>Every prerequisite remains visible before planning.</p></div></div><h4>Dependencies</h4>' + renderDependencyList(dependencies, "This is a self-contained full recovery point.") + '<h4>Active holds</h4>' + renderDependencyList(holds, "No active hold was returned.") + '</section></div><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Origin & retained evidence</h3><p>Correlation data for the job, physical exercise, catalog, and content-addressed artifacts.</p></div></div><div class="vault-origin-grid"><div><h4>Origin</h4>' + renderOrigin(origin, point) + '</div><div><h4>Artifacts</h4>' + renderRecoveryArtifacts(artifacts) + "</div></div>" + renderRecoveryEventsForVault(events) + "</section></article>";
+    const retiredLegacy = pick(coverage, "legacy_format_retired") === true;
+    const restoreBoundary = !pointVerified
+      ? '<div class="vault-plan-boundary"><strong>Not a valid recovery point</strong><span>' + (retiredLegacy ? "This Bacula-era point was retired during the Native v1 migration because no valid legacy media remain. Its records are audit history only." : "This outcome is not verified. Recovery planning and execution are unavailable.") + '</span></div>'
+      : nativeRestorePending
+        ? '<div class="vault-plan-boundary"><strong>Offline recovery available · in-console restore pending</strong><span>This DAR recovery point is cataloged, browseable, and physically read back. Use the independent tapescale-recovery utility on a recovery host; this console will not dispatch native restore yet.</span></div>'
+        : '<div class="vault-plan-boundary"><strong>Legacy restore path</strong><span>Planning and execution are offered only when the server returns an exact compatible legacy restore contract.</span></div>';
+    const planAction = pointVerified ? '<button class="button button-primary" type="button" data-action="open-restore-plan" data-id="' + esc(id) + '">' + (nativeRestorePending ? "Review plan · recover offline" : "Plan a legacy restore") + '</button>' : "";
+    return '<article class="panel vault-dossier"><header class="vault-dossier-hero"><div><span class="vault-kicker">Recovery point · ' + esc(human(representation)) + '</span><div class="vault-dossier-title"><h2>' + esc(label(dataset)) + '</h2>' + status(pointState) + '</div><p class="mono">' + esc(id) + '</p><span>' + esc(date(pick(point, "recovery_time", "created_at"))) + " · " + esc(human(pick(point, "level") || "unknown")) + ' backup</span></div><div class="vault-dossier-actions"><button class="button button-quiet" type="button" data-action="download-recovery-evidence" data-id="' + esc(id) + '">Download evidence</button>' + planAction + '</div></header>' + restoreBoundary + feedback + renderRecoveryPointFiles(id) + renderRestoreRehearsals(id) + '<section class="vault-proof-grid">' + renderVaultProof("Full media readback", fullReadback, verifications.length ? "Recorded independently of write completion" : "Loading verification evidence") + renderVaultProof("Isolated restore test", restoreTest, verifications.length ? "Application recovery evidence" : "Loading verification evidence") + renderVaultProof("Required media", volumes.length ? "recorded" : "missing", volumes.length + " cartridge" + (volumes.length === 1 ? "" : "s") + " in read order") + renderVaultProof("Dependencies", dependencies.length ? "required" : "ready", dependencies.length ? dependencies.length + " prerequisite recovery point(s)" : "No earlier recovery point required") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Required media in read order</h3><p>Load cartridges in this exact volume sequence. Engine record boundaries are retained for reconstruction.</p></div><span>' + volumes.length + " volume" + (volumes.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVolumes(volumes) + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Verification evidence</h3><p>Write completion, full readback, and restore testing remain separate claims.</p></div><span>' + verifications.length + " record" + (verifications.length === 1 ? "" : "s") + '</span></div>' + renderRecoveryVerifications(verifications) + '</section><div class="vault-two-column"><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Recovery contract</h3><p>The durable identity and retention boundary.</p></div></div><dl class="vault-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="' + (/hash|manifest|lineage|format/i.test(name) ? "mono" : "") + '">' + esc(value) + "</dd>").join("") + '</dl>' + (Object.keys(coverage).length ? '<details class="vault-json"><summary>Recorded coverage</summary><pre>' + esc(JSON.stringify(coverage, null, 2)) + "</pre></details>" : "") + '</section><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Dependencies & holds</h3><p>Every prerequisite remains visible before planning.</p></div></div><h4>Dependencies</h4>' + renderDependencyList(dependencies, "This is a self-contained full recovery point.") + '<h4>Active holds</h4>' + renderDependencyList(holds, "No active hold was returned.") + '</section></div><section class="vault-dossier-section"><div class="vault-section-head"><div><h3>Origin & retained evidence</h3><p>Correlation data for the job, physical exercise, catalog, and content-addressed artifacts.</p></div></div><div class="vault-origin-grid"><div><h4>Origin</h4>' + renderOrigin(origin, point) + '</div><div><h4>Artifacts</h4>' + renderRecoveryArtifacts(artifacts) + "</div></div>" + renderRecoveryEventsForVault(events) + "</section></article>";
   }
 
   function renderRestore() {
     const points = orderedRecoveryPoints();
-    let html = pageHead("Recovery vault", "Inspect durable recovery points, plan safely, and run attended one- or multi-tape restores where the retained Full backup format is supported.", refreshButton()) + noticeFor("recoveryPoints") + noticeFor("restoreRehearsals");
+    let html = pageHead("Recovery vault", "Browse durable recovery points and retained media evidence. Native offline recovery is available with tapescale-recovery; in-console restore remains pending.", refreshButton()) + noticeFor("recoveryPoints") + noticeFor("restoreRehearsals");
     if (!points.length) return html + empty("No recovery points", state.errors.recoveryPoints ? "Recovery points could not be loaded." : "A verified Full backup or physical recovery exercise will create the first durable recovery point.", '<a class="button button-primary" href="#jobs">Open Backup Center</a> <a class="button button-quiet" href="#recovery-lab">Open recovery exercise</a>');
     const selected = selectedRecoveryPoint();
     const verified = points.filter((point) => recoveryPointState(point) === "verified").length;
@@ -3226,9 +3314,7 @@
     }, 0);
     const lastVerified = points.find((point) => recoveryPointState(point) === "verified");
     html += '<section class="panel metric-strip vault-metrics"><div class="metric"><span>Recovery points</span><strong>' + points.length + '</strong><small>All retained outcomes</small></div><div class="metric"><span>Verified</span><strong>' + verified + '</strong><small>Ready for prerequisite planning</small></div><div class="metric"><span>Cataloged media</span><strong>' + tapes.size + '</strong><small>Unique cartridge labels</small></div><div class="metric"><span>Protected data</span><strong>' + (logicalBytes ? esc(bytes(logicalBytes)) : "—") + '</strong><small>' + (lastVerified ? "Latest verified " + esc(date(pick(lastVerified, "recovery_time", "created_at"))) : "No verified point yet") + "</small></div></section>";
-    const dossier = renderRecoveryPointDossier(selected)
-      .replace("A Restore run recovers the complete point across its exact ordered tape set into a new isolated destination after attended drive and media confirmation. File or directory selection, encrypted recovery points, and clean-catalog recovery are not available yet.", "A Restore run can recover the complete point across its exact ordered tape set. Server-normalized file or directory selection is executable only for a single-tape recovery point in this Alpha; multi-tape selected execution stays blocked until per-path media evidence is retained. Encrypted recovery points and clean-catalog recovery are not available yet.")
-      .replace(">Plan a restore</button>", ">Plan complete restore</button>");
+    const dossier = renderRecoveryPointDossier(selected);
     html += '<div class="vault-layout section">' + renderRecoveryPointCatalog(points, selected) + dossier + "</div>";
     const selectedId = recordId(selected);
     if (selectedId && !recoveryPointDetail(selectedId) && !state.recoveryPointDetailLoading.has(selectedId) && !state.errors["recoveryPoint:" + selectedId]) {
@@ -3315,8 +3401,14 @@
     return recoveryExerciseRecord(selected || exercises.find(recoveryExerciseActive) || exercises[0] || null);
   }
 
+  function systemFeatureEnabled(canonical, compatibilityAlias) {
+    const current = pick(state.data.system, canonical);
+    if (typeof current === "boolean") return current;
+    return pick(state.data.system, compatibilityAlias) === true;
+  }
+
   function recoveryLabEnabled() {
-    return pick(state.data.system, "lab_file_roundtrip_enabled") === true;
+    return systemFeatureEnabled("native_backup_enabled", "lab_file_roundtrip_enabled");
   }
 
   function sameNullable(left, right) {
@@ -3337,9 +3429,9 @@
       && String(pick(run, "expected_cartridge_label") || "") === String(mediaName(item) || "")
       && sameNullable(run.expected_media_generation, item.media_generation)
       && sameNullable(run.expected_media_format, item.media_format)
-      && pick(run, "engine_name") === "Bacula Community"
-      && pick(run, "engine_version") === "15.0.3"
-      && pick(run, "test_kind") === "btape_test";
+      && pick(run, "engine_name") === "TapeScale Native"
+      && pick(run, "engine_version") === "1"
+      && pick(run, "test_kind") === "native_tape_test";
   }
 
   function recoveryQualificationMatches(run, drive, item) {
@@ -3378,7 +3470,7 @@
     if (pick(item, "has_content") === true) return "The cartridge already contains a retained recovery point.";
     if (pick(item, "reserved_by")) return "The cartridge is reserved by another workflow.";
     if (["foreign", "mismatch"].includes(String(pick(item, "identity_status") || ""))) return "The cartridge identity is foreign or mismatched.";
-    if (String(pick(item, "health_status") || "") === "write_unverified") return "A prior write is unverified; run the destructive btape qualification again.";
+    if (String(pick(item, "health_status") || "") === "write_unverified") return "A prior write is unverified; prepare the tape with the native qualification again.";
     return null;
   }
 
@@ -3386,7 +3478,7 @@
     const safetyBlocker = recoveryDriveSafetyBlocker(drive);
     if (safetyBlocker) return safetyBlocker;
     const hasQualifiedPair = state.data.media.some((item) => recoveryMediaSafetyBlocker(item) === null && state.data.qualificationRuns.some((run) => recoveryQualificationMatches(run, drive, item)));
-    return hasQualifiedPair ? null : "Pass Bacula btape qualification for this exact drive and an eligible scratch cartridge first.";
+    return hasQualifiedPair ? null : "Prepare an eligible scratch cartridge with this exact drive first.";
   }
 
   function eligibleRecoveryDrives() {
@@ -3398,7 +3490,7 @@
     if (safetyBlocker) return safetyBlocker;
     const drives = drive ? [drive] : state.data.drives.filter((candidate) => recoveryDriveSafetyBlocker(candidate) === null);
     const passedQualification = drives.some((candidate) => state.data.qualificationRuns.some((run) => recoveryQualificationMatches(run, candidate, item)));
-    return passedQualification ? null : "Pass Bacula btape qualification with this exact drive and cartridge first.";
+    return passedQualification ? null : "Prepare this exact drive and cartridge first.";
   }
 
   function eligibleRecoveryMedia(drive) {
@@ -3543,11 +3635,11 @@
     const enabled = recoveryLabEnabled();
     const disabledReason = "The G0.2 recovery exercise is disabled in this deployment.";
     const createProfile = '<button class="button button-primary" type="button" data-action="open-recovery-profile"' + (!enabled ? ' disabled title="' + esc(disabledReason) + '"' : "") + '>Add source profile</button>';
-    const blocker = !enabled ? disabledReason : active ? "A recovery exercise is already active." : !profiles.length ? "Create a source and restore profile first." : !drives.length ? "No exact btape-qualified drive and scratch-cartridge pair is ready." : !media.length ? "No cartridge qualified with the selected ready drive is available." : null;
+    const blocker = !enabled ? disabledReason : active ? "A recovery exercise is already active." : !profiles.length ? "Create a source and restore profile first." : !drives.length ? "No exact native-qualified drive and scratch-cartridge pair is ready." : !media.length ? "No cartridge qualified with the selected ready drive is available." : null;
     const start = '<button class="button button-primary" type="button" data-action="open-recovery-run"' + (blocker ? ' disabled title="' + esc(blocker) + '"' : "") + '>Create recoverable tape</button>';
     let html = pageHead("Recovery exercise", "One guided physical write, readback, isolated restore, and manifest comparison.", refreshButton() + createProfile + start);
     html += noticeFor("recoveryProfiles") + noticeFor("recoveryExercises");
-    if (!enabled) html += '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Recovery exercise disabled</strong><span>Enable TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED on both the API and worker before creating profiles or destructive recovery exercises.</span></div></div>';
+    if (!enabled) html += '<div class="notice danger"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Native backup disabled</strong><span>Enable TAPESCALE_NATIVE_BACKUP_ENABLED on both the API and worker before creating backup profiles or destructive recovery exercises.</span></div></div>';
     html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>G0.2 laboratory path—not a production backup policy</strong><span>This workflow is full-only, one cartridge, prepared immutable fixture, and intentionally unencrypted. It destroys the selected scratch tape, then restores all captured content into the configured isolated destination. Incrementals, spanning, encryption, scheduling, and production qualification remain open.</span></div></div>';
     html += '<section class="recovery-hero section"><div class="recovery-hero-copy"><span class="lab-badge">Recoverability before convenience</span><h2>' + (exercises.length ? "Run another complete recovery proof" : "Create your first recoverable tape") + '</h2><p>TapeScale will not call a write successful until it can decode the physical tape, restore the fixture, and compare retained manifests.</p><div class="recovery-hero-actions">' + (profiles.length ? start : createProfile) + '</div></div><div class="recovery-constraints"><div><strong>1</strong><span>Prepared immutable source</span></div><div><strong>2</strong><span>Full write to one tape</span></div><div><strong>3</strong><span>Full isolated restore</span></div><div><strong>4</strong><span>Manifest match</span></div></div></section>';
     const profileSummary = profiles.length ? '<strong>' + esc(recoveryProfileName(profiles[0])) + '</strong><span>' + esc(label(pick(profiles[0], "source_subpath"))) + ' → ' + esc(label(pick(profiles[0], "restore_subpath"))) + "</span>" : '<strong>No profile</strong><span>Declare the prepared source and isolated restore subpaths.</span>';
@@ -3750,8 +3842,8 @@
   }
 
   function renderDrives() {
-    const motionEnabled = pick(state.data.system, "lab_tape_motion_enabled") === true;
-    const qualificationEnabled = pick(state.data.system, "lab_tape_qualification_enabled") === true;
+    const motionEnabled = systemFeatureEnabled("tape_motion_enabled", "lab_tape_motion_enabled");
+    const qualificationEnabled = systemFeatureEnabled("tape_preparation_enabled", "lab_tape_qualification_enabled");
     const initialize = '<button class="button button-danger" type="button" data-action="initialize-tape"' + (qualificationEnabled ? "" : ' disabled title="Enable attended tape setup first."') + '>Prepare tape</button>';
     let html = pageHead("Drives & libraries", "Hardware inventory returned by TapeScale.", refreshButton() + initialize) + noticeFor("drives");
     if (qualificationEnabled) {
@@ -3760,7 +3852,7 @@
     if (motionEnabled) {
       html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><div class="notice-copy"><strong>Manual scratch-media motion enabled</strong><span>Rewind and unload physically move tape. Linux can finalize a prior write with a filemark before moving it. Use designated scratch media only; this does not qualify the drive for backup.</span></div></div>';
     } else {
-      html += '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Manual scratch-media motion is disabled</strong><span>Rewind and Unload remain visible for discovered drives, but cannot run until the API and worker use TAPESCALE_LAB_TAPE_MOTION_ENABLED=true.</span></div></div>';
+      html += '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Manual scratch-media motion is disabled</strong><span>Rewind and Unload remain visible for discovered drives, but cannot run until the API and worker use TAPESCALE_TAPE_MOTION_ENABLED=true.</span></div></div>';
     }
     if (!state.data.drives.length) {
       const noDriveDetail = state.errors.drives ? "Drive and slot inventory could not be loaded." : "No SAS tape drive has been reported. Rewind and Unload appear after the worker discovers the exact mapped /dev/nstN device.";
@@ -3828,7 +3920,7 @@
                       : health.medium_loaded !== true || health.ready !== true ? "Load the designated scratch cartridge and wait for ready."
                             : !eligibleMedia.length ? "Register an unprotected, non-WORM scratch cartridge first."
                               : null;
-        let qualification = status(latestQualification ? "btape " + String(pick(latestQualification, "state")) : "not run");
+        let qualification = status(latestQualification ? "native " + String(pick(latestQualification, "state")) : "not run");
         const qualificationDisabled = qualificationBlocker ? ' disabled aria-disabled="true" title="' + esc(qualificationBlocker) + '"' : "";
         qualification += '<div class="drive-actions"><button class="button button-small button-danger" type="button" data-action="open-qualification" data-id="' + esc(recordId(drive)) + '" data-stable-id="' + esc(pick(drive, "stable_id")) + '" data-drive-label="' + esc(pick(drive, "model", "observed_path", "stable_id")) + '"' + qualificationDisabled + '>Prepare tape</button></div>';
         qualification += '<small class="drive-motion-reason">Product gate: ' + esc(label(pick(drive, "qualification_status"))) + "." + (qualificationBlocker ? " " + esc(qualificationBlocker) : " This will destroy the selected tape.") + "</small>";
@@ -3887,14 +3979,14 @@
     if (!value || !Object.keys(value).length) {
       html += empty("Qualification metadata not available", state.errors.qualification ? "The qualification definition could not be loaded; durable run history is still shown below." : "No qualification definition has been reported; durable run history is still shown below.");
     } else {
-      html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>G0 is still open</strong><span>A passing btape run proves Bacula record, filemark, positioning, append, and re-read behavior for one exact drive and scratch cartridge. It is not yet backup, full readback, restore, ACL, spanning, encryption, or clean-catalog recovery evidence.</span></div></div>';
+      html += '<div class="notice warning"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>Hardware qualification is still specific</strong><span>A passing native preparation proves 256 KiB records, multiple tape files, rewind, full re-read, and TapeScale cartridge identity for this exact drive and scratch cartridge. It does not qualify every drive, tape generation, or failure mode.</span></div></div>';
       html += metadata(value, ["cases", "generations"]);
     }
     if (runs.length) {
       const rows = runs.map((run) => {
         const result = run.result && typeof run.result === "object" ? run.result : {};
         const evidence = result.evidence && typeof result.evidence === "object" ? result.evidence : {};
-        const detail = pick(result, "detail") || pick(evidence, "detail") || (pick(run, "state") === "passed" ? "btape passed and cleanup rewind established BOT" : null);
+        const detail = pick(result, "detail") || pick(evidence, "detail") || (pick(run, "state") === "passed" ? "Native tape test passed and cleanup rewind established BOT" : null);
         return '<tr class="row-action" tabindex="0" data-action="open-record" data-kind="qualificationRuns" data-id="' + esc(recordId(run)) + '"><td class="primary-cell"><strong>' + esc(label(pick(run, "expected_cartridge_label"))) + '</strong><small>' + esc(label(pick(run, "engine_name"))) + " " + esc(label(pick(run, "engine_version"))) + "</small></td>" + cell(pick(run, "expected_stable_id")) + "<td>" + status(pick(run, "state")) + "</td>" + cell(date(pick(run, "finished_at", "started_at", "created_at"))) + cell(detail) + "</tr>";
       });
       html += '<section class="section"><div class="section-head"><div><h2>Physical qualification runs</h2><p>Durable, append-only evidence from the attended scratch-media harness.</p></div></div>' + table(["Scratch cartridge", "Drive", "Status", "Activity", "Evidence"], rows) + "</section>";
@@ -4213,12 +4305,14 @@
     const planId = pick(plan, "id", "plan_id");
     const previewHash = pick(plan, "preview_hash", "sha256", "digest");
     const expiresAt = pick(plan, "expires_at");
+    const execution = restorePlanExecution(plan);
+    const nativeRestorePending = pick(execution, "native_restore_pending") === true || pick(execution, "availability") === "pending_native_restore";
     const executionOffered = pick(plan, "execution_supported") === true;
     const selectedMultiVolume = selectedScope && multiVolume;
     const executionSupported = ready && executionOffered && volumeContractReady && !selectedMultiVolume;
     const executionDrives = restorePlanDrives(plan);
     const resultNotice = ready
-      ? '<div class="restore-result-hero ready"><span aria-hidden="true">✓</span><div><small>Readiness result</small><h3>Prerequisites satisfied</h3><p>' + (executionSupported ? "This supported verified Full recovery point can advance to an attended " + (multiVolume ? tapes.length + "-tape" : "single-tape") + " Restore run." : "The plan is ready for review, but the server did not offer a matching attended execution contract for this ordered media set.") + '</p></div></div>'
+      ? '<div class="restore-result-hero ready"><span aria-hidden="true">✓</span><div><small>Readiness result</small><h3>' + (nativeRestorePending ? "Offline recovery available · console restore pending" : "Prerequisites satisfied") + '</h3><p>' + (nativeRestorePending ? "Use the independent tapescale-recovery utility on a recovery host. This console retains the plan and evidence but will not dispatch native extraction yet." : executionSupported ? "This supported verified Full recovery point can advance to an attended " + (multiVolume ? tapes.length + "-tape" : "single-tape") + " Restore run." : "The plan is ready for review, but the server did not offer a matching attended execution contract for this ordered media set.") + '</p></div></div>'
       : '<div class="restore-result-hero blocked"><span aria-hidden="true">!</span><div><small>Readiness result</small><h3>Restore remains blocked</h3><p>' + blockers.length + " prerequisite" + (blockers.length === 1 ? "" : "s") + " must be resolved before any execution workflow.</p></div></div>";
     const facts = [
       ["Plan ID", planId],
@@ -4242,11 +4336,11 @@
       ? "The server did not bind this multi-tape plan to both multi_volume=true and an exact matching volume_count. Generate a fresh plan before loading media."
       : pick(plan, "execution_detail") || (ready ? "This recovery format is not supported by the attended Restore run worker." : "Resolve every planning blocker and generate a fresh plan.");
     const mediaInstructions = multiVolume
-      ? "Load tape 1 to start. TapeScale will pause durably at each media boundary and name the exact next cartridge before the same Bacula restore job continues."
+      ? "Load tape 1 to start. TapeScale will pause durably at each media boundary and name the exact next cartridge before the same compatible legacy restore job continues."
       : "Load the one retained cartridge to start and keep it in the selected drive until the read completes.";
     const executionAction = executionSupported
       ? '<section class="restore-execution-offer"><div><span class="lab-badge">Alpha · attended ' + (multiVolume ? "multi-tape" : "single-tape") + ' Restore run</span><h3>' + (selectedScope ? "Restore the selected content" : "Restore this complete recovery point") + '</h3><p>' + esc(mediaInstructions) + ' TapeScale writes only beneath the isolated destination and verifies ' + (selectedScope ? "the server-normalized selected scope" : "the complete restored manifest") + '. Encrypted recovery points and clean-catalog recovery remain unavailable.</p>' + renderRestorePlanTapeSequence(tapes, 1) + '</div><button class="button button-primary" type="button" data-action="open-restore-rehearsal" data-plan-id="' + esc(planId) + '">Start Restore run</button></section>'
-      : '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>' + (ready ? "This ready plan remains planning-only" : "Execution remains blocked") + '</strong><span>' + esc(executionDetail) + "</span></div></div>";
+      : '<div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><div class="notice-copy"><strong>' + (nativeRestorePending ? "Use tapescale-recovery offline; console restore pending" : ready ? "This ready plan remains planning-only" : "Execution remains blocked") + '</strong><span>' + esc(executionDetail) + "</span></div></div>";
     return resultNotice + '<div class="restore-result-boundary"><strong>Plan retained; nothing executed yet</strong><span>A Restore run starts only after exact-drive, first-tape, isolated-destination, and attended confirmation. Every later tape requires its own exact attended handoff.</span></div><dl class="restore-result-facts">' + facts.map(([name, value]) => "<dt>" + esc(name) + '</dt><dd class="mono">' + esc(value) + "</dd>").join("") + '</dl><div class="restore-result-grid">' + renderPlanRequirements("Restore scope", selection.paths, selectedScope ? "The server did not return normalized selected paths." : "Complete recovery point: every retained entry is included.") + renderPlanRequirements("Required media in order", tapes.map((tape, index) => (index + 1) + ". " + tape), "No media requirement was returned.") + renderPlanRequirements("Dependency chain", dependencies, "No earlier recovery point is required.") + renderPlanRequirements("Required keys", keys, "No recovery key requirement was returned.") + renderPlanRequirements("Verification gates", verification, "No verification prerequisite was returned.") + renderPlanRequirements("Destination", destination, "No destination assessment was returned.") + renderPlanRequirements("Read & staging estimate", estimates, "No work estimate was returned.") + renderPlanRequirements("Blockers", blockers.map(planIssueText), "No blocking prerequisite remains.") + renderPlanRequirements("Warnings", warnings.map(planIssueText), "No planning warning was returned.") + "</div>" + executionAction;
   }
 
@@ -5550,10 +5644,11 @@
       '<section class="backup-source-browser" id="backup-source-browser" aria-label="Source file browser" hidden></section>',
       '<div class="form-field"><label for="backup-retention-days">Keep completed backups for</label><div class="input-suffix"><input class="input" id="backup-retention-days" name="retention_days" type="number" min="1" max="36500" value="28" required><span>days</span></div></div>',
       '<div class="form-field"><label for="backup-media-pool">Tape pool <small>(optional)</small></label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div>',
-      '<div class="form-field"><label for="backup-compression">Compression</label><select class="select" id="backup-compression" name="compression_mode"><option value="auto" selected>Automatic · LZO (recommended)</option><option value="gzip">GZIP · balanced</option><option value="lzo">LZO · fastest</option><option value="none">None</option></select><small>Automatic uses LZO to prioritize source throughput and reduce tape starvation. Balanced GZIP may compress more but is substantially slower; already-compressed files may not shrink.</small></div>',
-      '<fieldset class="form-field full backup-delivery-options"><legend>Tape delivery</legend><label class="backup-delivery-option"><input type="radio" id="backup-delivery-disk-spool" name="data_delivery" value="disk_spool" checked><span><strong>Whole-archive staging <em>Recommended</em></strong><small>Stage toward a conservative whole-archive target before the tape data pass. This avoids intentionally running Bacula as repeated partial fill/drain batches.</small><small>The target is an estimate, not a guarantee. TapeScale cancels near the hard spool limit or if early draining is detected; use fast dedicated storage with room for the entire archive.</small></span></label><label class="backup-delivery-option"><input type="radio" id="backup-delivery-direct" name="data_delivery" value="direct"><span><strong>Direct streaming <em>Advanced</em></strong><small>Skip disk staging and send the processed source directly to tape. Use only when measured source and compression throughput continuously exceed the drive\'s minimum streaming rate.</small><small>Small-file or slow sources can starve the drive and cause shoe-shining.</small></span></label></fieldset>',
+      '<div class="form-field"><label for="backup-compression">Compression</label><select class="select" id="backup-compression" name="compression_mode"><option value="auto" selected>Automatic · Zstandard fast (recommended)</option><option value="zstd">Zstandard · fast</option><option value="lz4">LZ4 · fastest</option><option value="gzip">GZIP · compatible</option><option value="none">None</option></select><small>Automatic uses Zstandard level 1. LZ4 favors maximum packing speed; GZIP favors compatibility. Already-compressed files may not shrink.</small></div>',
+      '<input type="hidden" name="data_delivery" value="disk_spool">',
+      '<div class="form-field full backup-boundary info"><span aria-hidden="true">2</span><div><strong>Pack once, then stream sequentially</strong><p>DAR packages small files into large archive slices on disk. TapeScale validates the complete staged archive before the tape moves, then immediately reads each written volume back.</p></div></div>',
       '<div class="form-field"><label>Archive size</label><label class="check-option backup-span-option"><input type="checkbox" id="backup-media-spanning" name="spanning_enabled" checked> Continue onto additional prepared tapes when this archive fills a cartridge.</label></div>',
-      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · LZO · capacity-gated staging · spans tapes as needed</strong><small>TapeScale stages toward a conservative whole-archive target and fails closed if the spool nears its limit or drains early. Additional tapes are requested only if the archive needs them.</small></div></div></div>',
+      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · Zstandard fast · complete archive staging · spans tapes as needed</strong><small>Pack and validate on disk, stream each native volume once, read it back immediately, and request another tape only when needed.</small></div></div></div>',
       '</div>',
       '<p class="notice danger" id="backup-profile-error" role="alert" aria-live="assertive" hidden></p>',
       '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Continue to tape</button></div>',
@@ -5579,8 +5674,8 @@
     const detail = form.querySelector("#backup-plan-summary small");
     if (summary) summary.textContent = "Full backup · " + compression + " · " + delivery.toLowerCase() + " · " + (spanning ? "spans tapes as needed" : "one tape maximum");
     if (detail) detail.textContent = deliveryMode === "direct"
-      ? "Data goes directly to tape. Use this only when measured source and compression throughput can sustain the drive without backhitching."
-      : "TapeScale checks a conservative whole-archive target and fails closed near the spool limit or on early drain rather than knowingly cycling partial batches.";
+      ? "This legacy mode is retained only for old profile display; new native backups use complete archive staging."
+      : "DAR packs small files into large slices on disk. TapeScale validates the complete archive, streams each native volume sequentially, and reads it back immediately.";
   }
 
   async function submitBackupProfile(form) {
@@ -6605,7 +6700,7 @@
     if (!drive) return "Select a drive.";
     const health = objectValue(drive, "health");
     const observedAt = new Date(pick(drive, "last_observed_at") || 0).getTime();
-    if (pick(state.data.system, "lab_tape_qualification_enabled") !== true) return "Destructive tape qualification is disabled in this deployment.";
+    if (!systemFeatureEnabled("tape_preparation_enabled", "lab_tape_qualification_enabled")) return "Destructive tape preparation is disabled in this deployment.";
     if (!Number.isFinite(observedAt) || Date.now() - observedAt > 120000) return "The drive observation is stale; refresh and wait for the worker.";
     if (health.present !== true || health.accessible !== true) return "The configured tape device is not present and accessible.";
     if (health.identity_verified !== true || health.identity_conflict === true) return "The drive lacks one unambiguous stable SCSI identity.";
@@ -6649,8 +6744,8 @@
   }
 
   function openTapeInitialization(button) {
-    if (pick(state.data.system, "lab_tape_qualification_enabled") !== true) {
-      toast("Tape setup is disabled", "Enable the attended tape setup gate on both the API and worker first.");
+    if (!systemFeatureEnabled("tape_preparation_enabled", "lab_tape_qualification_enabled")) {
+      toast("Tape setup is disabled", "Enable TAPESCALE_TAPE_PREPARATION_ENABLED on both the API and worker first.");
       return false;
     }
     const requestedDriveId = button && button.dataset.driveId;
@@ -6784,7 +6879,7 @@
     let drive = state.data.drives.find((item) => recordId(item) === driveId);
     const expectedStableId = String(pick(drive, "stable_id") || "");
     const labelText = tapeInitializeLabel(form);
-    const expectedConfirmation = "DESTROY " + labelText + " WITH BACULA BTAPE TEST";
+    const expectedConfirmation = "DESTROY " + labelText + " WITH TAPESCALE NATIVE TEST";
     const initialBlocker = tapeInitializeDriveBlocker(drive);
     const activeAtSubmit = activeQualificationForDrive(driveId);
     const selectedExistingCartridgeId = form.elements.media_mode.value === "existing" ? String(form.elements.cartridge_id.value || "") : "";

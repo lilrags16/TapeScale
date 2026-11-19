@@ -1,24 +1,22 @@
 # Third-party runtime notices
 
-TapeScale's original Rust and browser source is licensed under Apache-2.0 as stated in [`LICENSE`](LICENSE). The test runtime image also distributes unmodified third-party Debian packages under their own licenses. Those packages are not relicensed under TapeScale's Apache-2.0 license.
+TapeScale's original Rust and browser source is licensed under Apache-2.0 as stated in [`LICENSE`](LICENSE). The runtime image also distributes third-party software under its own licenses. That software is not relicensed under TapeScale's Apache-2.0 license.
 
-## Bacula Community
+## DAR and libthreadar
 
-The G0 laboratory image installs these Debian bookworm-backports packages from Debian snapshot `20250730T000000Z`:
+The runtime image includes these separately executed archive tools, built without source changes from their upstream release archives:
 
-- `bacula-sd=15.0.3-3~bpo12+1`
-- `bacula-bscan=15.0.3-3~bpo12+1`
-- `bacula-common-pgsql=15.0.3-3~bpo12+1`
-- `bacula-console=15.0.3-3~bpo12+1`
-- `bacula-director=15.0.3-3~bpo12+1`
-- `bacula-director-pgsql=15.0.3-3~bpo12+1`
-- `bacula-fd=15.0.3-3~bpo12+1`
+- DAR `2.8.6`, licensed under GPL-2.0-or-later
+- libthreadar `1.6.1`, licensed under LGPL-3.0-or-later
 
-They provide the separately executed Director, Storage Daemon, File Daemon, restricted Console client, `/usr/sbin/btape`, and clean-catalog recovery utilities. Bacula Community is distributed under AGPLv3 with the additional terms and notices recorded by its authors and Debian maintainers. The installed authoritative notice is `/usr/share/doc/bacula-common/copyright` inside the image.
+The build enables DAR's multithreading, gzip, LZ4, Zstandard, extended-attribute, sparse-file, hard-link, and large-file support. Optional encryption, remote transport, delta, and additional compression libraries are not linked into this build. TapeScale invokes DAR as a separate process and does not link DAR or libthreadar code into the TapeScale Rust binaries.
 
-Corresponding source and Debian packaging for the exact build are available from the [Debian snapshot package record](https://snapshot.debian.org/package/bacula/15.0.3-3~bpo12%2B1/). The upstream release is available from the [Bacula Community source download center](https://www.bacula.org/source-download-center/).
+The exact, unmodified corresponding source archives are included in the image:
 
-TapeScale invokes Bacula as a separate process and does not modify or link Bacula code into the TapeScale binaries. Bacula names and trademarks belong to their respective owners; inclusion does not imply endorsement.
+- `/usr/share/doc/tapescale/sources/dar-2.8.6.tar.gz` (SHA-256 `d56caeb6c86f751cb454d8fef45f3daecc508f208290d9f51e8c75bba5dc46c5`)
+- `/usr/share/doc/tapescale/sources/libthreadar-1.6.1.tar.gz` (SHA-256 `467709320c54215ac8829ef48e856d890caa4f6a7831633d3992e0b5359f38d8`)
+
+License texts are installed at `/usr/share/doc/dar/COPYING` and `/usr/share/doc/libthreadar/`. Upstream project and release information is available from the [DAR project](https://dar.sourceforge.io/) and [libthreadar project](https://sourceforge.net/projects/libthreadar/).
 
 ## Other Debian packages
 

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     device::{MissingSasDrive, SasDriveObservation, SasMotionOperation},
     domain::lto::{can_read, DriveGeneration, MediaFormat},
-    qualification::{preparation_volume_cartridge_id, preparation_volume_label},
+    native_tape::{preparation_identity_cartridge_id, preparation_volume_identity},
 };
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -882,6 +882,7 @@ pub struct SingleTapeDataProfileRecord {
     pub engine_version: String,
     pub adapter_version: String,
     pub format_version: String,
+    pub archive_codec: String,
     pub immutable_snapshot_confirmed: bool,
     pub enabled: bool,
     pub production_eligible: bool,
@@ -919,6 +920,8 @@ pub struct SingleTapeDataRunRecord {
     pub engine_version: String,
     pub adapter_version: String,
     pub format_version: String,
+    pub archive_id: Uuid,
+    pub archive_codec: String,
     pub scratch_media_confirmed: bool,
     pub destructive_overwrite_confirmed: bool,
     pub encryption_deviation_confirmed: bool,
@@ -969,8 +972,35 @@ pub struct DataRunVolumeRecord {
     pub encoded_bytes: Option<i64>,
     pub first_record: Option<String>,
     pub last_record: Option<String>,
+    pub archive_volume_id: Option<Uuid>,
+    pub header_sha256: Option<String>,
+    pub index_sha256: Option<String>,
+    pub tape_file_count: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeStagedSegment {
+    pub segment_order: i32,
+    pub content_sha256: String,
+    pub encoded_bytes: u64,
+    pub storage_ref: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeVerifiedVolume {
+    pub volume_order: i32,
+    pub archive_volume_id: Uuid,
+    pub engine_volume_name: String,
+    pub header_sha256: String,
+    pub index_sha256: String,
+    pub tape_file_count: i32,
+    pub encoded_bytes: u64,
+    pub first_record: String,
+    pub last_record: String,
+    /// Pairs of `(segment_order, one-based tape_file_number)`.
+    pub segment_files: Vec<(i32, i32)>,
 }
 
 #[derive(Clone, Debug, FromRow, Serialize, PartialEq, Eq)]
@@ -1099,6 +1129,8 @@ pub struct SingleTapeLiveIoSample {
     pub progress_basis: &'static str,
     pub archive_entries_per_second: Option<f64>,
     pub pipeline_bytes_processed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_bytes_total: Option<u64>,
     pub pipeline_bytes_per_second: Option<u64>,
     pub file_daemon_read_bytes_processed: Option<u64>,
     pub file_daemon_read_bytes_per_second: Option<u64>,
@@ -1153,6 +1185,8 @@ pub struct SingleTapeTransferProgress {
     pub files_total: Option<u64>,
     pub progress_basis: &'static str,
     pub pipeline_bytes_processed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_bytes_total: Option<u64>,
     pub pipeline_basis: &'static str,
 }
 
@@ -1166,6 +1200,7 @@ impl From<&SingleTapeLiveIoSample> for SingleTapeTransferProgress {
             files_total: sample.files_total,
             progress_basis: sample.progress_basis,
             pipeline_bytes_processed: sample.pipeline_bytes_processed,
+            pipeline_bytes_total: sample.pipeline_bytes_total,
             pipeline_basis: sample.pipeline_basis,
         }
     }
@@ -1388,7 +1423,11 @@ struct FinalizedBackupVolume {
     volume_order: i32,
     cartridge_id: Uuid,
     engine_volume_name: String,
-    engine_media_id: i64,
+    engine_media_id: Option<i64>,
+    archive_volume_id: Option<Uuid>,
+    header_sha256: Option<String>,
+    index_sha256: Option<String>,
+    tape_file_count: Option<i32>,
     first_record: String,
     last_record: Option<String>,
     encoded_bytes: i64,
@@ -1422,6 +1461,140 @@ fn validated_backup_volume_evidence(
         );
     }
 
+    if engine_write_metadata
+        .get("archive_codec")
+        .and_then(Value::as_str)
+        == Some("dar")
+    {
+        let catalog_volumes = engine_write_metadata
+            .get("volumes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "native archive evidence has no ordered volume list".to_owned())?;
+        if catalog_volumes.len() != run_volumes.len() {
+            return Err(format!(
+                "native archive evidence contains {} volumes but TapeScale authorized {}",
+                catalog_volumes.len(),
+                run_volumes.len()
+            ));
+        }
+        let mut finalized = Vec::with_capacity(run_volumes.len());
+        for (index, (run_volume, native_volume)) in
+            run_volumes.iter().zip(catalog_volumes.iter()).enumerate()
+        {
+            let ordinal = native_volume
+                .get("volume_order")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .filter(|value| *value == run_volume.volume_order)
+                .ok_or_else(|| {
+                    format!("native archive volume {} has an invalid order", index + 1)
+                })?;
+            let volume_name = native_volume
+                .get("volume_name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                .ok_or_else(|| format!("native archive volume {ordinal} has no identity"))?;
+            let archive_volume_id = native_volume
+                .get("archive_volume_id")
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .filter(|value| !value.is_nil())
+                .ok_or_else(|| format!("native archive volume {ordinal} has no volume UUID"))?;
+            let digest = |key: &str| {
+                native_volume
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|value| {
+                        value.len() == 64
+                            && value
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    })
+                    .map(ToOwned::to_owned)
+            };
+            let header_sha256 = digest("header_sha256").ok_or_else(|| {
+                format!("native archive volume {ordinal} has no valid header digest")
+            })?;
+            let index_sha256 = digest("index_sha256").ok_or_else(|| {
+                format!("native archive volume {ordinal} has no valid index digest")
+            })?;
+            let encoded_bytes = native_volume
+                .get("encoded_bytes")
+                .and_then(Value::as_u64)
+                .and_then(|value| i64::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| format!("native archive volume {ordinal} has no byte count"))?;
+            let tape_file_count = native_volume
+                .get("tape_file_count")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .filter(|value| *value >= 6)
+                .ok_or_else(|| format!("native archive volume {ordinal} has no tape-file count"))?;
+            let string = |key: &str| {
+                native_volume
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                    .map(ToOwned::to_owned)
+            };
+            let first_record = string("first_record")
+                .ok_or_else(|| format!("native archive volume {ordinal} has no first record"))?;
+            let last_record = string("last_record")
+                .ok_or_else(|| format!("native archive volume {ordinal} has no last record"))?;
+            let engine_record_id = string("engine_record_id")
+                .ok_or_else(|| format!("native archive volume {ordinal} has no record identity"))?;
+            if run_volume.state != "verified"
+                || run_volume.engine_volume_name.as_deref() != Some(volume_name)
+                || run_volume.archive_volume_id != Some(archive_volume_id)
+                || run_volume.header_sha256.as_deref() != Some(&header_sha256)
+                || run_volume.index_sha256.as_deref() != Some(&index_sha256)
+                || run_volume.tape_file_count != Some(tape_file_count)
+                || run_volume.encoded_bytes != Some(encoded_bytes)
+                || run_volume.first_record.as_deref() != Some(&first_record)
+                || run_volume.last_record.as_deref() != Some(&last_record)
+            {
+                return Err(format!(
+                    "native archive volume {ordinal} does not match its verified physical ledger"
+                ));
+            }
+            finalized.push(FinalizedBackupVolume {
+                run_volume_id: run_volume.id,
+                volume_order: ordinal,
+                cartridge_id: run_volume.cartridge_id,
+                engine_volume_name: volume_name.to_owned(),
+                engine_media_id: None,
+                archive_volume_id: Some(archive_volume_id),
+                header_sha256: Some(header_sha256),
+                index_sha256: Some(index_sha256),
+                tape_file_count: Some(tape_file_count),
+                first_record,
+                last_record: Some(last_record),
+                encoded_bytes,
+                engine_record_id,
+            });
+        }
+        let total_encoded = finalized.iter().try_fold(0_i64, |total, volume| {
+            total.checked_add(volume.encoded_bytes)
+        });
+        if total_encoded != i64::try_from(evidence.encoded_bytes).ok() {
+            return Err(
+                "native archive bytes do not match the retained backup evidence".to_owned(),
+            );
+        }
+        let first = finalized.first().expect("native volume list is non-empty");
+        let last = finalized.last().expect("native volume list is non-empty");
+        if evidence.engine_volume_name != first.engine_volume_name
+            || evidence.engine_record_id != first.engine_record_id
+            || evidence.first_record != first.first_record
+            || evidence.last_record != last.last_record
+        {
+            return Err(
+                "summary evidence does not match the ordered native volume chain".to_owned(),
+            );
+        }
+        return Ok(finalized);
+    }
+
     let Some(catalog_volumes) = engine_write_metadata
         .get("volumes")
         .and_then(Value::as_array)
@@ -1449,7 +1622,11 @@ fn validated_backup_volume_evidence(
             volume_order: 1,
             cartridge_id: run_volume.cartridge_id,
             engine_volume_name: evidence.engine_volume_name.clone(),
-            engine_media_id,
+            engine_media_id: Some(engine_media_id),
+            archive_volume_id: None,
+            header_sha256: None,
+            index_sha256: None,
+            tape_file_count: None,
             first_record: evidence.first_record.clone(),
             last_record: evidence.last_record.clone(),
             encoded_bytes: i64::try_from(evidence.encoded_bytes)
@@ -1525,7 +1702,11 @@ fn validated_backup_volume_evidence(
             volume_order: run_volume.volume_order,
             cartridge_id: run_volume.cartridge_id,
             engine_volume_name: volume_name.to_owned(),
-            engine_media_id,
+            engine_media_id: Some(engine_media_id),
+            archive_volume_id: None,
+            header_sha256: None,
+            index_sha256: None,
+            tape_file_count: None,
             first_record,
             last_record: Some(last_record),
             encoded_bytes,
@@ -1962,12 +2143,12 @@ pub async fn media_on_tape_identity(
     Ok(
         record.map(|(internal_label, on_tape_identity, identity_status)| {
             let expected_identity = if identity_status == "reconciled" {
-                on_tape_identity.unwrap_or_else(|| preparation_volume_label(cartridge_id))
+                on_tape_identity.unwrap_or_else(|| preparation_volume_identity(cartridge_id))
             } else {
                 // The deterministic preparation identity is recoverable even if
                 // the physical label write won the race with a lost DB commit.
                 // The caller still has to read this exact value from the tape.
-                preparation_volume_label(cartridge_id)
+                preparation_volume_identity(cartridge_id)
             };
             (internal_label, expected_identity)
         }),
@@ -2136,10 +2317,10 @@ pub async fn record_drive_observation(
     Ok(record)
 }
 
-/// Retain the identity read from the first Bacula label on the currently loaded tape.
+/// Retain the native identity read from file zero on the currently loaded tape.
 ///
-/// The worker calls this only while the drive is idle and after a fixed-input `btape
-/// readlabel` probe.  Resolution is intentionally database-backed: a Bacula volume name is
+/// The worker calls this only while the drive is idle and after a closed TapeScale header
+/// probe. Resolution is intentionally database-backed: an on-tape identity is
 /// considered known only when it maps to exactly one registered cartridge through the exact
 /// deterministic preparation UUID, the cartridge's current on-tape identity, or an ordered
 /// archive-volume record. A normal drive observation clears these fields as soon as the kernel
@@ -2166,7 +2347,7 @@ pub async fn record_loaded_tape_identity(
     let volume_name = valid_volume_name.then_some(volume_name).flatten();
     let mut transaction = pool.begin().await?;
     let matches = if let Some(volume_name) = volume_name {
-        let preparation_cartridge_id = preparation_volume_cartridge_id(volume_name);
+        let preparation_cartridge_id = preparation_identity_cartridge_id(volume_name);
         sqlx::query_as::<_, (Uuid, String)>(
             "SELECT DISTINCT cartridge.id, cartridge.internal_label
                FROM cartridges cartridge
@@ -3242,9 +3423,9 @@ async fn queue_qualification_run_inner(
             "path": expected_path,
             "cartridge_id": cartridge_id,
             "cartridge_label": cartridge.internal_label,
-            "engine": "Bacula Community",
-            "engine_version": "15.0.3",
-            "test_kind": "btape_test",
+            "engine": "TapeScale Native",
+            "engine_version": "1",
+            "test_kind": "native_tape_test",
             "destructive": true
         }),
         "local-api",
@@ -3619,6 +3800,15 @@ fn qualification_run_blocker(
                 .to_owned(),
         );
     }
+    if run.engine_name != "TapeScale Native"
+        || run.engine_version != "1"
+        || run.test_kind != "native_tape_test"
+    {
+        return Some(
+            "the queued qualification belongs to the retired Bacula test path; queue a new native tape preparation"
+                .to_owned(),
+        );
+    }
     if !run.scratch_media_confirmed || !run.destructive_overwrite_confirmed {
         return Some("persisted destructive scratch-media confirmations are missing".to_owned());
     }
@@ -3742,7 +3932,7 @@ async fn append_qualification_event(
 const SINGLE_TAPE_DATA_PROFILE_SELECT: &str = "SELECT id, job_id, source_id,
             source_snapshot_id, name, source_subpath, restore_subpath,
             source_mount_path, restore_root_path, logical_root,
-            engine_name, engine_version, adapter_version, format_version,
+            engine_name, engine_version, adapter_version, format_version, archive_codec,
             immutable_snapshot_confirmed, enabled, production_eligible,
             workflow_kind, policy_id, media_pool_id, schedule_enabled, retention_days,
             created_at, updated_at
@@ -3755,6 +3945,7 @@ const SINGLE_TAPE_DATA_RUN_SELECT: &str = "SELECT id, profile_id, job_run_id,
             expected_cartridge_label, expected_media_generation, expected_media_format,
             source_mount_path, restore_root_path, logical_root,
             engine_name, engine_version, adapter_version, format_version,
+            archive_id, archive_codec,
             scratch_media_confirmed, destructive_overwrite_confirmed,
             encryption_deviation_confirmed,
             media_write_started, media_write_started_at,
@@ -3773,6 +3964,7 @@ const DATA_RUN_VOLUME_SELECT: &str = "SELECT id, single_tape_data_run_id,
             engine_volume_name, engine_media_id, state, media_lease_id,
             media_fencing_token, media_write_started_at, written_at, verified_at,
             encoded_bytes, first_record, last_record, created_at, updated_at
+            , archive_volume_id, header_sha256, index_sha256, tape_file_count
      FROM single_tape_data_run_volumes";
 
 const DATA_RUN_MEDIA_REQUEST_SELECT: &str = "SELECT id, single_tape_data_run_id,
@@ -5240,9 +5432,9 @@ async fn backup_media_readiness_inner(
                        IS NOT DISTINCT FROM cartridge.media_generation
                    AND qualification.expected_media_format
                        IS NOT DISTINCT FROM cartridge.media_format
-                   AND qualification.engine_name = 'Bacula Community'
-                   AND qualification.engine_version = '15.0.3'
-                   AND qualification.test_kind = 'btape_test'
+                   AND qualification.engine_name = 'TapeScale Native'
+                   AND qualification.engine_version = '1'
+                   AND qualification.test_kind = 'native_tape_test'
                    AND qualification.attempt > 0
                  ORDER BY qualification.created_at DESC, qualification.id DESC
                  LIMIT 1
@@ -5480,10 +5672,10 @@ async fn queue_single_tape_data_run_inner(
             ));
         };
         let resolved = match requested.as_str() {
-            "auto" => "lzo",
+            "auto" | "zstd" => "zstd",
             "none" => "none",
             "gzip" => "gzip",
-            "lzo" => "lzo",
+            "lzo" | "lz4" => "lz4",
             _ => {
                 transaction.rollback().await?;
                 return Ok(QueueSingleTapeDataRunResult::Blocked(
@@ -5491,10 +5683,10 @@ async fn queue_single_tape_data_run_inner(
                 ));
             }
         };
-        if !matches!(data_delivery.as_str(), "direct" | "disk_spool") {
+        if data_delivery != "disk_spool" {
             transaction.rollback().await?;
             return Ok(QueueSingleTapeDataRunResult::Blocked(
-                "the configured data delivery mode is unsupported".to_owned(),
+                "TapeScale Native requires complete disk staging before tape motion".to_owned(),
             ));
         }
         (requested, resolved.to_owned(), spanning, data_delivery)
@@ -6011,7 +6203,7 @@ pub async fn claim_next_single_tape_data_run(
         "write_in_progress" | "write_unverified"
     ) {
         Some(
-            "the cartridge entered write-unverified quarantine after queuing; run a fresh destructive btape qualification"
+            "the cartridge entered write-unverified quarantine after queuing; run a fresh destructive native qualification"
                 .to_owned(),
         )
     } else if !qualification_passed {
@@ -6166,9 +6358,9 @@ pub async fn claim_next_single_tape_data_run(
     )))
 }
 
-/// Publish one durable manual-media request while the same fenced Bacula job
-/// remains active.  Operator wait time is represented as state rather than as
-/// a failed or restarted backup.
+/// Publish one durable manual-media request while the same fenced archive
+/// operation remains active. Operator wait time is represented as state
+/// rather than as a failed or restarted backup.
 pub async fn ensure_data_run_media_request(
     pool: &PgPool,
     claim: &ClaimedSingleTapeDataRun,
@@ -6354,7 +6546,7 @@ pub async fn ensure_data_run_media_request(
         claim.run.job_run_id,
         Some(active_phase),
         "waiting_for_media",
-        "Bacula requires a manual tape change",
+        "the archive operation requires a manual tape change",
         evidence.clone(),
         claim.run.correlation_id,
     )
@@ -6824,7 +7016,7 @@ pub async fn mark_data_run_media_loaded(
         claim.run.job_run_id,
         Some("waiting_for_media"),
         resume_state,
-        "authorized tape loaded; resuming the same Bacula job",
+        "authorized tape loaded; resuming the same archive operation",
         evidence.clone(),
         claim.run.correlation_id,
     )
@@ -7037,7 +7229,17 @@ fn monotonic_single_tape_live_sample(
         }
         return Some(monotonic);
     }
+    let native_stage_reset = sample.progress_basis.starts_with("native_archive_");
     if previous.get("engine_job_id").and_then(Value::as_u64) != Some(sample.engine_job_id) {
+        if native_stage_reset {
+            if let Some(total) = monotonic.files_total {
+                monotonic.files_processed = monotonic.files_processed.min(total);
+            }
+            if let Some(total) = monotonic.pipeline_bytes_total {
+                monotonic.pipeline_bytes_processed = monotonic.pipeline_bytes_processed.min(total);
+            }
+            return Some(monotonic);
+        }
         return None;
     }
     if previous
@@ -7053,6 +7255,15 @@ fn monotonic_single_tape_live_sample(
         .and_then(Value::as_str)
         .is_some_and(|basis| basis != sample.progress_basis)
     {
+        if native_stage_reset {
+            if let Some(total) = monotonic.files_total {
+                monotonic.files_processed = monotonic.files_processed.min(total);
+            }
+            if let Some(total) = monotonic.pipeline_bytes_total {
+                monotonic.pipeline_bytes_processed = monotonic.pipeline_bytes_processed.min(total);
+            }
+            return Some(monotonic);
+        }
         return None;
     }
 
@@ -7081,6 +7292,14 @@ fn monotonic_single_tape_live_sample(
         (Some(files), None) => monotonic.files_total = Some(files),
         _ => {}
     }
+    match (
+        previous.get("pipeline_bytes_total").and_then(Value::as_u64),
+        sample.pipeline_bytes_total,
+    ) {
+        (Some(bytes), Some(sample_bytes)) if bytes != sample_bytes => return None,
+        (Some(bytes), None) => monotonic.pipeline_bytes_total = Some(bytes),
+        _ => {}
+    }
     if let Some(total) = monotonic.files_total {
         monotonic.files_processed = monotonic.files_processed.min(total);
     }
@@ -7093,6 +7312,8 @@ fn valid_single_tape_progress_basis(basis: &str) -> bool {
         "bacula_job_files_over_manifest_entries"
             | "bacula_job_files_over_backup_job_files"
             | "bacula_job_files_over_selected_manifest_entries"
+            | "native_archive_slices_or_entries"
+            | "native_archive_bytes_over_staged_bytes"
     )
 }
 
@@ -7120,7 +7341,9 @@ pub async fn record_single_tape_data_live_io(
         || !(5..=300).contains(&sample.stale_after_seconds)
         || !matches!(
             sample.pipeline_basis,
-            "bacula_job_bytes_delta" | "bacula_storage_running_job_bytes_delta"
+            "bacula_job_bytes_delta"
+                | "bacula_storage_running_job_bytes_delta"
+                | "native_archive_bytes"
         )
         || sample
             .tape_basis
@@ -7128,9 +7351,13 @@ pub async fn record_single_tape_data_live_io(
         || sample.tape_counters_available
             != (sample.tape_read_counter_available || sample.tape_write_counter_available)
         || (sample.tape_counters_available != sample.tape_basis.is_some())
-        || sample
-            .spool_basis
-            .is_some_and(|basis| basis != "run_scoped_bacula_spool_regular_file_bytes")
+        || sample.spool_basis.is_some_and(|basis| {
+            !matches!(
+                basis,
+                "run_scoped_bacula_spool_regular_file_bytes"
+                    | "run_scoped_native_archive_regular_file_bytes"
+            )
+        })
         || sample
             .file_daemon_basis
             .is_some_and(|basis| basis != "bacula_file_daemon_read_bytes_delta")
@@ -7157,6 +7384,10 @@ pub async fn record_single_tape_data_live_io(
             .spool_target_bytes
             .zip(sample.spool_capacity_bytes)
             .is_some_and(|(target, capacity)| target > capacity)
+        || sample.pipeline_bytes_total == Some(0)
+        || sample
+            .pipeline_bytes_total
+            .is_some_and(|total| sample.pipeline_bytes_processed > total)
         || sample.activity.is_some()
             != (sample.engine_state.is_some()
                 && sample.progress_idle_ms.is_some()
@@ -7182,6 +7413,10 @@ pub async fn record_single_tape_data_live_io(
                     | "failed"
                     | "incomplete"
                     | "unknown"
+                    | "packing"
+                    | "validating"
+                    | "writing_native_volume"
+                    | "reading_native_volume"
             )
         })
         || sample
@@ -7400,9 +7635,9 @@ pub async fn transition_single_tape_data_phase(
     Ok(true)
 }
 
-/// Persist the irreversible media boundary before Bacula is allowed to label
-/// or write the cartridge. The run marker and cartridge quarantine change are
-/// committed in one fenced transaction.
+/// Persist the irreversible media boundary before the archive engine is
+/// allowed to identify or write the cartridge. The run marker and cartridge
+/// quarantine change are committed in one fenced transaction.
 pub async fn mark_single_tape_media_write_started(
     pool: &PgPool,
     claim: &ClaimedSingleTapeDataRun,
@@ -7515,7 +7750,7 @@ pub async fn mark_data_run_volume_write_started(
             "volume_order": volume_order,
             "cartridge_id": volume.cartridge_id,
             "expected_engine_volume": expected_engine_volume,
-            "detail": "durable media-write boundary committed before Bacula label dispatch"
+            "detail": "durable media-write boundary committed before archive media identification"
         }),
         "tapescale-worker",
     )
@@ -7524,7 +7759,7 @@ pub async fn mark_data_run_volume_write_started(
     Ok(true)
 }
 
-/// Record the exact Bacula volume name immediately after the label command succeeds.
+/// Record the exact on-tape identity immediately after writing the media header or label.
 ///
 /// This is identity evidence, not write-completion evidence: the cartridge remains
 /// `write_in_progress` until the backup and physical readback gates finish.  Retaining it here
@@ -7593,7 +7828,7 @@ pub async fn mark_data_run_volume_labeled(
             "volume_order": volume_order,
             "cartridge_id": volume.cartridge_id,
             "engine_volume_name": engine_volume_name,
-            "detail": "the exact Bacula volume label was written and retained for automatic loaded-tape identification"
+            "detail": "the exact on-tape identity was written and retained for automatic loaded-tape identification"
         }),
         "tapescale-worker",
     )
@@ -7826,6 +8061,241 @@ pub async fn append_single_tape_data_artifact(
         transaction.rollback().await?;
         return Ok(false);
     }
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// Retain the complete staged native archive ledger before any tape is touched.
+///
+/// Segment paths point only at the dedicated worker spool and are never exposed
+/// through the public API. Hashes and byte counts remain after spool cleanup.
+pub async fn record_native_staged_segments(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    segments: &[NativeStagedSegment],
+) -> Result<bool, sqlx::Error> {
+    if segments.is_empty()
+        || segments.iter().enumerate().any(|(index, segment)| {
+            segment.segment_order != i32::try_from(index + 1).unwrap_or(i32::MAX)
+                || segment.encoded_bytes == 0
+                || segment.content_sha256.len() != 64
+                || !segment
+                    .content_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || segment.storage_ref.is_empty()
+                || segment.storage_ref.chars().any(char::is_control)
+                || i64::try_from(segment.encoded_bytes).is_err()
+        })
+    {
+        return Ok(false);
+    }
+    let Some(encoded_bytes) = segments.iter().try_fold(0_u64, |total, segment| {
+        total.checked_add(segment.encoded_bytes)
+    }) else {
+        return Ok(false);
+    };
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let current =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(claim.run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if current != "writing" || claim.run.archive_codec != "dar" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let existing = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM single_tape_data_run_segments
+          WHERE single_tape_data_run_id = $1",
+    )
+    .bind(claim.run.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if existing != 0 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    for segment in segments {
+        sqlx::query(
+            "INSERT INTO single_tape_data_run_segments
+                (single_tape_data_run_id, segment_order, segment_kind,
+                 content_sha256, encoded_bytes, storage_ref, metadata)
+             VALUES ($1, $2, 'dar_slice', $3, $4, $5,
+                     jsonb_build_object('codec', 'dar'))",
+        )
+        .bind(claim.run.id)
+        .bind(segment.segment_order)
+        .bind(&segment.content_sha256)
+        .bind(i64::try_from(segment.encoded_bytes).expect("segment size was checked"))
+        .bind(&segment.storage_ref)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "archive_staged",
+        json!({
+            "archive_id": claim.run.archive_id,
+            "archive_codec": claim.run.archive_codec,
+            "segment_count": segments.len(),
+            "encoded_bytes": encoded_bytes,
+            "detail": "the complete DAR archive is staged and hashed; tape streaming has not started"
+        }),
+        "tapescale-worker",
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// Commit one native volume only after its header, catalog, manifest, archive
+/// slices, index, and trailer have all been physically read back and verified.
+pub async fn mark_native_volume_verified(
+    pool: &PgPool,
+    claim: &ClaimedSingleTapeDataRun,
+    evidence: &NativeVerifiedVolume,
+) -> Result<bool, sqlx::Error> {
+    let digest_valid = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if evidence.volume_order <= 0
+        || evidence.archive_volume_id.is_nil()
+        || evidence.engine_volume_name.is_empty()
+        || evidence.engine_volume_name.len() > 127
+        || !evidence
+            .engine_volume_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !digest_valid(&evidence.header_sha256)
+        || !digest_valid(&evidence.index_sha256)
+        || evidence.tape_file_count < 6
+        || evidence.encoded_bytes == 0
+        || i64::try_from(evidence.encoded_bytes).is_err()
+        || evidence.first_record.is_empty()
+        || evidence.last_record.is_empty()
+        || evidence.segment_files.is_empty()
+        || evidence.segment_files.iter().any(|(order, tape_file)| {
+            *order <= 0 || *tape_file < 3 || *tape_file >= evidence.tape_file_count
+        })
+    {
+        return Ok(false);
+    }
+    let mut segment_orders = evidence
+        .segment_files
+        .iter()
+        .map(|(order, _)| *order)
+        .collect::<Vec<_>>();
+    segment_orders.sort_unstable();
+    segment_orders.dedup();
+    if segment_orders.len() != evidence.segment_files.len() {
+        return Ok(false);
+    }
+
+    let mut transaction = pool.begin().await?;
+    if !lock_valid_single_tape_claim(&mut transaction, claim).await? {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let current =
+        sqlx::query_scalar::<_, String>("SELECT state FROM job_runs WHERE id = $1 FOR UPDATE")
+            .bind(claim.run.job_run_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if current != "writing" || claim.run.archive_codec != "dar" {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let volume = sqlx::query_as::<_, DataRunVolumeRecord>(&format!(
+        "{DATA_RUN_VOLUME_SELECT}
+         WHERE single_tape_data_run_id = $1 AND volume_order = $2 FOR UPDATE"
+    ))
+    .bind(claim.run.id)
+    .bind(evidence.volume_order)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(volume) = volume else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    if !matches!(volume.state.as_str(), "write_started" | "written")
+        || volume.engine_volume_name.as_deref() != Some(&evidence.engine_volume_name)
+        || volume.media_write_started_at.is_none()
+    {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    for (segment_order, tape_file_number) in &evidence.segment_files {
+        let updated = sqlx::query(
+            "UPDATE single_tape_data_run_segments
+                SET state = 'verified', volume_order = $1, tape_file_number = $2,
+                    written_at = COALESCE(written_at, now()), verified_at = now(),
+                    updated_at = now()
+              WHERE single_tape_data_run_id = $3 AND segment_order = $4
+                AND state = 'staged' AND volume_order IS NULL",
+        )
+        .bind(evidence.volume_order)
+        .bind(tape_file_number)
+        .bind(claim.run.id)
+        .bind(segment_order)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+    }
+    let updated = sqlx::query(
+        "UPDATE single_tape_data_run_volumes
+            SET state = 'verified', written_at = COALESCE(written_at, now()),
+                verified_at = now(), encoded_bytes = $1, first_record = $2,
+                last_record = $3, archive_volume_id = $4, header_sha256 = $5,
+                index_sha256 = $6, tape_file_count = $7, updated_at = now()
+          WHERE id = $8 AND state IN ('write_started', 'written')",
+    )
+    .bind(i64::try_from(evidence.encoded_bytes).expect("volume size was checked"))
+    .bind(&evidence.first_record)
+    .bind(&evidence.last_record)
+    .bind(evidence.archive_volume_id)
+    .bind(&evidence.header_sha256)
+    .bind(&evidence.index_sha256)
+    .bind(evidence.tape_file_count)
+    .bind(volume.id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    append_single_tape_data_event(
+        &mut transaction,
+        claim.run.id,
+        claim.run.correlation_id,
+        "media_verified",
+        json!({
+            "archive_id": claim.run.archive_id,
+            "archive_volume_id": evidence.archive_volume_id,
+            "volume_order": evidence.volume_order,
+            "cartridge_id": volume.cartridge_id,
+            "engine_volume_name": evidence.engine_volume_name,
+            "header_sha256": evidence.header_sha256,
+            "index_sha256": evidence.index_sha256,
+            "tape_file_count": evidence.tape_file_count,
+            "encoded_bytes": evidence.encoded_bytes,
+            "physical_media_readback": true
+        }),
+        "tapescale-worker",
+    )
+    .await?;
     transaction.commit().await?;
     Ok(true)
 }
@@ -8469,9 +8939,9 @@ pub async fn finalize_single_tape_backup_pass(
         "INSERT INTO recovery_points
             (id, source_id, run_id, representation, level, source_scope_hash,
              format_version, status, recovery_time, expires_at, indefinite,
-             coverage, manifest_digest)
+             coverage, manifest_digest, archive_id, archive_codec)
          VALUES ($1, $2, $3, 'file', 'full', $4, $5, 'verified', $6,
-                 $6 + make_interval(days => $7), false, $8, $9)",
+                 $6 + make_interval(days => $7), false, $8, $9, $10, $11)",
     )
     .bind(recovery_point_id)
     .bind(source_id)
@@ -8482,14 +8952,17 @@ pub async fn finalize_single_tape_backup_pass(
     .bind(claim.run.retention_days)
     .bind(&coverage)
     .bind(manifest_digest)
+    .bind(claim.run.archive_id)
+    .bind(&claim.run.archive_codec)
     .execute(&mut *transaction)
     .await?;
     for (volume, record_id) in finalized_volumes.iter().zip(volume_record_ids.iter()) {
         sqlx::query(
             "INSERT INTO volume_records
                 (id, recovery_point_id, cartridge_id, volume_order,
-                 first_record, last_record, encoded_bytes, finalized, engine_record_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8)",
+                 first_record, last_record, encoded_bytes, finalized, engine_record_id,
+                 archive_volume_id, header_sha256, index_sha256, tape_file_count)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $9, $10, $11, $12)",
         )
         .bind(record_id)
         .bind(recovery_point_id)
@@ -8499,6 +8972,10 @@ pub async fn finalize_single_tape_backup_pass(
         .bind(&volume.last_record)
         .bind(volume.encoded_bytes)
         .bind(&volume.engine_record_id)
+        .bind(volume.archive_volume_id)
+        .bind(&volume.header_sha256)
+        .bind(&volume.index_sha256)
+        .bind(volume.tape_file_count)
         .execute(&mut *transaction)
         .await?;
     }
@@ -8566,10 +9043,14 @@ pub async fn finalize_single_tape_backup_pass(
     }
 
     let mut result = json!({
-        "detail": if finalized_volumes.len() > 1 {
-            "the full-file source was written through Bacula across an ordered tape set and read back completely from physical media"
+        "detail": if claim.run.archive_codec == "dar" && finalized_volumes.len() > 1 {
+            "the packed full-file archive was written across an ordered TapeScale Native tape set and each volume was read back completely"
+        } else if claim.run.archive_codec == "dar" {
+            "the packed full-file archive was written in TapeScale Native format and read back completely from physical tape"
+        } else if finalized_volumes.len() > 1 {
+            "the full-file source was written through the legacy engine across an ordered tape set and read back completely from physical media"
         } else {
-            "the full-file source was written through Bacula and read back completely from physical tape"
+            "the full-file source was written through the legacy engine and read back completely from physical tape"
         },
         "workflow_kind": "backup",
         "qualification": "test_slice",
@@ -8898,7 +9379,7 @@ async fn single_tape_qualification_passed(
 ) -> Result<bool, sqlx::Error> {
     // Read eligibility deliberately accepts the retained qualification that
     // authorized the original archive write. A 256 KiB maximum can read older
-    // 64 KiB records, and rerunning destructive btape on archive media would
+    // 64 KiB records, and rerunning destructive qualification on archive media would
     // destroy the data operators are trying to recover.
     Ok(
         single_tape_qualification_passed_id(transaction, drive, cartridge_id)
@@ -8954,9 +9435,9 @@ async fn single_tape_qualification_passed_id_for(
            AND qualification.expected_cartridge_label = cartridge.internal_label
            AND qualification.expected_media_generation IS NOT DISTINCT FROM cartridge.media_generation
            AND qualification.expected_media_format IS NOT DISTINCT FROM cartridge.media_format
-           AND qualification.engine_name = 'Bacula Community'
-           AND qualification.engine_version = '15.0.3'
-           AND qualification.test_kind = 'btape_test'
+           AND qualification.engine_name = 'TapeScale Native'
+           AND qualification.engine_version = '1'
+           AND qualification.test_kind = 'native_tape_test'
            AND qualification.attempt > 0
          ORDER BY qualification.created_at DESC, qualification.id DESC
          LIMIT 1",
@@ -9422,7 +9903,7 @@ pub async fn get_recovery_point_aggregate(
                  JOIN cartridges qualified_cartridge
                    ON qualified_cartridge.id = candidate.cartridge_id
                  WHERE candidate.drive_id = d.id
-                   -- A queued request that was rejected before btape ran does
+                   -- A queued request rejected before physical I/O does
                    -- not invalidate the last physical result.  Only terminal
                    -- attempts that could have changed our knowledge of the
                    -- drive/media pair participate in latest-result selection.
@@ -9432,9 +9913,9 @@ pub async fn get_recovery_point_aggregate(
                        IS NOT DISTINCT FROM qualified_cartridge.media_generation
                    AND candidate.expected_media_format
                        IS NOT DISTINCT FROM qualified_cartridge.media_format
-                   AND candidate.engine_name = 'Bacula Community'
-                   AND candidate.engine_version = '15.0.3'
-                   AND candidate.test_kind = 'btape_test'
+                   AND candidate.engine_name = 'TapeScale Native'
+                   AND candidate.engine_version = '1'
+                   AND candidate.test_kind = 'native_tape_test'
                    AND candidate.attempt > 0
                  ORDER BY candidate.cartridge_id,
                           candidate.expected_media_generation,
@@ -13710,6 +14191,10 @@ mod recovery_vault_tests {
             encoded_bytes: None,
             first_record: None,
             last_record: None,
+            archive_volume_id: None,
+            header_sha256: None,
+            index_sha256: None,
+            tape_file_count: None,
             created_at: now,
             updated_at: now,
         }
@@ -13939,7 +14424,7 @@ mod recovery_vault_tests {
         let finalized = validated_backup_volume_evidence(&run_volumes, &metadata, &evidence)
             .expect("ordered multi-volume catalog proof should validate");
         assert_eq!(finalized.len(), 2);
-        assert_eq!(finalized[1].engine_media_id, 12);
+        assert_eq!(finalized[1].engine_media_id, Some(12));
         assert_eq!(finalized[1].engine_record_id, "bacula-media:12:job:44");
         assert_eq!(finalized[1].last_record.as_deref(), Some("file=2:block=20"));
     }

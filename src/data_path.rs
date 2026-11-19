@@ -587,6 +587,32 @@ pub fn build_manifest_with_cancel_and_progress(
     cancellation: &AtomicBool,
     progress: Option<&ManifestBuildProgress>,
 ) -> Result<FileManifest, ManifestError> {
+    build_manifest_in_memory(
+        root,
+        cancellation,
+        progress,
+        MAX_G02_MANIFEST_ENTRIES,
+        MAX_G02_LOGICAL_BYTES,
+    )
+}
+
+/// Build an in-memory manifest without the historical laboratory fixture limits.
+///
+/// Operational backup creation uses the external-sort streaming builder below. This entry point
+/// exists for independent recovery verification, where both authenticated manifests must be
+/// compared after extraction and imposing the old 100,000-entry/100-GiB ceiling would reject a
+/// valid archive. Memory and local filesystem exhaustion remain ordinary operating-system limits.
+pub fn build_manifest_unbounded(root: &Path) -> Result<FileManifest, ManifestError> {
+    build_manifest_in_memory(root, &AtomicBool::new(false), None, u64::MAX, u64::MAX)
+}
+
+fn build_manifest_in_memory(
+    root: &Path,
+    cancellation: &AtomicBool,
+    progress: Option<&ManifestBuildProgress>,
+    maximum_entries: u64,
+    maximum_logical_bytes: u64,
+) -> Result<FileManifest, ManifestError> {
     let root = root.canonicalize().map_err(|source| ManifestError::Io {
         path: root.to_owned(),
         source,
@@ -639,10 +665,10 @@ pub fn build_manifest_with_cancel_and_progress(
                     .saturating_add(pending.len())
                     .saturating_add(children.len())
                     .saturating_add(1);
-                if u64::try_from(known_entries).unwrap_or(u64::MAX) > MAX_G02_MANIFEST_ENTRIES {
+                if u64::try_from(known_entries).unwrap_or(u64::MAX) > maximum_entries {
                     return Err(ManifestError::FixtureLimit {
                         kind: "manifest-entry",
-                        limit: MAX_G02_MANIFEST_ENTRIES,
+                        limit: maximum_entries,
                     });
                 }
             }
@@ -658,18 +684,18 @@ pub fn build_manifest_with_cancel_and_progress(
             .len()
             .saturating_add(pending.len())
             .saturating_add(1);
-        if u64::try_from(known_entries).unwrap_or(u64::MAX) > MAX_G02_MANIFEST_ENTRIES {
+        if u64::try_from(known_entries).unwrap_or(u64::MAX) > maximum_entries {
             return Err(ManifestError::FixtureLimit {
                 kind: "manifest-entry",
-                limit: MAX_G02_MANIFEST_ENTRIES,
+                limit: maximum_entries,
             });
         }
         if kind == EntryKind::File {
             logical_bytes_seen = logical_bytes_seen.saturating_add(metadata.len());
-            if logical_bytes_seen > MAX_G02_LOGICAL_BYTES {
+            if logical_bytes_seen > maximum_logical_bytes {
                 return Err(ManifestError::FixtureLimit {
                     kind: "logical-byte",
-                    limit: MAX_G02_LOGICAL_BYTES,
+                    limit: maximum_logical_bytes,
                 });
             }
         }
@@ -984,6 +1010,28 @@ fn load_manifest_bytes_with_limit(
 
 #[must_use]
 pub fn compare_manifests(expected: &FileManifest, actual: &FileManifest) -> ManifestComparison {
+    compare_manifests_with_root_policy(expected, actual, false)
+}
+
+/// Compare a complete extracted tree while treating its pre-created destination directory as a
+/// container, not archived content.
+///
+/// DAR restores every child and its metadata beneath `-R`, but intentionally does not chmod,
+/// chown, or retime that caller-owned root directory. The root entry must still exist and be a
+/// directory; only its container metadata is ignored. Every archived descendant remains exact.
+#[must_use]
+pub fn compare_extracted_manifests(
+    expected: &FileManifest,
+    actual: &FileManifest,
+) -> ManifestComparison {
+    compare_manifests_with_root_policy(expected, actual, true)
+}
+
+fn compare_manifests_with_root_policy(
+    expected: &FileManifest,
+    actual: &FileManifest,
+    ignore_root_container_metadata: bool,
+) -> ManifestComparison {
     let expected_by_path = expected
         .entries
         .iter()
@@ -1003,6 +1051,14 @@ pub fn compare_manifests(expected: &FileManifest, actual: &FileManifest) -> Mani
     let mut differences_truncated = false;
     for path in paths {
         let difference = match (expected_by_path.get(path), actual_by_path.get(path)) {
+            (Some(expected), Some(actual))
+                if ignore_root_container_metadata
+                    && path.as_str() == "."
+                    && expected.kind == EntryKind::Directory
+                    && actual.kind == EntryKind::Directory =>
+            {
+                None
+            }
             (Some(expected), Some(actual)) if expected == actual => None,
             (Some(expected), Some(actual)) => Some(format!(
                 "metadata or content mismatch at {path}: expected {}, observed {}",
@@ -2646,6 +2702,31 @@ mod tests {
             .differences
             .iter()
             .any(|difference| difference.contains("mismatch at same")));
+    }
+
+    #[test]
+    fn extracted_comparison_ignores_only_destination_root_container_metadata() {
+        let source = tempdir().expect("source");
+        fs::write(source.path().join("payload"), b"recoverable").expect("payload");
+        let expected = build_manifest(source.path()).expect("expected manifest");
+        let mut actual = expected.clone();
+        actual
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == ".")
+            .expect("root entry")
+            .mode ^= 0o077;
+
+        assert!(!compare_manifests(&expected, &actual).matched);
+        assert!(compare_extracted_manifests(&expected, &actual).matched);
+
+        actual
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == ".")
+            .expect("root entry")
+            .kind = EntryKind::File;
+        assert!(!compare_extracted_manifests(&expected, &actual).matched);
     }
 
     #[test]

@@ -182,15 +182,16 @@ impl NewBackupProfile {
         }
         if !matches!(
             self.compression_mode.as_str(),
-            "auto" | "none" | "gzip" | "lzo"
+            "auto" | "none" | "gzip" | "lzo" | "lz4" | "zstd"
         ) {
             return Err(BackupOpsError::Invalid(
-                "compression_mode must be auto, none, gzip, or lzo".to_owned(),
+                "compression_mode must be auto, zstd, lz4, gzip, none, or the legacy lzo alias"
+                    .to_owned(),
             ));
         }
-        if !matches!(self.data_delivery.as_str(), "direct" | "disk_spool") {
+        if self.data_delivery != "disk_spool" {
             return Err(BackupOpsError::Invalid(
-                "data_delivery must be direct or disk_spool".to_owned(),
+                "TapeScale Native requires disk_spool delivery".to_owned(),
             ));
         }
         if !(1..=36_500).contains(&self.retention_days) {
@@ -636,9 +637,9 @@ async fn create_backup_request(
         || profile.encryption_enabled
         || !matches!(
             profile.compression_mode.as_str(),
-            "auto" | "none" | "gzip" | "lzo"
+            "auto" | "none" | "gzip" | "lzo" | "lz4" | "zstd"
         )
-        || !matches!(profile.data_delivery.as_str(), "direct" | "disk_spool")
+        || profile.data_delivery != "disk_spool"
         || profile.verification_mode != "full_readback"
     {
         transaction.rollback().await?;
@@ -1440,6 +1441,12 @@ mod tests {
 
         let mut profile = NewBackupProfile::attended_full_file(Uuid::nil());
         profile.compression_mode = "zstd".to_owned();
+        profile
+            .validate()
+            .expect("native Zstandard compression should validate");
+
+        let mut profile = NewBackupProfile::attended_full_file(Uuid::nil());
+        profile.data_delivery = "direct".to_owned();
         assert!(profile.validate().is_err());
     }
 

@@ -43,11 +43,16 @@ use crate::{
         },
     },
     engine::{
-        bacula::BACULA_VERSION, simulator::SimulatorEngine, EngineCapabilities, EngineIdentity,
-        QualificationStatus, TapeEngine,
+        simulator::SimulatorEngine, EngineCapabilities, EngineIdentity, QualificationStatus,
+        TapeEngine,
     },
     error::AppError,
-    media_ops, qualification,
+    media_ops,
+    native_archive::{
+        DAR_CODEC_VERSION, NATIVE_ADAPTER_VERSION, NATIVE_ENGINE_NAME, NATIVE_ENGINE_VERSION,
+        NATIVE_FORMAT_NAME,
+    },
+    qualification,
     source_browser::{self, RetainedManifestReference, SourceBrowserError},
     store, VERSION,
 };
@@ -67,9 +72,6 @@ pub struct AppState {
 }
 
 const RETAINED_MANIFEST_BROWSER_CONCURRENCY: usize = 1;
-const BACULA_ADAPTER_VERSION: &str = "g0.2-lab-v1";
-const BACULA_FORMAT_VERSION: &str = "bacula-community-15.0.3-lab-v1";
-
 impl AppState {
     #[must_use]
     pub fn new(
@@ -263,9 +265,17 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
         "backend_language":"Rust",
         "engine":identity,
         "capabilities":capabilities,
+        "tape_motion_enabled":state.lab_tape_motion_enabled,
+        "tape_preparation_enabled":state.lab_tape_qualification_enabled,
+        "native_backup_enabled":state.lab_file_roundtrip_enabled,
         "lab_tape_motion_enabled":state.lab_tape_motion_enabled,
         "lab_tape_qualification_enabled":state.lab_tape_qualification_enabled,
         "lab_file_roundtrip_enabled":state.lab_file_roundtrip_enabled,
+        "native_backup_scope": if state.lab_file_roundtrip_enabled {
+            "attended_multivolume_full_backup_with_immediate_volume_readback"
+        } else {
+            "disabled"
+        },
         "file_roundtrip_scope": if state.lab_file_roundtrip_enabled {
             "attended_multivolume_full_file_backup_and_single_volume_recovery_exercise"
         } else {
@@ -273,28 +283,35 @@ async fn system(State(state): State<AppState>) -> Result<Json<Value>, AppError> 
         },
         "operational_backup_data_path": {
             "enabled": state.lab_file_roundtrip_enabled,
-            "engine": "Bacula Community",
-            "engine_version": BACULA_VERSION,
-            "adapter_version": BACULA_ADAPTER_VERSION,
-            "format_version": BACULA_FORMAT_VERSION,
+            "engine": NATIVE_ENGINE_NAME,
+            "engine_version": NATIVE_ENGINE_VERSION,
+            "adapter_version": NATIVE_ADAPTER_VERSION,
+            "format_version": NATIVE_FORMAT_NAME,
+            "archive_codec": "DAR",
+            "archive_codec_version": DAR_CODEC_VERSION,
             "backup_level": "full",
-            "compression_modes": ["auto_lzo", "gzip6", "lzo", "none"],
-            "data_delivery_modes": ["direct", "disk_spool"],
+            "compression_modes": ["auto", "zstd", "lz4", "gzip", "none"],
+            "default_compression": "auto_zstd_fast",
+            "data_delivery_modes": ["disk_spool"],
             "default_data_delivery": "disk_spool",
             "manual_media_spanning": true,
-            "complete_physical_readback": true,
+            "per_volume_immediate_physical_readback": true,
+            "offline_recovery_utility": "tapescale-recovery",
+            "in_console_restore": "pending",
+            "restore_execution": "pending",
             "production_eligible": false
         },
         "laboratory_data_path": {
             "enabled": state.lab_file_roundtrip_enabled,
-            "engine": "Bacula Community",
-            "engine_version": BACULA_VERSION,
-            "adapter_version": BACULA_ADAPTER_VERSION,
-            "format_version": BACULA_FORMAT_VERSION,
+            "engine": NATIVE_ENGINE_NAME,
+            "engine_version": NATIVE_ENGINE_VERSION,
+            "adapter_version": NATIVE_ADAPTER_VERSION,
+            "format_version": NATIVE_FORMAT_NAME,
+            "archive_codec_version": DAR_CODEC_VERSION,
             "production_eligible": false,
             "encryption": "disabled_with_explicit_per_run_deviation"
         },
-        "operational_data":"attended_bacula_full_backup_alpha"
+        "operational_data":"tapescale_native_full_backup_alpha"
     })))
 }
 
@@ -317,16 +334,16 @@ async fn system_engine_metadata(
 
     Ok((
         EngineIdentity {
-            adapter: "tapescale-bacula-attended".to_owned(),
-            adapter_version: BACULA_ADAPTER_VERSION.to_owned(),
-            engine_name: "Bacula Community".to_owned(),
-            engine_version: BACULA_VERSION.to_owned(),
+            adapter: "tapescale-native".to_owned(),
+            adapter_version: NATIVE_ADAPTER_VERSION.to_owned(),
+            engine_name: NATIVE_ENGINE_NAME.to_owned(),
+            engine_version: NATIVE_ENGINE_VERSION.to_owned(),
             qualification: QualificationStatus::DetectedUnqualified,
-            format_selected: false,
+            format_selected: true,
         },
         EngineCapabilities {
             file_backup: true,
-            native_stream: false,
+            native_stream: true,
             multi_volume: true,
             full_readback: true,
             changer_control: false,
@@ -342,7 +359,7 @@ async fn system_engine_metadata(
                 ),
                 (
                     "scope".to_owned(),
-                    "compressed or uncompressed Full file backup, attended standalone-drive spanning, and complete physical readback"
+                    "DAR-packed Full file backup, attended standalone-drive spanning, and immediate physical readback of every native volume"
                         .to_owned(),
                 ),
                 (
@@ -352,8 +369,9 @@ async fn system_engine_metadata(
                 ),
                 (
                     "format".to_owned(),
-                    "Bacula format exercised; not selected or qualified for production"
-                        .to_owned(),
+                    format!(
+                        "TapeScale Native v1 with DAR {DAR_CODEC_VERSION}; the independent tapescale-recovery utility is available while in-console restore remains pending, and the format is not production-qualified"
+                    ),
                 ),
                 (
                     "encryption".to_owned(),
@@ -546,15 +564,16 @@ async fn create_backup_profile(
     }
     if !matches!(
         request.compression_mode.as_str(),
-        "auto" | "none" | "gzip" | "lzo"
+        "auto" | "none" | "gzip" | "zstd" | "lz4" | "lzo"
     ) {
         return Err(AppError::Invalid(
-            "compression_mode must be auto, none, gzip, or lzo".to_owned(),
+            "compression_mode must be auto, zstd, lz4, gzip, none, or the legacy lzo alias"
+                .to_owned(),
         ));
     }
-    if !matches!(request.data_delivery.as_str(), "direct" | "disk_spool") {
+    if request.data_delivery != "disk_spool" {
         return Err(AppError::Invalid(
-            "data_delivery must be direct or disk_spool".to_owned(),
+            "data_delivery must be disk_spool for TapeScale Native backups".to_owned(),
         ));
     }
     let actor_label = backup_actor_label(request.requested_by_label.as_deref())?;
@@ -1906,7 +1925,7 @@ impl DriveActionRequest {
         }
         if !self.scratch_media_confirmed {
             return Err(AppError::Invalid(
-                "scratch_media_confirmed must be true for unqualified lab motion".to_owned(),
+                "scratch_media_confirmed must be true for manual tape motion".to_owned(),
             ));
         }
         if self.confirmation != self.expected_confirmation() {
@@ -1926,7 +1945,7 @@ async fn queue_drive_action(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     if !state.lab_tape_motion_enabled {
         return Err(AppError::Blocked(
-            "unqualified lab tape motion is disabled; set TAPESCALE_LAB_TAPE_MOTION_ENABLED=true on the API and worker only for an attended test host"
+            "manual tape motion is disabled; set TAPESCALE_TAPE_MOTION_ENABLED=true on the API and worker for an attended tape host"
                 .to_owned(),
         ));
     }
@@ -2645,7 +2664,7 @@ fn require_file_roundtrip(state: &AppState) -> Result<(), AppError> {
         Ok(())
     } else {
         Err(AppError::Blocked(
-            "the attended Bacula backup and recovery path is disabled; set TAPESCALE_LAB_FILE_ROUNDTRIP_ENABLED=true on the API and worker for operational full backups or the G0.2 single-tape recovery exercise"
+            "the TapeScale Native backup path is disabled; set TAPESCALE_NATIVE_BACKUP_ENABLED=true on the API and worker to enable attended Full backups"
                 .to_owned(),
         ))
     }
@@ -3287,6 +3306,9 @@ async fn plan_restore(
         Some("recovery_exercise") => ordered_finalized_volumes && aggregate.volumes.len() == 1,
         _ => false,
     };
+    let native_restore_pending = aggregate.origin.engine_name.as_deref()
+        == Some(NATIVE_ENGINE_NAME)
+        || aggregate.recovery_point.format_version == NATIVE_FORMAT_NAME;
     let execution_supported = state.lab_file_roundtrip_enabled
         && plan_ready
         && !selected_multi_volume
@@ -3330,6 +3352,8 @@ async fn plan_restore(
             ManifestSelectionKind::SelectedPaths =>
                 "The selected retained paths support an attended, read-only restore from this single-volume recovery point into the isolated destination.".to_owned(),
         }
+    } else if native_restore_pending {
+        "This TapeScale Native v1 recovery point is cataloged and browseable. Offline recovery is available through the independent tapescale-recovery utility; in-console restore execution remains pending and will not be dispatched from this plan. Any retained planning blockers remain visible for review.".to_owned()
     } else if !plan_ready {
         "Resolve every restore-planning blocker and generate a fresh plan before execution can be considered.".to_owned()
     } else {
@@ -3367,7 +3391,10 @@ async fn plan_restore(
         "original_drive_id": original_rehearsal_drive_id,
         "attended": true,
         "writes_tape": false,
-        "writes_only_to_isolated_destination": true
+        "writes_only_to_isolated_destination": true,
+        "native_restore_pending": native_restore_pending,
+        "offline_recovery_utility": if native_restore_pending { Some("tapescale-recovery") } else { None },
+        "availability": if native_restore_pending { "pending_native_restore" } else if execution_supported { "available" } else { "unsupported" }
     });
     let selection_request = json!({
         "recovery_point_id": recovery_point_id,
@@ -3691,7 +3718,7 @@ async fn restore_rehearsal_media_readiness(
             },
             "candidate": candidate,
             "live_drive_validated": false,
-            "final_validation": "after authorization the worker atomically leases the exact retained cartridge, freshly re-probes the drive, verifies the loaded tape, rewinds it, and only then mounts it for Bacula"
+            "final_validation": "after authorization the legacy restore worker atomically leases the exact retained cartridge, freshly re-probes the drive, verifies the loaded tape, rewinds it, and only then starts the compatible legacy reader"
         }
     })))
 }
@@ -4086,7 +4113,7 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
                 "engine",
                 "Tape backup engine",
                 "blocked",
-                "PostgreSQL is required before the attended Bacula backup path can retain requests and evidence",
+                "PostgreSQL is required before TapeScale Native can retain backup requests and evidence",
             ),
         ];
         return Ok(Json(json!({
@@ -4152,9 +4179,9 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
             "Prepared drive and tape",
             qualification_status,
             if prepared_pair_available {
-                "A current passing Bacula setup test matches the exact ready drive and eligible loaded scratch cartridge; this is narrow setup evidence, not general physical qualification"
+                "A current passing TapeScale native setup test matches the exact ready drive and eligible loaded scratch cartridge; this is narrow setup evidence, not general physical qualification"
             } else {
-                "No current passing Bacula setup test matches an exact ready drive and eligible loaded scratch cartridge"
+                "No current passing TapeScale native setup test matches an exact ready drive and eligible loaded scratch cartridge"
             },
         ),
         preflight_check(
@@ -4172,9 +4199,9 @@ async fn preflight(State(state): State<AppState>) -> Result<Json<Value>, AppErro
             "Tape backup engine",
             engine_status,
             if state.lab_file_roundtrip_enabled {
-                "Pinned Bacula 15.0.3 is enabled for attended compressed, ordered multi-tape Full backups and single-volume recovery exercises; this alpha path is not production-qualified"
+                "TapeScale Native v1 with DAR 2.8.6 is enabled for staged, compressed, ordered multi-tape Full backups with immediate per-volume physical readback; offline recovery uses tapescale-recovery and in-console restore is pending"
             } else {
-                "The attended Bacula backup and recovery data path is disabled"
+                "The TapeScale Native backup data path is disabled"
             },
         ),
     ];
@@ -4215,9 +4242,9 @@ async fn has_ready_prepared_tape_pair(pool: &PgPool) -> Result<bool, sqlx::Error
               WHERE qualification.state = 'passed'
                 AND qualification.result->>'maximum_block_size_bytes' = '262144'
                 AND qualification.attempt > 0
-                AND qualification.engine_name = 'Bacula Community'
-                AND qualification.engine_version = $1
-                AND qualification.test_kind = 'btape_test'
+                AND qualification.engine_name = 'TapeScale Native'
+                AND qualification.engine_version = '1'
+                AND qualification.test_kind = 'native_tape_test'
                 AND qualification.id = (
                     SELECT latest.id
                       FROM qualification_runs latest
@@ -4263,7 +4290,6 @@ async fn has_ready_prepared_tape_pair(pool: &PgPool) -> Result<bool, sqlx::Error
                        AND active_hold.released_at IS NULL)
          )",
     )
-    .bind(BACULA_VERSION)
     .fetch_one(pool)
     .await
 }
@@ -4275,7 +4301,7 @@ async fn qualification_runs(State(state): State<AppState>) -> Result<Json<Value>
     };
     Ok(Json(json!({
         "runs": runs,
-        "engine_candidate": {"name":"Bacula Community","version":"15.0.3"},
+        "engine_candidate": {"name":"TapeScale Native","version":"1"},
         "physical_qualification":"not_established"
     })))
 }
@@ -4313,7 +4339,10 @@ struct QueueQualificationRunRequest {
 
 impl QueueQualificationRunRequest {
     fn expected_confirmation(&self) -> String {
-        format!("DESTROY {} WITH BACULA BTAPE TEST", self.cartridge_label)
+        format!(
+            "DESTROY {} WITH TAPESCALE NATIVE TEST",
+            self.cartridge_label
+        )
     }
 
     fn validate(&self) -> Result<(&str, &str, &str), AppError> {
@@ -4367,9 +4396,9 @@ impl QueueQualificationRunRequest {
             cartridge_label,
             self.scratch_media_confirmed,
             self.destructive_overwrite_confirmed,
-            "Bacula Community",
-            "15.0.3",
-            "btape_test"
+            "TapeScale Native",
+            "1",
+            "native_tape_test"
         ]);
         format!(
             "{:x}",
@@ -4384,6 +4413,12 @@ async fn queue_qualification_run(
     State(state): State<AppState>,
     Json(request): Json<QueueQualificationRunRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
+    if !state.lab_tape_qualification_enabled {
+        return Err(AppError::Blocked(
+            "destructive tape preparation is disabled; set TAPESCALE_TAPE_PREPARATION_ENABLED=true on the API and worker for an attended tape host"
+                .to_owned(),
+        ));
+    }
     let pool = require_pool(&state)?;
     let (stable_id, cartridge_label, idempotency_key) = request.validate()?;
     let fingerprint = request.request_fingerprint(stable_id, cartridge_label);
@@ -4408,7 +4443,7 @@ async fn queue_qualification_run(
                 cartridge_id = %run.cartridge_id,
                 cartridge_label = %run.expected_cartridge_label,
                 state = %run.state,
-                "destructive Bacula tape qualification was durably queued"
+                "destructive TapeScale native qualification was durably queued"
             );
             Ok((
                 StatusCode::ACCEPTED,
@@ -4419,7 +4454,7 @@ async fn queue_qualification_run(
                     "disposition":"queued",
                     "idempotent_replay":false,
                     "destructive":true,
-                    "engine_candidate":"Bacula Community 15.0.3",
+                    "engine_candidate":"TapeScale Native 1",
                     "physical_qualification":"not_established"
                 })),
             ))
@@ -4433,7 +4468,7 @@ async fn queue_qualification_run(
                 "disposition":"existing",
                 "idempotent_replay":true,
                 "destructive":true,
-                "engine_candidate":"Bacula Community 15.0.3",
+                "engine_candidate":"TapeScale Native 1",
                 "physical_qualification":"not_established"
             })),
         )),
@@ -4947,7 +4982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operational_system_metadata_reports_the_attended_bacula_path() {
+    async fn operational_system_metadata_reports_the_native_dar_path() {
         let state = AppState::new(
             None,
             false,
@@ -4959,19 +4994,34 @@ mod tests {
         );
         let Json(value) = system(State(state)).await.expect("system metadata");
 
-        assert_eq!(value["engine"]["adapter"], "tapescale-bacula-attended");
-        assert_eq!(value["engine"]["engine_name"], "Bacula Community");
-        assert_eq!(value["engine"]["engine_version"], BACULA_VERSION);
+        assert_eq!(value["engine"]["adapter"], "tapescale-native");
+        assert_eq!(value["engine"]["engine_name"], NATIVE_ENGINE_NAME);
+        assert_eq!(value["engine"]["engine_version"], NATIVE_ENGINE_VERSION);
         assert_eq!(value["engine"]["qualification"], "detected_unqualified");
-        assert_eq!(value["engine"]["format_selected"], false);
+        assert_eq!(value["engine"]["format_selected"], true);
         assert_eq!(value["capabilities"]["file_backup"], true);
-        assert_eq!(value["capabilities"]["native_stream"], false);
+        assert_eq!(value["capabilities"]["native_stream"], true);
         assert_eq!(value["capabilities"]["multi_volume"], true);
         assert_eq!(value["capabilities"]["changer_control"], false);
         assert_eq!(
             value["operational_backup_data_path"]["production_eligible"],
             false
         );
+        assert_eq!(
+            value["operational_backup_data_path"]["archive_codec_version"],
+            DAR_CODEC_VERSION
+        );
+        assert_eq!(
+            value["operational_backup_data_path"]["in_console_restore"],
+            "pending"
+        );
+        assert_eq!(
+            value["operational_backup_data_path"]["offline_recovery_utility"],
+            "tapescale-recovery"
+        );
+        assert_eq!(value["native_backup_enabled"], true);
+        assert_eq!(value["tape_motion_enabled"], true);
+        assert_eq!(value["tape_preparation_enabled"], true);
     }
 
     #[tokio::test]
@@ -5102,7 +5152,7 @@ mod tests {
             stable_id: "scsi:naa.5001".to_owned(),
             cartridge_id: Uuid::now_v7(),
             cartridge_label: "SCRATCH-L9-001".to_owned(),
-            confirmation: "DESTROY SCRATCH-L9-001 WITH BACULA BTAPE TEST".to_owned(),
+            confirmation: "DESTROY SCRATCH-L9-001 WITH TAPESCALE NATIVE TEST".to_owned(),
             scratch_media_confirmed: true,
             destructive_overwrite_confirmed: true,
             idempotency_key: "  qualification-test-001  ".to_owned(),

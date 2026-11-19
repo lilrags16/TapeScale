@@ -1,4 +1,6 @@
-//! Attended Bacula backup and physical recovery execution, including ordered multi-volume runs.
+//! Attended physical backup and recovery execution.
+
+mod native;
 
 use std::{
     fs,
@@ -458,6 +460,7 @@ impl LiveIoSampler {
                 .expect("live transfer totals always carry an authoritative basis"),
             archive_entries_per_second,
             pipeline_bytes_processed: self.maximum_pipeline_bytes,
+            pipeline_bytes_total: None,
             pipeline_bytes_per_second,
             file_daemon_read_bytes_processed: file_daemon_read_bytes,
             file_daemon_read_bytes_per_second,
@@ -851,6 +854,10 @@ async fn execute_claimed(
         )
         .await?;
         return Ok(());
+    }
+
+    if claim.run.archive_codec == "dar" {
+        return native::execute_claimed(pool, sas_config, config, claim, cancellation).await;
     }
 
     let evidence_directory = config.evidence_root.join(claim.run.id.to_string());
@@ -4429,6 +4436,11 @@ mod tests {
             bacula_spool_max_bytes: u64::MAX,
             bacula_spool_reserve_bytes: 0,
             bacula_spool_min_bytes: u64::MAX,
+            dar_path: PathBuf::from("/usr/bin/dar"),
+            native_spool_dir: spool_directory.to_owned(),
+            native_spool_reserve_bytes: 0,
+            native_slice_bytes: 64 * 1024 * 1024,
+            native_compression_threads: 1,
         }
     }
 

@@ -1,118 +1,111 @@
 # Qualification and acceptance ledger
 
-This ledger prevents implementation progress from being confused with physical qualification.
+This ledger separates implemented behavior from evidence collected on physical tape hardware. It applies to TapeScale `0.2.0-alpha.1` and TapeScale Native v1.
 
 ## Status vocabulary
 
-- **Implemented**: the relevant code path exists and has automated evidence in this repository. This does not imply hardware qualification unless the evidence column names physical hardware.
-- **Simulated**: deterministic model or fake-engine evidence exists. It proves control-plane behavior only.
-- **Not run**: required evidence has not been executed or retained.
-- **Blocked**: a named prerequisite prevents execution and is release-blocking.
-- **Qualified**: reserved for reviewed evidence from the named TrueNAS, engine, tape, changer, media, and recovery environment. Nothing in the initial repository is Qualified.
+- **Implemented**: the code path exists and has automated repository evidence. It does not imply physical qualification.
+- **Simulated**: deterministic control-plane or file-backed evidence exists.
+- **Not run**: required evidence has not been collected.
+- **Blocked**: a named prerequisite prevents the test.
+- **Qualified**: reviewed evidence exists for the exact named TrueNAS host, TapeScale build, drive, HBA, firmware, media, filesystem, and recovery environment.
 
-Do not change an item to Qualified without a dated report containing fixture, exact software/hardware, steps, expected and observed results, retained artifacts, reviewer, and unresolved limitations.
+Nothing in this alpha is physically **Qualified**. Do not use it as the only copy of data.
+
+## Active implementation
+
+New backups use TapeScale Native v1. DAR 2.8.6 packages the selected immutable source into completed, tested slices on disk; TapeScale then writes those slices and its own self-identifying metadata directly to the non-rewinding tape device. PostgreSQL records operations but is not required by the clean-host recovery utility.
+
+Bacula is retired from the runtime. Earlier failed Bacula rows remain audit history only and are not valid recovery points. Native v1 is intentionally incompatible with earlier Bacula media.
 
 ## Current ledger
 
-This is the alpha qualification ledger. Automated test references should be added as the corresponding code lands; physical columns remain Not run until laboratory execution.
-
-| ID | Acceptance case | Software status | Physical/operational evidence | Release note |
+| ID | Acceptance case | Software status | Physical evidence | Remaining work |
 |---|---|---|---|---|
-| AT-01 | Clean installation and preflight | Implemented/Simulated | Not run | SAS discovery, identity reconciliation, gated motion, and a pinned G0.1 `btape` harness exist; named TrueNAS execution and remaining dependencies are pending. |
-| AT-02 | LTO-1 through LTO-10 compatibility | Simulated | Not run | Rules can be unit-tested; no generation is physically qualified. |
-| AT-03 | Manual multi-volume job | Implemented/Simulated | Not run | Operational backups retain ordered per-volume requests and authorizations, resume one Bacula JobId after attended media changes, and verify the exact catalog volume set; physical EOM and wrong-continuation-media evidence remains required. |
-| AT-04 | Automated inventory and movement | Simulated | Not run | Requires a named changer and import/export-slot evidence. |
-| AT-05 | Concurrent compatible drives | Implemented/Simulated | Not run | Durable per-drive motion/qualification leases, media reservations, and fencing are tested in PostgreSQL; two-drive hardware and engine routing remain unproven. |
-| AT-06 | Snapshot protection and cleanup | Simulated | Not run | Requires real TrueNAS snapshots, holds, hooks, and pressure cases. |
-| AT-07 | File content and metadata round trip | Implemented (G0.2 subset) | Not run | Operational full backup retains the source manifest and physical readback; G0.2 additionally compares paths, SHA-256 content, and declared manifest metadata after a Bacula restore. Representative POSIX and TrueNAS NFSv4 ACL fixtures remain required. |
-| AT-08 | Native dataset reconstruction | Not run | Not run | Requires actual `zfs send`/`receive` path and alternate pool. |
-| AT-09 | Explicit zvol coverage | Not run | Not run | UI/model treatment alone is insufficient. |
-| AT-10 | Exact selected recovery point | Implemented/Simulated | Not run | G0.2 binds a normalized read-only snapshot selection, Bacula JobId, cartridge, and restore comparison; broader namespace/snapshot automation remains. |
-| AT-11 | Object larger than one cartridge | Implemented/Simulated (file path) | Not run | The operational Bacula file path permits an object/job to cross ordered volumes without a TapeScale logical-size ceiling; forced-capacity and physical EOM restore evidence remains required, and native streaming is absent. |
-| AT-12 | Cancellation and host/process failure | Implemented/Simulated | Not run | Motion, destructive-test, operational backup, G0.2, and restore-rehearsal work is durable and fenced. Waiting backup requests cancel immediately; claimed backup/rehearsal runs have observed safe-boundary Bacula cancellation paths. Controlled power/process interruption on physical media remains. |
-| AT-13 | Unknown media/device loss/position | Implemented/Simulated | Not run | Missing/path-changed SAS devices, stale identity, protected/foreign/WORM inventory, and unverifiable postconditions are blocked. Restore rehearsals re-probe the exact identity and rely on Bacula volume-header/catalog matching without exposing a tape-write primitive. Physical wrong-media/reset/disconnect evidence remains. |
-| AT-14 | Compression modes restore | Implemented/Simulated (write/readback) | Not run | Operational policy and the pinned adapter support automatic LZO, explicit balanced GZIP, LZO, and none with physical Data readback; the required byte-exact restore matrix and physical evidence have not run. |
-| AT-15 | Corrupt/reordered/truncated content | Simulated | Not run | Record/authentication fault injection must be tied to selected engine. |
-| AT-16 | Media read-back and restore tests | Implemented (ordered-volume online subset); restarted source-independent file-backed restore runs in CI | Not run | CI proves label, Full backup, `Level=Data`, initial restore, daemon shutdown/restart, the original source made unavailable, a second restore, byte comparison, and both catalog relationships without hardware. The attended physical rehearsal path now retains exact ordered handoffs and all-volume proof, but named SAS/LTO execution evidence is still required. |
-| AT-17 | Loss of original host and catalog | Not run | Not run | Requires clean replacement installation and independently recovered keys. |
-| AT-18 | Independent keys and rotation | Simulated | Not run | Real encrypted historical backups and portable-key recovery remain. |
-| AT-19 | Dependencies/shared tapes/archives | Implemented/Simulated | Not run | Dependency and overwrite-gate tests are control-plane evidence. |
-| AT-20 | Overlap/downtime/local time | Implemented (weekly-full subset)/Simulated | Not run | Saturday 02:00 full occurrences are timezone-aware, idempotent, and coalesce missed weeks into the latest due waiting request. Overlap policy, other schedules, and named-host restart/DST evidence remain. |
-| AT-21 | Confirmed and missed exchanges | Implemented/Simulated | Not run | Custody workflow does not prove physical movement. |
-| AT-22 | Minimum recovery coverage | Simulated | Not run | Emergency recall and replacement-delivery cases remain operational exercises. |
-| AT-23 | Roles and safe destinations | Implemented/Simulated | Not run | Add API authorization and adversarial filesystem evidence. |
-| AT-24 | Container replacement/migration | Not run | Not run | Requires previous-version database and active-job drain exercise. |
-| AT-25 | Backpressure/exhausted capacity | Implemented/Simulated | Not run | Backup preflight proves the Storage Daemon working directory writable, reserves a conservative manifest-derived attribute allowance plus configurable free space, and requires a staged-stream estimate—125% payload, 64 KiB per entry, and 4 GiB framing—to fit before tape is touched. The target must remain below the hard limit by the greater of 10% of that limit or 1 GiB; this runtime headroom is separate from the filesystem and attribute reserves. A zero maximum selects all otherwise usable capacity. Because this is a point-in-time estimate rather than a byte-exact proof, runtime monitoring cancels near the hard limit or on early drain instead of knowingly continuing cyclic partial batches. Direct delivery bypasses the payload spool but still needs sustained source/compression throughput. Real metadata-heavy spool, concurrent capacity pressure, cancellation/quarantine, destination, snapshot, direct-stream starvation, and staging-pressure evidence remains. |
-| AT-26 | Representative workloads | Not run | Not run | Targets must be measured, not invented. |
-| AT-27 | Source errors/existing destinations | Implemented/Simulated | Not run | G0.2 rejects writable/changed sources; the later rehearsal does not need the source and only creates a new server-generated isolated destination. Replace, merge, and publication are unavailable. Physical error fixtures and broader metadata coverage remain. |
-| AT-28 | Durable events/actionable status | Implemented/Simulated | Not run | Motion, qualification, operational backup plans/requests, G0.2, and restore-rehearsal intents, append-only events/artifacts, claims, reservations, phases, cancellation, results, and audit evidence are durable; broader end-to-end restart and delivery-channel evidence is pending. |
-| AT-29 | Rust boundary/Linux dependency audit | Implemented (source boundary) | Not run | Rust owns the custom workflow; Debian Bacula 15.0.3 packages are pinned and process-isolated. Final image/SBOM/license audit remains. |
-| AT-30 | Safe external-tool execution | Implemented/Simulated | Not run | `mt-st` and Bacula daemon startup use closed argv; `btape` uses fixed test, preparation-label/readback, and identity-probe transcripts with required markers; after its durable destructive boundary G0.2 uses one fixed internal BOT file mark to invalidate the prior label, then generated configs and a restricted fixed-input `bconsole` adapter with structured JobId/status correlation. Physical interruption evidence remains, and kernel tape I/O may outlive a userspace deadline. |
-| AT-31 | Product-specific visual/workflow review | Implemented | Not run | Backup Center source browsing, guided tape preparation, G0.1/G0.2, Recovery Vault complete/selected planning, immutable scope display, and attended rehearsal display exact blockers, tape/drive/destination boundaries, durable phases, cancellation, evidence, and limitations; product-owner desktop/phone review must still be recorded. Browsing alone does not prove a selected restore. |
-
-`Implemented/Simulated` means an implementation exists but its present evidence uses simulated dependencies. A qualified backend may still be absent. `Implemented (source boundary)` is narrower than a completed runtime audit. Neither status may be shortened to Qualified.
+| AT-01 | Clean installation and preflight | Implemented/Simulated | Not run | Execute on the target TrueNAS release and retain container, device, mount, and dependency evidence. |
+| AT-02 | LTO generation rules | Simulated | Not run | Exercise every claimed generation and exact drive/media combination. No LTO generation is yet qualified. |
+| AT-03 | Attended multi-volume archive | Implemented/Simulated | Not run | Force real volume handoffs and validate ordering, identity, EOM behavior, readback, and clean-host restore. |
+| AT-04 | Automated changer inventory/motion | Not implemented | Not run | Native v1 alpha targets one attended standalone SAS drive. |
+| AT-05 | Concurrent drives | Control-plane only | Not run | Prove leases, fencing, routing, and isolation with two physical drives. |
+| AT-06 | Snapshot protection and cleanup | Partial | Not run | The source must already be an immutable read-only snapshot; automatic snapshot lifecycle remains open. |
+| AT-07 | File content and metadata round trip | Implemented/Simulated | Not run | Run representative POSIX/NFSv4 ACL, xattr, sparse, link, unusual-name, unreadable, and metadata-only fixtures on TrueNAS. |
+| AT-08 | Native dataset reconstruction | Not implemented | Not run | Native ZFS send/receive is outside this alpha. |
+| AT-09 | Zvol coverage | Not implemented | Not run | Add and qualify an explicit native-stream representation. |
+| AT-10 | Exact recovery point | Implemented for full archive | Not run | Web-operated and selected-path restore remain open; the independent CLI restores a complete archive. |
+| AT-11 | Object/archive larger than one cartridge | Implemented/Simulated | Not run | Prove physical spanning. Native v1 keeps each DAR slice whole and never splits one slice between tapes. |
+| AT-12 | Cancellation and process/host failure | Partial/Simulated | Not run | Exercise every boundary before and after media write, including lease loss, reset, restart, and power failure. |
+| AT-13 | Wrong/unknown media and device loss | Implemented/Simulated | Not run | Prove native preparation UUID and archive header rejection on real wrong, missing, reset, foreign, protected, and unreadable media. |
+| AT-14 | Compression modes | Implemented/Simulated | Not run | Qualify Zstandard, LZ4, GZIP, none, and automatic selection through write, readback, and restore. |
+| AT-15 | Corrupt/reordered/truncated content | Implemented/Simulated | Not run | Expand fault injection and prove every envelope, slice, index, and trailer failure is rejected. |
+| AT-16 | Immediate physical readback | Implemented | Not run | Run on named drives/media and retain per-tape hash and identity evidence. Readback is not a filesystem restore test. |
+| AT-17 | Loss of original host and database | Implemented/Simulated | Not run | On a clean host, capture every tape with `tapescale-recovery`, reconstruct the DAR set, restore, and compare. |
+| AT-18 | Encryption and key rotation | Not implemented | Not run | Native v1 alpha is unencrypted. Protect tapes and capture storage accordingly. |
+| AT-19 | Retention, holds, custody, and dependencies | Implemented/Simulated | Not run | Exercise the complete operational lifecycle, including protected media and expired archives. |
+| AT-20 | Scheduling, overlap, local time, and downtime | Partial/Simulated | Not run | Weekly full scheduling exists; broader policies and named-host DST/restart evidence remain. |
+| AT-21 | Confirmed and missed exchanges | Implemented/Simulated | Not run | Run attended continuation and readback exchanges with delayed, missed, and wrong cartridges. |
+| AT-22 | Minimum recovery coverage | Simulated | Not run | Exercise emergency recall and replacement-host delivery procedures. |
+| AT-23 | Roles and safe destinations | Partial | Not run | Add production authentication/RBAC and adversarial destination tests. |
+| AT-24 | Container replacement and migration | Partial | Not run | CI upgrades the prior schema; execute named-host replacement and interrupted-job drain exercises. |
+| AT-25 | Staging capacity and backpressure | Implemented/Simulated | Not run | Measure metadata-heavy, near-full, concurrent-pressure, and stalled-device cases on the chosen spool filesystem. |
+| AT-26 | Representative workloads and sustained speed | Not run | Not run | Measure small-file packaging, compression, disk staging, tape streaming, and backhitch behavior. |
+| AT-27 | Source errors and destination safety | Implemented/Simulated | Not run | Broaden physical error fixtures; restore remains limited to a caller-provided existing empty directory. |
+| AT-28 | Durable events and actionable status | Implemented/Simulated | Not run | Exercise restarts and long attended waits on the deployment host. |
+| AT-29 | Runtime dependency and license audit | Implemented | Not run | The image pins DAR/libdar/libthreadar and excludes Bacula; retain final image digest, SBOM, and license review. |
+| AT-30 | Safe external-tool execution | Implemented/Simulated | Not run | DAR and `mt-st` use closed argument vectors; exercise hangs, signals, cancellation, and kernel I/O that outlives userspace. |
+| AT-31 | Product-specific workflow review | Implemented | Not run | Record product-owner desktop/phone review of preparation, backups, handoffs, failure recovery, and clean-host restore. |
 
 ## Engineering gates
 
-### G0 — Architecture
+### G0 — Native architecture
 
-Required exit evidence:
+**Implemented; physical acceptance not passed.**
 
-- custom Rust boundary and existing Linux dependency inventory;
-- selected, pinned engine/format backed by real tape tests;
-- actual TrueNAS permissions and snapshot/ZFS streaming path;
-- tape/changer proof and stable device reconciliation;
-- POSIX and native NFSv4 ACL round trip;
-- stable logical source mapping;
-- documented restart boundaries;
-- reproducible measured workload plan.
-
-Current status: **Blocked by completion/review of the engine matrix and physical laboratory evidence**.
-
-Implemented entry stages:
-
-- **G0.1 Bacula `btape test` harness.** A local operator pass remains a prerequisite artifact for the exact drive/cartridge, not the G0 decision. No reviewed repository qualification report is implied.
-- **Guided tape preparation and browsing.** The wizard sequences the same identity reconciliation, media registration, and G0.1 gates from one destructive action. A pass writes and reads back the deterministic preparation identity, but creates no broader physical-format claim. Source browsing is advisory metadata selection, while Recovery Vault browsing projects a retained manifest and performs no tape read. A selected restore exists only after the server authenticates and normalizes the requested scope and, for an exactly one-volume point, a later attended run reads and compares that scope. Multi-volume selected planning remains blocked from execution.
-- **Operational attended full-backup slice.** A durable manual or weekly request waits for exact operator media assignment, then writes one compressed or uncompressed full-file Bacula job to an ordered set of manually supplied qualified scratch cartridges and requires ordered physical Data readback before atomically retaining a recovery point. Inventory uses a bounded-memory external merge and has no TapeScale total file-count or logical-byte ceiling. It is unencrypted and operator-dependent for immutable snapshot creation/retention and continuation media; verification is not a restore test. No physical multi-volume or compression report has been reviewed.
-- **G0.2 first-recoverable-tape harness.** One immutable source selection is written as a full Bacula file job to one qualified scratch cartridge, reread using Bacula Data verification, restored normally to an isolated destination, and compared using independent manifests. Encryption is explicitly disabled for this lab deviation. No physical G0.2 report has been reviewed in this ledger.
-- **Verified-point rehearsal.** A later attended run can re-open a compatible operational Full point through its original catalog, reserve its complete cartridge set, read each exact volume through a durable ordered handoff into a new isolated destination, and compare the complete point against the retained manifest. For an exactly one-volume point, it can instead resolve a server-normalized projection through JobId-pinned catalog identities and compare only that selected scope; selected evidence cannot satisfy the complete-point gate. Legacy G0.2 points remain one cartridge. Container CI repeats a restore after daemon restart with the source unavailable and exercises Bacula BVFS extraction in spanning mode as an engine-mechanism test only. It does not prove or enable TapeScale multi-volume selected execution. No physical single-volume, multi-volume, or selected-path rehearsal report has been reviewed.
-
-Neither stage qualifies spanning, compression, incrementals, changers, NFSv4 ACLs, native ZFS, encryption, interruption recovery, or clean-catalog reconstruction. “Implemented” for spanning/compression means the control and adapter paths exist; AT-03, AT-11, and AT-14 remain physically **Not run**.
+The selected alpha architecture is TapeScale Native v1 with DAR 2.8.6 as a separately executed archive codec. The on-tape envelope, cartridge/archive identity, whole-slice spanning, direct tape I/O, immediate byte readback, and independent recovery CLI are implemented and documented in [NATIVE_FORMAT.md](NATIVE_FORMAT.md). Real-hardware throughput, filesystem fidelity, EOM, wrong-media, interruption, and clean-host evidence remain required.
 
 ### G1 — Recovery safety
 
-Required exit evidence: file/native/incremental round trips, physical EOM, wrong/unknown media protection, dependency retention, and controlled interruption results.
+**Implemented in software; physical matrix not run.**
 
-Current status: **G0.2 path implemented; full G1 evidence not run**.
+Native metadata and every archive slice are hashed and physically reread before a recovery point is retained. The source is checked again after readback. This proves neither a filesystem restore nor every failure boundary.
 
 ### G2 — Independent recovery
 
-Required exit evidence: clean replacement installation restores after loss of the test catalog using documented tapes and independently recovered keys.
+**CLI implemented; clean-host physical exercise not run.**
 
-Current status: **Not run**.
+`tapescale-recovery capture-native-volume` authenticates and captures each volume without PostgreSQL. `restore-native-archive` requires the complete ordered set, tests and extracts it with pinned DAR, then independently compares the restored tree with the on-tape manifest.
 
 ### G3 — Operations
 
-Required exit evidence: rotation, roles, scheduling, notifications, updates, resource limits, recovery exercises, operator documentation, Rust boundary audit, safe tool integration, and product-specific UI review.
+**Alpha implementation; not passed.**
 
-Current status: **In implementation; not passed**.
+One attended standalone SAS drive, manual Full backups, whole-archive staging, ordered continuation, immediate readback, retention evidence, and weekly Full scheduling exist. Authentication/RBAC, encryption, changers, incrementals, native ZFS streams, automated snapshot lifecycle, web restore, monitoring, and production operations remain open.
 
 ### G4 — Compatibility claims
 
-Required exit evidence: complete LTO-1 through LTO-10 rule coverage plus named physical hardware qualification reports. Every untested combination remains disclosed.
+**Modeled only; no generation physically qualified.**
 
-Current status: **Compatibility modeled; no generation physically qualified**.
+Compatibility rules are not qualification. Every untested drive, HBA, firmware, media generation, filesystem, compression mode, capacity boundary, and recovery environment must remain disclosed as unqualified.
+
+## Required physical campaign
+
+Before a production claim, retain evidence for at least:
+
+1. Tape preparation, identity reread, backup, immediate readback, and unload on the exact target hardware.
+2. Full filesystem restoration and manifest comparison for representative TrueNAS POSIX and NFSv4 workloads.
+3. Real multi-volume operation, wrong continuation rejection, and an unexpected-capacity failure.
+4. Cancellation, worker/container restart, SCSI reset, disconnect, and power-loss cases at documented boundaries.
+5. Clean replacement-host recovery with no original PostgreSQL database.
+6. Sustained throughput and shoe-shine measurements for large-file, small-file, compressible, and incompressible sources.
+7. Retention, hold, reuse, custody, and operator-error exercises.
 
 ## Evidence report template
-
-Create one immutable report per execution:
 
 ```text
 Acceptance ID:
 Date and operator:
 TapeScale commit/image digest:
 TrueNAS/OpenZFS/kernel/driver versions:
-Engine/adapter/catalog/format versions:
+DAR and native-format versions:
 Drive/changer/HBA/firmware/media identifiers:
 Fixture version and checksum:
 Preconditions:
@@ -124,14 +117,14 @@ Limitations/deviations:
 Reviewer and decision:
 ```
 
-Store large logs and images in the controlled evidence system; store a checksum-addressed index in the repository. Never commit credentials, recovery keys, unredacted path inventories, or sensitive source data.
+Store large logs and images in the controlled evidence system and retain a checksum-addressed index. Never commit credentials, recovery keys, unredacted path inventories, or sensitive source data.
 
 ## Claim policy
 
-- “Supported” describes implemented product behavior only when its prerequisites are explicit.
-- “Compatible” describes the generation rule matrix, not a test result.
-- “Qualified” names the exact tested combination.
-- “Verified” describes the configured read-back scope for a particular recovery point.
-- “Restore tested” describes the exact content, metadata, destination, and date exercised.
+- **Supported** describes implemented behavior only when its prerequisites and alpha limits are explicit.
+- **Compatible** describes a modeled rule, not a physical test result.
+- **Qualified** names the exact tested combination.
+- **Verified** describes the exact physical byte-readback scope for one recovery point.
+- **Restore tested** names the exact archive, destination, metadata scope, and date actually restored and compared.
 
-Marketing, UI labels, diagnostics, and release notes must use the same distinctions.
+Product copy, diagnostics, release notes, and evidence must preserve these distinctions.

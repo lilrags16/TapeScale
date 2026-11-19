@@ -2,6 +2,29 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.2.0-alpha.1] - 2026-11-19
+
+### TapeScale Native v1
+
+- New backups no longer depend on Bacula. TapeScale inventories and hashes the immutable source, uses DAR 2.8.6 as a separate archive-codec process, and retains TapeScale-owned media, archive, volume, segment, and verification records.
+- Small-file workloads are packed into large, checksummed DAR slices before the tape moves. The complete archive is staged and tested on disk first, so source traversal, metadata latency, and compression cannot starve an active LTO write.
+- The native tape layout writes a versioned binary header, isolated DAR catalog, authenticated source manifest, whole archive slices, volume index, and trailer as separate tape files. Every record has an envelope checksum, and the header, index, and trailer bind the same archive and volume identities.
+- Multi-tape archives split only between complete slices. Each continuation has its own UUID and ordinal, is associated with the cartridge UUID read from the preparation header, and is immediately rewound and read back in full before it can be retained as verified.
+- Tape preparation and qualification are native operations. A successful destructive qualification writes and reads deterministic records across two tape files, then writes a durable TapeScale preparation header containing the cartridge UUID. The worker reads that identity directly at every media boundary instead of asking an operator to repeatedly attest which tape is loaded.
+- Live progress distinguishes source inventory, archive packing, disk validation, tape write, tape readback, current source path, staged bytes, physical tape rates, and attended volume waits.
+
+### Breaking format transition
+
+- `tapescale-native-v1` is a new and incompatible on-tape format. This deployment has no valid Bacula recovery media to preserve, so saved backup profiles and untouched queued requests migrate to the native engine. Every legacy Bacula recovery point is demoted from verified to failed while its rows remain as audit history; it can no longer appear valid or protect cartridges from reuse.
+- Blank and expendable media must be prepared again before a native backup. Preparation is destructive. Never prepare a cartridge containing data that must be preserved.
+- The runtime image no longer needs Bacula for new backup or qualification work. DAR remains a separately executed GPL-2.0-or-later program; TapeScale itself remains Apache-2.0.
+
+### Alpha limits
+
+- Native writes, spanning, and immediate physical readback are implemented. The independent `tapescale-recovery` utility can capture every ordered native volume on a clean host, authenticate all metadata and slices, rebuild the DAR archive, extract it into an empty destination, and compare the result with the captured source manifest. That CLI path is not yet physically qualified or wired into the web worker; selected-file recovery remains unavailable. Do not rely on this alpha as the only copy of data.
+- The first release is for attended, manually started Full backups on one standalone SAS tape drive. Incrementals, encryption, changers, automatic snapshot creation, native ZFS send streams, and production qualification remain open.
+- DAR archive fidelity and the TapeScale Native layout still require real-hardware qualification across supported filesystems, ACL/xattr combinations, drive generations, compression modes, volume boundaries, wrong-media handling, and controlled interruptions.
+
 ## [0.1.0-alpha.15] - 2026-11-18
 
 ### Database-backed identity fix
@@ -230,6 +253,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.2.0-alpha.1]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.1
 [0.1.0-alpha.15]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.15
 [0.1.0-alpha.14]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.14
 [0.1.0-alpha.13]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.13
