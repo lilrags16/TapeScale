@@ -1899,10 +1899,12 @@ pub async fn overview_counts(pool: &PgPool) -> Result<OverviewCounts, sqlx::Erro
                  OR (cartridge.identity_status = 'unknown' AND EXISTS (
                     SELECT 1 FROM volume_records volume
                     WHERE volume.cartridge_id = cartridge.id
+                      AND volume.retired_at IS NULL
                  ))
                  OR (cartridge.confirmed_location_id IS NULL AND EXISTS (
                     SELECT 1 FROM volume_records volume
-                    WHERE volume.cartridge_id = cartridge.id AND volume.finalized
+                    WHERE volume.cartridge_id = cartridge.id
+                      AND volume.retired_at IS NULL AND volume.finalized
                  )))) AS required_actions",
     )
     .fetch_one(pool)
@@ -2012,10 +2014,12 @@ pub async fn list_required_actions(
                 OR (cartridge.identity_status = 'unknown' AND EXISTS (
                     SELECT 1 FROM volume_records volume
                     WHERE volume.cartridge_id = cartridge.id
+                      AND volume.retired_at IS NULL
                 ))
                 OR (cartridge.confirmed_location_id IS NULL AND EXISTS (
                     SELECT 1 FROM volume_records volume
-                    WHERE volume.cartridge_id = cartridge.id AND volume.finalized
+                    WHERE volume.cartridge_id = cartridge.id
+                      AND volume.retired_at IS NULL AND volume.finalized
                 ))
          ) action
          ORDER BY (action.state = 'overdue') DESC,
@@ -2111,7 +2115,8 @@ const MEDIA_SELECT: &str =
             p.name AS pool_name, l.name AS location_name,
             (SELECT count(*) FROM holds h
              WHERE h.cartridge_id = c.id AND h.released_at IS NULL) AS active_holds,
-            EXISTS (SELECT 1 FROM volume_records vr WHERE vr.cartridge_id = c.id) AS has_content,
+            EXISTS (SELECT 1 FROM volume_records vr
+                    WHERE vr.cartridge_id = c.id AND vr.retired_at IS NULL) AS has_content,
             c.created_at, c.updated_at
      FROM cartridges c
      LEFT JOIN media_pools p ON p.id = c.pool_id
@@ -3140,7 +3145,8 @@ const QUALIFICATION_CARTRIDGE_SELECT: &str = "SELECT c.id, c.internal_label,
             c.worm, c.pool_id, c.reserved_by,
             (SELECT count(*) FROM holds h
              WHERE h.cartridge_id = c.id AND h.released_at IS NULL) AS active_holds,
-            EXISTS (SELECT 1 FROM volume_records vr WHERE vr.cartridge_id = c.id) AS has_content
+            EXISTS (SELECT 1 FROM volume_records vr
+                    WHERE vr.cartridge_id = c.id AND vr.retired_at IS NULL) AS has_content
      FROM cartridges c";
 
 pub async fn list_qualification_runs(

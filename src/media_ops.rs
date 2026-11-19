@@ -958,6 +958,7 @@ WITH RECURSIVE direct_points AS (
     FROM volume_records volume
     JOIN recovery_points recovery ON recovery.id = volume.recovery_point_id
     WHERE ($1::uuid IS NULL OR volume.cartridge_id = $1)
+      AND volume.retired_at IS NULL
     GROUP BY volume.cartridge_id
 ), direct_stats AS (
     SELECT cartridge_id,
@@ -1454,7 +1455,7 @@ pub async fn assign_media_pool(
          SELECT
              EXISTS(
                  SELECT 1 FROM volume_records
-                 WHERE cartridge_id = $1
+                 WHERE cartridge_id = $1 AND retired_at IS NULL
              ) AS recorded_content,
              (EXISTS(SELECT 1 FROM direct_holds)
               OR EXISTS(
@@ -1490,6 +1491,7 @@ pub async fn assign_media_pool(
                     AND EXISTS(
                         SELECT 1 FROM volume_records protected_volume
                         WHERE protected_volume.cartridge_id = $1
+                          AND protected_volume.retired_at IS NULL
                     )
               )) AS archive_protection,
              (SELECT truncated FROM graph_overflow) AS dependency_graph_truncated",

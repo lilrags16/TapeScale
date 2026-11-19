@@ -4283,7 +4283,8 @@ async fn has_ready_prepared_tape_pair(pool: &PgPool) -> Result<bool, sqlx::Error
                 AND cartridge.health_status = 'qualified_scratch'
                 AND NOT EXISTS (
                     SELECT 1 FROM volume_records volume
-                     WHERE volume.cartridge_id = cartridge.id)
+                     WHERE volume.cartridge_id = cartridge.id
+                       AND volume.retired_at IS NULL)
                 AND NOT EXISTS (
                     SELECT 1 FROM holds active_hold
                      WHERE active_hold.cartridge_id = cartridge.id

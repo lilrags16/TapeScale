@@ -19,8 +19,8 @@ ENV DAR_VERSION=2.8.6 \
 # unmodified, hash-pinned upstream releases against a fixed Debian snapshot.
 # Keeping DAR as a separate executable avoids linking GPL code into TapeScale.
 RUN printf '%s\n' \
-      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" \
-      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
+      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" \
+      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
       > /etc/apt/sources.list.d/tapescale-dar-builder.list \
     && apt-get \
          -o Acquire::Check-Valid-Until=false \
@@ -115,7 +115,7 @@ RUN install -D -m 0644 \
       /opt/runtime-docs/libthreadar/COPYING.LESSER
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
-ARG TAPESCALE_VERSION=0.2.0-alpha.1
+ARG TAPESCALE_VERSION=0.2.0-alpha.2
 ARG TAPESCALE_REVISION=unknown
 ARG DEBIAN_SNAPSHOT=20250730T000000Z
 LABEL org.opencontainers.image.title="TapeScale" \
@@ -126,8 +126,8 @@ LABEL org.opencontainers.image.title="TapeScale" \
       org.opencontainers.image.licenses="Apache-2.0 AND GPL-2.0-or-later AND LGPL-3.0-or-later"
 
 RUN printf '%s\n' \
-      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" \
-      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
+      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" \
+      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
       > /etc/apt/sources.list.d/tapescale-debian-snapshot.list \
     && printf '%s\n' \
       'Dir::Etc::sourcelist "/etc/apt/sources.list.d/tapescale-debian-snapshot.list";' \

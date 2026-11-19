@@ -2,7 +2,7 @@
 
 Status: **alpha; write/readback and independent full-archive recovery implemented, physical qualification pending**
 
-TapeScale Native v1 is the media format selected by TapeScale `0.2.0-alpha.1`. It replaces the failed Bacula-backed experiments for all new backups. It is designed so cartridge and archive identity, volume ordering, payload hashes, and the recovery catalog live on the media rather than existing only in PostgreSQL.
+TapeScale Native v1 is the media format selected by the TapeScale `0.2.0` alpha line. It replaces the failed Bacula-backed experiments for all new backups. It is designed so cartridge and archive identity, volume ordering, payload hashes, and the recovery catalog live on the media rather than existing only in PostgreSQL.
 
 The implementation constants are the normative source during this alpha:
 
@@ -132,7 +132,7 @@ The on-tape fields are sufficient in principle for a replacement-host reader to:
 6. extract through DAR into an isolated destination;
 7. compare the restored tree with the authenticated source manifest.
 
-`tapescale-recovery` implements that database-independent full-archive path in `0.2.0-alpha.1`:
+`tapescale-recovery` implements that database-independent full-archive path in `0.2.0-alpha.2`:
 
 1. `capture-native-volume --device /dev/nstN --archive-dir /capture` rewinds one cartridge, reads the authenticated header, and uses its `slice_count` to stream the catalog, manifest, slices, index, and trailer without guessing at end of data.
 2. The capture rejects mismatched identities, ordinals, tape-file numbers, offsets, lengths, hashes, index commitments, duplicate media, or artifacts from another archive. It writes canonical DAR slice names into a private capture directory.
@@ -153,6 +153,8 @@ The first native release deliberately does not attempt append-after-interruption
 
 ## Compatibility
 
-TapeScale Native v1 cannot read Bacula volumes, and Bacula cannot read TapeScale Native v1 volumes. The `0.2.0-alpha.1` transition assumes that the deployment has zero valid Bacula tapes: failed and touched Bacula runs remain audit history, not recovery points. The runtime does not include a legacy Bacula recovery engine.
+TapeScale Native v1 cannot read Bacula volumes, and Bacula cannot read TapeScale Native v1 volumes. The `0.2.0` transition assumes that the deployment has zero valid Bacula tapes: failed and touched Bacula runs remain audit history, not recovery points. The runtime does not include a legacy Bacula recovery engine.
+
+Legacy volume rows are retained for audit but retired from active protection and catalog-reconciliation decisions. A retired cartridge is never silently reused: it must still be loaded and explicitly authorized through the destructive **Prepare tape** workflow, which overwrites the old format with a verified TapeScale preparation identity.
 
 Do not destructively prepare older media merely to make it appear native. If an older cartridge might contain data worth recovering, remove it from this alpha workflow and preserve it with the software needed for its original format.

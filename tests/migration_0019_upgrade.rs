@@ -49,6 +49,18 @@ async fn native_archive_upgrade_preserves_legacy_rows_and_accepts_native_segment
         .await
         .expect("legacy schema should migrate through 0018");
 
+    let through_0019 = Migrator {
+        migrations: Cow::Owned(
+            all.iter()
+                .filter(|migration| migration.version <= 19)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+
     sqlx::raw_sql(
         r#"
         INSERT INTO truenas_instances
@@ -196,7 +208,8 @@ async fn native_archive_upgrade_preserves_legacy_rows_and_accepts_native_segment
     .await
     .expect("legacy fixtures should persist before the native upgrade");
 
-    all.run(&pool)
+    through_0019
+        .run(&pool)
         .await
         .expect("0019 should enable TapeScale native archive metadata");
 

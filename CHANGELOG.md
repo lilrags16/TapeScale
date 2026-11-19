@@ -2,6 +2,14 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.2.0-alpha.2] - 2026-11-19
+
+### Release pipeline and legacy-media cutover fixes
+
+- Restores Debian snapshot package bootstrap from the signed HTTP archive so the minimal runtime and DAR-builder stages can install `ca-certificates` before using HTTPS for the hash-pinned DAR and libthreadar source downloads.
+- Retains failed Bacula-era recovery and volume rows as audit history while retiring those volume rows from active protection, reconciliation, and prepared-media checks. A non-WORM cartridge with no independent hold can therefore be reused only through the existing explicit destructive **Prepare tape** confirmation.
+- Supersedes `v0.2.0-alpha.1`, whose container build could not bootstrap its CA bundle.
+
 ## [0.2.0-alpha.1] - 2026-11-19
 
 ### TapeScale Native v1
@@ -253,6 +261,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.2.0-alpha.2]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.2
 [0.2.0-alpha.1]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.1
 [0.1.0-alpha.15]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.15
 [0.1.0-alpha.14]: https://github.com/lilrags16/TapeScale/releases/tag/v0.1.0-alpha.14

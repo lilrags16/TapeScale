@@ -3306,13 +3306,14 @@
     let html = pageHead("Recovery vault", "Browse durable recovery points and retained media evidence. Native offline recovery is available with tapescale-recovery; in-console restore remains pending.", refreshButton()) + noticeFor("recoveryPoints") + noticeFor("restoreRehearsals");
     if (!points.length) return html + empty("No recovery points", state.errors.recoveryPoints ? "Recovery points could not be loaded." : "A verified Full backup or physical recovery exercise will create the first durable recovery point.", '<a class="button button-primary" href="#jobs">Open Backup Center</a> <a class="button button-quiet" href="#recovery-lab">Open recovery exercise</a>');
     const selected = selectedRecoveryPoint();
-    const verified = points.filter((point) => recoveryPointState(point) === "verified").length;
+    const verifiedPoints = points.filter((point) => recoveryPointState(point) === "verified");
+    const verified = verifiedPoints.length;
     const tapes = new Set(points.flatMap(recoveryPointMediaLabels));
-    const logicalBytes = points.reduce((total, point) => {
+    const logicalBytes = verifiedPoints.reduce((total, point) => {
       const value = Number(recoveryPointLogicalBytes(point));
       return total + (Number.isFinite(value) && value >= 0 ? value : 0);
     }, 0);
-    const lastVerified = points.find((point) => recoveryPointState(point) === "verified");
+    const lastVerified = verifiedPoints[0];
     html += '<section class="panel metric-strip vault-metrics"><div class="metric"><span>Recovery points</span><strong>' + points.length + '</strong><small>All retained outcomes</small></div><div class="metric"><span>Verified</span><strong>' + verified + '</strong><small>Ready for prerequisite planning</small></div><div class="metric"><span>Cataloged media</span><strong>' + tapes.size + '</strong><small>Unique cartridge labels</small></div><div class="metric"><span>Protected data</span><strong>' + (logicalBytes ? esc(bytes(logicalBytes)) : "—") + '</strong><small>' + (lastVerified ? "Latest verified " + esc(date(pick(lastVerified, "recovery_time", "created_at"))) : "No verified point yet") + "</small></div></section>";
     const dossier = renderRecoveryPointDossier(selected);
     html += '<div class="vault-layout section">' + renderRecoveryPointCatalog(points, selected) + dossier + "</div>";

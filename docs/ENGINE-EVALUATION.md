@@ -1,10 +1,10 @@
 # Tape engine decision record
 
-Decision status: **TapeScale Native v1 selected for the `0.2.0-alpha.1` architecture; physical production qualification remains open**.
+Decision status: **TapeScale Native v1 selected for the `0.2.0-alpha.2` architecture; physical production qualification remains open**.
 
 ## Decision
 
-The Bacula-backed alpha path failed to provide the performance, operational simplicity, identity model, and dependable recovery contract required for TapeScale. The deployment has no valid Bacula recovery media, so `0.2.0-alpha.1` makes a clean, intentionally incompatible transition:
+The Bacula-backed alpha path failed to provide the performance, operational simplicity, identity model, and dependable recovery contract required for TapeScale. The deployment has no valid Bacula recovery media, so the `0.2.0` native alpha line makes a clean, intentionally incompatible transition:
 
 - TapeScale owns the on-tape format, cartridge/archive identities, volume ordering, motion, direct device I/O, physical byte readback, evidence, and recovery contract.
 - DAR 2.8.6 is a pinned, separately executed archive codec used to package and restore file trees.
