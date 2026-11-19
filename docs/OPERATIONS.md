@@ -1,6 +1,6 @@
 # TapeScale Native operations
 
-This guide covers TapeScale `0.2.0-alpha.7`, an attended alpha for one standalone SAS tape drive. New backups use **TapeScale Native v2** with DAR 2.8.6 as a separate archive codec. Native v1 media remains readable. Bacula is not part of the runtime.
+This guide covers TapeScale `0.2.0-alpha.8`, an attended alpha for one standalone SAS tape drive. New backups use **TapeScale Native v2** with DAR 2.8.6 as a separate archive codec. Native v1 media remains readable. Bacula is not part of the runtime.
 
 Do not make this alpha the only copy of data. Physical qualification is pending.
 

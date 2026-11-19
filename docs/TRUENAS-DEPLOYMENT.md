@@ -1,6 +1,6 @@
 # TrueNAS custom-app deployment
 
-TapeScale `0.2.0-alpha.7` is an attended evaluation build for TrueNAS SCALE on x86-64. It is not production-qualified. The repository-root [`compose.truenas.yaml`](../compose.truenas.yaml) is the complete pasteable custom-app definition.
+TapeScale `0.2.0-alpha.8` is an attended evaluation build for TrueNAS SCALE on x86-64. It is not production-qualified. The repository-root [`compose.truenas.yaml`](../compose.truenas.yaml) is the complete pasteable custom-app definition.
 
 The active data path is TapeScale Native v2 with DAR 2.8.6. Native v1 remains readable; the runtime does not install or start Bacula.
 
@@ -28,15 +28,21 @@ The spool does not need to hold the complete archive. It must hold the configure
 
 The Compose bind mounts use `create_host_path: false`; installation fails instead of silently creating ordinary directories when a dataset is absent.
 
+All host-specific values are together at the top of the Compose file. Edit only this block during normal installation:
+
+```yaml
+x-tapescale-host-settings:
+  source: &tapescale-source-host-path /mnt
+  spool: &tapescale-spool-host-path /mnt/tapescale-spool
+  restore: &tapescale-restore-host-path /mnt/tapescale-restores
+  tape: &tapescale-tape-device-mapping /dev/nst0:/dev/nst0:rwm
+```
+
+The service mount lists consume those YAML anchors and retain their required read-only/read-write boundaries. Do not edit the repeated service definitions.
+
 ### 2. Identify the tape device
 
-On the TrueNAS host, determine the non-rewinding device exported for the standalone drive, normally `/dev/nst0`. The Compose file requires the same exact value in:
-
-- `TAPESCALE_TAPE_DEVICES`;
-- the `devices` mapping source;
-- the `devices` mapping destination.
-
-If the host uses `/dev/nst1`, change all three occurrences to `/dev/nst1`. Never map `/dev/stN` as the active device; automatic rewind on close breaks TapeScale's tape-file layout.
+On the TrueNAS host, determine the non-rewinding device exported for the standalone drive, normally `/dev/nst0`. Set the single `tape` value in `x-tapescale-host-settings`, keeping the mapping's host and container paths identical. If the host uses `/dev/nst1`, use `/dev/nst1:/dev/nst1:rwm`. The worker automatically discovers mapped `/dev/nstN` devices inside the container. Never map `/dev/stN`; automatic rewind on close breaks TapeScale's tape-file layout.
 
 ### 3. Confirm the source model
 
@@ -48,11 +54,11 @@ This broad read-only bind is an alpha convenience. A qualified deployment should
 
 1. Open **Apps → Discover Apps → ⋮ → Install via YAML**.
 2. Paste the entire contents of [`compose.truenas.yaml`](../compose.truenas.yaml).
-3. Check the tape device mapping and host port.
+3. Edit only `x-tapescale-host-settings` and check the host port.
 4. Install the app.
 5. Open `http://TRUENAS-IP:18080` from the isolated management network.
 
-The release Compose builds the immutable Git tag `v0.2.0-alpha.7` and labels the image with the same revision. `pull_policy: build` makes TrueNAS fetch and build that tagged source.
+The Compose build context follows GitHub `main`, and `pull_policy: build` makes every explicit install or TrueNAS redeploy resolve and build the current branch head. It does not update a running app in the background. This mutable channel favors rapid alpha testing over reproducible release pinning; retain the resulting image digest and application logs with any qualification evidence.
 
 ## Native worker configuration
 
@@ -140,14 +146,14 @@ See [RECOVERY.md](RECOVERY.md) for commands and evidence requirements. In-consol
 1. Wait for all runs and physical tape I/O to finish.
 2. Confirm no drive or cartridge has an uncertain write state.
 3. Back up PostgreSQL and the recovery evidence volume.
-4. Edit the installed custom app.
-5. Replace its YAML with the new complete release Compose.
-6. Save/redeploy, retain the resulting image digest, and inspect migrations/logs.
-7. Re-run preflight and a disposable scratch-media exercise before trusting a new physical path.
+4. Redeploy the installed custom app to build the newest `main` commit.
+5. If `compose.truenas.yaml` itself changed, replace the installed YAML with the newest file and reapply only the `x-tapescale-host-settings` values.
+6. Retain the resulting image digest and inspect migrations/logs.
+7. Re-run preflight and a disposable scratch-media exercise before trusting the new build.
 
 Never point an older application image at a database that has already migrated and call that rollback. Restore a consistent database backup with the matching release instead.
 
-An interrupted partial Native v2 member is not resumed in place by alpha.7. TapeScale quarantines touched media, and retry creates and restages a new archive set. Do not delete a retained failed spool until its diagnostic evidence has been reviewed.
+An interrupted partial Native v2 member is not resumed in place by alpha.8. TapeScale quarantines touched media, and retry creates and restages a new archive set. Do not delete a retained failed spool until its diagnostic evidence has been reviewed.
 
 ## Security warning
 

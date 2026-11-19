@@ -36,7 +36,12 @@ pub struct SasDiscoveryConfig {
 
 impl SasDiscoveryConfig {
     pub fn from_env() -> Result<Self> {
-        let devices = parse_device_list(&env::var("TAPESCALE_TAPE_DEVICES").unwrap_or_default())?;
+        let configured_devices = env::var("TAPESCALE_TAPE_DEVICES").unwrap_or_default();
+        let devices = if configured_devices.trim().is_empty() {
+            discover_mapped_non_rewinding_devices(Path::new("/dev"))?
+        } else {
+            parse_device_list(&configured_devices)?
+        };
         Ok(Self {
             devices,
             sysfs_root: absolute_setting("TAPESCALE_SYSFS_ROOT", "/sys")?,
@@ -504,6 +509,24 @@ fn parse_device_list(raw: &str) -> Result<Vec<PathBuf>> {
     Ok(devices.into_iter().collect())
 }
 
+fn discover_mapped_non_rewinding_devices(device_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut devices = BTreeSet::new();
+    for entry in fs::read_dir(device_dir)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(number) = name.strip_prefix("nst") else {
+            continue;
+        };
+        if number.is_empty() || !number.chars().all(|character| character.is_ascii_digit()) {
+            continue;
+        }
+        devices.insert(Path::new("/dev").join(name));
+    }
+    Ok(devices.into_iter().collect())
+}
+
 fn validate_tape_path(path: &Path) -> Result<()> {
     if !path.is_absolute() || path.parent() != Some(Path::new("/dev")) {
         bail!(
@@ -908,6 +931,19 @@ mod tests {
         ] {
             assert!(parse_device_list(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn empty_configuration_discovers_only_mapped_non_rewinding_devices() {
+        let device_dir = tempfile::tempdir().expect("temporary device directory");
+        for name in ["nst2", "nst0", "nstx", "st0", "sg0", "nst1-extra"] {
+            fs::write(device_dir.path().join(name), []).expect("device fixture");
+        }
+
+        assert_eq!(
+            discover_mapped_non_rewinding_devices(device_dir.path()).expect("device discovery"),
+            vec![PathBuf::from("/dev/nst0"), PathBuf::from("/dev/nst2")]
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # TapeScale alpha TrueNAS deployment for an isolated attended environment.
 # Disposable credentials are intentionally embedded; this is not a production security model.
-# The worker expects one standalone SAS tape drive at /dev/nst0. If TrueNAS
-# exposes /dev/nst1 instead, set TAPESCALE_TAPE_DEVICES and both sides of the
-# device mapping to /dev/nst1 so the container path matches Linux sysfs.
+# The worker expects one standalone SAS tape drive. Set its same-name host and
+# container mapping once in the operator settings block below; the worker
+# automatically discovers the mapped /dev/nstN device.
 # This alpha stack exposes status, rewind, unload, native TapeScale tape
 # preparation, graphical source browsing, compressed DAR archive creation,
 # operator-attended multi-cartridge writes, immediate physical readback, retained
@@ -20,13 +20,25 @@
 
 name: tapescale
 
+# ---------------------------------------------------------------------------
+# OPERATOR SETTINGS — EDIT HOST MOUNTS AND TAPE DEVICE ONLY HERE
+#
+# Keep both sides of the tape mapping identical so Linux sysfs telemetry maps
+# to the correct drive. Example for a second drive: /dev/nst1:/dev/nst1:rwm
+# ---------------------------------------------------------------------------
+x-tapescale-host-settings:
+  source: &tapescale-source-host-path /mnt
+  spool: &tapescale-spool-host-path /mnt/tapescale-spool
+  restore: &tapescale-restore-host-path /mnt/tapescale-restores
+  tape: &tapescale-tape-device-mapping /dev/nst0:/dev/nst0:rwm
+
 x-tapescale-common: &tapescale-common
   build:
-    context: https://github.com/lilrags16/TapeScale.git#v0.2.0-alpha.7
+    # Every install or explicit TrueNAS redeploy resolves the current main HEAD.
+    context: https://github.com/lilrags16/TapeScale.git#main
     args:
-      TAPESCALE_VERSION: 0.2.0-alpha.7
-      TAPESCALE_REVISION: v0.2.0-alpha.7
-  image: tapescale:0.2.0-alpha.7
+      TAPESCALE_REVISION: main
+  image: tapescale:latest
   pull_policy: build
   restart: unless-stopped
   read_only: true
@@ -62,9 +74,14 @@ services:
       - edge
     volumes:
       - worker_recovery:/var/lib/tapescale/recovery:ro
-      - /mnt:/source:ro
       - type: bind
-        source: /mnt/tapescale-restores
+        source: *tapescale-source-host-path
+        target: /source
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: *tapescale-restore-host-path
         target: /restore
         read_only: true
         bind:
@@ -91,7 +108,6 @@ services:
     environment:
       <<: *tapescale-environment
       TAPESCALE_WORKER_POLL_SECS: "5"
-      TAPESCALE_TAPE_DEVICES: /dev/nst0
       TAPESCALE_SYSFS_ROOT: /sys
       TAPESCALE_MT_PATH: /usr/bin/mt-st
       TAPESCALE_DAR_PATH: /usr/local/bin/dar
@@ -111,17 +127,22 @@ services:
     healthcheck:
       disable: true
     devices:
-      - /dev/nst0:/dev/nst0:rwm
+      - *tapescale-tape-device-mapping
     volumes:
       - worker_recovery:/var/lib/tapescale/recovery
       - type: bind
-        source: /mnt/tapescale-spool
+        source: *tapescale-spool-host-path
         target: /var/lib/tapescale/spool
         bind:
           create_host_path: false
-      - /mnt:/source:ro
       - type: bind
-        source: /mnt/tapescale-restores
+        source: *tapescale-source-host-path
+        target: /source
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: *tapescale-restore-host-path
         target: /restore
         bind:
           create_host_path: false

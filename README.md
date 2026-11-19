@@ -6,7 +6,7 @@
 TapeScale is a safety-first LTO backup control plane for TrueNAS. It manages standalone SAS tape drives, cartridges, bounded rolling file archives, physical verification evidence, recovery metadata, retention, holds, and custody through a graphical console.
 
 > [!IMPORTANT]
-> Version `0.2.0-alpha.7` is an attended evaluation build, not production protection. New backups use **TapeScale Native v2**, a bounded rolling-spool format; existing Native v1 captures remain readable. Multi-tape writing, immediate physical readback, and database-independent full-archive capture/restore are implemented. In-console restore and selected-file recovery are not. Do not make this alpha the only copy of any data.
+> Version `0.2.0-alpha.8` is an attended evaluation build, not production protection. New backups use **TapeScale Native v2**, a bounded rolling-spool format; existing Native v1 captures remain readable. Multi-tape writing, immediate physical readback, and database-independent full-archive capture/restore are implemented. In-console restore and selected-file recovery are not. Do not make this alpha the only copy of any data.
 
 ## What changed in 0.2
 
@@ -57,12 +57,12 @@ In TrueNAS SCALE:
 
 1. Open **Apps → Discover Apps → ⋮ → Install via YAML**.
 2. Paste the complete [`compose.truenas.yaml`](compose.truenas.yaml).
-3. Confirm the mapped non-rewinding tape device. The default is `/dev/nst0`; if the host uses another device, update both `TAPESCALE_TAPE_DEVICES` and the device mapping to the same exact path.
+3. Edit only the top `x-tapescale-host-settings` block. Set the read-only source root, rolling spool dataset, restore dataset, and same-name non-rewinding tape mapping. The defaults use `/mnt`, `/mnt/tapescale-spool`, `/mnt/tapescale-restores`, and `/dev/nst0`.
 4. Install the app and open `http://TRUENAS-IP:18080`.
 
 The alpha Compose file intentionally uses a disposable embedded database password for an isolated test environment. It maps host `/mnt` read-only as `/source`, maps only the spool and restore datasets writable to the worker, exposes one named non-rewinding tape device, and does not mount the Docker socket or host root.
 
-To update the custom app, edit the installed app, replace its YAML with the latest [`compose.truenas.yaml`](https://raw.githubusercontent.com/lilrags16/TapeScale/main/compose.truenas.yaml), and save. Release Compose files pin their Git build context and OCI revision to an immutable tag.
+The TrueNAS Compose tracks the GitHub `main` branch and uses `pull_policy: build`. Every explicit install or redeploy therefore resolves and builds the newest `main` commit; a running app does not poll GitHub or replace itself in the background. For code-only updates, redeploy the app. When the Compose structure itself changes, replace the installed YAML with the latest [`compose.truenas.yaml`](https://raw.githubusercontent.com/lilrags16/TapeScale/main/compose.truenas.yaml), reapply the one settings block, and save.
 
 ## Prepare a tape
 

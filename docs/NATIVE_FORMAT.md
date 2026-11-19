@@ -2,7 +2,7 @@
 
 Status: **alpha; software write, readback, and clean-host recovery paths are implemented, but physical qualification is pending**
 
-TapeScale `0.2.0-alpha.7` writes `tapescale-native-v2`. Native v2 replaces Native v1's complete-archive disk stage with independently finalized DAR packs in a bounded rolling spool. New writes are v2. The recovery utility keeps explicit v1 read compatibility; neither native format is compatible with the earlier Bacula experiments.
+TapeScale `0.2.0-alpha.8` writes `tapescale-native-v2`. Native v2 replaces Native v1's complete-archive disk stage with independently finalized DAR packs in a bounded rolling spool. New writes are v2. The recovery utility keeps explicit v1 read compatibility; neither native format is compatible with the earlier Bacula experiments.
 
 The implementation constants are normative during alpha. DAR 2.8.6 is an archive codec only; TapeScale owns cartridge identity, tape layout, spanning, verification, and archive-set completion.
 

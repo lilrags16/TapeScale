@@ -2,6 +2,14 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.2.0-alpha.8] - 2026-11-19
+
+### Simplified TrueNAS deployment
+
+- Consolidates every operator-supplied host bind path into one `x-tapescale-host-settings` block at the top of the pasteable Compose file. Source, rolling spool, and restore datasets now flow through scalar YAML anchors while each service retains its required read-only or read/write boundary.
+- Moves the standalone tape mapping into the same block and automatically discovers mapped non-rewinding `/dev/nstN` devices when no explicit device list is supplied. Changing drives no longer requires matching an environment value plus two device-mapping paths in separate sections.
+- Switches the TrueNAS build context to GitHub `main` with `pull_policy: build`, so every explicit install or redeploy builds the newest main-branch commit. A running app does not self-update; the resulting image digest should be retained because this mutable alpha channel is intentionally less reproducible than a release-pinned deployment.
+
 ## [0.2.0-alpha.7] - 2026-11-19
 
 ### Native v2 upgrade enforcement
@@ -311,6 +319,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.2.0-alpha.8]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.8
 [0.2.0-alpha.7]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.7
 [0.2.0-alpha.6]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.6
 [0.2.0-alpha.5]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.5

@@ -18,6 +18,14 @@ require_text() {
   fi
 }
 
+reject_text() {
+  local file=$1
+  local rejected=$2
+  if grep -Fq -- "$rejected" "$file"; then
+    fail "$file must not contain: $rejected"
+  fi
+}
+
 package_version="$(awk '
   /^\[package\]$/ { in_package = 1; next }
   /^\[/ && in_package { exit }
@@ -53,10 +61,12 @@ require_text Dockerfile 'org.opencontainers.image.revision="${TAPESCALE_REVISION
 require_text .env.example "TAPESCALE_VERSION=${package_version}"
 require_text compose.yaml 'TAPESCALE_VERSION: ${TAPESCALE_VERSION:-'"${package_version}"'}'
 require_text compose.yaml 'image: tapescale:${TAPESCALE_VERSION:-'"${package_version}"'}'
-require_text compose.truenas.yaml "context: https://github.com/lilrags16/TapeScale.git#${release_tag}"
-require_text compose.truenas.yaml "TAPESCALE_VERSION: ${package_version}"
-require_text compose.truenas.yaml "TAPESCALE_REVISION: ${release_tag}"
-require_text compose.truenas.yaml "image: tapescale:${package_version}"
+require_text compose.truenas.yaml 'x-tapescale-host-settings:'
+require_text compose.truenas.yaml 'context: https://github.com/lilrags16/TapeScale.git#main'
+require_text compose.truenas.yaml 'TAPESCALE_REVISION: main'
+require_text compose.truenas.yaml 'image: tapescale:latest'
+require_text compose.truenas.yaml 'pull_policy: build'
+reject_text compose.truenas.yaml 'TAPESCALE_VERSION:'
 require_text .github/workflows/ci.yml 'tags: ["v*"]'
 require_text .github/workflows/ci.yml 'run: scripts/check-release-consistency.sh'
 
