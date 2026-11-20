@@ -381,7 +381,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         QueueQualificationRunResult::Blocked(_)
     ));
     let scratch_request = NewMedia {
-        internal_label: "INTEGRATION-SCRATCH-L8-000001".to_owned(),
+        internal_label: "INTEGRATION-SCRATCH-L9-000001".to_owned(),
         barcode: Some("INT9SCR001".to_owned()),
         media_generation: 8,
         media_format: "LTO-8".to_owned(),
