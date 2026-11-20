@@ -381,10 +381,10 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         QueueQualificationRunResult::Blocked(_)
     ));
     let scratch_request = NewMedia {
-        internal_label: "INTEGRATION-SCRATCH-L9-000001".to_owned(),
+        internal_label: "INTEGRATION-SCRATCH-L8-000001".to_owned(),
         barcode: Some("INT9SCR001".to_owned()),
-        media_generation: 9,
-        media_format: "LTO-9".to_owned(),
+        media_generation: 8,
+        media_format: "LTO-8".to_owned(),
         worm: false,
     };
     let scratch = store::create_media(&pool, &scratch_request)
@@ -478,6 +478,26 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
     assert_eq!(replay_response["idempotent_replay"], true);
     assert_eq!(replay_response["audit"], "existing");
     assert_eq!(replay_response["disposition"], "existing");
+    let corrected_scratch = sqlx::query_as::<_, (Option<i16>, Option<String>)>(
+        "SELECT media_generation, media_format FROM cartridges WHERE id = $1",
+    )
+    .bind(scratch.id)
+    .fetch_one(&pool)
+    .await
+    .expect("loaded-media generation correction should persist");
+    assert_eq!(corrected_scratch, (Some(9), Some("LTO-9".to_owned())));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM audit_events
+              WHERE action = 'media.generation_observed'
+                AND object_type = 'cartridge' AND object_id = $1",
+        )
+        .bind(scratch.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("loaded-media generation correction audit should query"),
+        1
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM qualification_runs WHERE idempotency_key = $1"
