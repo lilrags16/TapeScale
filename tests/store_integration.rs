@@ -260,6 +260,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
 
     observation.ready = Some(true);
     observation.medium_loaded = Some(true);
+    observation.loaded_media_generation = Some(9);
     observation.at_bot = Some(false);
     observation.status = "ready".to_owned();
     observation.observed_at = Utc::now();
