@@ -3,10 +3,10 @@
 //! Native v1 deliberately staged one complete DAR archive before touching
 //! tape.  That is a useful qualification shape, but it cannot represent a
 //! 30 TiB archive with a 1 TiB spool.  Native v2 instead creates independently
-//! testable DAR packs.  A single background producer continuously builds and
-//! validates packs while the tape consumer drains earlier packs. Disk usage is
-//! bounded at the configured high-water mark, and every handoff occurs at a
-//! complete tape-file boundary.
+//! testable DAR packs. On a rotational spool, pack production and tape drain
+//! run as exclusive batches so competing seeks cannot starve the tape drive.
+//! Disk usage is bounded at the configured high-water mark, and every handoff
+//! occurs at a complete tape-file boundary.
 
 use std::{
     collections::VecDeque,
@@ -141,6 +141,7 @@ struct OpenVolume {
 struct SpoolWindow {
     capacity_bytes: u64,
     low_water_bytes: u64,
+    ready_bytes: u64,
     high_water_bytes: u64,
 }
 
@@ -155,6 +156,7 @@ struct ProducerSummary {
 /// filling the spool in a detached task.
 struct NativePackProducer {
     receiver: mpsc::Receiver<StagedPack>,
+    permits: mpsc::Sender<()>,
     task: Option<JoinHandle<Result<ProducerSummary, ExerciseFailure>>>,
     cancellation: CancellationToken,
 }
@@ -227,13 +229,15 @@ fn ready_queue_resume_bytes(
     spool: SpoolWindow,
     sizing: DarPackSizing,
 ) -> Result<u64, ExerciseFailure> {
-    let resume = spool
-        .high_water_bytes
-        .checked_sub(sizing.maximum_bytes)
-        .ok_or_else(|| ExerciseFailure::blocked("Native v2 ready-queue window underflowed"))?;
-    if resume < sizing.target_bytes || resume <= spool.low_water_bytes {
+    let resume = spool.ready_bytes;
+    if resume < sizing.target_bytes
+        || resume <= spool.low_water_bytes
+        || resume
+            .checked_add(sizing.maximum_bytes)
+            .is_none_or(|required| required > spool.high_water_bytes)
+    {
         return Err(ExerciseFailure::blocked(
-            "Native v2 spool watermarks cannot provide startup and refill hysteresis",
+            "Native v2 spool settings cannot hold the ready reserve plus one maximum pack",
         ));
     }
     Ok(resume)
@@ -244,7 +248,7 @@ const fn ready_queue_needs_refill(
     low_water_bytes: u64,
     producer_complete: bool,
 ) -> bool {
-    !producer_complete && ready_bytes <= low_water_bytes
+    !producer_complete && ready_bytes < low_water_bytes
 }
 
 async fn refill_ready_queue(
@@ -254,6 +258,11 @@ async fn refill_ready_queue(
     producer_summary: &mut Option<ProducerSummary>,
 ) -> Result<(), ExerciseFailure> {
     while ready.physical_bytes < resume_bytes && producer_summary.is_none() {
+        // Production is explicitly batch-gated. A single rotational spool
+        // never builds a new DAR pack while tape is draining an earlier pack;
+        // that seek fight was slower than either operation and made the drive
+        // shoe-shine. Each permit produces exactly one complete tested pack.
+        let _ = producer.permits.send(()).await;
         match producer.receiver.recv().await {
             Some(pack) => ready.push(pack)?,
             None => *producer_summary = Some(producer.finish().await?),
@@ -361,8 +370,10 @@ pub(super) async fn execute_claimed(
                 FailureClass::Interrupted => store::SingleTapeDataTerminalState::Interrupted,
                 FailureClass::Cancelled => store::SingleTapeDataTerminalState::Cancelled,
             };
+            let failure_code = error.code;
             let result = json!({
                 "detail": error.detail,
+                "failure_code": failure_code,
                 "position_uncertain": tape_touched && !cleanup.0,
                 "media_write_started": media_write_started,
                 "cleanup": cleanup.1,
@@ -397,6 +408,7 @@ async fn produce_native_v2_packs(
     sizing: DarPackSizing,
     compression: DarCompression,
     spool: SpoolWindow,
+    mut permits: mpsc::Receiver<()>,
     sender: mpsc::Sender<StagedPack>,
 ) -> Result<ProducerSummary, ExerciseFailure> {
     let pack_total = u64::try_from(plans.len())
@@ -405,9 +417,24 @@ async fn produce_native_v2_packs(
     let mut produced_encoded_bytes = 0_u64;
 
     for plan in &plans {
+        tokio::select! {
+            permit = permits.recv() => {
+                if permit.is_none() {
+                    return Err(ExerciseFailure::interrupted(
+                        "the Native v2 tape consumer stopped requesting pack batches",
+                    ));
+                }
+            }
+            _ = cancellation.cancelled() => {
+                return Err(ExerciseFailure::cancelled(
+                    "Native v2 pack production was cancelled while parked at a safe pack boundary",
+                ));
+            }
+        }
         // Reserve room for the worst permitted in-progress pack before DAR is
         // launched. The consumer reclaims complete packs after each durable
-        // tape-file close, so this wait naturally unblocks while tape streams.
+        // tape-file close; the next permitted batch begins while tape remains
+        // parked at that safe filemark boundary.
         loop {
             let usage = spool_usage(&stage_directory)?;
             if usage
@@ -440,6 +467,7 @@ async fn produce_native_v2_packs(
             &cancellation,
             &stage_directory,
             plan,
+            sizing,
             compression,
             spool,
             manifest_entry_start,
@@ -555,15 +583,15 @@ async fn perform_native_v2_backup(
     let spool = configured_spool_window(config)?;
     let sizing = effective_pack_sizing(config, claim, &source_manifest)?;
     if spool.high_water_bytes
-        < sizing
-            .target_bytes
+        < spool
+            .ready_bytes
             .checked_add(sizing.maximum_bytes)
             .ok_or_else(|| ExerciseFailure::blocked("Native v2 pack window overflowed"))?
     {
         return Err(ExerciseFailure::blocked(format!(
-            "the configured Native v2 spool high-water mark ({}) cannot hold one completed target pack plus one maximum in-progress pack ({})",
+            "the configured Native v2 spool high-water mark ({}) cannot hold the ready reserve plus one maximum in-progress pack ({})",
             spool.high_water_bytes,
-            sizing.target_bytes.saturating_add(sizing.maximum_bytes)
+            spool.ready_bytes.saturating_add(sizing.maximum_bytes)
         )));
     }
     let inputs = manifest
@@ -597,7 +625,7 @@ async fn perform_native_v2_backup(
         claim,
         store::SingleTapeDataPhase::Writing,
         json!({
-            "detail": "building independently testable DAR packs while concurrently streaming validated earlier packs from the bounded spool to tape",
+            "detail": "building independently testable DAR packs in bounded disk batches, then streaming each ready batch to tape without competing spool seeks",
             "archive_id": claim.run.archive_id,
             "archive_codec": "dar",
             "format_version": NATIVE_ROLLING_FORMAT_NAME,
@@ -609,8 +637,9 @@ async fn perform_native_v2_backup(
             "pack_maximum_bytes": sizing.maximum_bytes,
             "spool_capacity_bytes": spool.capacity_bytes,
             "spool_low_water_bytes": spool.low_water_bytes,
+            "spool_ready_bytes": spool.ready_bytes,
             "spool_high_water_bytes": spool.high_water_bytes,
-            "shoe_shine_protection": "concurrent_pack_producer_with_complete_filemark_boundaries"
+            "shoe_shine_protection": "exclusive_rotational_spool_batches_at_complete_filemarks"
         }),
     )
     .await?;
@@ -627,11 +656,8 @@ async fn perform_native_v2_backup(
     let pack_total = u64::try_from(plans.len())
         .map_err(|_| ExerciseFailure::failed("too many Native v2 packs"))?;
     let descriptor_capacity = plans.len();
-    let channel_capacity = usize::try_from(spool.high_water_bytes / sizing.target_bytes)
-        .unwrap_or(64)
-        .saturating_add(2)
-        .clamp(2, 64);
-    let (sender, receiver) = mpsc::channel(channel_capacity);
+    let (sender, receiver) = mpsc::channel(1);
+    let (permit_sender, permit_receiver) = mpsc::channel(1);
     let producer_cancellation = cancellation.child_token();
     let producer_task = tokio::spawn(produce_native_v2_packs(
         pool.clone(),
@@ -644,10 +670,12 @@ async fn perform_native_v2_backup(
         sizing,
         compression,
         spool,
+        permit_receiver,
         sender,
     ));
     let mut producer = NativePackProducer {
         receiver,
+        permits: permit_sender,
         task: Some(producer_task),
         cancellation: producer_cancellation,
     };
@@ -816,7 +844,7 @@ async fn perform_native_v2_backup(
         reclaim_staged_pack(pool, claim, stage_directory, &staged).await?;
 
         // The pack just ended at a committed filemark. If the ready reserve is
-        // at or below low-water, keep the drive parked at this safe boundary
+        // below low-water, keep the drive parked at this safe boundary
         // until the producer restores the resume threshold (or reaches EOF).
         if ready_queue_needs_refill(
             ready.physical_bytes,
@@ -1033,6 +1061,7 @@ fn configured_spool_window(config: &Config) -> Result<SpoolWindow, ExerciseFailu
     Ok(SpoolWindow {
         capacity_bytes: available.saturating_sub(config.native_spool_reserve_bytes),
         low_water_bytes: config.native_spool_low_water_bytes,
+        ready_bytes: config.native_spool_ready_bytes,
         high_water_bytes: config.native_spool_high_water_bytes,
     })
 }
@@ -1053,9 +1082,8 @@ fn effective_pack_sizing(
             "the selected tape leaves only {per_volume} bytes for Native v2 packs, below the minimum supported pack target of {MIN_NATIVE_PACK_TARGET_BYTES} bytes"
         )));
     }
-    let maximum = target
-        .checked_add(target / 2)
-        .unwrap_or(MAX_NATIVE_PACK_TARGET_BYTES)
+    let maximum = config
+        .native_pack_maximum_bytes
         .min(MAX_NATIVE_PACK_TARGET_BYTES)
         .min(per_volume);
     DarPackSizing::new(target, maximum).map_err(|error| ExerciseFailure::blocked(error.to_string()))
@@ -1304,6 +1332,7 @@ async fn stage_one_pack(
     cancellation: &CancellationToken,
     stage_directory: &Path,
     plan: &PlannedDarPack,
+    sizing: DarPackSizing,
     compression: DarCompression,
     spool: SpoolWindow,
     manifest_entry_start: u64,
@@ -1343,6 +1372,7 @@ async fn stage_one_pack(
         plan,
         pack_total,
         "packing_pack",
+        Some(sizing.maximum_bytes),
     )
     .await?;
     let archive = discover_staged_pack_with_progress(
@@ -1359,6 +1389,12 @@ async fn stage_one_pack(
         spool,
     )
     .await?;
+    if archive.encoded_bytes > sizing.maximum_bytes {
+        return Err(ExerciseFailure::blocked(format!(
+            "Native v2 pack {} produced {} bytes, exceeding its hard {} byte pack boundary; the pack was stopped before tape motion",
+            plan.pack_ordinal, archive.encoded_bytes, sizing.maximum_bytes
+        )));
+    }
     let test = DarTestInvocation::new(
         &config.dar_path,
         &archive.archive_base,
@@ -1377,6 +1413,7 @@ async fn stage_one_pack(
         plan,
         pack_total,
         "validating_pack",
+        None,
     )
     .await?;
     let usage = spool_usage(stage_directory)?;
@@ -1453,6 +1490,7 @@ async fn run_pack_command(
     plan: &PlannedDarPack,
     pack_total: u64,
     engine_state: &'static str,
+    pack_maximum_bytes: Option<u64>,
 ) -> Result<(), ExerciseFailure> {
     let mut child = Command::new(program)
         .args(args)
@@ -1513,6 +1551,21 @@ async fn run_pack_command(
                 }
                 renew_claim(pool, claim, "while building or testing a Native v2 pack").await?;
                 let usage = spool_usage(stage_directory)?;
+                if let Some(maximum) = pack_maximum_bytes {
+                    let pack_directory = stage_directory.join(format!("pack-{:08}", plan.pack_ordinal));
+                    let pack_usage = spool_usage(&pack_directory)?.0;
+                    if pack_usage > maximum && cancelled.is_none() {
+                        cancelled = Some("DAR exceeded the hard per-pack byte boundary before tape motion");
+                        let _ = child.start_kill();
+                    }
+                }
+                let available = statvfs(stage_directory)
+                    .map(|status| status.f_bavail.saturating_mul(status.f_frsize))
+                    .unwrap_or(0);
+                if available < config.native_spool_reserve_bytes && cancelled.is_none() {
+                    cancelled = Some("Native v2 stopped pack production before consuming the spool safety reserve");
+                    let _ = child.start_kill();
+                }
                 if usage.0 > spool.high_water_bytes && cancelled.is_none() {
                     cancelled = Some("Native v2 pack production exceeded the configured spool high-water boundary");
                     let _ = child.start_kill();
@@ -1661,6 +1714,7 @@ struct V2Sample {
     spool_capacity_bytes: Option<u64>,
     spool_high_water_bytes: Option<u64>,
     spool_low_water_bytes: Option<u64>,
+    spool_ready_bytes: Option<u64>,
     spool_file_count: Option<u64>,
     spool_pack_count: Option<u64>,
     spool_fill_rate: Option<u64>,
@@ -1701,6 +1755,7 @@ impl V2Sample {
             spool_capacity_bytes: Some(spool.capacity_bytes),
             spool_high_water_bytes: Some(spool.high_water_bytes),
             spool_low_water_bytes: Some(spool.low_water_bytes),
+            spool_ready_bytes: Some(spool.ready_bytes),
             spool_file_count: Some(usage.1),
             spool_pack_count: None,
             spool_fill_rate: None,
@@ -1792,7 +1847,7 @@ async fn publish_v2_sample(
         no_progress_timeout_ms: Some(sample.no_progress_timeout_ms),
         spool_bytes: sample.spool_bytes,
         spool_capacity_bytes: sample.spool_capacity_bytes,
-        spool_target_bytes: sample.spool_high_water_bytes,
+        spool_target_bytes: sample.spool_ready_bytes,
         spool_file_count: sample.spool_file_count,
         spool_fill_bytes_per_second: sample.spool_fill_rate,
         spool_drain_bytes_per_second: sample.spool_drain_rate,
@@ -1833,6 +1888,20 @@ const fn native_job_id(archive_id: Uuid, progress_scope: u64) -> u64 {
 enum TapePayload {
     Bytes(Vec<u8>),
     Path(PathBuf),
+}
+
+fn native_tape_write_failure(
+    error: NativeArchiveError,
+    display_name: &str,
+    written: u64,
+    expected: u64,
+) -> ExerciseFailure {
+    if matches!(&error, NativeArchiveError::Io(source) if source.raw_os_error() == Some(28)) {
+        return ExerciseFailure::tape_capacity(format!(
+            "physical tape reached end of media while writing {display_name} after {written} of {expected} bytes; the loaded cartridge's observed capacity did not match its catalog record, or this archive needs another tape"
+        ));
+    }
+    ExerciseFailure::failed(error.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1880,9 +1949,20 @@ async fn write_tape_file(
     loop {
         tokio::select! {
             result = &mut write => {
-                let written = result
-                    .map_err(|error| ExerciseFailure::failed(format!("Native v2 tape writer failed: {error}")))?
-                    .map_err(|error| ExerciseFailure::failed(error.to_string()))?;
+                let outcome = result
+                    .map_err(|error| ExerciseFailure::failed(format!("Native v2 tape writer failed: {error}")))?;
+                let written = match outcome {
+                    Ok(written) => written,
+                    Err(error) => {
+                        let written = write_progress.load(Ordering::Acquire).min(expected);
+                        return Err(native_tape_write_failure(
+                            error,
+                            &display_name,
+                            written,
+                            expected,
+                        ));
+                    }
+                };
                 if written != expected {
                     return Err(ExerciseFailure::failed("Native v2 tape writer returned an incomplete tape file"));
                 }
@@ -2021,6 +2101,7 @@ async fn revalidate_volume_before_write(
             "the selected drive or loaded tape changed before the Native v2 write: {reason}"
         )));
     }
+    validate_loaded_media_generation(observation, record)?;
 
     // This reads TapeScale's preparation identity from the physical medium;
     // the UUID, rather than an operator acknowledgement, proves which tape is
@@ -2050,6 +2131,7 @@ async fn revalidate_volume_before_write(
             "the selected drive or loaded tape changed during loaded-tape verification: {reason}"
         )));
     }
+    validate_loaded_media_generation(observation, record)?;
     if observation.at_bot != Some(true) || observation.position_lost == Some(true) {
         return Err(ExerciseFailure::blocked(
             "loaded-tape verification did not leave the exact selected tape at a known beginning-of-tape position",
@@ -2061,6 +2143,28 @@ async fn revalidate_volume_before_write(
         "after proving the loaded TapeScale identity and before tape writing",
     )
     .await
+}
+
+fn validate_loaded_media_generation(
+    observation: &crate::device::SasDriveObservation,
+    record: &store::DataRunVolumeRecord,
+) -> Result<(), ExerciseFailure> {
+    let expected = record.expected_media_generation.ok_or_else(|| {
+        ExerciseFailure::blocked(
+            "the assigned cartridge has no recorded LTO generation; prepare the loaded tape again",
+        )
+    })?;
+    let observed = observation.loaded_media_generation.ok_or_else(|| {
+        ExerciseFailure::blocked(
+            "the loaded tape did not report a recognized LTO generation immediately before writing; TapeScale will not guess its capacity",
+        )
+    })?;
+    if observed != expected {
+        return Err(ExerciseFailure::blocked(format!(
+            "loaded tape density is LTO-{observed}, but the assigned cartridge is recorded as LTO-{expected}; prepare the loaded tape again so TapeScale can correct its capacity before writing"
+        )));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3274,11 +3378,13 @@ async fn finalize_native_v2_backup(
 #[cfg(test)]
 mod tests {
     use super::{
-        dar_current_file, native_v2_spool_telemetry, ready_queue_needs_refill,
-        ready_queue_resume_bytes, BlockingDiscoveryCancellation, SpoolWindow,
+        dar_current_file, native_tape_write_failure, native_v2_spool_telemetry,
+        ready_queue_needs_refill, ready_queue_resume_bytes, BlockingDiscoveryCancellation,
+        SpoolWindow,
     };
-    use crate::native_archive::DarPackSizing;
+    use crate::native_archive::{DarPackSizing, NativeArchiveError};
     use std::{
+        io,
         path::Path,
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -3320,17 +3426,18 @@ mod tests {
         let gib = 1024_u64 * 1024 * 1024;
         let spool = SpoolWindow {
             capacity_bytes: 900 * gib,
-            low_water_bytes: 256 * gib,
-            high_water_bytes: 768 * gib,
+            low_water_bytes: 32 * gib,
+            ready_bytes: 128 * gib,
+            high_water_bytes: 512 * gib,
         };
-        let sizing = DarPackSizing::new(256 * gib, 384 * gib).expect("valid sizing");
+        let sizing = DarPackSizing::new(64 * gib, 384 * gib).expect("valid sizing");
         assert_eq!(
             ready_queue_resume_bytes(spool, sizing).expect("hysteresis window"),
-            384 * gib
+            128 * gib
         );
-        assert!(ready_queue_needs_refill(256 * gib, 256 * gib, false));
-        assert!(!ready_queue_needs_refill(257 * gib, 256 * gib, false));
-        assert!(!ready_queue_needs_refill(0, 256 * gib, true));
+        assert!(ready_queue_needs_refill(31 * gib, 32 * gib, false));
+        assert!(!ready_queue_needs_refill(32 * gib, 32 * gib, false));
+        assert!(!ready_queue_needs_refill(0, 32 * gib, true));
     }
 
     #[test]
@@ -3338,10 +3445,11 @@ mod tests {
         let gib = 1024_u64 * 1024 * 1024;
         let spool = SpoolWindow {
             capacity_bytes: 700 * gib,
-            low_water_bytes: 256 * gib,
-            high_water_bytes: 640 * gib,
+            low_water_bytes: 32 * gib,
+            ready_bytes: 128 * gib,
+            high_water_bytes: 511 * gib,
         };
-        let sizing = DarPackSizing::new(256 * gib, 384 * gib).expect("valid sizing");
+        let sizing = DarPackSizing::new(64 * gib, 384 * gib).expect("valid sizing");
         assert!(ready_queue_resume_bytes(spool, sizing).is_err());
     }
 
@@ -3356,5 +3464,20 @@ mod tests {
         .expect("valid ledger");
         assert_eq!(telemetry, (1, 700));
         assert!(native_v2_spool_telemetry([("staged", "present", -1)]).is_err());
+    }
+
+    #[test]
+    fn tape_enospc_is_reported_as_physical_end_of_media() {
+        let failure = native_tape_write_failure(
+            NativeArchiveError::Io(io::Error::from_raw_os_error(28)),
+            "pack-00000006.slice-000001",
+            212_370_157_722,
+            273_738_824_267,
+        );
+        assert_eq!(failure.code, Some("tape_capacity_exhausted"));
+        assert!(failure
+            .detail
+            .contains("physical tape reached end of media"));
+        assert!(failure.detail.contains("212370157722 of 273738824267"));
     }
 }

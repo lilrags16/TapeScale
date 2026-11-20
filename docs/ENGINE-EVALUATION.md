@@ -1,6 +1,6 @@
 # Tape engine decision record
 
-Decision status: **TapeScale Native v2 selected for the `0.2.0-alpha.9` architecture; physical production qualification remains open**.
+Decision status: **TapeScale Native v2 selected for the `0.2.0-alpha.11` architecture; physical production qualification remains open**.
 
 ## Decision
 
@@ -8,7 +8,7 @@ The Bacula-backed alpha path failed to provide the performance, operational simp
 
 - TapeScale owns the on-tape format, cartridge/archive identities, volume ordering, motion, direct device I/O, physical byte readback, evidence, and recovery contract.
 - DAR 2.8.6 is a pinned, separately executed archive codec used to package and restore file trees.
-- The source is split into independently tested DAR packs that are produced concurrently into a bounded rolling disk spool; a 1 TiB spool does not need to hold a 30 TiB archive.
+- The source is split into independently tested DAR packs produced in bounded disk batches; a 1 TiB spool does not need to hold a 30 TiB archive.
 - Every native volume carries an authenticated header and source manifest, ordered pack descriptors/catalogs/slices, a chained index, and a trailer; the final member carries the archive-set seal.
 - A clean-host `tapescale-recovery` utility captures and authenticates tapes, reconstructs the archive, extracts it, and compares the restored tree without PostgreSQL.
 - The runtime image contains no Bacula package, daemon, console, or catalog utility.
@@ -20,7 +20,7 @@ The exact media contract is documented in [NATIVE_FORMAT.md](NATIVE_FORMAT.md). 
 The new architecture directly addresses the observed failure modes:
 
 - Independently finalized DAR packs turn tiny files into long sequential tape files while bounded disk absorbs short source, metadata, and compression stalls.
-- Concurrent production and consumption avoid the long whole-archive pre-stage while high/low watermarks bound disk use. Sustained production below the drive's streaming floor can still cause a safe filemark pause and must be measured physically.
+- Exclusive production and drain batches avoid rotational seek contention while ready/low/high watermarks bound disk use. Pack production below the drive's consumption rate causes an intentional safe-filemark pause and must be measured physically.
 - TapeScale reads identity from media at destructive boundaries instead of asking the operator to attest repeatedly to the only loaded cartridge.
 - Native headers and trailers make a cartridge self-describing and bind it to one archive and volume ordinal.
 - Immediate readback verifies the bytes actually readable from every written tape.

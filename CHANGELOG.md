@@ -2,6 +2,16 @@
 
 All notable TapeScale releases are documented here. TapeScale uses Semantic Versioning prerelease identifiers; alpha releases are not production-qualified.
 
+## [0.2.0-alpha.11] - 2026-11-20
+
+### Physical media capacity and deterministic spool batches
+
+- Reads the loaded cartridge's physical LTO density from the kernel, exposes it in drive health, and requires that evidence at preparation and immediately before every Native v2 write. Destructive preparation automatically corrects an eligible empty catalog record to the observed generation, preventing an LTO-5 cartridge from being planned at LTO-6 capacity.
+- Classifies device `ENOSPC` during a tape write as physical end-of-media rather than spool exhaustion. The retained result and operator page now explain that the partial set is not a recovery point, show completed-pack bytes separately from whole-archive totals, and report successful rewind-to-BOT cleanup instead of leaving apparent background motion unexplained.
+- Makes multi-tape continuation automatic for new and existing Native v2 backup profiles. Conservative capacity planning changes tapes at complete pack boundaries; unexpected physical EOM still fails closed because a partially written pack cannot be sealed safely.
+- Replaces simultaneous pack production and tape drain on a single rotational spool with exclusive bounded batches at durable filemarks. Normal packs shrink from 256 GiB to 64 GiB, tape starts at a 128 GiB ready reserve, refill begins below 32 GiB, the disk ceiling is 512 GiB, and an independent 384 GiB maximum still permits a large file or hard-link allocation group.
+- Enforces the per-pack hard limit and the filesystem free-space reserve while DAR is running, keeps live spool progress tied to the ready target, and makes new backup policies unconditionally multi-tape capable.
+
 ## [0.2.0-alpha.10] - 2026-11-19
 
 ### Lease-safe Native v2 preparation
@@ -336,6 +346,7 @@ First public alpha release.
 - The general backup path proves complete write/readback, not a restore. The separate G0.2 recovery exercise remains single-cartridge and bounded.
 - Clean-host catalog reconstruction, independent key recovery, native ZFS streaming, path-selective restore, and production qualification remain open.
 
+[0.2.0-alpha.11]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.11
 [0.2.0-alpha.10]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.10
 [0.2.0-alpha.9]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.9
 [0.2.0-alpha.8]: https://github.com/lilrags16/TapeScale/releases/tag/v0.2.0-alpha.8

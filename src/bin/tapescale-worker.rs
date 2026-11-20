@@ -1347,6 +1347,7 @@ mod tests {
             wwn: Some("naa.5001".to_owned()),
             firmware: Some("A1".to_owned()),
             generation: None,
+            loaded_media_generation: Some(9),
             observed_path: "/dev/nst0".to_owned(),
             device_major: 9,
             device_minor: 128,

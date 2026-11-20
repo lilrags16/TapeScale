@@ -2,7 +2,7 @@
 
 Status: **alpha; software write, readback, and clean-host recovery paths are implemented, but physical qualification is pending**
 
-TapeScale `0.2.0-alpha.9` writes `tapescale-native-v2`. Native v2 replaces Native v1's complete-archive disk stage with independently finalized DAR packs in a bounded rolling spool. New writes are v2. The recovery utility keeps explicit v1 read compatibility; neither native format is compatible with the earlier Bacula experiments.
+TapeScale `0.2.0-alpha.11` writes `tapescale-native-v2`. Native v2 replaces Native v1's complete-archive disk stage with independently finalized DAR packs in a bounded rolling spool. New writes are v2. The recovery utility keeps explicit v1 read compatibility; neither native format is compatible with the earlier Bacula experiments.
 
 The implementation constants are normative during alpha. DAR 2.8.6 is an archive codec only; TapeScale owns cartridge identity, tape layout, spanning, verification, and archive-set completion.
 
@@ -27,17 +27,19 @@ The release defaults are:
 
 | Control | Default |
 |---|---:|
-| pack target | 256 GiB (`274877906944`) |
-| spool high-water | 768 GiB (`824633720832`) |
-| spool low-water | 256 GiB (`274877906944`) |
-| derived ready-queue resume threshold | 384 GiB (high-water minus one maximum in-progress pack) |
+| normal pack target | 64 GiB (`68719476736`) |
+| oversized allocation maximum | 384 GiB (`412316860416`) |
+| spool high-water | 512 GiB (`549755813888`) |
+| ready-queue target | 128 GiB (`137438953472`) |
+| spool low-water | 32 GiB (`34359738368`) |
+| DAR slice size | 16 GiB (`17179869184`) |
 | filesystem free-space reserve | 8 GiB (`8589934592`) |
 
-The worker inventories the immutable source, groups hard links, and assigns hard-link-closed manifest intervals to ordered packs. It creates, tests, hashes, and seals packs sequentially on disk. Before initial tape motion, the consumer collects validated packs to the derived resume threshold, or waits for producer completion when the entire archive is smaller. Pack production then continues concurrently with tape consumption. After a pack's complete tape files close durably, its spool files can be reclaimed; the pack remains unverified until the containing volume is rewound and passes full physical readback.
+The worker inventories the immutable source, groups hard links, and assigns hard-link-closed manifest intervals to ordered packs. It creates, tests, hashes, and seals packs sequentially on disk. Before initial tape motion, the consumer collects validated packs to the ready target, or waits for producer completion when the entire archive is smaller. On a rotational spool, DAR then parks while tape drains that batch through sequential reads. After a pack's complete tape files close durably, its spool files can be reclaimed; the pack remains unverified until the containing volume is rewound and passes full physical readback.
 
-Low-water controls refill hysteresis, not merely telemetry. When validated ready bytes reach or fall below low-water, the writer stays at the clean filemark after the current pack until the queue reaches the resume threshold or the producer finishes. It never pauses halfway through a DAR slice or native record.
+Low-water controls refill hysteresis, not merely telemetry. When validated ready bytes fall below low-water, the writer stays at the clean filemark after the current pack until the queue reaches the ready target or the producer finishes. It never pauses halfway through a DAR slice or native record.
 
-The spool therefore does **not** need to hold the whole archive. A 1 TiB spool supports the shipped 768/256/8 GiB policy, subject to filesystem overhead and other use. It must remain a dedicated writable POSIX-compatible filesystem outside the source, restore, and evidence trees.
+The spool therefore does **not** need to hold the whole archive. A 1 TiB spool supports the shipped 512 GiB high-water plus 8 GiB reserve policy, subject to filesystem overhead and other use. It must remain a dedicated writable POSIX-compatible filesystem outside the source, restore, and evidence trees.
 
 ### Allocation limit
 

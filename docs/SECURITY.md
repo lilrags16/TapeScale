@@ -1,6 +1,6 @@
 # Security model
 
-TapeScale `0.2.0-alpha.9` is an attended, non-production release. The alpha web application has no accounts, authorization, or TLS termination. Anyone who can reach its HTTP port can inspect filenames and attempt to initiate the exposed workflows. Deploy it only on an isolated trusted network behind host-level access controls, and never load retained or unknown media while destructive features are enabled.
+TapeScale `0.2.0-alpha.11` is an attended, non-production release. The alpha web application has no accounts, authorization, or TLS termination. Anyone who can reach its HTTP port can inspect filenames and attempt to initiate the exposed workflows. Deploy it only on an isolated trusted network behind host-level access controls, and never load retained or unknown media while destructive features are enabled.
 
 ## Authority boundaries
 

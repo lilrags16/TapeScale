@@ -896,7 +896,10 @@
       const value = pick(source, ...keys);
       if (value !== null) return value;
     }
+    const aggregateSize = keys.some((key) => ["logical_bytes", "source_bytes", "encoded_bytes", "media_bytes", "bytes_written"].includes(key));
+    const perPackEvents = new Set(["pack_staged", "pack_assigned", "pack_written", "spool_reclaimed"]);
     for (const event of backupRunEvents(run).slice().reverse()) {
+      if (aggregateSize && perPackEvents.has(String(pick(event, "event_type") || "").toLowerCase())) continue;
       const value = pick(objectValue(event, "evidence"), ...keys);
       if (value !== null) return value;
     }
@@ -1260,7 +1263,7 @@
               ? "Physical readback"
               : backupPipeline ? "Archive write stream" : readPipeline ? "Archive read stream" : "Archive engine stream";
     const pipelineDetail = nativePacking
-      ? "Source files packaged into a bounded rolling disk buffer · ready packs may stream in parallel"
+      ? "Source files packaged into a bounded rolling disk buffer · tape stays safely parked during pack production"
       : engineState === "hashing_pack"
         ? "The completed disk pack is hashed before it joins the tape-ready queue"
         : nativeValidating
@@ -1331,9 +1334,9 @@
         : " The no-progress safety threshold has been reached."
       : "";
     const nativeActivityDetail = {
-      packing: "DAR is packaging the next bounded archive pack on disk. Before startup or after low-water, tape stays at a safe boundary until the validated reserve reaches its resume threshold.",
-      packing_pack: "DAR is packaging the next bounded archive pack while TapeScale enforces the spool high-water mark and streams ready packs in parallel.",
-      refilling_spool: "TapeScale is prefilling or replenishing the validated ready reserve; tape stays at a safe tape-file boundary until the resume threshold or producer completion.",
+      packing: "DAR is packaging the next bounded archive pack on disk. Before startup or below low-water, tape stays safely parked until the validated reserve reaches its ready target.",
+      packing_pack: "DAR is packaging the next bounded archive pack while TapeScale enforces the spool high-water mark; tape remains safely parked until the ready batch is complete.",
+      refilling_spool: "TapeScale is prefilling or replenishing the validated ready reserve; tape stays at a safe tape-file boundary until the ready target or producer completion.",
       validating: "TapeScale is validating a completed archive pack before allowing it onto tape.",
       validating_pack: "TapeScale is validating a completed archive pack before allowing it onto tape.",
       hashing_pack: "TapeScale is hashing the completed disk pack before allowing it onto tape.",
@@ -1539,8 +1542,8 @@
     } else if (runState === "writing") {
       const nativeStages = {
         packing: ["Packing the rolling archive buffer", "Packing", "DAR is packaging the next bounded archive pack. Tape remains at a safe boundary until the validated startup or refill reserve is ready."],
-        packing_pack: ["Packing the next archive pack", "Packing", "DAR is building an independently finalized pack while TapeScale streams already validated packs when available."],
-        refilling_spool: ["Refilling the archive buffer", "Refilling", "TapeScale is prefilling or replenishing the validated reserve; tape remains at a safe tape-file boundary until the resume threshold or producer completion."],
+        packing_pack: ["Packing the next archive pack", "Packing", "DAR is building an independently finalized pack while tape remains safely parked at a complete filemark."],
+        refilling_spool: ["Refilling the archive buffer", "Refilling", "TapeScale is prefilling or replenishing the validated reserve; tape remains at a safe tape-file boundary until the ready target or producer completion."],
         validating: ["Validating an archive pack", "Validating", "TapeScale is checking a completed DAR pack before allowing it onto tape."],
         validating_pack: ["Validating the next archive pack", "Validating", "TapeScale is checking a completed DAR pack before allowing it onto tape."],
         hashing_pack: ["Hashing the completed archive pack", "Hashing", "TapeScale is computing and retaining the completed disk pack's SHA-256 before allowing it onto tape."],
@@ -1674,7 +1677,7 @@
       progress,
       metrics,
       action: cancellationRequested ? null : backupOperatorAction(run),
-      modeNote: prewriteTerminal ? "Selected tape untouched · staging starts over on restart" : runState === "writing" ? direct ? "Legacy direct streaming record" : nativePacking || nativeValidating ? "Concurrent bounded pack producer" : nativeReadback ? "Physical readback after durable spool reclamation" : "TapeScale Native v2 · bounded rolling tape stream" : null,
+      modeNote: prewriteTerminal ? "Selected tape untouched · staging starts over on restart" : runState === "writing" ? direct ? "Legacy direct streaming record" : nativePacking || nativeValidating ? "Disk-pack production · tape safely parked" : nativeReadback ? "Physical readback after durable spool reclamation" : "TapeScale Native v2 · bounded rolling tape stream" : null,
       activity,
       preparationStep,
       cancellationRequested,
@@ -2016,11 +2019,18 @@
     const encoded = backupEvidenceValue(run, "encoded_bytes", "media_bytes", "bytes_written");
     const throughput = backupEvidenceValue(run, "throughput_bytes_per_second", "bytes_per_second");
     const volumes = backupRunVolumes(run);
+    const cleanup = objectValue(objectValue(run, "result"), "cleanup");
+    const cleanupAfter = objectValue(cleanup, "after");
+    const cleanupStatus = pick(cleanup, "postcondition") === "ready_at_bot" && pick(cleanupAfter, "in_flight") === 0
+      ? "Rewound to beginning · drive idle"
+      : pick(cleanup, "postcondition") === "ready_at_bot" ? "Rewound to beginning" : null;
+    const completePackBytes = backupRunEvents(run).filter((event) => String(pick(event, "event_type") || "").toLowerCase() === "spool_reclaimed").reduce((total, event) => total + Number(pick(objectValue(event, "evidence"), "reclaimed_bytes") || 0), 0);
     const values = [
       ["Source entries", entries],
       ["Files", files],
       ["Logical bytes", logical == null ? null : bytes(logical)],
       ["Encoded bytes", encoded == null ? null : bytes(encoded)],
+      ["Complete packs written", completePackBytes > 0 ? bytes(completePackBytes) : null],
       ["Recorded average", throughput == null ? null : bytes(throughput) + "/s"],
       ["Source manifest", backupEvidenceValue(run, "source_manifest_sha256", "source_manifest_digest", "manifest_sha256")],
       ["Engine job", backupEvidenceValue(run, "backup_job_id", "engine_job_id", "bacula_job_id", "engine_operation_id")],
@@ -2028,7 +2038,8 @@
       ["Delivery", backupDataDeliveryLabel(run)],
       ["Tapes used", volumes.length || null],
       ["Archive volumes", volumes.length ? volumes.map((volume) => volume.sequence + ". " + volume.label).join(" · ") : null],
-      ["Recovery point", backupEvidenceValue(run, "recovery_point_id") || pick(run, "recovery_point_id")]
+      ["Recovery point", backupEvidenceValue(run, "recovery_point_id") || pick(run, "recovery_point_id")],
+      ["Drive cleanup", cleanupStatus]
     ].filter((item) => item[1] !== null && item[1] !== undefined && item[1] !== "");
     if (!values.length) return '<p class="recovery-evidence-pending">Evidence will appear as the source inventory, tape write, and readback complete.</p>';
     return '<div class="backup-evidence-grid">' + values.map(([name, value]) => '<div><span>' + esc(name) + '</span><strong' + (/manifest/i.test(name) ? ' class="digest-value"' : "") + '>' + esc(value) + "</strong></div>").join("") + "</div>";
@@ -2082,12 +2093,22 @@
   function backupOperatorFailure(run) {
     const raw = String(backupFailureDetail(run) || "");
     if (!raw) return "TapeScale stopped before it could create a verified recovery point. Open technical details for the recorded cause.";
+    const failureCode = String(backupEvidenceValue(run, "failure_code") || "");
+    const writeBoundary = backupEvidenceValue(run, "media_write_started");
+    const mediaWriteStarted = writeBoundary === true || String(writeBoundary).toLowerCase() === "true";
+    if (failureCode === "tape_capacity_exhausted" || (mediaWriteStarted && /no space left on device|os error 28|end of (?:media|tape)/i.test(raw))) {
+      const result = run && typeof run.result === "object" && run.result ? run.result : {};
+      const cleanup = result.cleanup && typeof result.cleanup === "object" ? result.cleanup : {};
+      const cleanupReady = cleanup.postcondition === "ready_at_bot" && cleanup.position_uncertain === false;
+      const cleanupFact = cleanupReady
+        ? "Rewind cleanup completed and the drive was recorded ready at beginning of tape."
+        : "Cleanup did not prove the drive ready at beginning of tape; wait for physical motion to stop and reconcile the drive before reuse.";
+      return "The physical tape reached end of media before the archive volume could be sealed. Completed packs were written, but this attempt is not a valid recovery point. " + cleanupFact + " Prepare the tape again so its physical LTO generation is detected, then restart with multi-tape continuation.";
+    }
     if (/complete (?:archive )?staging.*(?:needs?|requires?).*bytes|whole[- ]archive.*stag(?:e|ing).*(?:capacity|available|reserve)|staging needs approximately.*bytes.*available/i.test(raw)) {
       return "This legacy attempt required the complete archive to fit on the staging disk before tape motion, but the disk did not have enough usable space. The tape was not changed. Retry with Native v2, which uses a bounded rolling buffer instead of staging the whole backup.";
     }
     if (/\blease\b.*\b(?:expir|lost|fenc)|\b(?:expir|lost)\w*\b.*\blease\b|fencing token/i.test(raw)) {
-      const writeBoundary = backupEvidenceValue(run, "media_write_started");
-      const mediaWriteStarted = writeBoundary === true || String(writeBoundary).toLowerCase() === "true";
       const mediaWriteNotStarted = writeBoundary === false || String(writeBoundary).toLowerCase() === "false";
       if (mediaWriteNotStarted) {
         const position = backupEvidenceValue(run, "position_uncertain");
@@ -5789,9 +5810,10 @@
       '<div class="form-field"><label for="backup-media-pool">Tape pool <small>(optional)</small></label><select class="select" id="backup-media-pool" name="media_pool_id">' + poolOptions.join("") + '</select></div>',
       '<div class="form-field"><label for="backup-compression">Compression</label><select class="select" id="backup-compression" name="compression_mode"><option value="auto" selected>Automatic · Zstandard fast (recommended)</option><option value="zstd">Zstandard · fast</option><option value="lz4">LZ4 · fastest</option><option value="gzip">GZIP · compatible</option><option value="none">None</option></select><small>Automatic uses Zstandard level 1. LZ4 favors maximum packing speed; GZIP favors compatibility. Already-compressed files may not shrink.</small></div>',
       '<input type="hidden" name="data_delivery" value="disk_spool">',
-      '<div class="form-field full backup-boundary info"><span aria-hidden="true">2</span><div><strong>Bounded disk buffer, any archive size</strong><p>DAR builds independently validated archive packs inside fixed high- and low-water limits. TapeScale streams complete packs at safe tape-file boundaries and reclaims disk space as the verified set advances.</p></div></div>',
-      '<div class="form-field"><label>Archive size</label><label class="check-option backup-span-option"><input type="checkbox" id="backup-media-spanning" name="spanning_enabled" checked> Continue onto additional prepared tapes when this archive fills a cartridge.</label></div>',
-      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · Zstandard fast · bounded rolling staging · spans tapes as needed</strong><small>Fill and validate a bounded disk window, stream complete packs, reclaim verified space, and request another tape only when needed.</small></div></div></div>',
+      '<div class="form-field full backup-boundary info"><span aria-hidden="true">2</span><div><strong>Bounded disk buffer, any archive size</strong><p>DAR builds independently tested archive packs inside fixed ready/low/high-water limits. TapeScale streams complete packs at safe tape-file boundaries and reclaims each disk pack after its tape files close. The containing tape still requires complete physical readback.</p></div></div>',
+      '<input type="hidden" id="backup-media-spanning" name="spanning_enabled" value="true">',
+      '<div class="form-field"><label>Archive size</label><div class="static-field backup-span-option"><strong>Multi-tape automatically</strong><small>TapeScale closes at a complete pack boundary and asks for another prepared tape whenever the current cartridge is full.</small></div></div>',
+      '<div class="form-field full"><div class="backup-plan-summary" id="backup-plan-summary"><span aria-hidden="true">✓</span><div><strong>Full backup · Zstandard fast · bounded rolling staging · spans tapes as needed</strong><small>Build a ready batch, stream complete packs without competing disk seeks, reclaim closed pack files, and request another tape only when needed.</small></div></div></div>',
       '</div>',
       '<p class="notice danger" id="backup-profile-error" role="alert" aria-live="assertive" hidden></p>',
       '<div class="modal-foot"><button class="button button-quiet" type="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit">Continue to tape</button></div>',
@@ -5812,13 +5834,13 @@
     const compression = backupCompressionLabel({ compression_mode: String(form.elements.compression_mode && form.elements.compression_mode.value || "auto") });
     const deliveryMode = String(form.elements.data_delivery && form.elements.data_delivery.value || "disk_spool");
     const delivery = backupDataDeliveryLabel({ data_delivery: deliveryMode });
-    const spanning = Boolean(form.elements.spanning_enabled && form.elements.spanning_enabled.checked);
+    const spanning = true;
     const summary = form.querySelector("#backup-plan-summary strong");
     const detail = form.querySelector("#backup-plan-summary small");
     if (summary) summary.textContent = "Full backup · " + compression + " · " + delivery.toLowerCase() + " · " + (spanning ? "spans tapes as needed" : "one tape maximum");
     if (detail) detail.textContent = deliveryMode === "direct"
       ? "This legacy mode is retained only for old profile display; new native backups use bounded rolling staging."
-      : "DAR builds independently validated packs inside a bounded disk window. TapeScale streams and verifies them sequentially while reclaiming spool space.";
+      : "DAR builds independently tested packs in bounded batches. TapeScale alternates pack production and sequential tape drain, reclaims closed pack files, and requires full physical readback before creating a recovery point.";
   }
 
   async function submitBackupProfile(form) {
@@ -5846,7 +5868,7 @@
           media_pool_id: String(values.get("media_pool_id") || "") || null,
           compression_mode: String(values.get("compression_mode") || "auto"),
           data_delivery: String(values.get("data_delivery") || "disk_spool"),
-          spanning_enabled: values.get("spanning_enabled") === "on",
+          spanning_enabled: true,
           schedule_timezone: form.dataset.timezone || "UTC",
           schedule_enabled: false,
           retention_days: Number(values.get("retention_days")),
@@ -6883,6 +6905,14 @@
     return state.data.driveOperations.find((operation) => String(pick(operation, "drive_id")) === String(driveId) && ["queued", "running"].includes(String(pick(operation, "state") || "").toLowerCase())) || null;
   }
 
+  function loadedTapeGeneration(drive) {
+    const health = objectValue(drive, "health");
+    const explicit = Number(pick(health, "loaded_media_generation"));
+    if (Number.isInteger(explicit) && explicit >= 1 && explicit <= 10) return explicit;
+    const match = String(pick(health, "raw_mt_status") || "").toUpperCase().match(/LTO-(10|[1-9])(?![0-9])/);
+    return match ? Number(match[1]) : null;
+  }
+
   function tapeInitializeDriveBlocker(drive) {
     if (!drive) return "Select a drive.";
     const health = objectValue(drive, "health");
@@ -6894,6 +6924,7 @@
     if (health.motion_position_uncertain === true) return "A prior result left tape position uncertain; reconcile the drive first.";
     if (health.immediate_mode !== false || health.in_flight !== 0) return "Kernel tape I/O state is not safe for qualification.";
     if (health.medium_loaded !== true || health.ready !== true) return "Load the designated scratch cartridge and wait for the drive to report ready.";
+    if (!loadedTapeGeneration(drive)) return "The loaded tape did not report a recognizable LTO generation; TapeScale will not guess its capacity.";
     if (activeOperationForDrive(recordId(drive))) return "A tape motion request is already active on this drive.";
     return null;
   }
@@ -6946,9 +6977,10 @@
     const initialMode = existingMedia.length ? "existing" : "new";
     const initialDrive = state.data.drives.find((drive) => recordId(drive) === String(initialDriveId));
     const initialMedia = existingMedia.find((item) => recordId(item) === String(initialMediaId));
-    const generations = [];
-    generations.push('<option value="">Select media generation</option>');
-    for (let generation = 1; generation <= 10; generation += 1) generations.push('<option value="' + generation + '">LTO-' + generation + "</option>");
+    const observedGeneration = loadedTapeGeneration(initialDrive);
+    const generations = observedGeneration
+      ? ['<option value="' + observedGeneration + '" selected>LTO-' + observedGeneration + ' · detected from loaded tape</option>']
+      : ['<option value="">Generation unavailable</option>'];
     const driveControl = safeDrives.length === 1 && initialDrive
       ? '<div class="form-field"><label>Drive reporting loaded and ready</label><div class="static-field"><strong>' + esc(label(pick(initialDrive, "model", "stable_id", "observed_path"))) + '</strong><small>' + esc(label(pick(initialDrive, "observed_path", "stable_id"))) + '</small></div><select id="tape-init-drive" name="drive_id" required hidden>' + tapeInitializeDriveOptions(initialDriveId).join("") + '</select></div>'
       : '<div class="form-field"><label for="tape-init-drive">Drive reporting loaded and ready</label><select class="select" id="tape-init-drive" name="drive_id" required>' + tapeInitializeDriveOptions(initialDriveId).join("") + '</select></div>';
@@ -7021,9 +7053,11 @@
     form.elements.internal_label.required = mode === "new";
     form.elements.media_generation.required = mode === "new";
     const drive = state.data.drives.find((item) => recordId(item) === driveId);
-    const driveGeneration = Number(pick(drive, "generation", "media_generation"));
-    if (mode === "new" && !form.elements.media_generation.value && Number.isInteger(driveGeneration) && driveGeneration >= 1 && driveGeneration <= 10) {
-      form.elements.media_generation.value = String(driveGeneration);
+    const observedGeneration = loadedTapeGeneration(drive);
+    if (mode === "new" && form.elements.media_generation) {
+      form.elements.media_generation.innerHTML = observedGeneration
+        ? '<option value="' + observedGeneration + '" selected>LTO-' + observedGeneration + ' · detected from loaded tape</option>'
+        : '<option value="">Generation unavailable</option>';
     }
     const driveState = form.querySelector("#tape-init-drive-state");
     const blocker = tapeInitializeDriveBlocker(drive);
@@ -7036,7 +7070,13 @@
     const labelText = tapeInitializeLabel(form);
     const selectedRecord = state.data.media.find((item) => recordId(item) === String(existingSelect.value || ""));
     const staticMedia = form.querySelector("[data-tape-init-media-fact]");
-    if (staticMedia && selectedRecord) staticMedia.innerHTML = '<strong>' + esc(mediaName(selectedRecord)) + '</strong><small>' + esc(label(pick(selectedRecord, "media_format", "media_generation"))) + '</small>';
+    if (staticMedia && selectedRecord) {
+      const recordedGeneration = Number(pick(selectedRecord, "media_generation", "generation"));
+      const generationFact = observedGeneration && Number.isInteger(recordedGeneration) && recordedGeneration !== observedGeneration
+        ? "Recorded LTO-" + recordedGeneration + " · loaded tape reports LTO-" + observedGeneration + " · preparation will correct the record"
+        : observedGeneration ? "LTO-" + observedGeneration + " · detected from loaded tape" : label(pick(selectedRecord, "media_format", "media_generation"));
+      staticMedia.innerHTML = '<strong>' + esc(mediaName(selectedRecord)) + '</strong><small>' + esc(generationFact) + '</small>';
+    }
     const submit = form.querySelector('[type="submit"]');
     if (submit) {
       submit.disabled = Boolean(blocker && !active) || !labelText;

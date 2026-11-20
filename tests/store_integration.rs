@@ -202,6 +202,7 @@ async fn fresh_database_persists_inventory_and_sas_identity_safely() {
         wwn: None,
         firmware: Some("A1B2".to_owned()),
         generation: None,
+        loaded_media_generation: None,
         observed_path: "/dev/nst0".to_owned(),
         device_major: 9,
         device_minor: 128,

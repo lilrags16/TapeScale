@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     device::{MissingSasDrive, SasDriveObservation, SasMotionOperation},
-    domain::lto::{can_read, DriveGeneration, MediaFormat},
+    domain::lto::{can_read, can_write, DriveGeneration, MediaFormat},
     native_archive::{
         NATIVE_ADAPTER_VERSION, NATIVE_ENGINE_NAME, NATIVE_ENGINE_VERSION, NATIVE_FORMAT_NAME,
     },
@@ -3472,11 +3472,18 @@ async fn queue_qualification_run_inner(
     .bind(cartridge_id)
     .fetch_optional(&mut *transaction)
     .await?;
-    let Some(cartridge) = cartridge else {
+    let Some(mut cartridge) = cartridge else {
         transaction.rollback().await?;
         return Ok(QueueQualificationRunResult::NotFound);
     };
 
+    let correlation_id = Uuid::now_v7();
+    let observed_media_generation = drive
+        .health
+        .get("loaded_media_generation")
+        .and_then(Value::as_i64)
+        .and_then(|value| i16::try_from(value).ok())
+        .filter(|value| (1..=10).contains(value));
     let blocker = if drive.stable_id != expected_stable_id {
         Some("the requested stable identity does not match the current drive".to_owned())
     } else if !scratch_media_confirmed || !destructive_overwrite_confirmed {
@@ -3488,12 +3495,71 @@ async fn queue_qualification_run_inner(
         Some("the typed cartridge label does not exactly match the selected cartridge".to_owned())
     } else if let Some(reason) = drive_motion_blocker(&drive) {
         Some(reason)
+    } else if observed_media_generation.is_none() {
+        Some(
+            "the loaded tape did not report a recognized LTO generation; TapeScale will not guess media capacity for a destructive preparation"
+                .to_owned(),
+        )
+    } else if drive
+        .generation
+        .and_then(drive_generation)
+        .zip(media_format(observed_media_generation, None))
+        .is_some_and(|(drive, media)| !can_write(drive, media))
+    {
+        Some(
+            "the selected drive cannot write the physically observed LTO media generation"
+                .to_owned(),
+        )
     } else {
         qualification_cartridge_blocker(&cartridge, None)
     };
     if let Some(reason) = blocker {
         transaction.rollback().await?;
         return Ok(QueueQualificationRunResult::Blocked(reason));
+    }
+
+    // A blank/legacy scratch record is operator-supplied metadata.  At the
+    // attended destructive boundary the loaded medium's kernel-reported
+    // density is stronger evidence. Correct an eligible empty record here so
+    // capacity planning can never treat a physical LTO-5 tape as LTO-6.
+    let observed_media_generation = observed_media_generation.expect("validated above");
+    let observed_format = format!("LTO-{observed_media_generation}");
+    if cartridge.media_generation != Some(observed_media_generation)
+        || cartridge.media_format.as_deref() != Some(observed_format.as_str())
+    {
+        let previous_generation = cartridge.media_generation;
+        let previous_format = cartridge.media_format.clone();
+        sqlx::query(
+            "UPDATE cartridges
+                SET media_generation = $1, media_format = $2, updated_at = now()
+              WHERE id = $3",
+        )
+        .bind(observed_media_generation)
+        .bind(&observed_format)
+        .bind(cartridge.id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO audit_events
+                (id, actor_label, action, object_type, object_id,
+                 requested, result, correlation_id)
+             VALUES ($1, 'local-api', 'media.generation_observed', 'cartridge', $2,
+                     $3, 'corrected_from_loaded_media', $4)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(cartridge.id.to_string())
+        .bind(json!({
+            "previous_media_generation": previous_generation,
+            "previous_media_format": previous_format,
+            "observed_media_generation": observed_media_generation,
+            "observed_media_format": observed_format,
+            "evidence_basis": "linux_mt_loaded_media_density"
+        }))
+        .bind(correlation_id)
+        .execute(&mut *transaction)
+        .await?;
+        cartridge.media_generation = Some(observed_media_generation);
+        cartridge.media_format = Some(observed_format);
     }
 
     let busy = sqlx::query_scalar::<_, bool>(
@@ -3530,7 +3596,6 @@ async fn queue_qualification_run_inner(
         .as_deref()
         .expect("the qualification gate requires an observed path");
     let id = Uuid::now_v7();
-    let correlation_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO qualification_runs
             (id, drive_id, cartridge_id, expected_stable_id, expected_path,

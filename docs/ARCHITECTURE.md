@@ -1,6 +1,6 @@
 # Architecture
 
-TapeScale is a control plane for durable LTO protection on TrueNAS. `0.2.0-alpha.9` writes **TapeScale Native v2**, a self-describing on-tape format owned by TapeScale. Native v2 replaces v1's whole-archive disk stage with independently finalized DAR packs in a bounded rolling spool. DAR 2.8.6 is a separately executed archive codec; it does not own cartridge identity, tape motion, media handoff, verification evidence, retention, or recovery policy.
+TapeScale is a control plane for durable LTO protection on TrueNAS. `0.2.0-alpha.11` writes **TapeScale Native v2**, a self-describing on-tape format owned by TapeScale. Native v2 replaces v1's whole-archive disk stage with independently finalized DAR packs in a bounded rolling spool. DAR 2.8.6 is a separately executed archive codec; it does not own cartridge identity, tape motion, media handoff, verification evidence, retention, or recovery policy.
 
 The active runtime has no Bacula package or daemon dependency. Bacula-specific source modules and historical database values remain only so failed earlier-alpha rows can be read as audit history; new profiles, preparation runs, backups, and recovery media use the native contract.
 
@@ -54,7 +54,7 @@ The archive writer later replaces that preparation record with an archive-volume
 
 The selected source must resolve beneath `/source` to a named `.zfs/snapshot` path and the kernel must report its open mount read-only. Inventory uses bounded-memory external sorting and disk-backed hard-link grouping, producing a content-addressed manifest with per-file SHA-256 and declared metadata coverage. TapeScale imposes no total file-count or logical-byte policy ceiling; filesystem, artifact, storage, and time limits remain real.
 
-### 2. Concurrent pack production and rolling spool
+### 2. Batched pack production and rolling spool
 
 Each run receives an empty private directory beneath `TAPESCALE_NATIVE_SPOOL_DIR`. The worker partitions the authenticated manifest into ordered, hard-link-closed allocation ranges and invokes the absolute DAR executable with a closed noninteractive argument vector for each pack:
 
@@ -67,11 +67,11 @@ Each run receives an empty private directory beneath `TAPESCALE_NATIVE_SPOOL_DIR
 
 Only expected regular slice and catalog files are accepted. TapeScale hashes every slice, verifies contiguous ordinals and checked byte totals, asks DAR to test the completed pack, and commits its durable pack ledger before that pack can reach tape.
 
-Pack production runs concurrently with tape consumption, but the writer does not start on the first pack. Before initial tape motion it fills the validated ready queue to high-water minus one maximum in-progress pack, or reaches producer completion for a smaller archive. At or below low-water, tape remains parked at the current clean filemark until that resume threshold is restored or production completes. The release defaults are a 256 GiB pack target, 768 GiB high-water mark, 256 GiB low-water mark, 384 GiB derived resume threshold, and 8 GiB free-space reserve. A 1 TiB spool can therefore protect an archive much larger than 1 TiB without staging it all. The disk window absorbs short source/CPU stalls; it cannot compensate indefinitely when sustained pack production remains below the drive's streaming floor.
+Pack production and tape consumption are explicitly exclusive on the single configured spool. Before initial tape motion the worker builds a validated ready batch, or reaches producer completion for a smaller archive. DAR then parks while the drive drains complete packs through uncontested sequential disk reads. Below low-water, tape remains parked at the current clean filemark while the next batch is built. The release defaults are a 64 GiB normal pack target, independent 384 GiB oversized-allocation maximum, 512 GiB high-water mark, 128 GiB ready target, 32 GiB low-water mark, 16 GiB slices, and 8 GiB free-space reserve. A 1 TiB spool can therefore protect an archive much larger than 1 TiB without staging it all. The deliberate batch pause trades tape-idle time for stable disk access and prevents rotational seek contention from starving an in-progress tape file.
 
 ### 3. Capacity and volume planning
 
-TapeScale maps recorded LTO generation/format to native decimal capacity, subtracts a five-percent reserve, repeated manifest/native metadata, and additional framing allowance. Every DAR pack and slice remains whole at its declared boundary. Planning fails if one file or hard-link allocation interval cannot fit the configured pack maximum or an empty supported volume. There is no total archive-size policy ceiling when spanning is enabled.
+TapeScale reads the loaded medium's physical LTO density during preparation, reconciles eligible empty inventory metadata to that observation, and rechecks generation immediately before writing. It maps that generation/format to native decimal capacity, subtracts a five-percent reserve, repeated manifest/native metadata, and additional framing allowance. Every DAR pack and slice remains whole at its declared boundary. Planning fails if one file or hard-link allocation interval cannot fit the configured pack maximum or an empty supported volume. There is no total archive-size policy ceiling when spanning is enabled.
 
 Unexpected physical EOM is not used as normal flow. It fails and quarantines the volume instead of guessing how much of a pack reached media. Normal spanning closes at a known pack boundary, verifies the member, and requests the next prepared cartridge.
 
@@ -156,13 +156,13 @@ Inventory labels and barcodes are human/custody metadata; the native UUID read f
 - pre-write failures delete unused temporary packs and leave tape untouched;
 - after a complete pack's tape files close durably, its disk copy may be reclaimed to keep the spool bounded; the archive remains invalid until the containing volume passes full physical readback;
 - post-boundary failures mark touched media uncertain and never promote a partial set;
-- an interrupted partial volume is quarantined; alpha.7 does not resume or append mid-volume, so a retry creates and restages a new archive set;
+- an interrupted partial volume is quarantined; alpha.11 does not resume or append mid-volume, so a retry creates and restages a new archive set;
 - cancellation is cooperative at safe boundaries because blocking kernel tape I/O cannot be forcibly made atomic;
 - wrong tape, identity conflict, lease loss, device replacement, reset position, malformed native metadata, length/hash mismatch, source mutation, or failed cleanup prevents recovery-point creation;
 - terminal evidence never upgrades a broader hardware/format qualification state.
 
 ## Current scope
 
-Implemented: native preparation, graphical snapshot selection, bounded inventory, concurrent independently tested DAR-pack production, bounded rolling spool, manual multi-tape write, immediate full-volume physical readback, chained archive-set sealing, recovery point/evidence retention, manifest browsing, and independent offline v1/v2 capture/restore.
+Implemented: native preparation, graphical snapshot selection, bounded inventory, independently tested batched DAR-pack production, bounded rolling spool, manual multi-tape write, immediate full-volume physical readback, chained archive-set sealing, recovery point/evidence retention, manifest browsing, and independent offline v1/v2 capture/restore.
 
 Open: in-console native restore, selected-file native extraction, incrementals, encryption, changer automation, automatic snapshots, native ZFS send, mid-volume restart/resume, metadata signing, authentication/RBAC, and the physical qualification matrix.

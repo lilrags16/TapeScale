@@ -686,6 +686,7 @@ fn bacula_spool_usage(directory: &Path) -> Result<BaculaSpoolUsage, ExerciseFail
 #[derive(Debug)]
 struct ExerciseFailure {
     class: FailureClass,
+    code: Option<&'static str>,
     detail: String,
 }
 
@@ -693,6 +694,7 @@ impl ExerciseFailure {
     fn blocked(detail: impl Into<String>) -> Self {
         Self {
             class: FailureClass::Blocked,
+            code: None,
             detail: detail.into(),
         }
     }
@@ -700,6 +702,7 @@ impl ExerciseFailure {
     fn failed(detail: impl Into<String>) -> Self {
         Self {
             class: FailureClass::Failed,
+            code: None,
             detail: detail.into(),
         }
     }
@@ -707,6 +710,7 @@ impl ExerciseFailure {
     fn interrupted(detail: impl Into<String>) -> Self {
         Self {
             class: FailureClass::Interrupted,
+            code: None,
             detail: detail.into(),
         }
     }
@@ -714,6 +718,15 @@ impl ExerciseFailure {
     fn cancelled(detail: impl Into<String>) -> Self {
         Self {
             class: FailureClass::Cancelled,
+            code: None,
+            detail: detail.into(),
+        }
+    }
+
+    fn tape_capacity(detail: impl Into<String>) -> Self {
+        Self {
+            class: FailureClass::Failed,
+            code: Some("tape_capacity_exhausted"),
             detail: detail.into(),
         }
     }
@@ -4447,9 +4460,11 @@ mod tests {
             dar_path: PathBuf::from("/usr/bin/dar"),
             native_spool_dir: spool_directory.to_owned(),
             native_spool_reserve_bytes: 0,
-            native_pack_target_bytes: 256 * 1024 * 1024 * 1024,
-            native_spool_high_water_bytes: 768 * 1024 * 1024 * 1024,
-            native_spool_low_water_bytes: 256 * 1024 * 1024 * 1024,
+            native_pack_target_bytes: 64 * 1024 * 1024 * 1024,
+            native_pack_maximum_bytes: 384 * 1024 * 1024 * 1024,
+            native_spool_high_water_bytes: 512 * 1024 * 1024 * 1024,
+            native_spool_low_water_bytes: 32 * 1024 * 1024 * 1024,
+            native_spool_ready_bytes: 128 * 1024 * 1024 * 1024,
             native_slice_bytes: 64 * 1024 * 1024,
             native_compression_threads: 1,
         }

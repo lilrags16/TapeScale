@@ -19,8 +19,8 @@ test("the console presents an explicit alpha identity and truthful local access 
   assert.match(index, /class="release-badge">Alpha<\/span>/);
   assert.match(index, /class="version-channel">Alpha<\/span>/);
   assert.match(index, /id="app-version">—<\/span>/);
-  assert.match(index, /app\.css\?v=tapescale-alpha-17/);
-  assert.match(index, /app\.js\?v=tapescale-alpha-17/);
+  assert.match(index, /app\.css\?v=tapescale-alpha-18/);
+  assert.match(index, /app\.js\?v=tapescale-alpha-18/);
   assert.match(css, /\.release-badge/);
   assert.match(app, /document\.title = routeTitle \+ " · TapeScale Alpha"/);
   assert.match(index, /<strong>Local console<\/strong><small>No application sign-in<\/small>/);
@@ -148,16 +148,18 @@ test("new backup policy uses bounded native DAR packs before sequential tape str
   assert.match(open, /value="none"/);
   assert.match(open, /Automatic · Zstandard fast \(recommended\)/);
   assert.match(open, /Automatic uses Zstandard level 1/);
-  assert.match(open, /name="spanning_enabled" checked/);
+  assert.match(open, /type="hidden"[^>]*name="spanning_enabled"[^>]*value="true"/);
+  assert.match(open, /Multi-tape automatically/);
   assert.match(open, /spans tapes as needed/);
   assert.match(open, /type="hidden" name="data_delivery" value="disk_spool"/);
   assert.doesNotMatch(open, /name="data_delivery" value="direct"/);
   assert.match(open, /Bounded disk buffer, any archive size/);
-  assert.match(open, /independently validated archive packs/);
-  assert.match(open, /reclaims disk space as the verified set advances/);
+  assert.match(open, /independently tested archive packs/);
+  assert.match(open, /reclaims each disk pack after its tape files close/);
+  assert.match(open, /requires complete physical readback/);
   assert.match(submit, /compression_mode: String\(values\.get\("compression_mode"\) \|\| "auto"\)/);
   assert.match(submit, /data_delivery: String\(values\.get\("data_delivery"\) \|\| "disk_spool"\)/);
-  assert.match(submit, /spanning_enabled: values\.get\("spanning_enabled"\) === "on"/);
+  assert.match(submit, /spanning_enabled: true/);
 });
 
 test("delivery labels distinguish advanced direct, bounded rolling, legacy, and unsupported plans", () => {
@@ -963,7 +965,7 @@ test("the operation hero renders phase-specific progress, rates, and tape action
   assert.match(staged, /Rolling spool/);
   assert.match(staged, /250 B \/ 1,000 B/);
   assert.match(staged, /25% of high-water mark · hard limit 1,200 B/);
-  assert.match(staged, /Concurrent bounded pack producer/);
+  assert.match(staged, /Disk-pack production · tape safely parked/);
   assert.doesNotMatch(staged, /Tape read/);
 
   const legacyStaged = render({
@@ -1202,7 +1204,7 @@ test("shared preparation and engine telemetry remain honest about stale or missi
   assert.match(packing, /Packing the archive buffer/);
   assert.match(packing, /DAR pack production/);
   assert.match(packing, /Tape<\/span><strong>Idle/);
-  assert.match(packing, /validated reserve reaches its resume threshold/i);
+  assert.match(packing, /validated reserve reaches its ready target/i);
 
   const refilling = render({ state: "writing", result: { live_io: { ...freshSample, engine_state: "refilling_spool", activity: "refilling" } } });
   assert.match(refilling, /Refilling the archive buffer/);
@@ -1806,6 +1808,14 @@ test("lease failures explain tape state without exposing raw JSON", () => {
   const legacyCapacity = operatorFailure({
     failure_detail: "complete archive staging needs approximately 2112779023008 bytes before tape motion, but only 956971745280 bytes are available after the configured reserve"
   });
+  const tapeCapacity = operatorFailure({
+    failure_detail: "native archive I/O failed: No space left on device (os error 28)",
+    result: {
+      failure_code: "tape_capacity_exhausted",
+      media_write_started: true,
+      cleanup: { postcondition: "ready_at_bot", position_uncertain: false }
+    }
+  });
 
   assert.match(beforeWrite, /before any tape-motion or data-write command was dispatched/);
   assert.match(beforeWrite, /selected tape is untouched/);
@@ -1821,6 +1831,22 @@ test("lease failures explain tape state without exposing raw JSON", () => {
   assert.match(legacyCapacity, /tape was not changed/i);
   assert.match(legacyCapacity, /Retry with Native v2/);
   assert.doesNotMatch(legacyCapacity, /drive or tape changed/i);
+  assert.match(tapeCapacity, /physical tape reached end of media/i);
+  assert.match(tapeCapacity, /not a valid recovery point/i);
+  assert.match(tapeCapacity, /rewind cleanup/i);
+  assert.match(tapeCapacity, /ready at beginning of tape/i);
+  assert.match(tapeCapacity, /multi-tape continuation/i);
+});
+
+test("backup evidence does not present the last pack as the whole archive", () => {
+  const evidence = section("  function backupEvidenceValue(", "  function backupLiveIo(");
+  const rendered = section("  function renderBackupEvidence(", "  function renderBackupOutcome(");
+  assert.match(evidence, /aggregateSize/);
+  assert.match(evidence, /pack_staged/);
+  assert.match(evidence, /spool_reclaimed/);
+  assert.match(evidence, /if \(aggregateSize && perPackEvents\.has/);
+  assert.match(rendered, /Complete packs written/);
+  assert.match(rendered, /Rewound to beginning · drive idle/);
 });
 
 test("an interrupted Native v2 pre-write attempt distinguishes disk-pack work from tape data", () => {

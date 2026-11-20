@@ -67,6 +67,11 @@ pub struct SasDriveObservation {
     pub wwn: Option<String>,
     pub firmware: Option<String>,
     pub generation: Option<i16>,
+    /// LTO generation reported for the currently loaded medium by `mt status`.
+    /// This is deliberately separate from the drive generation: the former is
+    /// physical media evidence, while a model string is not authoritative
+    /// drive-capability evidence.
+    pub loaded_media_generation: Option<i16>,
     pub observed_path: String,
     pub device_major: u64,
     pub device_minor: u64,
@@ -110,6 +115,7 @@ impl SasDriveObservation {
             "status": self.status,
             "status_detail": self.status_detail,
             "raw_mt_status": self.raw_status,
+            "loaded_media_generation": self.loaded_media_generation,
             "identity_verified": self.identity_verified,
             "identity_conflict": self.identity_conflict,
             "identity_basis": self.identity_basis,
@@ -399,6 +405,14 @@ async fn probe_one(config: &SasDiscoveryConfig, device: &Path) -> SasProbeResult
     };
     apply_position_loss(identity.position_lost, &mut mt_status);
 
+    let loaded_media_generation = (mt_status.medium_loaded == Some(true))
+        .then(|| {
+            mt_status
+                .raw
+                .as_deref()
+                .and_then(lto_generation_from_mt_status)
+        })
+        .flatten();
     SasProbeResult::Observed(Box::new(SasDriveObservation {
         stable_id,
         identity_verified,
@@ -411,6 +425,7 @@ async fn probe_one(config: &SasDiscoveryConfig, device: &Path) -> SasProbeResult
         firmware: identity.firmware,
         // Model names are not authoritative generation evidence.
         generation: None,
+        loaded_media_generation,
         observed_path: device.display().to_string(),
         device_major: device_numbers.major,
         device_minor: device_numbers.minor,
@@ -835,6 +850,31 @@ fn parse_mt_success(stdout: &str, stderr: &str) -> MtStatus {
     }
 }
 
+/// Extract the loaded medium generation from the human-readable density name
+/// emitted by GNU mt-st.  Match a numeric boundary so `LTO-1` cannot be
+/// mistaken for `LTO-10`. Unknown/vendor-specific density names stay unknown
+/// and therefore fail closed at destructive preparation and write time.
+#[must_use]
+pub fn lto_generation_from_mt_status(raw: &str) -> Option<i16> {
+    let uppercase = raw.to_ascii_uppercase();
+    for generation in (1_i16..=10).rev() {
+        let needle = format!("LTO-{generation}");
+        let mut offset = 0;
+        while let Some(found) = uppercase[offset..].find(&needle) {
+            let end = offset + found + needle.len();
+            if uppercase
+                .as_bytes()
+                .get(end)
+                .is_none_or(|byte| !byte.is_ascii_digit())
+            {
+                return Some(generation);
+            }
+            offset = end;
+        }
+    }
+    None
+}
+
 fn parse_mt_error(error: ToolError) -> MtStatus {
     let (status, detail) = match error {
         ToolError::Failed { code, stderr, .. } => {
@@ -1150,13 +1190,22 @@ mod tests {
     #[test]
     fn status_parser_distinguishes_loaded_and_empty_drives() {
         let ready = parse_mt_success(
-            "SCSI 2 tape drive:\nGeneral status bits on (41010000):\n BOT ONLINE IM_REP_EN\n",
+            "SCSI 2 tape drive:\nDensity code 0x58 (LTO-5)\nGeneral status bits on (41010000):\n BOT ONLINE IM_REP_EN\n",
             "",
         );
         assert!(ready.accessible);
         assert_eq!(ready.ready, Some(true));
         assert_eq!(ready.medium_loaded, Some(true));
         assert_eq!(ready.at_bot, Some(true));
+        assert_eq!(
+            lto_generation_from_mt_status(ready.raw.as_deref().expect("raw status")),
+            Some(5)
+        );
+        assert_eq!(
+            lto_generation_from_mt_status("Density code 0x62 (LTO-10)"),
+            Some(10)
+        );
+        assert_eq!(lto_generation_from_mt_status("Density code 0x7f"), None);
 
         let empty = parse_mt_success("General status bits on:\n DR_OPEN IM_REP_EN\n", "");
         assert!(empty.accessible);
@@ -1184,6 +1233,7 @@ mod tests {
             wwn: Some("naa.5001".to_owned()),
             firmware: None,
             generation: None,
+            loaded_media_generation: None,
             observed_path: "/dev/nst0".to_owned(),
             device_major: 9,
             device_minor: 128,

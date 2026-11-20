@@ -1,6 +1,6 @@
 # TrueNAS custom-app deployment
 
-TapeScale `0.2.0-alpha.9` is an attended evaluation build for TrueNAS SCALE on x86-64. It is not production-qualified. The repository-root [`compose.truenas.yaml`](../compose.truenas.yaml) is the complete pasteable custom-app definition.
+TapeScale `0.2.0-alpha.11` is an attended evaluation build for TrueNAS SCALE on x86-64. It is not production-qualified. The repository-root [`compose.truenas.yaml`](../compose.truenas.yaml) is the complete pasteable custom-app definition.
 
 The active data path is TapeScale Native v2 with DAR 2.8.6. Native v1 remains readable; the runtime does not install or start Bacula.
 
@@ -24,7 +24,7 @@ Create:
 
 Use the Generic/POSIX ACL preset. Do not share either dataset over SMB or NFS. The worker runs as container root with a narrow capability set and must be able to create, write, rename, and `fsync` files in both locations.
 
-The spool does not need to hold the complete archive. It must hold the configured high-water window plus reserve; a dedicated 1 TiB filesystem supports the release 768/256/8 GiB policy when sufficient free space remains. Fast HDD may be usable but NVMe/SSD provides more headroom for concurrent pack production and tape consumption. Do not place the spool beneath the source, restore, or evidence tree.
+The spool does not need to hold the complete archive. It must hold the configured high-water window plus reserve; a dedicated 1 TiB filesystem supports the release 512 GiB high-water, 128 GiB ready, 32 GiB low-water, and 8 GiB reserve policy when sufficient free space remains. On a single HDD, TapeScale alternates pack production and tape drain at safe filemarks to avoid competing seeks. NVMe/SSD provides more headroom but is not required by the default batch policy. Do not place the spool beneath the source, restore, or evidence tree.
 
 The Compose bind mounts use `create_host_path: false`; installation fails instead of silently creating ordinary directories when a dataset is absent.
 
@@ -71,10 +71,12 @@ TAPESCALE_NATIVE_BACKUP_ENABLED=true
 TAPESCALE_DAR_PATH=/usr/local/bin/dar
 TAPESCALE_NATIVE_SPOOL_DIR=/var/lib/tapescale/spool
 TAPESCALE_NATIVE_SPOOL_RESERVE_BYTES=8589934592
-TAPESCALE_NATIVE_PACK_TARGET_BYTES=274877906944
-TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES=824633720832
-TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES=274877906944
-TAPESCALE_NATIVE_SLICE_BYTES=68719476736
+TAPESCALE_NATIVE_PACK_TARGET_BYTES=68719476736
+TAPESCALE_NATIVE_PACK_MAXIMUM_BYTES=412316860416
+TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES=549755813888
+TAPESCALE_NATIVE_SPOOL_READY_BYTES=137438953472
+TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES=34359738368
+TAPESCALE_NATIVE_SLICE_BYTES=17179869184
 TAPESCALE_NATIVE_COMPRESSION_THREADS=4
 ```
 
@@ -123,7 +125,7 @@ For backup:
 2. save a profile with automatic Zstd, Zstd, LZ4, GZIP, or no compression;
 3. create a request and review server-calculated media readiness;
 4. start the destructive action;
-5. watch the first DAR pack become ready, then concurrent rolling-spool production and tape writing;
+5. watch the 128 GiB ready batch build, then stream sequentially from spool to tape;
 6. supply requested prepared continuation cartridges;
 7. wait for immediate full readback of every volume.
 
@@ -133,7 +135,7 @@ A recovery point is created only after every planned native volume passes and th
 
 The worker reads physical byte counters from `/sys/class/scsi_tape/stN/stats` for the exact mapped drive when the kernel exposes them. The UI reports source inventory, disk-stage bytes, DAR current file, physical tape write, and physical tape read as separate facts. Missing, first, or stale samples remain unavailable; they are not displayed as zero throughput.
 
-Packing delays indicate source traversal, CPU/compression, or spool I/O. Tape writing can begin after the first validated pack while later packs are produced concurrently. If the ready window drains, TapeScale pauses only at a completed tape-file boundary; repeated draining means sustained pack production is below tape consumption and the source, compression, pack size, and spool throughput need investigation.
+Packing delays indicate source traversal, CPU/compression, or spool I/O. Tape writing begins when the configured ready batch is validated (or the producer finishes a smaller archive). On a rotational spool, DAR then pauses so tape receives uncontested sequential reads. When the ready queue falls below low-water, TapeScale parks only at a completed tape-file boundary and builds the next batch. This can make the drive intentionally idle between batches, but it avoids slow concurrent seeks and repeated backhitching inside a tape file.
 
 ## Offline recovery access
 
@@ -153,7 +155,7 @@ See [RECOVERY.md](RECOVERY.md) for commands and evidence requirements. In-consol
 
 Never point an older application image at a database that has already migrated and call that rollback. Restore a consistent database backup with the matching release instead.
 
-An interrupted partial Native v2 member is not resumed in place by alpha.9. TapeScale quarantines touched media, and retry creates and restages a new archive set. Do not delete a retained failed spool until its diagnostic evidence has been reviewed.
+An interrupted partial Native v2 member is not resumed in place by alpha.11. TapeScale quarantines touched media, and retry creates and restages a new archive set. Do not delete a retained failed spool until its diagnostic evidence has been reviewed.
 
 ## Security warning
 

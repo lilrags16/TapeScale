@@ -1,6 +1,6 @@
 # TapeScale Native operations
 
-This guide covers TapeScale `0.2.0-alpha.9`, an attended alpha for one standalone SAS tape drive. New backups use **TapeScale Native v2** with DAR 2.8.6 as a separate archive codec. Native v1 media remains readable. Bacula is not part of the runtime.
+This guide covers TapeScale `0.2.0-alpha.11`, an attended alpha for one standalone SAS tape drive. New backups use **TapeScale Native v2** with DAR 2.8.6 as a separate archive codec. Native v1 media remains readable. Bacula is not part of the runtime.
 
 Do not make this alpha the only copy of data. Physical qualification is pending.
 
@@ -9,10 +9,10 @@ Do not make this alpha the only copy of data. Physical qualification is pending.
 1. Select an existing named, read-only ZFS snapshot with the graphical browser.
 2. TapeScale inventories and hashes the immutable source and groups hard links.
 3. The worker creates and tests independently finalized DAR packs in a bounded spool.
-4. Before the first tape motion, TapeScale fills the validated ready queue to high-water minus one maximum in-progress pack, or reaches producer completion for an archive smaller than that threshold.
-5. TapeScale writes complete packs sequentially while the producer continues filling the ready window.
+4. Before the first tape motion, TapeScale fills the validated ready queue to the configured ready threshold, or reaches producer completion for an archive smaller than that threshold.
+5. TapeScale writes complete packs sequentially from the spool without running DAR against the same rotational disk at the same time.
 6. Once a pack's complete tape files close durably, its disk space may be reclaimed. It remains unverified until the containing volume is rewound and read back completely.
-7. At or below low-water, the drive remains parked after a clean tape filemark until the ready queue reaches the resume threshold or the producer finishes.
+7. Below low-water, the drive remains parked after a clean tape filemark while the next ready batch is produced. This deliberate stop avoids seek contention and partial-file shoe-shining.
 8. At a volume boundary, TapeScale verifies and unloads the member, then requests the next prepared cartridge.
 9. A recovery point is retained only after every volume passes and the final archive-set seal and source stability checks succeed.
 
@@ -24,19 +24,21 @@ The TrueNAS Compose supplies:
 
 | Environment variable | Release default |
 |---|---:|
-| `TAPESCALE_NATIVE_PACK_TARGET_BYTES` | `274877906944` (256 GiB) |
-| `TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES` | `824633720832` (768 GiB) |
-| `TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES` | `274877906944` (256 GiB) |
+| `TAPESCALE_NATIVE_PACK_TARGET_BYTES` | `68719476736` (64 GiB) |
+| `TAPESCALE_NATIVE_PACK_MAXIMUM_BYTES` | `412316860416` (384 GiB) |
+| `TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES` | `549755813888` (512 GiB) |
+| `TAPESCALE_NATIVE_SPOOL_READY_BYTES` | `137438953472` (128 GiB) |
+| `TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES` | `34359738368` (32 GiB) |
 | `TAPESCALE_NATIVE_SPOOL_RESERVE_BYTES` | `8589934592` (8 GiB) |
-| `TAPESCALE_NATIVE_SLICE_BYTES` | `68719476736` (64 GiB) |
+| `TAPESCALE_NATIVE_SLICE_BYTES` | `17179869184` (16 GiB) |
 
-Use a dedicated, fast, writable POSIX-compatible spool outside the source, restore, and evidence trees. A 1 TiB spool supports the defaults, allowing for filesystem overhead and other use. The high-water value must fit alongside the reserve and leave a ready-pack resume threshold above low-water after reserving one maximum in-progress pack. With the defaults that threshold is 384 GiB. Smaller media generations may impose a lower effective pack maximum.
+Use a dedicated, fast, writable POSIX-compatible spool outside the source, restore, and evidence trees. A 1 TiB spool supports the defaults, allowing for filesystem overhead and other use. High-water must fit alongside the reserve and must hold the ready threshold plus one maximum in-progress pack. The normal 64 GiB target keeps startup and refill latency bounded; the independent 384 GiB maximum exists only for one large file or hard-link allocation group. Smaller media generations may impose a lower effective maximum.
 
 Only packs whose complete tape files closed durably are eligible for disk reclamation. Reclamation is not verification; no recovery point exists until the whole volume and final archive-set seal pass physical readback. A write failure never silently promotes the last diagnostic state.
 
 ## Prepare and identify tape
 
-Preparation is destructive. Use only blank or expendable media. The single **Prepare tape** action writes and reads a deterministic qualification pattern, then writes a durable TapeScale cartridge UUID. At each later destructive boundary the worker reads that UUID from tape and matches it to the reservation; the operator does not repeatedly attest a printed label.
+Preparation is destructive. Use only blank or expendable media. The single **Prepare tape** action reads the loaded medium's physical LTO density, corrects an eligible empty inventory record when needed, writes and reads a deterministic qualification pattern, then writes a durable TapeScale cartridge UUID. At each later destructive boundary the worker rechecks both generation and UUID against the reservation; the operator does not repeatedly attest a printed label or guess tape capacity.
 
 Preparation proves only that exact drive/media pass. It is not general hardware, spanning, restore, or filesystem-fidelity qualification.
 
@@ -74,7 +76,7 @@ Upgrading does not rewrite retained media. Untouched queued v1 operational backu
 - After writing starts, a failed or interrupted member is uncertain until reconciled or verified.
 - Startup prefill occurs before tape motion; later low-water refills occur only at clean filemarks. Partial packs never become recovery points.
 - Unexpected end of media fails closed; normal spanning occurs at planned pack/slice boundaries.
-- Worker/container restart does not resume a partially written member in alpha.9; touched media is quarantined and retry creates a new archive set.
+- Worker/container restart does not resume a partially written member in alpha.11; touched media is quarantined and retry creates a new archive set.
 - No in-console or selected-file restore, encryption, changer automation, incrementals, automatic snapshots, native ZFS send, or append-after-interruption is available.
 - ACLs, xattrs, sparse files, hard links, unusual names, all codecs/generations, spanning, refill, interruption, and clean-host recovery remain physically unqualified.
 

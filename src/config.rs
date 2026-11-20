@@ -11,10 +11,12 @@ use crate::engine::bacula::DATA_SPOOL_DIRECTORY;
 const DEFAULT_DATA_SPOOL_MAX_BYTES: u64 = 0;
 const DEFAULT_DATA_SPOOL_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_DATA_SPOOL_MIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const DEFAULT_NATIVE_SLICE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-const DEFAULT_NATIVE_PACK_TARGET_BYTES: u64 = 256 * 1024 * 1024 * 1024;
-const DEFAULT_NATIVE_SPOOL_HIGH_WATER_BYTES: u64 = 768 * 1024 * 1024 * 1024;
-const DEFAULT_NATIVE_SPOOL_LOW_WATER_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+const DEFAULT_NATIVE_SLICE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const DEFAULT_NATIVE_PACK_TARGET_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const DEFAULT_NATIVE_PACK_MAXIMUM_BYTES: u64 = 384 * 1024 * 1024 * 1024;
+const DEFAULT_NATIVE_SPOOL_HIGH_WATER_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+const DEFAULT_NATIVE_SPOOL_LOW_WATER_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const DEFAULT_NATIVE_SPOOL_READY_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -44,8 +46,10 @@ pub struct Config {
     pub native_spool_dir: PathBuf,
     pub native_spool_reserve_bytes: u64,
     pub native_pack_target_bytes: u64,
+    pub native_pack_maximum_bytes: u64,
     pub native_spool_high_water_bytes: u64,
     pub native_spool_low_water_bytes: u64,
+    pub native_spool_ready_bytes: u64,
     pub native_slice_bytes: u64,
     pub native_compression_threads: u16,
 }
@@ -119,6 +123,10 @@ impl Config {
             "TAPESCALE_NATIVE_PACK_TARGET_BYTES",
             DEFAULT_NATIVE_PACK_TARGET_BYTES,
         )?;
+        let native_pack_maximum_bytes = parse(
+            "TAPESCALE_NATIVE_PACK_MAXIMUM_BYTES",
+            DEFAULT_NATIVE_PACK_MAXIMUM_BYTES,
+        )?;
         let native_spool_high_water_bytes = parse(
             "TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES",
             DEFAULT_NATIVE_SPOOL_HIGH_WATER_BYTES,
@@ -126,6 +134,10 @@ impl Config {
         let native_spool_low_water_bytes = parse(
             "TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES",
             DEFAULT_NATIVE_SPOOL_LOW_WATER_BYTES,
+        )?;
+        let native_spool_ready_bytes = parse(
+            "TAPESCALE_NATIVE_SPOOL_READY_BYTES",
+            DEFAULT_NATIVE_SPOOL_READY_BYTES,
         )?;
         let native_slice_bytes = parse("TAPESCALE_NATIVE_SLICE_BYTES", DEFAULT_NATIVE_SLICE_BYTES)?;
         let native_compression_threads = parse("TAPESCALE_NATIVE_COMPRESSION_THREADS", 4_u16)?;
@@ -210,28 +222,28 @@ impl Config {
             "TAPESCALE_NATIVE_PACK_TARGET_BYTES must be at least TAPESCALE_NATIVE_SLICE_BYTES"
         );
         anyhow::ensure!(
-            native_spool_low_water_bytes >= native_pack_target_bytes,
-            "TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES must be at least TAPESCALE_NATIVE_PACK_TARGET_BYTES"
+            native_pack_maximum_bytes >= native_pack_target_bytes
+                && native_pack_maximum_bytes <= 1024_u64 * 1024 * 1024 * 1024,
+            "TAPESCALE_NATIVE_PACK_MAXIMUM_BYTES must be at least the pack target and no more than 1 TiB"
         );
         anyhow::ensure!(
-            native_spool_low_water_bytes < native_spool_high_water_bytes,
-            "TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES must be less than TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES"
+            native_spool_low_water_bytes > 0
+                && native_spool_low_water_bytes < native_spool_ready_bytes,
+            "TAPESCALE_NATIVE_SPOOL_LOW_WATER_BYTES must be non-zero and less than TAPESCALE_NATIVE_SPOOL_READY_BYTES"
         );
-        // High-water reserves one maximum in-progress pack. The remaining
-        // ready-pack window must sit strictly above low-water so startup and
-        // refill have real hysteresis rather than immediately restarting on a
-        // single pack.
-        let maximum_pack_bytes = native_pack_target_bytes
-            .checked_add(native_pack_target_bytes / 2)
-            .context("TAPESCALE_NATIVE_PACK_TARGET_BYTES is too large")?
-            .min(1024_u64 * 1024 * 1024 * 1024);
-        let minimum_high_water = native_spool_low_water_bytes
-            .checked_add(maximum_pack_bytes)
-            .and_then(|value| value.checked_add(1))
-            .context("the Native v2 spool hysteresis window is too large")?;
+        anyhow::ensure!(
+            native_spool_ready_bytes >= native_pack_target_bytes,
+            "TAPESCALE_NATIVE_SPOOL_READY_BYTES must hold at least one normal target pack"
+        );
+        // Ready reserve and worst-case oversized allocation group are
+        // independent. This lets ordinary packs stay small without rejecting
+        // a single large file or hard-link group.
+        let minimum_high_water = native_spool_ready_bytes
+            .checked_add(native_pack_maximum_bytes)
+            .context("the Native v2 ready reserve plus maximum pack is too large")?;
         anyhow::ensure!(
             native_spool_high_water_bytes >= minimum_high_water,
-            "TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES must leave a ready-pack resume threshold above low-water after reserving one maximum-size in-progress pack"
+            "TAPESCALE_NATIVE_SPOOL_HIGH_WATER_BYTES must hold the ready reserve plus one maximum-size in-progress pack"
         );
         native_spool_high_water_bytes
             .checked_add(native_spool_reserve_bytes)
@@ -277,8 +289,10 @@ impl Config {
             native_spool_dir,
             native_spool_reserve_bytes,
             native_pack_target_bytes,
+            native_pack_maximum_bytes,
             native_spool_high_water_bytes,
             native_spool_low_water_bytes,
+            native_spool_ready_bytes,
             native_slice_bytes,
             native_compression_threads,
         })

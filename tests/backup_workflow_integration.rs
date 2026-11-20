@@ -150,6 +150,9 @@ async fn create_backup_profile(
 ) -> backup_ops::BackupProfileRecord {
     let source = create_source_profile(pool, name, source_subpath).await;
     let mut request = NewBackupProfile::attended_full_file(source.id);
+    // A legacy/API client can still send the retired opt-out field. Native v2
+    // normalizes it to automatic continuation so a full tape is not fatal.
+    request.spanning_enabled = false;
     request.schedule_enabled = scheduled;
     request.schedule_timezone = "America/New_York".to_owned();
     request.actor_label = "Backup integration operator".to_owned();
@@ -175,6 +178,7 @@ fn loaded_drive_observation() -> SasDriveObservation {
         wwn: None,
         firmware: Some("B100".to_owned()),
         generation: Some(9),
+        loaded_media_generation: Some(9),
         observed_path: "/dev/nst9".to_owned(),
         device_major: 9,
         device_minor: 200,
@@ -320,6 +324,14 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
         .iter()
         .any(|blocker| blocker.code == "no_registered_media"));
 
+    // Simulate a retained pre-upgrade opt-out. Request creation must repair
+    // mutable policy before any physical run can inherit the unsafe setting.
+    sqlx::query("UPDATE protection_policies SET spanning_enabled = false WHERE id = $1")
+        .bind(manual_profile.policy_id)
+        .execute(&pool)
+        .await
+        .expect("legacy single-tape policy fixture should persist");
+
     let first = backup_ops::create_manual_backup_request(
         &pool,
         manual_profile.id,
@@ -335,6 +347,13 @@ async fn operational_backup_requests_schedule_and_assign_media_durably() {
     assert_eq!(first.trigger_kind, "manual");
     assert_eq!(first.requested_level, "full");
     assert!(first.assigned_data_run_id.is_none());
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT spanning_enabled FROM protection_policies WHERE id = $1"
+    )
+    .bind(manual_profile.policy_id)
+    .fetch_one(&pool)
+    .await
+    .expect("request creation should retain the normalized policy"));
 
     let retained = backup_ops::get_backup_request_by_idempotency_key(
         &pool,

@@ -6,7 +6,7 @@
 TapeScale is a safety-first LTO backup control plane for TrueNAS. It manages standalone SAS tape drives, cartridges, bounded rolling file archives, physical verification evidence, recovery metadata, retention, holds, and custody through a graphical console.
 
 > [!IMPORTANT]
-> Version `0.2.0-alpha.10` is an attended evaluation build, not production protection. New backups use **TapeScale Native v2**, a bounded rolling-spool format; existing Native v1 captures remain readable. Multi-tape writing, immediate physical readback, and database-independent full-archive capture/restore are implemented. In-console restore and selected-file recovery are not. Do not make this alpha the only copy of any data.
+> Version `0.2.0-alpha.11` is an attended evaluation build, not production protection. New backups use **TapeScale Native v2**, a bounded rolling-spool format; existing Native v1 captures remain readable. Multi-tape writing, immediate physical readback, and database-independent full-archive capture/restore are implemented. In-console restore and selected-file recovery are not. Do not make this alpha the only copy of any data.
 
 ## What changed in 0.2
 
@@ -16,15 +16,15 @@ The Native v2 path uses independently finalized packs in a bounded spool window:
 
 1. Inventory and SHA-256 hash the selected immutable snapshot.
 2. Deterministically group manifest entries into independently recoverable DAR packs, keeping hard links together.
-3. Prefill a validated ready-pack reserve to the high-water mark minus one maximum in-progress pack (or finish producing a smaller archive) before the first tape motion.
-4. Stream only complete packs to tape, reclaim each pack after its tape files close durably, and refill from low-water to the resume threshold while parked at a clean filemark.
+3. Prefill a validated 128 GiB ready-pack reserve (or finish producing a smaller archive) before the first tape motion.
+4. Stream only complete packs to tape with uncontested sequential spool reads, reclaim each pack after its tape files close durably, and build the next batch only while parked at a clean filemark.
 5. Read the loaded tape's preparation UUID and reject the wrong cartridge.
 6. Write a TapeScale volume header, source manifest, typed pack descriptors, isolated catalogs, payload slices, volume index, and trailer.
 7. Chain continuation-volume indexes and place a final archive-set seal on the last cartridge.
 8. Rewind and immediately read every tape file back, validating its digest and identity bindings.
 9. Retain a recovery point only after every volume, pack, chain link, and final seal passes physical readback.
 
-Small files are packaged into large sequential files before they reach tape. A 30 TB archive therefore does not need a 30 TB staging disk: only the configured rolling window is retained, and pack production overlaps tape consumption. If sustained production cannot keep up, TapeScale waits between complete pack tape files instead of starving a partially written tape file.
+Small files are packaged into large sequential files before they reach tape. A 30 TB archive therefore does not need a 30 TB staging disk: only the configured rolling window is retained. On a rotational spool, production and drain run as separate batches so concurrent seeks do not collapse throughput. If production cannot keep up, TapeScale waits at a complete tape-file boundary instead of starving a partially written tape file.
 
 See [TapeScale Native v2 format](docs/NATIVE_FORMAT.md) for the media contract and current recovery limitations.
 
@@ -37,7 +37,7 @@ See [TapeScale Native v2 format](docs/NATIVE_FORMAT.md) for the media contract a
 - Graphical source browser restricted to named ZFS snapshot directories beneath the read-only source mount
 - Bounded-memory source inventory and retained-manifest browsing without an artificial total file-count or logical-byte ceiling
 - DAR Full archives with automatic fast Zstandard, fast LZ4, balanced GZIP, or no compression
-- Bounded rolling-disk staging with 256 GiB target packs, startup prefill, and functional high/low-water refill hysteresis
+- Bounded rolling-disk staging with 64 GiB normal packs, a 128 GiB ready batch, and safe filemark refill boundaries
 - Ordered attended multi-cartridge continuation at complete pack boundaries without whole-archive staging
 - Versioned self-identifying headers, typed pack records, chained indexes, final archive-set seal, per-file checksums, and per-pack database records
 - Immediate physical full readback of every written native volume
@@ -48,10 +48,10 @@ See [TapeScale Native v2 format](docs/NATIVE_FORMAT.md) for the media contract a
 
 Create two datasets before installing the app:
 
-- `/mnt/tapescale-spool`: a fast Generic/POSIX dataset used as the bounded rolling-pack window. The release defaults are 768 GiB high-water, 256 GiB low-water, and 8 GiB reserved free space; the user's 1 TB spool is sufficient for those defaults.
+- `/mnt/tapescale-spool`: a fast Generic/POSIX dataset used as the bounded rolling-pack window. The release defaults are 512 GiB high-water, 128 GiB ready, 32 GiB low-water, and 8 GiB reserved free space; the user's 1 TB spool is sufficient for those defaults.
 - `/mnt/tapescale-restores`: an isolated Generic/POSIX dataset reserved for future restore execution. Do not share it over SMB or NFS.
 
-The spool does not need to match the source size. It must hold the configured high-water window plus reserve and allow the container worker to create, write, and `fsync` files. With the defaults, tape starts or resumes with at least 384 GiB of validated ready packs unless the producer has already finished a smaller archive. One individual file or hard-link allocation group must still fit both the configured pack maximum and a usable cartridge payload.
+The spool does not need to match the source size. It must hold the configured high-water window plus reserve and allow the container worker to create, write, and `fsync` files. With the defaults, tape starts or resumes with 128 GiB of validated ready packs unless the producer has already finished a smaller archive. One unusually large file or hard-link allocation group may grow to the separate 384 GiB maximum and must still fit a usable cartridge payload.
 
 In TrueNAS SCALE:
 
@@ -71,13 +71,13 @@ The TrueNAS Compose tracks the GitHub `main` branch and uses `pull_policy: build
 
 1. Load one blank or expendable tape and wait for the drive to report ready.
 2. Open **Prepare tape** from the drive or tape view.
-3. Register or select its human-readable inventory label and LTO generation.
+3. Register or select its human-readable inventory label. TapeScale reads the physical LTO generation from the loaded medium and will not accept a guessed capacity.
 4. Review the detected drive and cartridge, then choose **Prepare tape** once.
 5. Leave the worker and drive running until qualification and identity readback complete.
 
 Qualification writes deterministic 256 KiB records across two tape files, rewinds, verifies every record and filemark, then writes a `TapeScale Native Preparation` header containing the durable cartridge UUID. Later discovery and destructive boundaries read that UUID from tape; the operator does not need to repeatedly type or attest the loaded identity.
 
-A qualification pass applies only to the exact recorded drive, firmware, media generation, and test. It is not backup or restore proof.
+A qualification pass applies only to the exact recorded drive, firmware, physically observed media generation, and test. Preparing an eligible empty tape automatically corrects an older catalog generation mismatch. It is not backup or restore proof.
 
 ## Run a native backup
 
@@ -93,7 +93,7 @@ The current backup path protects one existing immutable snapshot with a manually
 
 Automatic compression selects fast Zstandard. Compression occurs while building each disk pack, not while feeding that pack to tape. Packs contain fixed-size DAR slices and are assigned whole to volumes; an archive can span as many eligible prepared cartridges as its plan requires without staging the complete set.
 
-Cancellation before physical writing leaves the selected tape unchanged. Once a media write starts, cancellation is cooperative and cannot stop kernel tape I/O instantaneously. An interrupted or failed write leaves that cartridge uncertain and no recovery point is created from it. Alpha.9 does not resume a partially written member; retry creates and restages a new archive set.
+Cancellation before physical writing leaves the selected tape unchanged. Once a media write starts, cancellation is cooperative and cannot stop kernel tape I/O instantaneously. An interrupted or failed write leaves that cartridge uncertain and no recovery point is created from it. Alpha.11 does not resume a partially written member; retry creates and restages a new archive set.
 
 Terminal jobs can be removed from **Backup Center** with **Delete job**. This is a history-management action: it does not erase tape data, delete recovery points, release protected cartridges, remove manifests, or mutate append-only audit evidence. Active work must be cancelled and reach a terminal state before deletion becomes available.
 

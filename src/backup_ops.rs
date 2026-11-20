@@ -274,6 +274,11 @@ pub async fn create_backup_profile(
     request: &NewBackupProfile,
 ) -> Result<BackupProfileRecord, BackupOpsError> {
     request.validate()?;
+    // Native v2 always closes at a conservative complete-pack boundary and
+    // requests continuation media. A single-tape archive is simply the
+    // one-volume case; persisting an opt-out turns ordinary EOM into an
+    // avoidable terminal failure.
+    let spanning_enabled = true;
     let mut transaction = pool.begin().await?;
     let source = sqlx::query_as::<_, SourceProfileBinding>(
         "SELECT id, job_id, source_id, name, immutable_snapshot_confirmed,
@@ -357,7 +362,7 @@ pub async fn create_backup_profile(
     .bind(&request.full_schedule)
     .bind(request.retention_days)
     .bind(&request.compression_mode)
-    .bind(request.spanning_enabled)
+    .bind(spanning_enabled)
     .bind(&request.data_delivery)
     .bind(json!({
         "workflow": "attended_full_file_backup",
@@ -365,7 +370,7 @@ pub async fn create_backup_profile(
         "incremental_supported": false,
         "compression_mode": request.compression_mode,
         "spanning_supported": true,
-        "spanning_enabled": request.spanning_enabled,
+        "spanning_enabled": spanning_enabled,
         "data_delivery": request.data_delivery,
         "encryption_supported": false,
         "production_eligible": false,
@@ -414,7 +419,7 @@ pub async fn create_backup_profile(
             "verification_mode": "full_readback",
             "encryption_enabled": false,
             "compression_mode": request.compression_mode,
-            "spanning_enabled": request.spanning_enabled,
+            "spanning_enabled": spanning_enabled,
             "data_delivery": request.data_delivery,
             "production_eligible": false
         }),
@@ -629,6 +634,7 @@ async fn create_backup_request(
 
     #[derive(FromRow)]
     struct RequestProfile {
+        policy_id: Uuid,
         job_id: Uuid,
         source_snapshot_id: Uuid,
         schedule_enabled: bool,
@@ -646,8 +652,8 @@ async fn create_backup_request(
         format_version: String,
         archive_codec: String,
     }
-    let profile = sqlx::query_as::<_, RequestProfile>(
-        "SELECT data_profile.job_id, data_profile.source_snapshot_id,
+    let mut profile = sqlx::query_as::<_, RequestProfile>(
+        "SELECT policy.id AS policy_id, data_profile.job_id, data_profile.source_snapshot_id,
                 data_profile.schedule_enabled, data_profile.enabled,
                 data_profile.production_eligible, policy.representation,
                 policy.encryption_enabled, policy.compression_mode,
@@ -717,6 +723,33 @@ async fn create_backup_request(
             Uuid::now_v7(),
         )
         .await?;
+    }
+    if !profile.spanning_enabled {
+        sqlx::query(
+            "UPDATE protection_policies
+                SET spanning_enabled = true, updated_at = now()
+              WHERE id = $1",
+        )
+        .bind(profile.policy_id)
+        .execute(&mut *transaction)
+        .await?;
+        append_audit(
+            &mut transaction,
+            requested_by_label,
+            "backup.profile.multivolume_upgrade",
+            "single_tape_data_profile",
+            profile_id.to_string(),
+            json!({
+                "policy_id": profile.policy_id,
+                "from_spanning_enabled": false,
+                "to_spanning_enabled": true,
+                "reason": "Native v2 handles the one-tape case and requests continuation media at complete pack boundaries"
+            }),
+            "upgraded",
+            Uuid::now_v7(),
+        )
+        .await?;
+        profile.spanning_enabled = true;
     }
     if !profile.enabled
         || profile.production_eligible

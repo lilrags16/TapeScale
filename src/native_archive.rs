@@ -578,11 +578,10 @@ pub struct RollingSpoolPlan {
     pub completed_pack_slots: u64,
 }
 
-/// Calculate bounded high/low watermarks. The high-water mark retains fifteen
-/// percent of usable space for filesystem/DAR transients. The low-water mark
-/// drives refill hysteresis: physical writing remains at a complete tape-file
-/// boundary until the validated queue reaches high-water minus the reserved
-/// maximum in-progress pack (or production is complete).
+/// Calculate a generic bounded high/low capacity window. The high-water mark
+/// retains fifteen percent of usable space for filesystem/DAR transients. The
+/// operational writer configures its ready-batch target separately and uses
+/// low-water only to choose a complete tape-file refill boundary.
 pub fn plan_rolling_spool(
     available_bytes: u64,
     reserve_bytes: u64,

@@ -1,6 +1,6 @@
 # Qualification and acceptance ledger
 
-This ledger separates implemented behavior from evidence collected on physical tape hardware. It applies to TapeScale `0.2.0-alpha.9` and TapeScale Native v2; Native v1 is recovery-compatible history.
+This ledger separates implemented behavior from evidence collected on physical tape hardware. It applies to TapeScale `0.2.0-alpha.11` and TapeScale Native v2; Native v1 is recovery-compatible history.
 
 ## Status vocabulary
 
@@ -14,7 +14,7 @@ Nothing in this alpha is physically **Qualified**. Do not use it as the only cop
 
 ## Active implementation
 
-New backups use TapeScale Native v2. DAR 2.8.6 packages ordered, hard-link-closed source ranges into independently tested packs while TapeScale concurrently consumes a bounded rolling spool. Complete pack tape files, chained volume indexes, and the final archive-set seal are written directly to the non-rewinding tape device. PostgreSQL records operations but is not required by the clean-host recovery utility.
+New backups use TapeScale Native v2. DAR 2.8.6 packages ordered, hard-link-closed source ranges into independently tested batches in a bounded rolling spool. TapeScale alternates pack production and tape drain at complete filemarks on a rotational spool. Complete pack tape files, chained volume indexes, and the final archive-set seal are written directly to the non-rewinding tape device. PostgreSQL records operations but is not required by the clean-host recovery utility.
 
 Bacula is retired from the runtime. Earlier failed Bacula rows remain audit history only and are not valid recovery points. Native v1/v2 are intentionally incompatible with earlier Bacula media.
 
@@ -46,7 +46,7 @@ Bacula is retired from the runtime. Earlier failed Bacula rows remain audit hist
 | AT-22 | Minimum recovery coverage | Simulated | Not run | Exercise emergency recall and replacement-host delivery procedures. |
 | AT-23 | Roles and safe destinations | Partial | Not run | Add production authentication/RBAC and adversarial destination tests. |
 | AT-24 | Container replacement and migration | Partial | Not run | CI upgrades the prior schema; prove v1 read compatibility and the documented no-mid-volume-resume quarantine behavior. |
-| AT-25 | Rolling-spool capacity and backpressure | Implemented/Simulated | Not run | Measure 1 TiB high/low-water operation, metadata-heavy input, near-full capacity, concurrent production/consumption, and stalled-device cases. |
+| AT-25 | Rolling-spool capacity and backpressure | Implemented/Simulated | Not run | Measure 1 TiB ready/low/high-water operation, metadata-heavy input, near-full capacity, exclusive production/drain batches, and stalled-device cases. |
 | AT-26 | Representative workloads and sustained speed | Implemented/Simulated | Not run | Measure small-file pack production, compression, rolling-spool rates, tape streaming, and backhitch behavior. |
 | AT-27 | Source errors and destination safety | Implemented/Simulated | Not run | Broaden physical error fixtures; restore remains limited to a caller-provided existing empty directory. |
 | AT-28 | Durable events and actionable status | Implemented/Simulated | Not run | Exercise restarts and long attended waits on the deployment host. |
@@ -60,7 +60,7 @@ Bacula is retired from the runtime. Earlier failed Bacula rows remain audit hist
 
 **Implemented; physical acceptance not passed.**
 
-The selected alpha architecture is TapeScale Native v2 with DAR 2.8.6 as a separately executed archive codec. Bounded concurrent pack production, the on-tape envelope, cartridge/archive identity, pack-boundary spanning, direct tape I/O, immediate whole-volume readback, final set sealing, and independent recovery CLI are implemented and documented in [NATIVE_FORMAT.md](NATIVE_FORMAT.md). Real-hardware throughput, filesystem fidelity, EOM, wrong-media, interruption, and clean-host evidence remain required.
+The selected alpha architecture is TapeScale Native v2 with DAR 2.8.6 as a separately executed archive codec. Bounded batched pack production, the on-tape envelope, cartridge/archive identity, pack-boundary spanning, direct tape I/O, immediate whole-volume readback, final set sealing, and independent recovery CLI are implemented and documented in [NATIVE_FORMAT.md](NATIVE_FORMAT.md). Real-hardware throughput, filesystem fidelity, EOM, wrong-media, interruption, and clean-host evidence remain required.
 
 ### G1 — Recovery safety
 
